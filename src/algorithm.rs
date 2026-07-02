@@ -182,8 +182,7 @@ impl CpmAlgorithm {
                             // `current_ef > task.earliest_start` above is
                             // false and EF stays at the default 0 instead
                             // of ES + effort_hours.
-                            task.earliest_finish =
-                                task.earliest_start + task.effort_hours;
+                            task.earliest_finish = task.earliest_start + task.effort_hours;
                             queue.push_back(task.id.clone());
                             // EF finalised when all predecessors are in
                         }
