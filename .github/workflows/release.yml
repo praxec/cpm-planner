@@ -63,3 +63,25 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+  registry:
+    name: MCP registry
+    needs: image
+    runs-on: ubuntu-latest
+    # Publishes server.json to the official MCP registry under io.github.praxec/*,
+    # verified via GitHub OIDC (no secrets). NOTE: confirm the mcp-publisher install
+    # + subcommands against current registry docs — the CLI is young.
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: install mcp-publisher
+        run: |
+          os=$(uname -s | tr '[:upper:]' '[:lower:]')
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_${os}_amd64.tar.gz" -o mcp-publisher.tgz
+          tar xzf mcp-publisher.tgz mcp-publisher
+      - name: login (GitHub OIDC) + publish
+        run: |
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher publish
