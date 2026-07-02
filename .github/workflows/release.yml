@@ -1,18 +1,23 @@
 name: release
-# Publishes cross-platform binaries + a multi-arch container image when a
-# vX.Y.Z tag is pushed. (Registering in the MCP registry is a separate,
-# auth-gated step — see server.json + README.)
 on:
   push:
     tags: ["v*"]
-
 permissions:
-  contents: write   # upload release assets
-  packages: write   # push to ghcr.io
-
+  contents: write
+  packages: write
 jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: create GitHub release (once, so binary jobs can upload to it)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "${{ github.ref_name }}" --title "${{ github.ref_name }}" --generate-notes || echo "release already exists"
+
   binaries:
     name: binary (${{ matrix.target }})
+    needs: create-release
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -68,20 +73,16 @@ jobs:
     name: MCP registry
     needs: image
     runs-on: ubuntu-latest
-    # Publishes server.json to the official MCP registry under io.github.praxec/*,
-    # verified via GitHub OIDC (no secrets). NOTE: confirm the mcp-publisher install
-    # + subcommands against current registry docs — the CLI is young.
+    # Publishes server.json to the MCP registry under io.github.praxec/* via GitHub
+    # OIDC. Non-blocking: the CLI is young, so a failure here must not red the release.
     permissions:
       id-token: write
       contents: read
     steps:
       - uses: actions/checkout@v4
-      - name: install mcp-publisher
+      - name: publish to MCP registry (best-effort)
+        continue-on-error: true
         run: |
           os=$(uname -s | tr '[:upper:]' '[:lower:]')
-          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_${os}_amd64.tar.gz" -o mcp-publisher.tgz
-          tar xzf mcp-publisher.tgz mcp-publisher
-      - name: login (GitHub OIDC) + publish
-        run: |
-          ./mcp-publisher login github-oidc
-          ./mcp-publisher publish
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_${os}_amd64.tar.gz" -o mcp-publisher.tgz && tar xzf mcp-publisher.tgz mcp-publisher
+          ./mcp-publisher login github-oidc && ./mcp-publisher publish
