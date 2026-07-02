@@ -1,0 +1,34 @@
+[package]
+name = "cpm-planner"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.83"
+license = "Apache-2.0"
+repository = "https://github.com/praxec/cpm-planner"
+description = "Critical Path Method (CPM) planner exposed as an MCP server: schedules a task graph (earliest/latest start, slack, critical path, bottlenecks) and coordinates lock-aware parallel execution over MCP."
+authors = ["Matthew Cochran <matthew@cochranweb.com>"]
+readme = "README.md"
+keywords = ["mcp", "cpm", "critical-path", "planner", "scheduling"]
+categories = ["development-tools", "command-line-utilities"]
+
+[lib]
+name = "cpm_planner"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cpm-planner"
+path = "src/bin/server.rs"
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+rmcp = { version = "1.7", default-features = false, features = ["server", "macros", "transport-io"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v4", "serde"] }

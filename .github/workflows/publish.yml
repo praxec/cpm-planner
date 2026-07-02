@@ -1,0 +1,52 @@
+# Publish cpm-planner to crates.io when a `v*` tag is pushed.
+#
+# Required repository secret:
+#   CRATES_IO_TOKEN — a crates.io API token with publish scope. Generate at
+#   https://crates.io/me, add at Settings → Secrets and variables → Actions.
+#
+# Usage:
+#   git tag v0.0.1
+#   git push origin v0.0.1
+#
+# Fails fast if the tag does not match the crate version in Cargo.toml, and
+# runs the test suite before anything reaches crates.io.
+
+name: Publish to crates.io
+
+on:
+    push:
+        tags:
+            - 'v*'
+
+env:
+    CARGO_TERM_COLOR: always
+
+jobs:
+    publish:
+        name: cargo publish (tag-triggered)
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Install Rust toolchain
+              uses: dtolnay/rust-toolchain@stable
+
+            - name: Cache cargo registry + build
+              uses: Swatinem/rust-cache@v2
+
+            - name: Verify tag matches crate version
+              run: |
+                  tag="${GITHUB_REF#refs/tags/v}"
+                  ver=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+                  if [ "$tag" != "$ver" ]; then
+                    echo "::error::Tag v$tag does not match crate version $ver"
+                    exit 1
+                  fi
+                  echo "Tag v$tag matches crate version $ver — OK."
+
+            - name: cargo test (final safety net)
+              run: cargo test
+
+            - name: cargo publish
+              run: cargo publish --token "${{ secrets.CRATES_IO_TOKEN }}"
