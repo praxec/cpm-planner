@@ -6,10 +6,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use cpm_planner::BasicCpmPlanner;
 use cpm_planner::audit::MemoryAuditSink;
 use cpm_planner::plan::{CallerId, Deliverable, DeliverableStatus, PlanGraph, PlannerError};
 use cpm_planner::ports::Planner;
-use cpm_planner::BasicCpmPlanner;
 
 fn deliverable(id: &str, files: &[&str], prereqs: &[&str], effort: Option<f32>) -> Deliverable {
     Deliverable {

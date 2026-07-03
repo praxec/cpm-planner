@@ -46,6 +46,7 @@ use crate::plan::{
     CallerId, Cohort, DeliverableStatus, PlanGraph, PlanId, PlanStatus, PlannerError,
 };
 use crate::ports::Planner;
+use rmcp::ErrorData as McpError;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, Implementation, InitializeRequestParams,
     InitializeResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities,
@@ -53,10 +54,9 @@ use rmcp::model::{
 };
 use rmcp::service::{NotificationContext, RequestContext, RoleServer};
 use rmcp::transport::stdio;
-use rmcp::ErrorData as McpError;
 use rmcp::{ServerHandler, ServiceExt};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::BasicCpmPlanner;
 

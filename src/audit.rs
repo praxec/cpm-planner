@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 /// A single audit record. Builder-style: `AuditEvent::new(type).with_*(…)`.

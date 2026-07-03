@@ -9,10 +9,10 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
+use cpm_planner::BasicCpmPlanner;
 use cpm_planner::audit::MemoryAuditSink;
 use cpm_planner::plan::{CallerId, Deliverable, DeliverableStatus, PlanGraph};
 use cpm_planner::ports::Planner;
-use cpm_planner::BasicCpmPlanner;
 
 fn deliverable(id: &str, files: &[&str], prereqs: &[&str], effort: Option<f32>) -> Deliverable {
     Deliverable {

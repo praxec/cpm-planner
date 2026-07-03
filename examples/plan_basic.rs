@@ -26,10 +26,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use cpm_planner::BasicCpmPlanner;
 use cpm_planner::audit::{AuditEvent, AuditSink};
 use cpm_planner::plan::{CallerId, Deliverable, DeliverableStatus, PlanGraph};
 use cpm_planner::ports::Planner;
-use cpm_planner::BasicCpmPlanner;
 
 /// A trivial audit sink that buffers every event for inspection.
 #[derive(Debug, Default)]
