@@ -1,7 +1,7 @@
 [package]
 name = "cpm-planner"
 version = "0.0.1"
-edition = "2021"
+edition = "2024"
 rust-version = "1.83"
 license = "Apache-2.0"
 repository = "https://github.com/praxec/cpm-planner"
