@@ -2,7 +2,7 @@
 name = "cpm-planner"
 version = "0.0.1"
 edition = "2024"
-rust-version = "1.83"
+rust-version = "1.85"
 license = "Apache-2.0"
 repository = "https://github.com/praxec/cpm-planner"
 description = "Critical Path Method (CPM) planner exposed as an MCP server: schedules a task graph (earliest/latest start, slack, critical path, bottlenecks) and coordinates lock-aware parallel execution over MCP."
