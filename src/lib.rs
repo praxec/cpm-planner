@@ -50,11 +50,11 @@ pub mod server;
 pub mod task;
 
 pub use algorithm::CpmAlgorithm;
-pub use drag::{diameter, drag, DragResult};
+pub use drag::{DragResult, diameter, drag};
 pub use estimator::{EffortEstimator, EstimationConfig};
 pub use planner::{BasicCpmPlanner, ClockFn, DEFAULT_EFFORT_HOURS, DEFAULT_TTL};
 pub use server::{
-    plan_tool_definitions, PlanServer, PLAN_TOOL_NAMES, TOOL_ACQUIRE_COHORT, TOOL_FORCE_RELEASE,
-    TOOL_HEARTBEAT, TOOL_MARK_STATUS, TOOL_STATUS, TOOL_SUBMIT,
+    PLAN_TOOL_NAMES, PlanServer, TOOL_ACQUIRE_COHORT, TOOL_FORCE_RELEASE, TOOL_HEARTBEAT,
+    TOOL_MARK_STATUS, TOOL_STATUS, TOOL_SUBMIT, plan_tool_definitions,
 };
 pub use task::{Bottleneck, CriticalPathResult, Task, TaskBatch, TaskKind, TaskStatus};

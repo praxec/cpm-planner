@@ -18,7 +18,7 @@ use cpm_planner::{
     TOOL_MARK_STATUS, TOOL_STATUS, TOOL_SUBMIT,
 };
 use rmcp::model::{CallToolRequestParams, JsonObject};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
