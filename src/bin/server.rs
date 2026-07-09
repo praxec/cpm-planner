@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use cpm_planner::audit::{AuditSink, NullAuditSink};
-use cpm_planner::{BasicCpmPlanner, PlanServer};
+use cpm_planner::{BasicCpmPlanner, PlanServer, SqlitePlanStore};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -34,7 +34,16 @@ async fn main() -> anyhow::Result<()> {
     // wired in later the planner's correctness is unaffected by sink
     // outages.
     let audit: Arc<dyn AuditSink> = Arc::new(NullAuditSink);
-    let planner = Arc::new(BasicCpmPlanner::with_audit(audit));
+
+    // Durable state: plans, statuses, and cohort locks survive restarts
+    // and are shared (atomically) with any other process pointed at the
+    // same database — e.g. an external orchestrate CLI. Default path is
+    // ~/.local/share/praxec/cpm-planner.db; override with CPM_PLANNER_DB
+    // (":memory:" gives the old ephemeral behaviour).
+    let db_path = SqlitePlanStore::default_db_path()?;
+    tracing::info!(db = %db_path.display(), "opening planner database");
+    let store = SqlitePlanStore::open(&db_path)?;
+    let planner = Arc::new(BasicCpmPlanner::with_store(store, audit));
 
     tracing::info!("starting cpm-planner stdio server");
     let server = PlanServer::new(planner);

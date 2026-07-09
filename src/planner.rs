@@ -5,18 +5,27 @@
 //! described on [`Planner`], and emits an audit lifecycle for every lock
 //! state transition.
 //!
-//! # Atomicity
+//! # Atomicity & persistence
 //!
-//! All mutating methods take the single top-level
-//! `tokio::sync::Mutex<HashMap<PlanId, PlanState>>`. Holding that mutex
-//! for the entirety of [`acquire_cohort`][Planner::acquire_cohort] is what
-//! makes "acquire N disjoint deliverables together" a single observable
-//! step: no other concurrent acquirer can witness a half-applied lock map.
+//! All state lives in a [`SqlitePlanStore`]. Every mutating method runs
+//! its entire body — load [`PlanState`], apply the existing in-memory
+//! scheduling logic, write back — inside ONE `BEGIN IMMEDIATE` SQLite
+//! transaction. That is what makes "acquire N disjoint deliverables
+//! together" a single observable step, and because the write lock is
+//! database-level it holds across OS processes, not just tasks in this
+//! process: an MCP server and an external `orchestrate` CLI pointed at
+//! the same database can never double-acquire.
+//!
+//! Constructors without an explicit store ([`BasicCpmPlanner::new`],
+//! [`BasicCpmPlanner::with_audit`], [`BasicCpmPlanner::with_parts`]) use a
+//! private in-memory database — the historical ephemeral behaviour. Use
+//! [`BasicCpmPlanner::with_store`] with a file-backed
+//! [`SqlitePlanStore`] for durable, cross-process state.
 //!
 //! # Audit emission
 //!
-//! Audit events are buffered into a `Vec<AuditEvent>` while the mutex is
-//! held, then drained to the [`AuditSink`] AFTER the mutex is dropped.
+//! Audit events are buffered into a `Vec<AuditEvent>` while the
+//! transaction is open, then drained to the [`AuditSink`] AFTER commit.
 //! A slow sink therefore never holds up concurrent acquirers.
 
 use std::collections::{HashMap, HashSet};
@@ -29,12 +38,12 @@ use crate::plan::{
     CallerId, Cohort, CohortRow, Deliverable, DeliverableStatus, LockInfo, PlanGraph, PlanId,
     PlanStatus, PlannerError,
 };
+use crate::plan_store::SqlitePlanStore;
 use crate::ports::Planner;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
 
 use crate::algorithm::CpmAlgorithm;
 use crate::estimator::EffortEstimator;
@@ -60,10 +69,9 @@ pub type ClockFn = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
 
 /// Open-source CPM planner with file-aware locking.
 pub struct BasicCpmPlanner {
-    plans: Arc<Mutex<HashMap<PlanId, PlanState>>>,
-    /// `graph_hash -> PlanId` map used by [`submit_plan`] to make
-    /// resubmissions idempotent without re-running CPM.
-    dedup: Arc<Mutex<HashMap<String, PlanId>>>,
+    /// Durable state: plans, statuses, locks, and the submit-dedup map.
+    /// Also the atomicity mechanism — see the module docs.
+    store: SqlitePlanStore,
     audit: Arc<dyn AuditSink>,
     ttl: Duration,
     clock: ClockFn,
@@ -96,12 +104,30 @@ impl BasicCpmPlanner {
         self
     }
 
-    /// Full-parts constructor. Public for clients that want explicit
-    /// control over every field at once.
+    /// Full-parts constructor with an ephemeral in-memory store. Public
+    /// for clients that want explicit control over every field at once.
     pub fn with_parts(audit: Arc<dyn AuditSink>, ttl: Duration, clock: ClockFn) -> Self {
+        let store = SqlitePlanStore::open_in_memory()
+            .expect("INVARIANT: opening a private in-memory sqlite database cannot fail");
+        Self::with_store_parts(store, audit, ttl, clock)
+    }
+
+    /// Construct a planner backed by the supplied (typically file-backed)
+    /// store, with the default TTL and real clock. This is the durable,
+    /// cross-process configuration used by the MCP server binary.
+    pub fn with_store(store: SqlitePlanStore, audit: Arc<dyn AuditSink>) -> Self {
+        Self::with_store_parts(store, audit, DEFAULT_TTL, Arc::new(Utc::now))
+    }
+
+    /// Full-parts constructor over an explicit store.
+    pub fn with_store_parts(
+        store: SqlitePlanStore,
+        audit: Arc<dyn AuditSink>,
+        ttl: Duration,
+        clock: ClockFn,
+    ) -> Self {
         Self {
-            plans: Arc::new(Mutex::new(HashMap::new())),
-            dedup: Arc::new(Mutex::new(HashMap::new())),
+            store,
             audit,
             ttl,
             clock,
@@ -418,66 +444,52 @@ impl Planner for BasicCpmPlanner {
         validate_graph(&graph)?;
         let graph_hash = hash_graph(&graph);
 
-        // Fast path: dedup hit -> return existing PlanId.
-        {
-            let dedup = self.dedup.lock().await;
-            if let Some(existing) = dedup.get(&graph_hash) {
-                return Ok(existing.clone());
+        // The dedup check + build + insert all happen inside ONE immediate
+        // sqlite transaction, so identical concurrent submissions — even
+        // from different processes — resolve to a single PlanId. The build
+        // closure only runs on a dedup miss.
+        self.store.submit_or_get(&graph_hash, move || {
+            // Build the CPM kernel input and run the algorithm. A single
+            // default-config estimator fills in effort for deliverables that
+            // omit an explicit `estimated_effort_hours`.
+            let estimator = EffortEstimator::new();
+            let mut tasks: Vec<Task> = graph
+                .deliverables
+                .iter()
+                .map(|d| deliverable_to_task(d, &estimator))
+                .collect();
+            let cached_result = CpmAlgorithm::calculate(&mut tasks);
+
+            // `validate_graph` above already rejected cyclic graphs, so the CPM
+            // kernel must have scheduled every task. If `unscheduled` is non-empty
+            // here, the two cycle detectors disagree — a correctness bug, not bad
+            // input. Surface it as an InvalidGraph rather than caching and serving
+            // a confidently-wrong plan.
+            if !cached_result.unscheduled.is_empty() {
+                return Err(PlannerError::InvalidGraph {
+                    reason: format!(
+                        "internal CPM inconsistency: deliverables passed cycle validation but \
+                         could not be scheduled: [{}]",
+                        cached_result.unscheduled.join(", ")
+                    ),
+                });
             }
-        }
 
-        // Build the CPM kernel input and run the algorithm. A single
-        // default-config estimator fills in effort for deliverables that
-        // omit an explicit `estimated_effort_hours`.
-        let estimator = EffortEstimator::new();
-        let mut tasks: Vec<Task> = graph
-            .deliverables
-            .iter()
-            .map(|d| deliverable_to_task(d, &estimator))
-            .collect();
-        let cached_result = CpmAlgorithm::calculate(&mut tasks);
+            // Initialise per-deliverable status: zero-prereq -> Ready, else Pending.
+            let mut statuses: HashMap<String, DeliverableStatus> =
+                HashMap::with_capacity(graph.deliverables.len());
+            for d in &graph.deliverables {
+                let status = if d.prerequisites.is_empty() {
+                    DeliverableStatus::Ready
+                } else {
+                    DeliverableStatus::Pending
+                };
+                statuses.insert(d.id.clone(), status);
+            }
 
-        // `validate_graph` above already rejected cyclic graphs, so the CPM
-        // kernel must have scheduled every task. If `unscheduled` is non-empty
-        // here, the two cycle detectors disagree — a correctness bug, not bad
-        // input. Surface it as an InvalidGraph rather than caching and serving
-        // a confidently-wrong plan.
-        if !cached_result.unscheduled.is_empty() {
-            return Err(PlannerError::InvalidGraph {
-                reason: format!(
-                    "internal CPM inconsistency: deliverables passed cycle validation but could \
-                     not be scheduled: [{}]",
-                    cached_result.unscheduled.join(", ")
-                ),
-            });
-        }
-
-        // Initialise per-deliverable status: zero-prereq -> Ready, else Pending.
-        let mut statuses: HashMap<String, DeliverableStatus> =
-            HashMap::with_capacity(graph.deliverables.len());
-        for d in &graph.deliverables {
-            let status = if d.prerequisites.is_empty() {
-                DeliverableStatus::Ready
-            } else {
-                DeliverableStatus::Pending
-            };
-            statuses.insert(d.id.clone(), status);
-        }
-
-        // Mint a fresh PlanId and insert. Re-check dedup under both locks to
-        // avoid a TOCTOU race between the read above and the insert below
-        // when two callers submit identical graphs concurrently.
-        let plan_id = PlanId(format!("plan_{}", uuid::Uuid::new_v4().simple()));
-        let state = PlanState::new(graph, statuses, cached_result);
-
-        let mut dedup = self.dedup.lock().await;
-        if let Some(existing) = dedup.get(&graph_hash) {
-            return Ok(existing.clone());
-        }
-        let mut plans = self.plans.lock().await;
-        dedup.insert(graph_hash, plan_id.clone());
-        plans.insert(plan_id.clone(), state);
-        Ok(plan_id)
+            let plan_id = PlanId(format!("plan_{}", uuid::Uuid::new_v4().simple()));
+            Ok((plan_id, PlanState::new(graph, statuses, cached_result)))
+        })
     }
 
     async fn acquire_cohort(
@@ -491,18 +503,11 @@ impl Planner for BasicCpmPlanner {
             + chrono::Duration::from_std(self.ttl)
                 .expect("INVARIANT: planner TTL fits in chrono::Duration");
 
-        // Whole acquire body runs under the top-level mutex — that's what
-        // gives us atomicity against concurrent acquirers.
-        let (cohort, audit_buf) = {
-            let mut plans = self.plans.lock().await;
-            let state = plans
-                .get_mut(plan_id)
-                .ok_or_else(|| PlannerError::PlanNotFound {
-                    plan_id: plan_id.0.clone(),
-                })?;
-
-            let mut audit_buf: Vec<AuditEvent> = Vec::new();
-
+        // Whole acquire body runs inside one immediate sqlite transaction —
+        // that's what gives us atomicity against concurrent acquirers,
+        // including acquirers in other OS processes.
+        let mut audit_buf: Vec<AuditEvent> = Vec::new();
+        let cohort = self.store.mutate_plan(plan_id, |state| {
             // 1. Reap expired locks, emitting expiry events.
             let reaped = state.reap_expired(now);
             for lock in &reaped {
@@ -586,13 +591,11 @@ impl Planner for BasicCpmPlanner {
                 });
             }
 
-            let cohort = Cohort {
+            Ok(Cohort {
                 plan_id: plan_id.clone(),
                 rows,
-            };
-
-            (cohort, audit_buf)
-        };
+            })
+        })?;
 
         self.flush_audit(audit_buf).await;
         Ok(cohort)
@@ -605,14 +608,8 @@ impl Planner for BasicCpmPlanner {
         caller_id: &CallerId,
         status: DeliverableStatus,
     ) -> Result<(), PlannerError> {
-        let audit_buf = {
-            let mut plans = self.plans.lock().await;
-            let state = plans
-                .get_mut(plan_id)
-                .ok_or_else(|| PlannerError::PlanNotFound {
-                    plan_id: plan_id.0.clone(),
-                })?;
-
+        let mut audit_buf: Vec<AuditEvent> = Vec::new();
+        self.store.mutate_plan(plan_id, |state| {
             // Deliverable existence.
             if !state
                 .graph
@@ -635,8 +632,6 @@ impl Planner for BasicCpmPlanner {
                     });
                 }
             }
-
-            let mut audit_buf: Vec<AuditEvent> = Vec::new();
 
             // Lock release on terminal status.
             let release_reason: Option<&'static str> = match &status {
@@ -702,8 +697,8 @@ impl Planner for BasicCpmPlanner {
                 }
             }
 
-            audit_buf
-        };
+            Ok(())
+        })?;
 
         // SPEC §33 audit fixup (F6 ORPHAN-001): the previous
         // `let _ = status_recompute_needed;` extension marker was
@@ -727,71 +722,61 @@ impl Planner for BasicCpmPlanner {
             + chrono::Duration::from_std(self.ttl)
                 .expect("INVARIANT: planner TTL fits in chrono::Duration");
 
-        let mut plans = self.plans.lock().await;
-        let state = plans
-            .get_mut(plan_id)
-            .ok_or_else(|| PlannerError::PlanNotFound {
-                plan_id: plan_id.0.clone(),
-            })?;
+        self.store.mutate_plan(plan_id, |state| {
+            let lock =
+                state
+                    .locks
+                    .get_mut(deliverable_id)
+                    .ok_or_else(|| PlannerError::LockNotHeld {
+                        caller_id: caller_id.0.clone(),
+                        deliverable_id: deliverable_id.to_string(),
+                    })?;
 
-        let lock =
-            state
-                .locks
-                .get_mut(deliverable_id)
-                .ok_or_else(|| PlannerError::LockNotHeld {
+            if lock.caller_id != *caller_id {
+                return Err(PlannerError::LockNotHeld {
                     caller_id: caller_id.0.clone(),
                     deliverable_id: deliverable_id.to_string(),
-                })?;
+                });
+            }
 
-        if lock.caller_id != *caller_id {
-            return Err(PlannerError::LockNotHeld {
-                caller_id: caller_id.0.clone(),
-                deliverable_id: deliverable_id.to_string(),
-            });
-        }
+            // TTL already lapsed at the moment of the heartbeat — surface it so
+            // the caller knows their work item may have been reclaimed.
+            if lock.expires_at < now {
+                return Err(PlannerError::LockExpired {
+                    deliverable_id: deliverable_id.to_string(),
+                    expired_at: lock.expires_at,
+                });
+            }
 
-        // TTL already lapsed at the moment of the heartbeat — surface it so
-        // the caller knows their work item may have been reclaimed.
-        if lock.expires_at < now {
-            return Err(PlannerError::LockExpired {
-                deliverable_id: deliverable_id.to_string(),
-                expired_at: lock.expires_at,
-            });
-        }
-
-        lock.expires_at = expires_at;
-        Ok(())
+            lock.expires_at = expires_at;
+            Ok(())
+        })
     }
 
     async fn status(&self, plan_id: &PlanId) -> Result<PlanStatus, PlannerError> {
-        let plans = self.plans.lock().await;
-        let state = plans
-            .get(plan_id)
-            .ok_or_else(|| PlannerError::PlanNotFound {
-                plan_id: plan_id.0.clone(),
-            })?;
+        self.store.read_plan(plan_id, |state| {
+            // Preserve insertion order from the original graph for stable UI.
+            let deliverables: Vec<(String, DeliverableStatus)> = state
+                .graph
+                .deliverables
+                .iter()
+                .map(|d| {
+                    let status = state
+                        .statuses
+                        .get(&d.id)
+                        .cloned()
+                        .unwrap_or(DeliverableStatus::Pending);
+                    (d.id.clone(), status)
+                })
+                .collect();
 
-        // Preserve insertion order from the original graph for stable UI.
-        let deliverables: Vec<(String, DeliverableStatus)> = state
-            .graph
-            .deliverables
-            .iter()
-            .map(|d| {
-                let status = state
-                    .statuses
-                    .get(&d.id)
-                    .cloned()
-                    .unwrap_or(DeliverableStatus::Pending);
-                (d.id.clone(), status)
-            })
-            .collect();
-
-        Ok(PlanStatus {
-            plan_id: plan_id.clone(),
-            deliverables,
-            critical_path: state.cached_result.critical_path.clone(),
-            critical_path_hours: state.cached_result.critical_path_duration,
-            locks_held: state.locks.values().cloned().collect(),
+            PlanStatus {
+                plan_id: plan_id.clone(),
+                deliverables,
+                critical_path: state.cached_result.critical_path.clone(),
+                critical_path_hours: state.cached_result.critical_path_duration,
+                locks_held: state.locks.values().cloned().collect(),
+            }
         })
     }
 
@@ -801,14 +786,8 @@ impl Planner for BasicCpmPlanner {
         deliverable_id: &str,
         reason: &str,
     ) -> Result<(), PlannerError> {
-        let audit_buf = {
-            let mut plans = self.plans.lock().await;
-            let state = plans
-                .get_mut(plan_id)
-                .ok_or_else(|| PlannerError::PlanNotFound {
-                    plan_id: plan_id.0.clone(),
-                })?;
-
+        let mut audit_buf: Vec<AuditEvent> = Vec::new();
+        self.store.mutate_plan(plan_id, |state| {
             if !state
                 .graph
                 .deliverables
@@ -821,7 +800,6 @@ impl Planner for BasicCpmPlanner {
                 });
             }
 
-            let mut audit_buf: Vec<AuditEvent> = Vec::new();
             if let Some(lock) = state.locks.remove(deliverable_id) {
                 // Deliverable existence was verified above; the held lock
                 // implies the graph entry exists.
@@ -845,8 +823,8 @@ impl Planner for BasicCpmPlanner {
                 audit_buf.push(make_force_released_event(&lock, reason));
             }
 
-            audit_buf
-        };
+            Ok(())
+        })?;
 
         self.flush_audit(audit_buf).await;
         Ok(())
