@@ -134,8 +134,8 @@ async fn plan_and_statuses_survive_reopen() {
     assert_eq!(
         status.deliverables,
         vec![
-            ("d1".to_string(), DeliverableStatus::Ready),
-            ("d2".to_string(), DeliverableStatus::Pending),
+            ("d1".to_string(), DeliverableStatus::Ready, 0),
+            ("d2".to_string(), DeliverableStatus::Pending, 0),
         ]
     );
     assert!(status.locks_held.is_empty());
@@ -374,8 +374,8 @@ async fn expired_lock_is_quarantined_on_reopen() {
     );
     assert_eq!(
         status.deliverables[0],
-        ("d1".to_string(), DeliverableStatus::Ready),
-        "quarantined deliverable goes back to ready"
+        ("d1".to_string(), DeliverableStatus::Ready, 1),
+        "quarantined deliverable goes back to ready with its lease still counted"
     );
 
     // And it is immediately re-acquirable.
@@ -441,6 +441,80 @@ async fn heartbeat_ttl_refresh_is_persisted_across_connections() {
         .expect("acquire after refreshed expiry");
     assert_eq!(cohort.rows.len(), 1);
     assert_eq!(cohort.rows[0].deliverable.id, "d1");
+}
+
+// ---------------------------------------------------------------------
+// Acceptance: circuit-breaker attempt counting is durable
+// ---------------------------------------------------------------------
+
+/// Each "process" (fresh store connection) leases d1 and crashes without
+/// marking it; the lock expires and d1 reverts to Ready. The attempt
+/// counter must survive every reopen, so after MAX_ATTEMPTS crashed
+/// drivers the next process circuit-breaks d1 to Failed instead of
+/// leasing it a fourth time.
+#[tokio::test]
+async fn attempt_count_survives_reopen_and_circuit_breaks_across_processes() {
+    let db = TempDb::new();
+    let ttl = Duration::from_secs(60);
+    // Far-future fake clock: the startup quarantine in each open() runs
+    // against the REAL wall clock and must not sweep these locks; expiry
+    // is driven by the fake clock on the acquire path.
+    let t0 = Utc
+        .with_ymd_and_hms(2100, 1, 1, 0, 0, 0)
+        .single()
+        .expect("valid t0");
+
+    let mut plan_id = None;
+    for attempt in 1..=cpm_planner::MAX_ATTEMPTS {
+        // Each iteration is a fresh "process", opened after the previous
+        // process's lock has already lapsed on the fake clock.
+        let now = t0 + chrono::Duration::minutes(10 * i64::from(attempt));
+        let planner = open_planner_with_clock(&db.path, ttl, TestClock::at(now));
+        let id = planner.submit_plan(chain_graph()).await.expect("submit");
+        let cohort = planner
+            .acquire_cohort(&id, &caller(&format!("crasher-{attempt}")), 1)
+            .await
+            .expect("acquire");
+        assert_eq!(cohort.rows.len(), 1, "attempt {attempt} must lease d1");
+        assert_eq!(cohort.rows[0].deliverable.id, "d1");
+
+        let status = planner.status(&id).await.expect("status");
+        assert_eq!(
+            status.deliverables[0].2, attempt,
+            "attempt_count must accumulate durably across reopens"
+        );
+        plan_id = Some(id);
+        // Planner dropped without mark_status — the "crash".
+    }
+    let plan_id = plan_id.expect("plan submitted");
+
+    // A fresh process past all TTLs: d1 must be circuit-broken, not
+    // re-leased, and the plan converges (empty cohort).
+    let planner = open_planner_with_clock(
+        &db.path,
+        ttl,
+        TestClock::at(t0 + chrono::Duration::hours(10)),
+    );
+    let cohort = planner
+        .acquire_cohort(&plan_id, &caller("fresh"), 10)
+        .await
+        .expect("acquire after circuit-break");
+    assert!(
+        cohort.rows.is_empty(),
+        "poison deliverable re-leased after {} attempts",
+        cpm_planner::MAX_ATTEMPTS
+    );
+
+    let status = planner.status(&plan_id).await.expect("status");
+    let (_, d1_status, d1_attempts) = &status.deliverables[0];
+    assert!(
+        matches!(d1_status, DeliverableStatus::Failed { reason } if reason.contains("circuit-break")),
+        "expected circuit-broken Failed, got {d1_status:?}"
+    );
+    assert_eq!(*d1_attempts, cpm_planner::MAX_ATTEMPTS);
+    assert!(status.locks_held.is_empty());
+    // Dependent of the failed prereq never becomes Ready.
+    assert_eq!(status.deliverables[1].1, DeliverableStatus::Pending);
 }
 
 #[tokio::test]

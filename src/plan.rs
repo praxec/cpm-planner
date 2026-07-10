@@ -299,10 +299,14 @@ impl TryFrom<FlatCohort> for Cohort {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanStatus {
     pub plan_id: PlanId,
-    /// Per-deliverable status. Order matches insertion order in the
-    /// originally submitted [`PlanGraph::deliverables`] so callers can
-    /// render a stable table.
-    pub deliverables: Vec<(String, DeliverableStatus)>,
+    /// Per-deliverable `(id, status, attempt_count)`. Order matches
+    /// insertion order in the originally submitted
+    /// [`PlanGraph::deliverables`] so callers can render a stable table.
+    /// `attempt_count` is how many times the deliverable has been leased
+    /// via [`crate::ports::Planner::acquire_cohort`] — operators read it
+    /// as retry pressure against the circuit-break cap
+    /// ([`crate::planner::MAX_ATTEMPTS`]).
+    pub deliverables: Vec<(String, DeliverableStatus, u32)>,
     /// Ids on the longest dependency chain, in execution order. Empty
     /// when the plan has no deliverables.
     pub critical_path: Vec<String>,

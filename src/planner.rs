@@ -54,6 +54,14 @@ use crate::task::{Task, TaskKind};
 /// open-source default called out in SPEC §33 PA3.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(5 * 60);
 
+/// Circuit-breaker: maximum number of times a deliverable may be leased
+/// via [`Planner::acquire_cohort`] before it is auto-failed instead of
+/// re-leased. A driver that crashes or times out without calling
+/// `mark_status` leaves its lock to expire, which reverts the
+/// deliverable to `Ready` — without this bound a deliverable that can
+/// never be built would be re-acquired forever across driver restarts.
+pub const MAX_ATTEMPTS: u32 = 3;
+
 /// Legacy flat fallback for missing effort estimates.
 ///
 /// As of CMP-016 the planner no longer uses this: when a deliverable omits
@@ -389,6 +397,21 @@ fn make_expired_event(lock: &LockInfo, expired_at: DateTime<Utc>) -> AuditEvent 
         }))
 }
 
+fn make_circuit_break_event(
+    plan_id: &PlanId,
+    deliverable_id: &str,
+    attempt_count: u32,
+    reason: &str,
+) -> AuditEvent {
+    AuditEvent::new("plan.deliverable.circuit_broken").with_payload(json!({
+        "plan_id": plan_id.as_str(),
+        "deliverable_id": deliverable_id,
+        "attempt_count": attempt_count,
+        "max_attempts": MAX_ATTEMPTS,
+        "reason": reason,
+    }))
+}
+
 fn make_force_released_event(lock: &LockInfo, reason: &str) -> AuditEvent {
     AuditEvent::new("plan.lock.force_released")
         .with_actor(lock.caller_id.as_str())
@@ -514,7 +537,33 @@ impl Planner for BasicCpmPlanner {
                 audit_buf.push(make_expired_event(lock, now));
             }
 
-            // 2. Build CP priority + ES lookup tables.
+            // 2. Circuit-break: a Ready deliverable that has already been
+            //    leased MAX_ATTEMPTS times is a poison item — every prior
+            //    lease ended in lock expiry (driver crash / timeout) or a
+            //    revert, and re-leasing it would loop forever. Transition
+            //    it to Failed and skip it. It holds no lock (it is Ready),
+            //    it is never handed out again (Failed is terminal), and
+            //    its dependents simply never become Ready — the plan
+            //    converges to `exhausted` instead of retrying unboundedly.
+            let poisoned: Vec<(String, u32)> = state
+                .graph
+                .deliverables
+                .iter()
+                .filter(|d| {
+                    matches!(state.statuses.get(&d.id), Some(DeliverableStatus::Ready))
+                        && state.attempt_count(&d.id) >= MAX_ATTEMPTS
+                })
+                .map(|d| (d.id.clone(), state.attempt_count(&d.id)))
+                .collect();
+            for (id, attempts) in poisoned {
+                let reason = format!("circuit-break: exceeded {MAX_ATTEMPTS} build attempts");
+                audit_buf.push(make_circuit_break_event(plan_id, &id, attempts, &reason));
+                state
+                    .statuses
+                    .insert(id, DeliverableStatus::Failed { reason });
+            }
+
+            // 3. Build CP priority + ES lookup tables.
             let cp_positions: HashMap<&str, usize> = state
                 .cached_result
                 .critical_path
@@ -529,7 +578,7 @@ impl Planner for BasicCpmPlanner {
                 .map(|t| (t.id.as_str(), t.earliest_start))
                 .collect();
 
-            // 3. Build the ready set: status=Ready AND no lock currently held.
+            // 4. Build the ready set: status=Ready AND no lock currently held.
             let mut ready: Vec<&Deliverable> = state
                 .graph
                 .deliverables
@@ -541,7 +590,7 @@ impl Planner for BasicCpmPlanner {
                 .collect();
             ready.sort_by_key(|d| priority_key(&d.id, &cp_positions, &es_by_id));
 
-            // 4. Greedy fill with file-disjointness check.
+            // 5. Greedy fill with file-disjointness check.
             let mut selected: Vec<Deliverable> = Vec::new();
             let mut selected_files: HashSet<PathBuf> = HashSet::new();
             for candidate in ready {
@@ -560,8 +609,8 @@ impl Planner for BasicCpmPlanner {
                 selected.push(candidate.clone());
             }
 
-            // 5. Atomically acquire: status -> InProgress, locks inserted,
-            //    file index updated, audit events buffered.
+            // 6. Atomically acquire: status -> InProgress, locks inserted,
+            //    file index updated, attempt counted, audit events buffered.
             //
             // F5 INTERFACE_GAP-001: build `Vec<CohortRow>` directly so
             // the pairing invariant is type-enforced — pre-F5 we
@@ -580,6 +629,10 @@ impl Planner for BasicCpmPlanner {
                 state
                     .statuses
                     .insert(d.id.clone(), DeliverableStatus::InProgress);
+                // Increment on LEASE, not on candidate evaluation: only a
+                // deliverable actually handed to a driver counts as an
+                // attempt (a file-conflict skip above does not).
+                *state.attempt_counts.entry(d.id.clone()).or_insert(0) += 1;
                 for f in &d.owned_files {
                     state.file_to_deliverable.insert(f.clone(), d.id.clone());
                 }
@@ -756,7 +809,7 @@ impl Planner for BasicCpmPlanner {
     async fn status(&self, plan_id: &PlanId) -> Result<PlanStatus, PlannerError> {
         self.store.read_plan(plan_id, |state| {
             // Preserve insertion order from the original graph for stable UI.
-            let deliverables: Vec<(String, DeliverableStatus)> = state
+            let deliverables: Vec<(String, DeliverableStatus, u32)> = state
                 .graph
                 .deliverables
                 .iter()
@@ -766,7 +819,7 @@ impl Planner for BasicCpmPlanner {
                         .get(&d.id)
                         .cloned()
                         .unwrap_or(DeliverableStatus::Pending);
-                    (d.id.clone(), status)
+                    (d.id.clone(), status, state.attempt_count(&d.id))
                 })
                 .collect();
 
