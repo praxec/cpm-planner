@@ -468,4 +468,7 @@ async fn plan_mark_status_failed_carries_reason() {
         .expect("d1 entry present");
     assert_eq!(d1[1]["status"], json!("failed"));
     assert_eq!(d1[1]["reason"], json!("intentional test failure"));
+    // Third element of each status row is the lease attempt_count —
+    // d1 was leased exactly once before being marked failed.
+    assert_eq!(d1[2], json!(1));
 }

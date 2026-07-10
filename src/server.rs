@@ -210,7 +210,9 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
             Cow::Borrowed(TOOL_ACQUIRE_COHORT),
             Cow::Borrowed(
                 "Acquire up to max_count ready, file-disjoint deliverables \
-                 atomically. Returns the cohort plus per-deliverable locks.",
+                 atomically. Returns the cohort plus per-deliverable locks. \
+                 A deliverable leased 3 times without completing is \
+                 circuit-broken to failed instead of re-leased.",
             ),
             schema_object(json!({
                 "type": "object",
@@ -259,7 +261,10 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
         ),
         Tool::new(
             Cow::Borrowed(TOOL_STATUS),
-            Cow::Borrowed("Read-only snapshot: per-deliverable status, critical path, held locks."),
+            Cow::Borrowed(
+                "Read-only snapshot: per-deliverable [id, status, attempt_count] rows, \
+                 critical path, held locks.",
+            ),
             schema_object(json!({
                 "type": "object",
                 "properties": {
@@ -572,7 +577,7 @@ Tools (six total, all `plan.<verb>`):
   plan.acquire_cohort  — atomically acquire ready, file-disjoint deliverables
   plan.heartbeat       — refresh a held lock's TTL
   plan.mark_status     — set a deliverable's status (Complete/Failed releases the lock)
-  plan.status          — read-only snapshot (statuses, critical path, held locks)
+  plan.status          — read-only snapshot ([id, status, attempt_count] rows, critical path, held locks)
   plan.force_release   — operator escape hatch; emits audit event with `reason`
 
 Errors carry stable prefixes: LOCK_HELD, LOCK_NOT_HELD, LOCK_EXPIRED,
@@ -582,5 +587,11 @@ DELIVERABLE_NOT_FOUND, INVALID_GRAPH, BACKEND_ERROR.
 DeliverableStatus is internally tagged on `status`:
   {"status":"pending"} | {"status":"ready"} | {"status":"in_progress"} |
   {"status":"complete"} | {"status":"failed","reason":"..."}
+
+Circuit-breaker: every lease increments the deliverable's attempt_count
+(visible in plan.status). A ready deliverable already leased 3 times —
+e.g. its drivers kept crashing until the lock TTL expired — is auto-failed
+by the next acquire_cohort (reason "circuit-break: exceeded 3 build
+attempts") instead of being re-leased forever.
 "#
 }

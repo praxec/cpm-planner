@@ -31,6 +31,15 @@ pub(crate) struct PlanState {
     /// Per-deliverable lifecycle status keyed by deliverable id.
     pub(crate) statuses: HashMap<String, DeliverableStatus>,
 
+    /// How many times each deliverable has been LEASED to a driver via
+    /// `acquire_cohort`, keyed by deliverable id. A missing entry means
+    /// zero. Incremented at lease time only — a candidate skipped for a
+    /// file conflict does not count. Never reset by lock expiry or
+    /// force-release: the failed attempt already happened, and the
+    /// counter is what lets `acquire_cohort` circuit-break a poison
+    /// deliverable instead of re-leasing it forever.
+    pub(crate) attempt_counts: HashMap<String, u32>,
+
     /// Currently held locks keyed by deliverable id. A deliverable is
     /// `InProgress` iff this map contains it.
     pub(crate) locks: HashMap<String, LockInfo>,
@@ -55,10 +64,19 @@ impl PlanState {
         Self {
             graph,
             statuses,
+            attempt_counts: HashMap::new(),
             locks: HashMap::new(),
             file_to_deliverable: HashMap::new(),
             cached_result,
         }
+    }
+
+    /// Lease count for `deliverable_id`. Missing entry = never leased.
+    pub(crate) fn attempt_count(&self, deliverable_id: &str) -> u32 {
+        self.attempt_counts
+            .get(deliverable_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Drop every lock whose `expires_at` is strictly before `now`. Returns
@@ -68,6 +86,11 @@ impl PlanState {
     /// Reverting status: an expired deliverable goes back to `Ready`.
     /// (Prereqs were Complete when it was acquired and remain Complete
     /// now — TTL expiry does not unwind upstream work.)
+    ///
+    /// `attempt_counts` is deliberately NOT reset here: the lease was
+    /// counted at acquire time and the crashed/timed-out attempt counts,
+    /// so a poison deliverable converges to the circuit-break cap instead
+    /// of looping forever.
     pub(crate) fn reap_expired(&mut self, now: DateTime<Utc>) -> Vec<LockInfo> {
         let expired_ids: Vec<String> = self
             .locks

@@ -9,10 +9,10 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
-use cpm_planner::BasicCpmPlanner;
 use cpm_planner::audit::MemoryAuditSink;
 use cpm_planner::plan::{CallerId, Deliverable, DeliverableStatus, PlanGraph};
 use cpm_planner::ports::Planner;
+use cpm_planner::{BasicCpmPlanner, MAX_ATTEMPTS};
 
 fn deliverable(id: &str, files: &[&str], prereqs: &[&str], effort: Option<f32>) -> Deliverable {
     Deliverable {
@@ -92,6 +92,178 @@ async fn ttl_expiry_test() {
         .expect("plan.lock.expired emitted");
     assert_eq!(expiry.payload["deliverable_id"], "a");
     assert_eq!(expiry.payload["last_caller_id"], "c1");
+}
+
+/// Circuit-breaker: a deliverable whose drivers crash (lock expires,
+/// status reverts to Ready) on every attempt is auto-failed after
+/// MAX_ATTEMPTS leases instead of being re-leased forever.
+#[tokio::test]
+async fn poison_deliverable_circuit_breaks_after_max_attempts() {
+    let audit = Arc::new(MemoryAuditSink::new());
+    let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let clock = TestClock::new(t0);
+    let clock_arc = clock.clone();
+    let planner = BasicCpmPlanner::with_parts(
+        audit.clone(),
+        Duration::from_secs(60),
+        Arc::new(move || clock_arc.read()),
+    );
+
+    let graph = PlanGraph {
+        deliverables: vec![
+            deliverable("poison", &["src/poison.rs"], &[], Some(1.0)),
+            deliverable("dependent", &["src/dep.rs"], &["poison"], Some(1.0)),
+        ],
+        max_chained_dispatch: None,
+    };
+    let plan_id = planner.submit_plan(graph).await.unwrap();
+
+    // MAX_ATTEMPTS leases, each ending in a driver crash: no mark_status,
+    // the lock is left to expire, and the acquire-path reap reverts the
+    // deliverable to Ready.
+    for attempt in 1..=MAX_ATTEMPTS {
+        let cohort = planner
+            .acquire_cohort(&plan_id, &caller(&format!("crasher-{attempt}")), 1)
+            .await
+            .unwrap();
+        assert_eq!(cohort.rows.len(), 1, "attempt {attempt} must lease");
+        assert_eq!(cohort.rows[0].deliverable.id, "poison");
+        clock.set(t0 + chrono::Duration::minutes(5 * i64::from(attempt)));
+    }
+
+    // The next acquire must NOT lease it a fourth time: it circuit-breaks
+    // to Failed and the cohort comes back empty.
+    let cohort = planner
+        .acquire_cohort(&plan_id, &caller("fresh"), 10)
+        .await
+        .unwrap();
+    assert!(
+        cohort.rows.is_empty(),
+        "circuit-broken deliverable was re-leased: {:?}",
+        cohort
+            .rows
+            .iter()
+            .map(|r| r.deliverable.id.clone())
+            .collect::<Vec<_>>()
+    );
+
+    let status = planner.status(&plan_id).await.unwrap();
+    let (_, poison_status, poison_attempts) = status
+        .deliverables
+        .iter()
+        .find(|(id, _, _)| id == "poison")
+        .expect("poison entry present");
+    match poison_status {
+        DeliverableStatus::Failed { reason } => assert_eq!(
+            reason,
+            &format!("circuit-break: exceeded {MAX_ATTEMPTS} build attempts"),
+            "auto-fail reason must carry the circuit-break marker"
+        ),
+        other => panic!("expected Failed after circuit-break, got {other:?}"),
+    }
+    assert_eq!(*poison_attempts, MAX_ATTEMPTS);
+    assert!(
+        status.locks_held.is_empty(),
+        "auto-failed deliverable must hold no lock"
+    );
+
+    // The dependent of the failed prereq stays Pending — never Ready,
+    // never leased. That's correct: a failed prerequisite means it can't
+    // run; the plan converges instead of blocking on it.
+    let (_, dep_status, dep_attempts) = status
+        .deliverables
+        .iter()
+        .find(|(id, _, _)| id == "dependent")
+        .expect("dependent entry present");
+    assert_eq!(*dep_status, DeliverableStatus::Pending);
+    assert_eq!(*dep_attempts, 0);
+
+    // Audit trail carries the circuit-break event.
+    let evt = audit
+        .snapshot()
+        .into_iter()
+        .find(|e| e.event_type == "plan.deliverable.circuit_broken")
+        .expect("circuit_broken event present");
+    assert_eq!(evt.payload["deliverable_id"], "poison");
+    assert_eq!(evt.payload["attempt_count"], MAX_ATTEMPTS);
+    assert_eq!(evt.payload["max_attempts"], MAX_ATTEMPTS);
+
+    // And it is never handed out again on later acquires either.
+    clock.set(t0 + chrono::Duration::hours(1));
+    let again = planner
+        .acquire_cohort(&plan_id, &caller("much-later"), 10)
+        .await
+        .unwrap();
+    assert!(again.rows.is_empty(), "failed deliverable re-leased later");
+}
+
+/// A deliverable that completes normally on its first lease is untouched
+/// by the circuit-breaker: its attempt_count stops at 1.
+#[tokio::test]
+async fn completed_deliverable_attempt_count_stops_at_one() {
+    let planner = BasicCpmPlanner::new();
+    let graph = PlanGraph {
+        deliverables: vec![deliverable("a", &["src/a.rs"], &[], Some(1.0))],
+        max_chained_dispatch: None,
+    };
+    let plan_id = planner.submit_plan(graph).await.unwrap();
+
+    planner
+        .acquire_cohort(&plan_id, &caller("c1"), 1)
+        .await
+        .unwrap();
+    planner
+        .mark_status(&plan_id, "a", &caller("c1"), DeliverableStatus::Complete)
+        .await
+        .unwrap();
+
+    let status = planner.status(&plan_id).await.unwrap();
+    assert_eq!(
+        status.deliverables,
+        vec![("a".to_string(), DeliverableStatus::Complete, 1)]
+    );
+
+    // A further acquire neither re-leases it nor bumps the counter.
+    let cohort = planner
+        .acquire_cohort(&plan_id, &caller("c2"), 1)
+        .await
+        .unwrap();
+    assert!(cohort.rows.is_empty());
+    let status = planner.status(&plan_id).await.unwrap();
+    assert_eq!(status.deliverables[0].2, 1);
+}
+
+/// attempt_count increments on LEASE only: a Ready candidate left behind
+/// because the cohort was already full is not charged an attempt.
+#[tokio::test]
+async fn unleased_candidate_is_not_charged_an_attempt() {
+    let planner = BasicCpmPlanner::new();
+    let graph = PlanGraph {
+        deliverables: vec![
+            deliverable("first", &["src/first.rs"], &[], Some(4.0)),
+            deliverable("second", &["src/second.rs"], &[], Some(1.0)),
+        ],
+        max_chained_dispatch: None,
+    };
+    let plan_id = planner.submit_plan(graph).await.unwrap();
+
+    // max_count = 1: exactly one of the two Ready candidates is leased.
+    let cohort = planner
+        .acquire_cohort(&plan_id, &caller("c1"), 1)
+        .await
+        .unwrap();
+    assert_eq!(cohort.rows.len(), 1);
+    let leased = cohort.rows[0].deliverable.id.clone();
+
+    let status = planner.status(&plan_id).await.unwrap();
+    for (id, deliverable_status, attempts) in &status.deliverables {
+        if *id == leased {
+            assert_eq!(*attempts, 1, "leased deliverable counts one attempt");
+        } else {
+            assert_eq!(*attempts, 0, "unleased candidate must not be charged");
+            assert_eq!(*deliverable_status, DeliverableStatus::Ready);
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
