@@ -42,6 +42,7 @@ use crate::plan_store::SqlitePlanStore;
 use crate::ports::Planner;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use execution_policy::classify::{FailureClass, RetryDecision};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
@@ -60,7 +61,25 @@ pub const DEFAULT_TTL: Duration = Duration::from_secs(5 * 60);
 /// `mark_status` leaves its lock to expire, which reverts the
 /// deliverable to `Ready` — without this bound a deliverable that can
 /// never be built would be re-acquired forever across driver restarts.
+///
+/// This is the retry budget for the DURABLE, cross-process deliverable lease
+/// (distinct from `execution_policy`'s in-process async retry): the decision to
+/// keep leasing vs. circuit-break is expressed through that crate's
+/// [`RetryDecision`] ([`lease_retry_decision`]), and a broken deliverable is
+/// classified [`FailureClass::Permanent`].
 pub const MAX_ATTEMPTS: u32 = 3;
+
+/// Decide, from a deliverable's durable lease `attempt_count`, whether to keep
+/// leasing it or circuit-break — expressed in `execution_policy`'s shared
+/// vocabulary. `Retry` while under [`MAX_ATTEMPTS`]; `Stop` (→ auto-fail,
+/// [`FailureClass::Permanent`]) once the budget is spent.
+fn lease_retry_decision(attempt_count: u32) -> RetryDecision {
+    if attempt_count >= MAX_ATTEMPTS {
+        RetryDecision::Stop
+    } else {
+        RetryDecision::Retry
+    }
+}
 
 /// Legacy flat fallback for missing effort estimates.
 ///
@@ -401,6 +420,7 @@ fn make_circuit_break_event(
     plan_id: &PlanId,
     deliverable_id: &str,
     attempt_count: u32,
+    class: FailureClass,
     reason: &str,
 ) -> AuditEvent {
     AuditEvent::new("plan.deliverable.circuit_broken").with_payload(json!({
@@ -408,6 +428,8 @@ fn make_circuit_break_event(
         "deliverable_id": deliverable_id,
         "attempt_count": attempt_count,
         "max_attempts": MAX_ATTEMPTS,
+        "failure_class": format!("{class:?}"),
+        "retry_decision": format!("{:?}", RetryDecision::Stop),
         "reason": reason,
     }))
 }
@@ -551,13 +573,21 @@ impl Planner for BasicCpmPlanner {
                 .iter()
                 .filter(|d| {
                     matches!(state.statuses.get(&d.id), Some(DeliverableStatus::Ready))
-                        && state.attempt_count(&d.id) >= MAX_ATTEMPTS
+                        && lease_retry_decision(state.attempt_count(&d.id)) == RetryDecision::Stop
                 })
                 .map(|d| (d.id.clone(), state.attempt_count(&d.id)))
                 .collect();
             for (id, attempts) in poisoned {
+                // A spent lease budget is a PERMANENT failure (not retryable) in
+                // execution_policy's classification — the deliverable is out.
                 let reason = format!("circuit-break: exceeded {MAX_ATTEMPTS} build attempts");
-                audit_buf.push(make_circuit_break_event(plan_id, &id, attempts, &reason));
+                audit_buf.push(make_circuit_break_event(
+                    plan_id,
+                    &id,
+                    attempts,
+                    FailureClass::Permanent,
+                    &reason,
+                ));
                 state
                     .statuses
                     .insert(id, DeliverableStatus::Failed { reason });

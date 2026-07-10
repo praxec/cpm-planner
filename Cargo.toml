@@ -22,6 +22,11 @@ path = "src/bin/server.rs"
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
+# Shared reliability vocabulary (retry / circuit-break). The durable, cross-process
+# deliverable-lease circuit breaker classifies + decides through this crate's
+# FailureClass / RetryDecision types so cpm-planner speaks the same reliability
+# language as the rest of praxec (rather than hand-rolling its own).
+execution-policy = { git = "https://github.com/matt-cochran/execution-policy" }
 chrono = { version = "0.4", features = ["serde"] }
 rmcp = { version = "1.7", default-features = false, features = ["server", "macros", "transport-io"] }
 rusqlite = { version = "0.40.1", features = ["bundled"] }

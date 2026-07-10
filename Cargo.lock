@@ -113,6 +113,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "execution-policy",
  "rmcp",
  "rusqlite",
  "serde",
@@ -202,6 +203,14 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys",
+]
+
+[[package]]
+name = "execution-policy"
+version = "0.0.3"
+source = "git+https://github.com/matt-cochran/execution-policy#d3fb903ec3b3c973039a62159dcb4a973c9a312c"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]
