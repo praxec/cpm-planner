@@ -10,9 +10,9 @@ use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
 use cpm_planner::audit::MemoryAuditSink;
-use cpm_planner::plan::{CallerId, Deliverable, DeliverableStatus, PlanGraph};
+use cpm_planner::plan::{CallerId, Deliverable, DeliverableStatus, PlanGraph, PlannerError};
 use cpm_planner::ports::Planner;
-use cpm_planner::{BasicCpmPlanner, MAX_ATTEMPTS};
+use cpm_planner::{BasicCpmPlanner, MAX_ATTEMPTS, MAX_LAPSES};
 
 fn deliverable(id: &str, files: &[&str], prereqs: &[&str], effort: Option<f32>) -> Deliverable {
     Deliverable {
@@ -94,11 +94,12 @@ async fn ttl_expiry_test() {
     assert_eq!(expiry.payload["last_caller_id"], "c1");
 }
 
-/// Circuit-breaker: a deliverable whose drivers crash (lock expires,
-/// status reverts to Ready) on every attempt is auto-failed after
-/// MAX_ATTEMPTS leases instead of being re-leased forever.
+/// Defect fix: a lease lost to the ENVIRONMENT (driver killed externally,
+/// lock lapses via TTL, no terminal mark) is NOT an implementation
+/// attempt. MAX_ATTEMPTS environmental lapses must not trip the failure
+/// circuit-breaker — the deliverable stays leasable.
 #[tokio::test]
-async fn poison_deliverable_circuit_breaks_after_max_attempts() {
+async fn environmental_lapses_do_not_trip_the_failure_circuit_breaker() {
     let audit = Arc::new(MemoryAuditSink::new());
     let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
     let clock = TestClock::new(t0);
@@ -110,6 +111,54 @@ async fn poison_deliverable_circuit_breaks_after_max_attempts() {
     );
 
     let graph = PlanGraph {
+        deliverables: vec![deliverable("healthy", &["src/healthy.rs"], &[], Some(1.0))],
+        max_chained_dispatch: None,
+    };
+    let plan_id = planner.submit_plan(graph).await.unwrap();
+
+    // MAX_ATTEMPTS leases, each lost environmentally: no mark_status, the
+    // lock is left to lapse via TTL, and the acquire-path reap reverts the
+    // deliverable to Ready.
+    for lapse in 1..=MAX_ATTEMPTS {
+        let cohort = planner
+            .acquire_cohort(&plan_id, &caller(&format!("killed-{lapse}")), 1)
+            .await
+            .unwrap();
+        assert_eq!(cohort.rows.len(), 1, "lease {lapse} must be granted");
+        clock.set(t0 + chrono::Duration::minutes(5 * i64::from(lapse)));
+    }
+
+    // The next acquire must STILL lease it: lapses are not failed attempts.
+    let cohort = planner
+        .acquire_cohort(&plan_id, &caller("fresh"), 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        cohort.rows.len(),
+        1,
+        "a healthy deliverable was circuit-broken by environmental lapses"
+    );
+    assert_eq!(cohort.rows[0].deliverable.id, "healthy");
+
+    // Counters tell the two stories apart: every lease counted, every
+    // lapse counted, zero implementation failures.
+    let status = planner.status(&plan_id).await.unwrap();
+    let (_, d_status, attempts, failures, lapses) = &status.deliverables[0];
+    assert_eq!(*d_status, DeliverableStatus::InProgress);
+    assert_eq!(*attempts, MAX_ATTEMPTS + 1, "all leases counted");
+    assert_eq!(*failures, 0, "a lapse is not an implementation failure");
+    assert_eq!(*lapses, MAX_ATTEMPTS, "every TTL lapse counted");
+}
+
+/// Circuit-breaker: a deliverable EXPLICITLY marked failed (plan.mark_status
+/// status=failed) on every attempt is auto-failed after MAX_ATTEMPTS real
+/// failed attempts instead of being re-leased forever.
+#[tokio::test]
+async fn poison_deliverable_circuit_breaks_after_max_failed_attempts() {
+    let audit = Arc::new(MemoryAuditSink::new());
+    let planner = BasicCpmPlanner::with_audit(audit.clone());
+
+    let graph = PlanGraph {
         deliverables: vec![
             deliverable("poison", &["src/poison.rs"], &[], Some(1.0)),
             deliverable("dependent", &["src/dep.rs"], &["poison"], Some(1.0)),
@@ -118,18 +167,43 @@ async fn poison_deliverable_circuit_breaks_after_max_attempts() {
     };
     let plan_id = planner.submit_plan(graph).await.unwrap();
 
-    // MAX_ATTEMPTS leases, each ending in a driver crash: no mark_status,
-    // the lock is left to expire, and the acquire-path reap reverts the
-    // deliverable to Ready.
+    // MAX_ATTEMPTS real attempts: each lease ends with the driver
+    // EXPLICITLY reporting failure, and the orchestrator re-marking the
+    // deliverable ready for another try.
     for attempt in 1..=MAX_ATTEMPTS {
-        let cohort = planner
-            .acquire_cohort(&plan_id, &caller(&format!("crasher-{attempt}")), 1)
-            .await
-            .unwrap();
+        let who = caller(&format!("builder-{attempt}"));
+        let cohort = planner.acquire_cohort(&plan_id, &who, 1).await.unwrap();
         assert_eq!(cohort.rows.len(), 1, "attempt {attempt} must lease");
         assert_eq!(cohort.rows[0].deliverable.id, "poison");
-        clock.set(t0 + chrono::Duration::minutes(5 * i64::from(attempt)));
+        planner
+            .mark_status(
+                &plan_id,
+                "poison",
+                &who,
+                DeliverableStatus::Failed {
+                    reason: format!("build attempt {attempt} broke"),
+                },
+            )
+            .await
+            .unwrap();
+        if attempt < MAX_ATTEMPTS {
+            // Orchestrator retry: back into the pool.
+            planner
+                .mark_status(&plan_id, "poison", &who, DeliverableStatus::Ready)
+                .await
+                .unwrap();
+        }
     }
+    // Final retry attempt puts it back to Ready with the budget spent.
+    planner
+        .mark_status(
+            &plan_id,
+            "poison",
+            &caller("orchestrator"),
+            DeliverableStatus::Ready,
+        )
+        .await
+        .unwrap();
 
     // The next acquire must NOT lease it a fourth time: it circuit-breaks
     // to Failed and the cohort comes back empty.
@@ -148,20 +222,22 @@ async fn poison_deliverable_circuit_breaks_after_max_attempts() {
     );
 
     let status = planner.status(&plan_id).await.unwrap();
-    let (_, poison_status, poison_attempts) = status
+    let (_, poison_status, poison_attempts, poison_failures, poison_lapses) = status
         .deliverables
         .iter()
-        .find(|(id, _, _)| id == "poison")
+        .find(|(id, _, _, _, _)| id == "poison")
         .expect("poison entry present");
     match poison_status {
         DeliverableStatus::Failed { reason } => assert_eq!(
             reason,
-            &format!("circuit-break: exceeded {MAX_ATTEMPTS} build attempts"),
+            &format!("circuit-break: exceeded {MAX_ATTEMPTS} failed attempts"),
             "auto-fail reason must carry the circuit-break marker"
         ),
         other => panic!("expected Failed after circuit-break, got {other:?}"),
     }
     assert_eq!(*poison_attempts, MAX_ATTEMPTS);
+    assert_eq!(*poison_failures, MAX_ATTEMPTS);
+    assert_eq!(*poison_lapses, 0, "no lease ever lapsed in this scenario");
     assert!(
         status.locks_held.is_empty(),
         "auto-failed deliverable must hold no lock"
@@ -170,10 +246,10 @@ async fn poison_deliverable_circuit_breaks_after_max_attempts() {
     // The dependent of the failed prereq stays Pending — never Ready,
     // never leased. That's correct: a failed prerequisite means it can't
     // run; the plan converges instead of blocking on it.
-    let (_, dep_status, dep_attempts) = status
+    let (_, dep_status, dep_attempts, _, _) = status
         .deliverables
         .iter()
-        .find(|(id, _, _)| id == "dependent")
+        .find(|(id, _, _, _, _)| id == "dependent")
         .expect("dependent entry present");
     assert_eq!(*dep_status, DeliverableStatus::Pending);
     assert_eq!(*dep_attempts, 0);
@@ -185,16 +261,118 @@ async fn poison_deliverable_circuit_breaks_after_max_attempts() {
         .find(|e| e.event_type == "plan.deliverable.circuit_broken")
         .expect("circuit_broken event present");
     assert_eq!(evt.payload["deliverable_id"], "poison");
-    assert_eq!(evt.payload["attempt_count"], MAX_ATTEMPTS);
+    assert_eq!(evt.payload["failure_count"], MAX_ATTEMPTS);
     assert_eq!(evt.payload["max_attempts"], MAX_ATTEMPTS);
 
     // And it is never handed out again on later acquires either.
-    clock.set(t0 + chrono::Duration::hours(1));
     let again = planner
         .acquire_cohort(&plan_id, &caller("much-later"), 10)
         .await
         .unwrap();
     assert!(again.rows.is_empty(), "failed deliverable re-leased later");
+}
+
+/// Runaway protection: environmental lapses never auto-fail a
+/// deliverable, but an infinitely-crashing environment must not spin
+/// forever either. At MAX_LAPSES lapses, acquire_cohort refuses to
+/// re-lease and surfaces the stable LAPSE_LIMIT error naming the
+/// environmental (not implementation) cause.
+#[tokio::test]
+async fn lapse_limit_stops_releasing_with_stable_prefix_error() {
+    let audit = Arc::new(MemoryAuditSink::new());
+    let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let clock = TestClock::new(t0);
+    let clock_arc = clock.clone();
+    let planner = BasicCpmPlanner::with_parts(
+        audit.clone(),
+        Duration::from_secs(60),
+        Arc::new(move || clock_arc.read()),
+    );
+
+    let graph = PlanGraph {
+        deliverables: vec![deliverable("doomed-env", &["src/d.rs"], &[], Some(1.0))],
+        max_chained_dispatch: None,
+    };
+    let plan_id = planner.submit_plan(graph).await.unwrap();
+
+    // MAX_LAPSES leases, every one lost to the environment.
+    for lapse in 1..=MAX_LAPSES {
+        let cohort = planner
+            .acquire_cohort(&plan_id, &caller(&format!("killed-{lapse}")), 1)
+            .await
+            .unwrap();
+        assert_eq!(cohort.rows.len(), 1, "lease {lapse} must be granted");
+        clock.set(t0 + chrono::Duration::minutes(5 * i64::from(lapse)));
+    }
+
+    // The next acquire must fail loudly instead of leasing an 11th time.
+    let err = planner
+        .acquire_cohort(&plan_id, &caller("fresh"), 1)
+        .await
+        .expect_err("lapse limit must stop the re-lease loop");
+    assert!(
+        matches!(&err, PlannerError::LapseLimit { deliverable_id, lapse_count, max_lapses }
+            if deliverable_id == "doomed-env"
+                && *lapse_count == MAX_LAPSES
+                && *max_lapses == MAX_LAPSES),
+        "expected LapseLimit, got {err}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.starts_with("LAPSE_LIMIT:"),
+        "stable prefix missing: {msg}"
+    );
+    assert!(
+        msg.contains("environmental"),
+        "message must name the environmental cause: {msg}"
+    );
+
+    // The deliverable is NOT auto-failed — it is healthy as far as anyone
+    // knows — and its failure budget is untouched. The Err rolled back the
+    // in-flight reap, so the durable lapse count stays at the limit.
+    let status = planner.status(&plan_id).await.unwrap();
+    let (_, d_status, _, failures, lapses) = &status.deliverables[0];
+    assert!(
+        !matches!(d_status, DeliverableStatus::Failed { .. }),
+        "lapse limit must not auto-fail; got {d_status:?}"
+    );
+    assert_eq!(*failures, 0);
+    assert_eq!(*lapses, MAX_LAPSES - 1, "final reap rolled back with Err");
+
+    // Every subsequent acquire keeps failing the same way (stable, loud).
+    let err2 = planner
+        .acquire_cohort(&plan_id, &caller("again"), 1)
+        .await
+        .expect_err("still lapse-limited");
+    assert!(err2.to_string().starts_with("LAPSE_LIMIT:"));
+
+    // Operator escape hatch: clear the (long-expired) lease, then
+    // explicitly mark the deliverable terminal to unblock the plan
+    // (here: give up on it).
+    planner
+        .force_release(
+            &plan_id,
+            "doomed-env",
+            "operator: environment unrecoverable",
+        )
+        .await
+        .unwrap();
+    planner
+        .mark_status(
+            &plan_id,
+            "doomed-env",
+            &caller("operator"),
+            DeliverableStatus::Failed {
+                reason: "operator: environment unrecoverable".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    let cohort = planner
+        .acquire_cohort(&plan_id, &caller("after-triage"), 1)
+        .await
+        .expect("plan proceeds after operator triage");
+    assert!(cohort.rows.is_empty(), "nothing else to lease");
 }
 
 /// A deliverable that completes normally on its first lease is untouched
@@ -220,7 +398,7 @@ async fn completed_deliverable_attempt_count_stops_at_one() {
     let status = planner.status(&plan_id).await.unwrap();
     assert_eq!(
         status.deliverables,
-        vec![("a".to_string(), DeliverableStatus::Complete, 1)]
+        vec![("a".to_string(), DeliverableStatus::Complete, 1, 0, 0)]
     );
 
     // A further acquire neither re-leases it nor bumps the counter.
@@ -256,7 +434,7 @@ async fn unleased_candidate_is_not_charged_an_attempt() {
     let leased = cohort.rows[0].deliverable.id.clone();
 
     let status = planner.status(&plan_id).await.unwrap();
-    for (id, deliverable_status, attempts) in &status.deliverables {
+    for (id, deliverable_status, attempts, _, _) in &status.deliverables {
         if *id == leased {
             assert_eq!(*attempts, 1, "leased deliverable counts one attempt");
         } else {

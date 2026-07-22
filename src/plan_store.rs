@@ -142,6 +142,8 @@ impl SqlitePlanStore {
                  deliverable_id TEXT NOT NULL,
                  status         TEXT NOT NULL,
                  attempt_count  INTEGER NOT NULL DEFAULT 0,
+                 failure_count  INTEGER NOT NULL DEFAULT 0,
+                 lapse_count    INTEGER NOT NULL DEFAULT 0,
                  PRIMARY KEY (plan_id, deliverable_id)
              );
              CREATE TABLE IF NOT EXISTS locks (
@@ -159,7 +161,7 @@ impl SqlitePlanStore {
         )
         .context("creating planner tables")?;
 
-        migrate_attempt_count_column(&conn)?;
+        migrate_counter_columns(&conn)?;
 
         let store = Self {
             conn: Mutex::new(conn),
@@ -171,13 +173,14 @@ impl SqlitePlanStore {
     }
 
     /// Reap every lock whose TTL lapsed before `now`: the deliverable
-    /// goes back to `ready` and the lock row is deleted. Also resets any
-    /// orphaned `in_progress` deliverable that has no lock row. In both
-    /// cases `attempt_count` is preserved — the interrupted lease was
-    /// already counted at acquire time, which is what lets the
-    /// circuit-breaker converge on a poison deliverable. Returns
-    /// the number of expired locks reaped. Public so operators/tests can
-    /// force a sweep; `open` runs it automatically.
+    /// goes back to `ready`, its `lapse_count` is incremented (the lease
+    /// was lost ENVIRONMENTALLY — no terminal mark was ever recorded —
+    /// so it feeds the lapse bound, never the failure circuit-breaker),
+    /// and the lock row is deleted. Also resets any orphaned
+    /// `in_progress` deliverable that has no lock row, likewise counted
+    /// as a lapse. `attempt_count` and `failure_count` are preserved
+    /// untouched. Returns the number of expired locks reaped. Public so
+    /// operators/tests can force a sweep; `open` runs it automatically.
     pub fn quarantine_expired(&self, now: DateTime<Utc>) -> anyhow::Result<usize> {
         let mut conn = self
             .conn
@@ -190,7 +193,7 @@ impl SqlitePlanStore {
         let now_us = now.timestamp_micros();
 
         tx.execute(
-            "UPDATE deliverable_statuses SET status = ?1
+            "UPDATE deliverable_statuses SET status = ?1, lapse_count = lapse_count + 1
              WHERE (plan_id, deliverable_id) IN
                    (SELECT plan_id, deliverable_id FROM locks WHERE expires_at_us < ?2)",
             params![ready, now_us],
@@ -201,9 +204,10 @@ impl SqlitePlanStore {
         )?;
 
         // Orphaned in_progress with no lock at all: cannot be legitimately
-        // held by anyone, so it goes back to the pool.
+        // held by anyone, so it goes back to the pool. Losing the lock row
+        // without a terminal mark is an environmental loss — count the lapse.
         let orphaned = tx.execute(
-            "UPDATE deliverable_statuses SET status = ?1
+            "UPDATE deliverable_statuses SET status = ?1, lapse_count = lapse_count + 1
              WHERE status = ?2
                AND (plan_id, deliverable_id) NOT IN
                    (SELECT plan_id, deliverable_id FROM locks)",
@@ -323,30 +327,35 @@ impl SqlitePlanStore {
     }
 }
 
-/// Migration: add `deliverable_statuses.attempt_count` to databases
-/// created before the circuit-breaker existed. Guarded by a
+/// Migration: add the per-deliverable counter columns to databases
+/// created before they existed — `attempt_count` (pre-circuit-breaker
+/// databases), `failure_count` + `lapse_count` (databases from before
+/// environmental lapses were split off failed attempts). Guarded by a
 /// `PRAGMA table_info` probe so reopening an already-migrated (or
 /// freshly created) database is a no-op — the live database is never
-/// dropped or recreated.
-fn migrate_attempt_count_column(conn: &Connection) -> anyhow::Result<()> {
+/// dropped or recreated. Every added column defaults to 0: on a legacy
+/// database the acquire-derived `attempt_count` history is preserved as
+/// telemetry but treated as NEITHER failures NOR lapses, so an existing
+/// deliverable is exactly as far from both breakers as a fresh one.
+fn migrate_counter_columns(conn: &Connection) -> anyhow::Result<()> {
     let mut stmt = conn
         .prepare("PRAGMA table_info(deliverable_statuses)")
         .context("probing deliverable_statuses columns")?;
-    let mut has_attempt_count = false;
+    let mut existing: Vec<String> = Vec::new();
     let names = stmt
         .query_map([], |row| row.get::<_, String>(1))
         .context("reading deliverable_statuses column names")?;
     for name in names {
-        if name.context("reading deliverable_statuses column name")? == "attempt_count" {
-            has_attempt_count = true;
-        }
+        existing.push(name.context("reading deliverable_statuses column name")?);
     }
-    if !has_attempt_count {
-        conn.execute_batch(
-            "ALTER TABLE deliverable_statuses
-             ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0",
-        )
-        .context("adding deliverable_statuses.attempt_count column")?;
+    for column in ["attempt_count", "failure_count", "lapse_count"] {
+        if !existing.iter().any(|c| c == column) {
+            conn.execute_batch(&format!(
+                "ALTER TABLE deliverable_statuses
+                 ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+            ))
+            .with_context(|| format!("adding deliverable_statuses.{column} column"))?;
+        }
     }
     Ok(())
 }
@@ -375,10 +384,12 @@ fn load_plan_state(
 
     let mut statuses: HashMap<String, DeliverableStatus> = HashMap::new();
     let mut attempt_counts: HashMap<String, u32> = HashMap::new();
+    let mut failure_counts: HashMap<String, u32> = HashMap::new();
+    let mut lapse_counts: HashMap<String, u32> = HashMap::new();
     {
         let mut stmt = tx
             .prepare(
-                "SELECT deliverable_id, status, attempt_count
+                "SELECT deliverable_id, status, attempt_count, failure_count, lapse_count
                  FROM deliverable_statuses WHERE plan_id = ?1",
             )
             .map_err(backend)?;
@@ -388,15 +399,24 @@ fn load_plan_state(
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, u32>(2)?,
+                    row.get::<_, u32>(3)?,
+                    row.get::<_, u32>(4)?,
                 ))
             })
             .map_err(backend)?;
         for row in rows {
-            let (id, status_json, attempt_count) = row.map_err(backend)?;
+            let (id, status_json, attempt_count, failure_count, lapse_count) =
+                row.map_err(backend)?;
             let status: DeliverableStatus = serde_json::from_str(&status_json).map_err(backend)?;
             statuses.insert(id.clone(), status);
             if attempt_count > 0 {
-                attempt_counts.insert(id, attempt_count);
+                attempt_counts.insert(id.clone(), attempt_count);
+            }
+            if failure_count > 0 {
+                failure_counts.insert(id.clone(), failure_count);
+            }
+            if lapse_count > 0 {
+                lapse_counts.insert(id, lapse_count);
             }
         }
     }
@@ -448,6 +468,8 @@ fn load_plan_state(
         graph,
         statuses,
         attempt_counts,
+        failure_counts,
+        lapse_counts,
         locks,
         file_to_deliverable,
         cached_result,
@@ -466,11 +488,13 @@ fn save_plan_state(
         let mut stmt = tx
             .prepare(
                 "INSERT INTO deliverable_statuses
-                     (plan_id, deliverable_id, status, attempt_count)
-                 VALUES (?1, ?2, ?3, ?4)
+                     (plan_id, deliverable_id, status, attempt_count, failure_count, lapse_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(plan_id, deliverable_id) DO UPDATE
                      SET status = excluded.status,
-                         attempt_count = excluded.attempt_count",
+                         attempt_count = excluded.attempt_count,
+                         failure_count = excluded.failure_count,
+                         lapse_count = excluded.lapse_count",
             )
             .map_err(backend)?;
         for (deliverable_id, status) in &state.statuses {
@@ -479,7 +503,9 @@ fn save_plan_state(
                 plan_id.0,
                 deliverable_id,
                 status_json,
-                state.attempt_count(deliverable_id)
+                state.attempt_count(deliverable_id),
+                state.failure_count(deliverable_id),
+                state.lapse_count(deliverable_id)
             ])
             .map_err(backend)?;
         }
@@ -651,6 +677,31 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn failure_and_lapse_counts_round_trip_through_the_store() {
+        let store = SqlitePlanStore::open_in_memory().unwrap();
+        let plan_id = store
+            .submit_or_get("hash-1", || {
+                Ok((PlanId("plan_a".into()), plan_state_with_one_ready()))
+            })
+            .unwrap();
+
+        store
+            .mutate_plan(&plan_id, |state| {
+                *state.failure_counts.entry("d1".to_string()).or_insert(0) += 1;
+                *state.lapse_counts.entry("d1".to_string()).or_insert(0) += 2;
+                Ok(())
+            })
+            .unwrap();
+
+        store
+            .read_plan(&plan_id, |state| {
+                assert_eq!(state.failure_count("d1"), 1);
+                assert_eq!(state.lapse_count("d1"), 2);
+            })
+            .unwrap();
+    }
+
     /// Unique on-disk temp db removed (with WAL sidecars) on drop, so a
     /// passing OR failing run leaves no litter behind.
     struct TempDbFile {
@@ -768,6 +819,116 @@ mod tests {
         store2
             .read_plan(&plan_id, |state| {
                 assert_eq!(state.attempt_count("d1"), 2);
+            })
+            .unwrap();
+    }
+
+    /// Migration safety for the LIVE production schema: a database from
+    /// the lease-counting era (`attempt_count` present, no
+    /// `failure_count`/`lapse_count`) must open without error, and a
+    /// deliverable with acquire-derived attempt history — e.g.
+    /// attempt_count=2 accrued purely from environmental lapses — must be
+    /// exactly as far from BOTH breakers as a fresh one: legacy attempts
+    /// are telemetry, treated as neither failures nor lapses. A second
+    /// open must be a no-op (guarded ALTER, no duplicate-column error).
+    #[test]
+    fn opening_a_pre_lapse_count_database_treats_legacy_attempts_as_neither_failures_nor_lapses() {
+        let db = TempDbFile::new("lapse-migration");
+
+        // Hand-build the lease-counting-era schema + one in-flight plan
+        // row, exactly as the pre-fix binary would have left it after two
+        // environmental lease losses.
+        {
+            let conn = Connection::open(&db.path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE plans (
+                     plan_id       TEXT PRIMARY KEY,
+                     graph         TEXT NOT NULL,
+                     cached_result TEXT NOT NULL,
+                     created_at_us INTEGER NOT NULL
+                 );
+                 CREATE TABLE deliverable_statuses (
+                     plan_id        TEXT NOT NULL REFERENCES plans(plan_id) ON DELETE CASCADE,
+                     deliverable_id TEXT NOT NULL,
+                     status         TEXT NOT NULL,
+                     attempt_count  INTEGER NOT NULL DEFAULT 0,
+                     PRIMARY KEY (plan_id, deliverable_id)
+                 );
+                 CREATE TABLE locks (
+                     plan_id        TEXT NOT NULL REFERENCES plans(plan_id) ON DELETE CASCADE,
+                     deliverable_id TEXT NOT NULL,
+                     caller_id      TEXT NOT NULL,
+                     acquired_at_us INTEGER NOT NULL,
+                     expires_at_us  INTEGER NOT NULL,
+                     PRIMARY KEY (plan_id, deliverable_id)
+                 );
+                 CREATE TABLE submit_dedup (
+                     graph_hash TEXT PRIMARY KEY,
+                     plan_id    TEXT NOT NULL REFERENCES plans(plan_id) ON DELETE CASCADE
+                 );",
+            )
+            .unwrap();
+
+            let legacy = plan_state_with_one_ready();
+            conn.execute(
+                "INSERT INTO plans (plan_id, graph, cached_result, created_at_us)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    "plan_live",
+                    serde_json::to_string(&legacy.graph).unwrap(),
+                    serde_json::to_string(&legacy.cached_result).unwrap(),
+                    0i64
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO deliverable_statuses (plan_id, deliverable_id, status, attempt_count)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    "plan_live",
+                    "d1",
+                    serde_json::to_string(&DeliverableStatus::Ready).unwrap(),
+                    2u32
+                ],
+            )
+            .unwrap();
+        }
+
+        let plan_id = PlanId("plan_live".into());
+
+        // Open migrates in place: legacy lease history preserved as
+        // telemetry, both breaker counters start at zero.
+        let store = SqlitePlanStore::open(&db.path).unwrap();
+        store
+            .read_plan(&plan_id, |state| {
+                assert_eq!(state.statuses.get("d1"), Some(&DeliverableStatus::Ready));
+                assert_eq!(state.attempt_count("d1"), 2, "legacy history preserved");
+                assert_eq!(
+                    state.failure_count("d1"),
+                    0,
+                    "legacy leases are not failures"
+                );
+                assert_eq!(state.lapse_count("d1"), 0, "legacy leases are not lapses");
+            })
+            .unwrap();
+
+        // The migrated columns accept and persist writes.
+        store
+            .mutate_plan(&plan_id, |state| {
+                state.failure_counts.insert("d1".to_string(), 1);
+                state.lapse_counts.insert("d1".to_string(), 3);
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+
+        // Reopen: the guarded ALTER is a no-op, data intact.
+        let store2 = SqlitePlanStore::open(&db.path).unwrap();
+        store2
+            .read_plan(&plan_id, |state| {
+                assert_eq!(state.attempt_count("d1"), 2);
+                assert_eq!(state.failure_count("d1"), 1);
+                assert_eq!(state.lapse_count("d1"), 3);
             })
             .unwrap();
     }

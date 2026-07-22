@@ -134,8 +134,8 @@ async fn plan_and_statuses_survive_reopen() {
     assert_eq!(
         status.deliverables,
         vec![
-            ("d1".to_string(), DeliverableStatus::Ready, 0),
-            ("d2".to_string(), DeliverableStatus::Pending, 0),
+            ("d1".to_string(), DeliverableStatus::Ready, 0, 0, 0),
+            ("d2".to_string(), DeliverableStatus::Pending, 0, 0, 0),
         ]
     );
     assert!(status.locks_held.is_empty());
@@ -374,8 +374,9 @@ async fn expired_lock_is_quarantined_on_reopen() {
     );
     assert_eq!(
         status.deliverables[0],
-        ("d1".to_string(), DeliverableStatus::Ready, 1),
-        "quarantined deliverable goes back to ready with its lease still counted"
+        ("d1".to_string(), DeliverableStatus::Ready, 1, 0, 1),
+        "quarantined deliverable goes back to ready with its lease still counted \
+         and the environmental loss recorded as a lapse (never a failure)"
     );
 
     // And it is immediately re-acquirable.
@@ -444,16 +445,18 @@ async fn heartbeat_ttl_refresh_is_persisted_across_connections() {
 }
 
 // ---------------------------------------------------------------------
-// Acceptance: circuit-breaker attempt counting is durable
+// Acceptance: circuit-breaker counters are durable — and environmental
+// lapses are NOT failed attempts
 // ---------------------------------------------------------------------
 
-/// Each "process" (fresh store connection) leases d1 and crashes without
-/// marking it; the lock expires and d1 reverts to Ready. The attempt
-/// counter must survive every reopen, so after MAX_ATTEMPTS crashed
-/// drivers the next process circuit-breaks d1 to Failed instead of
-/// leasing it a fourth time.
+/// Each "process" (fresh store connection) leases d1 and is killed
+/// EXTERNALLY without marking it; the lock lapses via TTL and d1 reverts
+/// to Ready. Those lapses are environmental, not implementation
+/// failures: the lapse counter must survive every reopen, and the
+/// failure circuit-breaker must NOT fire — the next process still gets
+/// the lease.
 #[tokio::test]
-async fn attempt_count_survives_reopen_and_circuit_breaks_across_processes() {
+async fn lapse_count_survives_reopen_and_never_trips_the_failure_breaker() {
     let db = TempDb::new();
     let ttl = Duration::from_secs(60);
     // Far-future fake clock: the startup quarantine in each open() runs
@@ -465,31 +468,31 @@ async fn attempt_count_survives_reopen_and_circuit_breaks_across_processes() {
         .expect("valid t0");
 
     let mut plan_id = None;
-    for attempt in 1..=cpm_planner::MAX_ATTEMPTS {
+    for lease in 1..=cpm_planner::MAX_ATTEMPTS {
         // Each iteration is a fresh "process", opened after the previous
         // process's lock has already lapsed on the fake clock.
-        let now = t0 + chrono::Duration::minutes(10 * i64::from(attempt));
+        let now = t0 + chrono::Duration::minutes(10 * i64::from(lease));
         let planner = open_planner_with_clock(&db.path, ttl, TestClock::at(now));
         let id = planner.submit_plan(chain_graph()).await.expect("submit");
         let cohort = planner
-            .acquire_cohort(&id, &caller(&format!("crasher-{attempt}")), 1)
+            .acquire_cohort(&id, &caller(&format!("killed-{lease}")), 1)
             .await
             .expect("acquire");
-        assert_eq!(cohort.rows.len(), 1, "attempt {attempt} must lease d1");
+        assert_eq!(cohort.rows.len(), 1, "lease {lease} must be granted");
         assert_eq!(cohort.rows[0].deliverable.id, "d1");
 
         let status = planner.status(&id).await.expect("status");
-        assert_eq!(
-            status.deliverables[0].2, attempt,
-            "attempt_count must accumulate durably across reopens"
-        );
+        let (_, _, attempts, failures, lapses) = &status.deliverables[0];
+        assert_eq!(*attempts, lease, "attempt_count accumulates durably");
+        assert_eq!(*failures, 0, "no driver ever reported failure");
+        assert_eq!(*lapses, lease - 1, "each lost lease recorded as a lapse");
         plan_id = Some(id);
-        // Planner dropped without mark_status — the "crash".
+        // Planner dropped without mark_status — the external kill.
     }
     let plan_id = plan_id.expect("plan submitted");
 
-    // A fresh process past all TTLs: d1 must be circuit-broken, not
-    // re-leased, and the plan converges (empty cohort).
+    // A fresh process past all TTLs: d1 must STILL be leasable — the
+    // lapses burned no circuit-breaker lives.
     let planner = open_planner_with_clock(
         &db.path,
         ttl,
@@ -498,20 +501,78 @@ async fn attempt_count_survives_reopen_and_circuit_breaks_across_processes() {
     let cohort = planner
         .acquire_cohort(&plan_id, &caller("fresh"), 10)
         .await
+        .expect("acquire after lapses");
+    assert_eq!(
+        cohort.rows.len(),
+        1,
+        "healthy deliverable was circuit-broken by environmental lapses"
+    );
+    assert_eq!(cohort.rows[0].deliverable.id, "d1");
+}
+
+/// Each "process" (fresh store connection) leases d1, EXPLICITLY marks
+/// it failed, and re-marks it ready for retry. The failure counter must
+/// survive every reopen, so after MAX_ATTEMPTS real failed attempts the
+/// next process circuit-breaks d1 to Failed instead of leasing it a
+/// fourth time.
+#[tokio::test]
+async fn failure_count_survives_reopen_and_circuit_breaks_across_processes() {
+    let db = TempDb::new();
+
+    let mut plan_id = None;
+    for attempt in 1..=cpm_planner::MAX_ATTEMPTS {
+        // Each iteration is a fresh "process".
+        let planner = open_planner(&db.path);
+        let id = planner.submit_plan(chain_graph()).await.expect("submit");
+        let who = caller(&format!("builder-{attempt}"));
+        let cohort = planner.acquire_cohort(&id, &who, 1).await.expect("acquire");
+        assert_eq!(cohort.rows.len(), 1, "attempt {attempt} must lease d1");
+        assert_eq!(cohort.rows[0].deliverable.id, "d1");
+        planner
+            .mark_status(
+                &id,
+                "d1",
+                &who,
+                DeliverableStatus::Failed {
+                    reason: format!("build attempt {attempt} broke"),
+                },
+            )
+            .await
+            .expect("mark failed");
+        // Orchestrator retry: back into the pool.
+        planner
+            .mark_status(&id, "d1", &who, DeliverableStatus::Ready)
+            .await
+            .expect("re-mark ready");
+
+        let status = planner.status(&id).await.expect("status");
+        let (_, _, _, failures, lapses) = &status.deliverables[0];
+        assert_eq!(*failures, attempt, "failure_count accumulates durably");
+        assert_eq!(*lapses, 0, "no lease ever lapsed in this scenario");
+        plan_id = Some(id);
+    }
+    let plan_id = plan_id.expect("plan submitted");
+
+    // A fresh process: d1 must be circuit-broken, not re-leased, and the
+    // plan converges (empty cohort).
+    let planner = open_planner(&db.path);
+    let cohort = planner
+        .acquire_cohort(&plan_id, &caller("fresh"), 10)
+        .await
         .expect("acquire after circuit-break");
     assert!(
         cohort.rows.is_empty(),
-        "poison deliverable re-leased after {} attempts",
+        "poison deliverable re-leased after {} failed attempts",
         cpm_planner::MAX_ATTEMPTS
     );
 
     let status = planner.status(&plan_id).await.expect("status");
-    let (_, d1_status, d1_attempts) = &status.deliverables[0];
+    let (_, d1_status, _, d1_failures, _) = &status.deliverables[0];
     assert!(
         matches!(d1_status, DeliverableStatus::Failed { reason } if reason.contains("circuit-break")),
         "expected circuit-broken Failed, got {d1_status:?}"
     );
-    assert_eq!(*d1_attempts, cpm_planner::MAX_ATTEMPTS);
+    assert_eq!(*d1_failures, cpm_planner::MAX_ATTEMPTS);
     assert!(status.locks_held.is_empty());
     // Dependent of the failed prereq never becomes Ready.
     assert_eq!(status.deliverables[1].1, DeliverableStatus::Pending);
