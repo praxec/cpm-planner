@@ -138,7 +138,7 @@ async fn main() -> anyhow::Result<()> {
     let complete = status
         .deliverables
         .iter()
-        .filter(|(_, s, _)| matches!(s, DeliverableStatus::Complete))
+        .filter(|(_, s, _, _, _)| matches!(s, DeliverableStatus::Complete))
         .count();
     println!(
         "final state: {complete}/{total} deliverables complete; {locks} locks held",

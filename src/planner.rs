@@ -55,12 +55,15 @@ use crate::task::{Task, TaskKind};
 /// open-source default called out in SPEC §33 PA3.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(5 * 60);
 
-/// Circuit-breaker: maximum number of times a deliverable may be leased
-/// via [`Planner::acquire_cohort`] before it is auto-failed instead of
-/// re-leased. A driver that crashes or times out without calling
-/// `mark_status` leaves its lock to expire, which reverts the
-/// deliverable to `Ready` — without this bound a deliverable that can
-/// never be built would be re-acquired forever across driver restarts.
+/// Circuit-breaker: maximum number of times a deliverable may be
+/// EXPLICITLY marked failed (via [`Planner::mark_status`] with
+/// `status = Failed`) before the next [`Planner::acquire_cohort`]
+/// auto-fails it instead of re-leasing. Only real implementation
+/// attempts count: a driver got the lease, did the work, and reported
+/// failure. A lease lost environmentally (driver killed, harness
+/// timeout — the lock lapses via TTL with no terminal mark) is tracked
+/// separately as a lapse and NEVER burns a circuit-breaker life; see
+/// [`MAX_LAPSES`] for the runaway bound on those.
 ///
 /// This is the retry budget for the DURABLE, cross-process deliverable lease
 /// (distinct from `execution_policy`'s in-process async retry): the decision to
@@ -69,12 +72,23 @@ pub const DEFAULT_TTL: Duration = Duration::from_secs(5 * 60);
 /// classified [`FailureClass::Permanent`].
 pub const MAX_ATTEMPTS: u32 = 3;
 
-/// Decide, from a deliverable's durable lease `attempt_count`, whether to keep
-/// leasing it or circuit-break — expressed in `execution_policy`'s shared
+/// Runaway protection for ENVIRONMENTAL lease lapses (TTL expiry with no
+/// terminal mark). Deliberately generous — a lapse says nothing about the
+/// deliverable's buildability, so it must not trip the failure
+/// circuit-breaker — but an infinitely-crashing environment still cannot
+/// spin forever: once a deliverable's `lapse_count` reaches this bound,
+/// [`Planner::acquire_cohort`] refuses to re-lease it and surfaces
+/// [`PlannerError::LapseLimit`] (stable `LAPSE_LIMIT:` prefix) so an
+/// operator fixes the environment instead of the planner silently
+/// burning leases.
+pub const MAX_LAPSES: u32 = 10;
+
+/// Decide, from a deliverable's durable explicit-`failure_count`, whether to
+/// keep leasing it or circuit-break — expressed in `execution_policy`'s shared
 /// vocabulary. `Retry` while under [`MAX_ATTEMPTS`]; `Stop` (→ auto-fail,
 /// [`FailureClass::Permanent`]) once the budget is spent.
-fn lease_retry_decision(attempt_count: u32) -> RetryDecision {
-    if attempt_count >= MAX_ATTEMPTS {
+fn lease_retry_decision(failure_count: u32) -> RetryDecision {
+    if failure_count >= MAX_ATTEMPTS {
         RetryDecision::Stop
     } else {
         RetryDecision::Retry
@@ -419,14 +433,14 @@ fn make_expired_event(lock: &LockInfo, expired_at: DateTime<Utc>) -> AuditEvent 
 fn make_circuit_break_event(
     plan_id: &PlanId,
     deliverable_id: &str,
-    attempt_count: u32,
+    failure_count: u32,
     class: FailureClass,
     reason: &str,
 ) -> AuditEvent {
     AuditEvent::new("plan.deliverable.circuit_broken").with_payload(json!({
         "plan_id": plan_id.as_str(),
         "deliverable_id": deliverable_id,
-        "attempt_count": attempt_count,
+        "failure_count": failure_count,
         "max_attempts": MAX_ATTEMPTS,
         "failure_class": format!("{class:?}"),
         "retry_decision": format!("{:?}", RetryDecision::Stop),
@@ -559,32 +573,55 @@ impl Planner for BasicCpmPlanner {
                 audit_buf.push(make_expired_event(lock, now));
             }
 
-            // 2. Circuit-break: a Ready deliverable that has already been
-            //    leased MAX_ATTEMPTS times is a poison item — every prior
-            //    lease ended in lock expiry (driver crash / timeout) or a
-            //    revert, and re-leasing it would loop forever. Transition
-            //    it to Failed and skip it. It holds no lock (it is Ready),
-            //    it is never handed out again (Failed is terminal), and
-            //    its dependents simply never become Ready — the plan
-            //    converges to `exhausted` instead of retrying unboundedly.
+            // 2a. Lapse bound: a Ready deliverable whose lease has lapsed
+            //     environmentally MAX_LAPSES times is evidence of a broken
+            //     ENVIRONMENT (drivers keep getting killed before they can
+            //     report), not a broken deliverable. Do NOT auto-fail it —
+            //     that would misdiagnose a healthy deliverable — but stop
+            //     re-leasing: fail the acquire loudly with the stable
+            //     LAPSE_LIMIT error so an operator intervenes. The Err
+            //     rolls this transaction back, so the check is stable
+            //     across retries.
+            if let Some(d) = state.graph.deliverables.iter().find(|d| {
+                matches!(state.statuses.get(&d.id), Some(DeliverableStatus::Ready))
+                    && !state.locks.contains_key(&d.id)
+                    && state.lapse_count(&d.id) >= MAX_LAPSES
+            }) {
+                return Err(PlannerError::LapseLimit {
+                    deliverable_id: d.id.clone(),
+                    lapse_count: state.lapse_count(&d.id),
+                    max_lapses: MAX_LAPSES,
+                });
+            }
+
+            // 2b. Circuit-break: a Ready deliverable that has already been
+            //     EXPLICITLY marked failed MAX_ATTEMPTS times is a poison
+            //     item — every prior lease ended with the driver reporting
+            //     a real implementation failure, and re-leasing it would
+            //     loop forever. Transition it to Failed and skip it. It
+            //     holds no lock (it is Ready), it is never handed out
+            //     again (Failed is terminal), and its dependents simply
+            //     never become Ready — the plan converges to `exhausted`
+            //     instead of retrying unboundedly. Environmental lapses
+            //     deliberately do NOT feed this counter.
             let poisoned: Vec<(String, u32)> = state
                 .graph
                 .deliverables
                 .iter()
                 .filter(|d| {
                     matches!(state.statuses.get(&d.id), Some(DeliverableStatus::Ready))
-                        && lease_retry_decision(state.attempt_count(&d.id)) == RetryDecision::Stop
+                        && lease_retry_decision(state.failure_count(&d.id)) == RetryDecision::Stop
                 })
-                .map(|d| (d.id.clone(), state.attempt_count(&d.id)))
+                .map(|d| (d.id.clone(), state.failure_count(&d.id)))
                 .collect();
-            for (id, attempts) in poisoned {
-                // A spent lease budget is a PERMANENT failure (not retryable) in
+            for (id, failures) in poisoned {
+                // A spent retry budget is a PERMANENT failure (not retryable) in
                 // execution_policy's classification — the deliverable is out.
-                let reason = format!("circuit-break: exceeded {MAX_ATTEMPTS} build attempts");
+                let reason = format!("circuit-break: exceeded {MAX_ATTEMPTS} failed attempts");
                 audit_buf.push(make_circuit_break_event(
                     plan_id,
                     &id,
-                    attempts,
+                    failures,
                     FailureClass::Permanent,
                     &reason,
                 ));
@@ -746,6 +783,24 @@ impl Planner for BasicCpmPlanner {
                 }
             }
 
+            // An EXPLICIT Failed mark is a real implementation attempt —
+            // this (and only this) feeds the failure circuit-breaker.
+            // Guarded on the prior status so an idempotent re-mark of an
+            // already-Failed deliverable does not double-charge, and the
+            // acquire-path auto-fail (which writes Failed directly) never
+            // routes through here.
+            if matches!(status, DeliverableStatus::Failed { .. })
+                && !matches!(
+                    state.statuses.get(deliverable_id),
+                    Some(DeliverableStatus::Failed { .. })
+                )
+            {
+                *state
+                    .failure_counts
+                    .entry(deliverable_id.to_string())
+                    .or_insert(0) += 1;
+            }
+
             // Set status.
             state
                 .statuses
@@ -839,7 +894,7 @@ impl Planner for BasicCpmPlanner {
     async fn status(&self, plan_id: &PlanId) -> Result<PlanStatus, PlannerError> {
         self.store.read_plan(plan_id, |state| {
             // Preserve insertion order from the original graph for stable UI.
-            let deliverables: Vec<(String, DeliverableStatus, u32)> = state
+            let deliverables: Vec<(String, DeliverableStatus, u32, u32, u32)> = state
                 .graph
                 .deliverables
                 .iter()
@@ -849,7 +904,13 @@ impl Planner for BasicCpmPlanner {
                         .get(&d.id)
                         .cloned()
                         .unwrap_or(DeliverableStatus::Pending);
-                    (d.id.clone(), status, state.attempt_count(&d.id))
+                    (
+                        d.id.clone(),
+                        status,
+                        state.attempt_count(&d.id),
+                        state.failure_count(&d.id),
+                        state.lapse_count(&d.id),
+                    )
                 })
                 .collect();
 
