@@ -28,7 +28,8 @@
 //! responses whose `message` is the variant's `Display` output. The
 //! variant prefixes (`LOCK_HELD:`, `LOCK_NOT_HELD:`, `LOCK_EXPIRED:`,
 //! `OVERLAP_DETECTED:`, `MISSING_PREREQUISITE:`, `PLAN_NOT_FOUND:`,
-//! `DELIVERABLE_NOT_FOUND:`, `INVALID_GRAPH:`, `BACKEND_ERROR:`) are
+//! `DELIVERABLE_NOT_FOUND:`, `LAPSE_LIMIT:`, `INVALID_GRAPH:`,
+//! `BACKEND_ERROR:`) are
 //! stable machine-parseable signals — see `core::plan` for the contract.
 //! Malformed arguments yield `invalid_params` with the serde error.
 //!
@@ -46,6 +47,7 @@ use crate::plan::{
     CallerId, Cohort, DeliverableStatus, PlanGraph, PlanId, PlanStatus, PlannerError,
 };
 use crate::ports::Planner;
+use rmcp::ErrorData as McpError;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, Implementation, InitializeRequestParams,
     InitializeResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities,
@@ -53,10 +55,9 @@ use rmcp::model::{
 };
 use rmcp::service::{NotificationContext, RequestContext, RoleServer};
 use rmcp::transport::stdio;
-use rmcp::ErrorData as McpError;
 use rmcp::{ServerHandler, ServiceExt};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::BasicCpmPlanner;
 
@@ -210,7 +211,11 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
             Cow::Borrowed(TOOL_ACQUIRE_COHORT),
             Cow::Borrowed(
                 "Acquire up to max_count ready, file-disjoint deliverables \
-                 atomically. Returns the cohort plus per-deliverable locks.",
+                 atomically. Returns the cohort plus per-deliverable locks. \
+                 A deliverable explicitly marked failed 3 times is \
+                 circuit-broken to failed instead of re-leased; leases lost \
+                 environmentally (TTL lapse, no terminal mark) never trip \
+                 that breaker but are bounded separately (LAPSE_LIMIT at 10).",
             ),
             schema_object(json!({
                 "type": "object",
@@ -259,7 +264,10 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
         ),
         Tool::new(
             Cow::Borrowed(TOOL_STATUS),
-            Cow::Borrowed("Read-only snapshot: per-deliverable status, critical path, held locks."),
+            Cow::Borrowed(
+                "Read-only snapshot: per-deliverable [id, status, attempt_count, \
+                 failure_count, lapse_count] rows, critical path, held locks.",
+            ),
             schema_object(json!({
                 "type": "object",
                 "properties": {
@@ -572,15 +580,25 @@ Tools (six total, all `plan.<verb>`):
   plan.acquire_cohort  — atomically acquire ready, file-disjoint deliverables
   plan.heartbeat       — refresh a held lock's TTL
   plan.mark_status     — set a deliverable's status (Complete/Failed releases the lock)
-  plan.status          — read-only snapshot (statuses, critical path, held locks)
+  plan.status          — read-only snapshot ([id, status, attempt_count, failure_count, lapse_count] rows, critical path, held locks)
   plan.force_release   — operator escape hatch; emits audit event with `reason`
 
 Errors carry stable prefixes: LOCK_HELD, LOCK_NOT_HELD, LOCK_EXPIRED,
 OVERLAP_DETECTED, MISSING_PREREQUISITE, PLAN_NOT_FOUND,
-DELIVERABLE_NOT_FOUND, INVALID_GRAPH, BACKEND_ERROR.
+DELIVERABLE_NOT_FOUND, LAPSE_LIMIT, INVALID_GRAPH, BACKEND_ERROR.
 
 DeliverableStatus is internally tagged on `status`:
   {"status":"pending"} | {"status":"ready"} | {"status":"in_progress"} |
   {"status":"complete"} | {"status":"failed","reason":"..."}
+
+Circuit-breaker (visible in plan.status): every lease increments
+attempt_count (telemetry). An EXPLICIT mark_status failed increments
+failure_count — a ready deliverable with 3 failed attempts is auto-failed
+by the next acquire_cohort (reason "circuit-break: exceeded 3 failed
+attempts") instead of being re-leased forever. A lease that lapses via
+TTL with no terminal mark (driver killed/timed out) increments
+lapse_count instead: environmental losses never trip the failure breaker,
+but at 10 lapses acquire_cohort refuses to re-lease and errors LAPSE_LIMIT
+so an operator can fix the environment.
 "#
 }

@@ -30,6 +30,8 @@
 //!   (the `Task` types carry ES/EF/LS/LF/slack/batching state the wire model
 //!   doesn't need to expose).
 //! - [`planner`] — [`BasicCpmPlanner`], the lock-aware implementation.
+//! - [`plan_store`] — durable SQLite persistence (plans, statuses, cohort
+//!   locks, submit dedup) and the cross-process atomicity mechanism.
 //! - [`server`] — the MCP tool façade.
 //! - [`audit`] — the lock-lifecycle audit surface.
 //!
@@ -43,6 +45,7 @@ pub mod estimator;
 mod locks;
 pub mod network_health;
 pub mod plan;
+pub mod plan_store;
 pub mod planner;
 pub mod ports;
 pub mod risk;
@@ -50,11 +53,14 @@ pub mod server;
 pub mod task;
 
 pub use algorithm::CpmAlgorithm;
-pub use drag::{diameter, drag, DragResult};
+pub use drag::{DragResult, diameter, drag};
 pub use estimator::{EffortEstimator, EstimationConfig};
-pub use planner::{BasicCpmPlanner, ClockFn, DEFAULT_EFFORT_HOURS, DEFAULT_TTL};
+pub use plan_store::{DB_PATH_ENV, SqlitePlanStore};
+pub use planner::{
+    BasicCpmPlanner, ClockFn, DEFAULT_EFFORT_HOURS, DEFAULT_TTL, MAX_ATTEMPTS, MAX_LAPSES,
+};
 pub use server::{
-    plan_tool_definitions, PlanServer, PLAN_TOOL_NAMES, TOOL_ACQUIRE_COHORT, TOOL_FORCE_RELEASE,
-    TOOL_HEARTBEAT, TOOL_MARK_STATUS, TOOL_STATUS, TOOL_SUBMIT,
+    PLAN_TOOL_NAMES, PlanServer, TOOL_ACQUIRE_COHORT, TOOL_FORCE_RELEASE, TOOL_HEARTBEAT,
+    TOOL_MARK_STATUS, TOOL_STATUS, TOOL_SUBMIT, plan_tool_definitions,
 };
 pub use task::{Bottleneck, CriticalPathResult, Task, TaskBatch, TaskKind, TaskStatus};

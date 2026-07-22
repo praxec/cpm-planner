@@ -1,1 +1,935 @@
-[{'anyhow': 'Result as AnyhowResult;\nuse rusqlite::{params', 'serde': {'std': 'collections::HashMap;\nuse std::sync::{Arc', 'thiserror': 'Error;\n\n/// Error type for PlanStore operations.\n#[derive(Debug', 'error(': 'ransition conflict: expected {expected:?'}, 'actual': ''}, {'expected': 'DeliverableStatus', 'actual': 'DeliverableStatus'}, ['error("SQLite error: {0}', 'Sqlite(#[from] rusqlite::Error),\n    #[error("Serialization error: {0}', 'Serialization(#[from] serde_json::Error),\n    #[error("Other error: {0}', 'Other(#[from] anyhow::Error),\n}\n\n/// Result type for PlanStore operations.\npub type PlanStoreResult<T> = Result<T, PlanStoreError>;\n\n/// Plan storage trait for persisting plans and tracking deliverable status.\n#[async_trait::async_trait]\npub trait PlanStore: Send + Sync {\n    /// Create a new plan in the store.\n    fn create_plan(&self, plan_id: PlanId, graph: PlanGraph) -> PlanStoreResult<()>;\n\n    /// Get a plan from the store.\n    fn get_plan(&self, plan_id: &PlanId) -> PlanStoreResult<Option<PlanGraph>>;\n\n    /// Update the status of a deliverable with compare-and-swap semantics.\n    fn update_deliverable_status(\n        &self,\n        plan_id: &PlanId,\n        deliverable_id: &str,\n        expected: DeliverableStatus,\n        next: DeliverableStatus,\n    ) -> PlanStoreResult<()>;\n\n    /// List all plan IDs in the store.\n    fn list_plans(&self) -> PlanStoreResult<Vec<PlanId>>;\n\n    /// Get the status of all deliverables in a plan.\n    fn get_plan_status(&self, plan_id: &PlanId) -> PlanStoreResult<PlanStatusInfo>;\n}\n\n/// Information about plan status for reporting.\n#[derive(Debug, Clone, Serialize, Deserialize)]\npub struct PlanStatusInfo {\n    /// Per-deliverable status.\n    pub deliverables: Vec<(String, DeliverableStatus)>,\n    /// Count of deliverables in each status.\n    pub status_counts: HashMap<String, usize>,\n}\n\n/// SQLite-backed implementation of PlanStore.\npub struct SqlitePlanStore {\n    /// SQLite connection wrapped in Arc<Mutex<>> for thread safety.\n    conn: Arc<Mutex<Connection>>,\n}\n\nimpl SqlitePlanStore {\n    /// Create a new SqlitePlanStore with the given database path.\n    pub fn new(db_path: &str) -> PlanStoreResult<Self> {\n        let conn = Connection::open(db_path)?;\n\n        // Set WAL mode and busy timeout for concurrent access\n        conn.execute_batch(\n            "PRAGMA journal_mode=WAL;\n             PRAGMA busy_timeout=5000;"\n        )?;\n\n        // Create plans table if it doesn\'t exist\n        conn.execute(', 'CREATE TABLE IF NOT EXISTS plans (\n                plan_id TEXT PRIMARY KEY,\n                graph TEXT NOT NULL,\n                created_at DATETIME DEFAULT CURRENT_TIMESTAMP\n            )', [], "Create deliverable statuses table if it doesn't exist\n        conn.execute(", 'CREATE TABLE IF NOT EXISTS deliverable_statuses (\n                plan_id TEXT,\n                deliverable_id TEXT,\n                status TEXT NOT NULL,\n                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n                PRIMARY KEY (plan_id, deliverable_id),\n                FOREIGN KEY (plan_id) REFERENCES plans(plan_id) ON DELETE CASCADE\n            )', [], 'Ensure in_progress deliverables are quarantined on startup\n        Self::quarantine_in_progress(&conn)?;\n\n        Ok(SqlitePlanStore {\n            conn: Arc::new(Mutex::new(conn)),\n        })\n    }\n\n    /// Quarantine any deliverables left in in_progress status at startup.\n    fn quarantine_in_progress(conn: &Connection) -> PlanStoreResult<()> {\n        let mut stmt = conn.prepare(', "SELECT plan_id, deliverable_id FROM deliverable_statuses WHERE status = 'in_progress'", 'let in_progress_deliverables = stmt.query_map([], |row| {\n            let plan_id: String = row.get(0)?;\n            let deliverable_id: String = row.get(1)?;\n            Ok((plan_id, deliverable_id))\n        })?;\n\n        for result in in_progress_deliverables {\n            let (plan_id, deliverable_id) = result?;\n            tracing::warn!(', 'Quarantining deliverable left in in_progress at startup: plan_id={}, deliverable_id={}', 'plan_id,\n                deliverable_id\n            );\n\n            conn.execute(\n                "UPDATE deliverable_statuses \n                 SET status = \'pending\' \n                 WHERE plan_id = ?1 AND deliverable_id = ?2', 'params![plan_id, deliverable_id],\n            )?;\n        }\n\n        Ok(())\n    }\n}\n\n#[async_trait::async_trait]\nimpl PlanStore for SqlitePlanStore {\n    fn create_plan(&self, plan_id: PlanId, graph: PlanGraph) -> PlanStoreResult<()> {\n        let conn = self.conn.lock().map_err(|_| PlanStoreError::Other(anyhow::anyhow!("Failed to lock connection")))?;\n\n        // Start a transaction\n        let tx = conn.transaction()?;\n\n        // Insert the plan\n        let graph_json = serde_json::to_string(&graph)?;\n        tx.execute(', 'INSERT OR REPLACE INTO plans (plan_id, graph) VALUES (?1, ?2)', 'params![plan_id.0, graph_json],\n        )?;\n\n        // Initialize all deliverables with pending status\n        for deliverable in &graph.deliverables {\n            tx.execute(', "INSERT OR REPLACE INTO deliverable_statuses (plan_id, deliverable_id, status) \n                 VALUES (?1, ?2, 'pending')", 'params![plan_id.0, deliverable.id],\n            )?;\n        }\n\n        tx.commit()?;\n        Ok(())\n    }\n\n    fn get_plan(&self, plan_id: &PlanId) -> PlanStoreResult<Option<PlanGraph>> {\n        let conn = self.conn.lock().map_err(|_| PlanStoreError::Other(anyhow::anyhow!("Failed to lock connection")))?;\n\n        let mut stmt = conn.prepare("SELECT graph FROM plans WHERE plan_id = ?1', 'let graph_json: SqliteResult<String> = stmt.query_row(params![plan_id.0], |row| row.get(0));\n\n        match graph_json {\n            Ok(json) => {\n                let graph: PlanGraph = serde_json::from_str(&json)?;\n                Ok(Some(graph))\n            }\n            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),\n            Err(e) => Err(PlanStoreError::Sqlite(e)),\n        }\n    }\n\n    fn update_deliverable_status(\n        &self,\n        plan_id: &PlanId,\n        deliverable_id: &str,\n        expected: DeliverableStatus,\n        next: DeliverableStatus,\n    ) -> PlanStoreResult<()> {\n        let conn = self.conn.lock().map_err(|_| PlanStoreError::Other(anyhow::anyhow!("Failed to lock connection")))?;\n\n        // Start an immediate transaction for atomicity\n        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;\n\n        // Get current status\n        let mut stmt = tx.prepare(\n            "SELECT status FROM deliverable_statuses WHERE plan_id = ?1 AND deliverable_id = ?2', 'let current_status_str: SqliteResult<String> = stmt.query_row(\n            params![plan_id.0, deliverable_id],\n            |row| row.get(0)\n        );\n\n        let current_status = match current_status_str {\n            Ok(status_str) => {\n                // Deserialize the status from JSON\n                serde_json::from_str(&status_str)?\n            }\n            Err(rusqlite::Error::QueryReturnedNoRows) => {\n                return Err(PlanStoreError::Other(anyhow::anyhow!(', 'Deliverable not found: plan_id={}, deliverable_id={}', 'plan_id.0,\n                    deliverable_id\n                )));\n            }\n            Err(e) => return Err(PlanStoreError::Sqlite(e)),\n        };\n\n        // Check if current status matches expected status (CAS)\n        if current_status != expected {\n            return Err(PlanStoreError::TransitionConflict {\n                expected,\n                actual: current_status,\n            });\n        }\n\n        // Update to new status\n        let next_status_str = serde_json::to_string(&next)?;\n        tx.execute(', 'UPDATE deliverable_statuses \n             SET status = ?1, updated_at = CURRENT_TIMESTAMP\n             WHERE plan_id = ?2 AND deliverable_id = ?3', 'params![next_status_str, plan_id.0, deliverable_id],\n        )?;\n\n        tx.commit()?;\n        Ok(())\n    }\n\n    fn list_plans(&self) -> PlanStoreResult<Vec<PlanId>> {\n        let conn = self.conn.lock().map_err(|_| PlanStoreError::Other(anyhow::anyhow!("Failed to lock connection")))?;\n\n        let mut stmt = conn.prepare("SELECT plan_id FROM plans', 'let plan_ids = stmt.query_map([], |row| {\n            let plan_id: String = row.get(0)?;\n            Ok(PlanId(plan_id))\n        })?;\n\n        Ok(plan_ids.collect::<SqliteResult<Vec<PlanId>>>()?)\n    }\n\n    fn get_plan_status(&self, plan_id: &PlanId) -> PlanStoreResult<PlanStatusInfo> {\n        let conn = self.conn.lock().map_err(|_| PlanStoreError::Other(anyhow::anyhow!("Failed to lock connection")))?;\n\n        // Get all deliverable statuses for this plan\n        let mut stmt = conn.prepare(', 'SELECT deliverable_id, status FROM deliverable_statuses WHERE plan_id = ?1', 'let deliverables_result = stmt.query_map(params![plan_id.0], |row| {\n            let deliverable_id: String = row.get(0)?;\n            let status_str: String = row.get(1)?;\n            let status: DeliverableStatus = serde_json::from_str(&status_str)?;\n            Ok((deliverable_id, status))\n        })?;\n\n        let mut deliverables = Vec::new();\n        let mut status_counts: HashMap<String, usize> = HashMap::new();\n\n        for result in deliverables_result {\n            let (deliverable_id, status) = result?;\n            \n            // Add to deliverables list\n            deliverables.push((deliverable_id.clone(), status.clone()));\n            \n            // Update counts\n            let status_str = match &status {\n                DeliverableStatus::Pending => "pending', 'DeliverableStatus::Ready => "ready', 'DeliverableStatus::InProgress => "in_progress', 'DeliverableStatus::Complete => "complete', 'DeliverableStatus::Failed { .. } => "failed'], {'super': 'use crate::plan::{CallerId', 'std': 'path::PathBuf;\n\n    fn setup_test_store() -> PlanStoreResult<SqlitePlanStore> {\n        // Use in-memory database for testing\n        SqlitePlanStore::new(', 'memory': ')\n    }\n\n    #[test]\n    fn test_create_and_get_plan() -> PlanStoreResult<()> {\n        let store = setup_test_store()?;\n        let plan_id = PlanId("test_plan".to_string());\n\n        let graph = PlanGraph {\n            deliverables: vec![\n                Deliverable {\n                    id: "d1".to_string(),\n                    owned_files: vec![PathBuf::from("src/foo.rs', 'prerequisites': 'vec![]', 'estimated_effort_hours': 'Some(1.5)', 'metadata': 'serde_json::json!({', 'description': 'test deliverable'}, ['test]\n    fn test_update_deliverable_status_cas() -> PlanStoreResult<()> {\n        let store = setup_test_store()?;\n        let plan_id = PlanId("test_plan".to_string());\n\n        let graph = PlanGraph {\n            deliverables: vec![\n                Deliverable {\n                    id: "d1', '.', 'to_string(),\n                    owned_files: vec![PathBuf::from("src/foo.rs', 'prerequisites: vec![],\n                    estimated_effort_hours: Some(1.5),\n                    metadata: serde_json::json!({"description": "test deliverable'], {'reason': 'test', 'PlanStoreError': 'TransitionConflict { ..'}, {}, ['test]\n    fn test_list_plans() -> PlanStoreResult<()> {\n        let store = setup_test_store()?;\n\n        let plan_id1 = PlanId("test_plan_1".to_string());\n        let plan_id2 = PlanId("test_plan_2".to_string());\n\n        let graph = PlanGraph {\n            deliverables: vec![\n                Deliverable {\n                    id: "d1', '.', 'to_string(),\n                    owned_files: vec![PathBuf::from("src/foo.rs', 'prerequisites: vec![],\n                    estimated_effort_hours: Some(1.5),\n                    metadata: serde_json::json!({"description": "test deliverable'], ['test]\n    fn test_get_plan_status() -> PlanStoreResult<()> {\n        let store = setup_test_store()?;\n        let plan_id = PlanId("test_plan".to_string());\n\n        let graph = PlanGraph {\n            deliverables: vec![\n                Deliverable {\n                    id: "d1', '.', 'to_string(),\n                    owned_files: vec![PathBuf::from("src/foo.rs', 'prerequisites: vec![],\n                    estimated_effort_hours: Some(1.5),\n                    metadata: serde_json::json!({"description": "test deliverable'], {'id': 'd2".to_string(),\n                    owned_files: vec![PathBuf::from("src/bar.rs', 'prerequisites': 'vec![]', 'estimated_effort_hours': 'Some(2.0)', 'metadata': 'serde_json::json!({', 'description': 'another deliverable'}]
+//! SQLite persistence for [`crate::planner::BasicCpmPlanner`].
+//!
+//! The store is the single source of truth for planner state: submitted
+//! plans (graph + cached CPM result), per-deliverable statuses, held
+//! cohort locks, and the submit-dedup map. Every planner operation loads
+//! the relevant [`PlanState`] from SQLite, runs the in-memory scheduling
+//! logic, and writes the result back — all inside ONE
+//! `BEGIN IMMEDIATE` transaction.
+//!
+//! # Cross-process atomicity
+//!
+//! `TransactionBehavior::Immediate` takes the database write lock at
+//! `BEGIN`, so the whole read-modify-write of an `acquire_cohort` (ready
+//! check + within-cohort file disjointness + disjoint-from-held-locks +
+//! lock insert + status flip to `in_progress`) is serialised across
+//! processes. Two concurrent acquirers — even in different OS processes —
+//! can never both observe the same "ready and unlocked" deliverable, so
+//! double-acquisition of a deliverable (or of file-overlapping
+//! deliverables) is structurally impossible.
+//!
+//! WAL mode keeps concurrent readers cheap; `busy_timeout` makes writers
+//! queue behind each other instead of erroring.
+//!
+//! # Startup quarantine
+//!
+//! [`SqlitePlanStore::open`] reaps every lock whose TTL has already
+//! lapsed: the lock row is deleted and the deliverable's status goes back
+//! to `ready` (its prerequisites were complete when it was acquired and
+//! TTL expiry does not unwind upstream work — the same rule as
+//! [`PlanState::reap_expired`]). A deliverable left `in_progress` with no
+//! lock row at all (a crash between partial writes on a pre-WAL database,
+//! or manual surgery) is likewise reset to `ready`. Locks that are still
+//! within TTL are preserved: another process may legitimately be working
+//! under them, and clearing them on an unrelated restart would break the
+//! cross-process contract.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use anyhow::{Context, anyhow};
+use chrono::{DateTime, Utc};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+
+use crate::locks::PlanState;
+use crate::plan::{CallerId, DeliverableStatus, LockInfo, PlanGraph, PlanId, PlannerError};
+use crate::task::CriticalPathResult;
+
+/// Environment variable that overrides the default database path.
+/// The special value `:memory:` selects a private in-memory database
+/// (useful for tests / ephemeral runs).
+pub const DB_PATH_ENV: &str = "CPM_PLANNER_DB";
+
+/// Default on-disk location relative to `$HOME`.
+const DEFAULT_DB_RELATIVE: &str = ".local/share/praxec/cpm-planner.db";
+
+/// Map any backend failure into the planner's wire-stable error variant.
+fn backend(err: impl Into<anyhow::Error>) -> PlannerError {
+    PlannerError::BackendError(err.into())
+}
+
+/// Convert a stored microsecond timestamp back into a `DateTime<Utc>`.
+fn dt_from_micros(us: i64, column: &str) -> Result<DateTime<Utc>, PlannerError> {
+    DateTime::from_timestamp_micros(us)
+        .ok_or_else(|| backend(anyhow!("corrupt timestamp in column {column}: {us}")))
+}
+
+/// SQLite-backed persistence for the planner.
+///
+/// One instance per process. The inner `Mutex<Connection>` serialises
+/// in-process callers; `BEGIN IMMEDIATE` serialises across processes.
+/// The mutex is never held across an `.await`.
+pub struct SqlitePlanStore {
+    conn: Mutex<Connection>,
+}
+
+impl SqlitePlanStore {
+    /// Open (creating if necessary) the database at `path`. Parent
+    /// directories are created. The special path `:memory:` opens a
+    /// private in-memory database.
+    pub fn open(path: &Path) -> anyhow::Result<Self> {
+        if path.as_os_str() == ":memory:" {
+            return Self::open_in_memory();
+        }
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating parent directory for {}", path.display()))?;
+            }
+        }
+        let conn = Connection::open(path)
+            .with_context(|| format!("opening sqlite database at {}", path.display()))?;
+        Self::init(conn)
+    }
+
+    /// Open a private in-memory database. State does NOT survive the
+    /// process and is NOT shared with other connections — this is the
+    /// test / ephemeral configuration.
+    pub fn open_in_memory() -> anyhow::Result<Self> {
+        let conn = Connection::open_in_memory().context("opening in-memory sqlite database")?;
+        Self::init(conn)
+    }
+
+    /// Open the database at [`Self::default_db_path`].
+    pub fn open_default() -> anyhow::Result<Self> {
+        Self::open(&Self::default_db_path()?)
+    }
+
+    /// Resolve the database path: `$CPM_PLANNER_DB` if set, else
+    /// `~/.local/share/praxec/cpm-planner.db`.
+    pub fn default_db_path() -> anyhow::Result<PathBuf> {
+        if let Some(overridden) = std::env::var_os(DB_PATH_ENV) {
+            return Ok(PathBuf::from(overridden));
+        }
+        let home = std::env::var_os("HOME").ok_or_else(|| {
+            anyhow!("HOME is not set and {DB_PATH_ENV} was not provided; cannot locate database")
+        })?;
+        Ok(PathBuf::from(home).join(DEFAULT_DB_RELATIVE))
+    }
+
+    fn init(conn: Connection) -> anyhow::Result<Self> {
+        // WAL + busy_timeout: concurrent processes queue on the write
+        // lock instead of failing; readers never block the writer.
+        // (`execute_batch` tolerates pragmas that return a row.)
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA busy_timeout=5000;
+             PRAGMA synchronous=NORMAL;
+             PRAGMA foreign_keys=ON;",
+        )
+        .context("applying sqlite pragmas")?;
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS plans (
+                 plan_id       TEXT PRIMARY KEY,
+                 graph         TEXT NOT NULL,
+                 cached_result TEXT NOT NULL,
+                 created_at_us INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS deliverable_statuses (
+                 plan_id        TEXT NOT NULL REFERENCES plans(plan_id) ON DELETE CASCADE,
+                 deliverable_id TEXT NOT NULL,
+                 status         TEXT NOT NULL,
+                 attempt_count  INTEGER NOT NULL DEFAULT 0,
+                 failure_count  INTEGER NOT NULL DEFAULT 0,
+                 lapse_count    INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (plan_id, deliverable_id)
+             );
+             CREATE TABLE IF NOT EXISTS locks (
+                 plan_id        TEXT NOT NULL REFERENCES plans(plan_id) ON DELETE CASCADE,
+                 deliverable_id TEXT NOT NULL,
+                 caller_id      TEXT NOT NULL,
+                 acquired_at_us INTEGER NOT NULL,
+                 expires_at_us  INTEGER NOT NULL,
+                 PRIMARY KEY (plan_id, deliverable_id)
+             );
+             CREATE TABLE IF NOT EXISTS submit_dedup (
+                 graph_hash TEXT PRIMARY KEY,
+                 plan_id    TEXT NOT NULL REFERENCES plans(plan_id) ON DELETE CASCADE
+             );",
+        )
+        .context("creating planner tables")?;
+
+        migrate_counter_columns(&conn)?;
+
+        let store = Self {
+            conn: Mutex::new(conn),
+        };
+        store
+            .quarantine_expired(Utc::now())
+            .context("quarantining expired locks at startup")?;
+        Ok(store)
+    }
+
+    /// Reap every lock whose TTL lapsed before `now`: the deliverable
+    /// goes back to `ready`, its `lapse_count` is incremented (the lease
+    /// was lost ENVIRONMENTALLY — no terminal mark was ever recorded —
+    /// so it feeds the lapse bound, never the failure circuit-breaker),
+    /// and the lock row is deleted. Also resets any orphaned
+    /// `in_progress` deliverable that has no lock row, likewise counted
+    /// as a lapse. `attempt_count` and `failure_count` are preserved
+    /// untouched. Returns the number of expired locks reaped. Public so
+    /// operators/tests can force a sweep; `open` runs it automatically.
+    pub fn quarantine_expired(&self, now: DateTime<Utc>) -> anyhow::Result<usize> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("planner store mutex poisoned"))?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let ready = serde_json::to_string(&DeliverableStatus::Ready)?;
+        let in_progress = serde_json::to_string(&DeliverableStatus::InProgress)?;
+        let now_us = now.timestamp_micros();
+
+        tx.execute(
+            "UPDATE deliverable_statuses SET status = ?1, lapse_count = lapse_count + 1
+             WHERE (plan_id, deliverable_id) IN
+                   (SELECT plan_id, deliverable_id FROM locks WHERE expires_at_us < ?2)",
+            params![ready, now_us],
+        )?;
+        let reaped = tx.execute(
+            "DELETE FROM locks WHERE expires_at_us < ?1",
+            params![now_us],
+        )?;
+
+        // Orphaned in_progress with no lock at all: cannot be legitimately
+        // held by anyone, so it goes back to the pool. Losing the lock row
+        // without a terminal mark is an environmental loss — count the lapse.
+        let orphaned = tx.execute(
+            "UPDATE deliverable_statuses SET status = ?1, lapse_count = lapse_count + 1
+             WHERE status = ?2
+               AND (plan_id, deliverable_id) NOT IN
+                   (SELECT plan_id, deliverable_id FROM locks)",
+            params![ready, in_progress],
+        )?;
+
+        tx.commit()?;
+        if reaped > 0 || orphaned > 0 {
+            tracing::warn!(
+                expired_locks = reaped,
+                orphaned_in_progress = orphaned,
+                "quarantined stale planner state"
+            );
+        }
+        Ok(reaped)
+    }
+
+    // -----------------------------------------------------------------
+    // Planner-facing primitives
+    // -----------------------------------------------------------------
+
+    /// Idempotent submit: inside ONE immediate transaction, return the
+    /// existing `PlanId` for `graph_hash` if present, otherwise run
+    /// `build` (pure CPU: CPM + initial statuses) and persist the new
+    /// plan + dedup row. The transaction closes the TOCTOU window between
+    /// concurrent identical submissions across processes.
+    pub(crate) fn submit_or_get(
+        &self,
+        graph_hash: &str,
+        build: impl FnOnce() -> Result<(PlanId, PlanState), PlannerError>,
+    ) -> Result<PlanId, PlannerError> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(backend)?;
+
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT plan_id FROM submit_dedup WHERE graph_hash = ?1",
+                params![graph_hash],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(backend)?;
+        if let Some(plan_id) = existing {
+            return Ok(PlanId(plan_id));
+        }
+
+        let (plan_id, state) = build()?;
+        let graph_json = serde_json::to_string(&state.graph).map_err(backend)?;
+        let result_json = serde_json::to_string(&state.cached_result).map_err(backend)?;
+        tx.execute(
+            "INSERT INTO plans (plan_id, graph, cached_result, created_at_us)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                plan_id.0,
+                graph_json,
+                result_json,
+                Utc::now().timestamp_micros()
+            ],
+        )
+        .map_err(backend)?;
+        save_plan_state(&tx, &plan_id, &state)?;
+        tx.execute(
+            "INSERT INTO submit_dedup (graph_hash, plan_id) VALUES (?1, ?2)",
+            params![graph_hash, plan_id.0],
+        )
+        .map_err(backend)?;
+
+        tx.commit().map_err(backend)?;
+        Ok(plan_id)
+    }
+
+    /// Load the plan, hand a mutable [`PlanState`] to `f`, persist the
+    /// mutated statuses + locks, and commit — all inside ONE
+    /// `BEGIN IMMEDIATE` transaction. An `Err` from `f` rolls the
+    /// transaction back, so failed operations never persist partial
+    /// mutations.
+    pub(crate) fn mutate_plan<R>(
+        &self,
+        plan_id: &PlanId,
+        f: impl FnOnce(&mut PlanState) -> Result<R, PlannerError>,
+    ) -> Result<R, PlannerError> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(backend)?;
+        let mut state =
+            load_plan_state(&tx, plan_id)?.ok_or_else(|| PlannerError::PlanNotFound {
+                plan_id: plan_id.0.clone(),
+            })?;
+        let out = f(&mut state)?;
+        save_plan_state(&tx, plan_id, &state)?;
+        tx.commit().map_err(backend)?;
+        Ok(out)
+    }
+
+    /// Read-only snapshot of a plan under a deferred transaction (a
+    /// consistent WAL read snapshot that never blocks writers).
+    pub(crate) fn read_plan<R>(
+        &self,
+        plan_id: &PlanId,
+        f: impl FnOnce(&PlanState) -> R,
+    ) -> Result<R, PlannerError> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction().map_err(backend)?;
+        let state = load_plan_state(&tx, plan_id)?.ok_or_else(|| PlannerError::PlanNotFound {
+            plan_id: plan_id.0.clone(),
+        })?;
+        Ok(f(&state))
+    }
+
+    fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, PlannerError> {
+        self.conn
+            .lock()
+            .map_err(|_| backend(anyhow!("planner store mutex poisoned")))
+    }
+}
+
+/// Migration: add the per-deliverable counter columns to databases
+/// created before they existed — `attempt_count` (pre-circuit-breaker
+/// databases), `failure_count` + `lapse_count` (databases from before
+/// environmental lapses were split off failed attempts). Guarded by a
+/// `PRAGMA table_info` probe so reopening an already-migrated (or
+/// freshly created) database is a no-op — the live database is never
+/// dropped or recreated. Every added column defaults to 0: on a legacy
+/// database the acquire-derived `attempt_count` history is preserved as
+/// telemetry but treated as NEITHER failures NOR lapses, so an existing
+/// deliverable is exactly as far from both breakers as a fresh one.
+fn migrate_counter_columns(conn: &Connection) -> anyhow::Result<()> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(deliverable_statuses)")
+        .context("probing deliverable_statuses columns")?;
+    let mut existing: Vec<String> = Vec::new();
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .context("reading deliverable_statuses column names")?;
+    for name in names {
+        existing.push(name.context("reading deliverable_statuses column name")?);
+    }
+    for column in ["attempt_count", "failure_count", "lapse_count"] {
+        if !existing.iter().any(|c| c == column) {
+            conn.execute_batch(&format!(
+                "ALTER TABLE deliverable_statuses
+                 ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+            ))
+            .with_context(|| format!("adding deliverable_statuses.{column} column"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Load the full [`PlanState`] for `plan_id`, or `None` if the plan does
+/// not exist. The `file -> deliverable` inverse index is rebuilt from the
+/// persisted locks + graph (it is derived state; persisting it separately
+/// could only ever drift).
+fn load_plan_state(
+    tx: &Transaction<'_>,
+    plan_id: &PlanId,
+) -> Result<Option<PlanState>, PlannerError> {
+    let row: Option<(String, String)> = tx
+        .query_row(
+            "SELECT graph, cached_result FROM plans WHERE plan_id = ?1",
+            params![plan_id.0],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(backend)?;
+    let Some((graph_json, result_json)) = row else {
+        return Ok(None);
+    };
+    let graph: PlanGraph = serde_json::from_str(&graph_json).map_err(backend)?;
+    let cached_result: CriticalPathResult = serde_json::from_str(&result_json).map_err(backend)?;
+
+    let mut statuses: HashMap<String, DeliverableStatus> = HashMap::new();
+    let mut attempt_counts: HashMap<String, u32> = HashMap::new();
+    let mut failure_counts: HashMap<String, u32> = HashMap::new();
+    let mut lapse_counts: HashMap<String, u32> = HashMap::new();
+    {
+        let mut stmt = tx
+            .prepare(
+                "SELECT deliverable_id, status, attempt_count, failure_count, lapse_count
+                 FROM deliverable_statuses WHERE plan_id = ?1",
+            )
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map(params![plan_id.0], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u32>(2)?,
+                    row.get::<_, u32>(3)?,
+                    row.get::<_, u32>(4)?,
+                ))
+            })
+            .map_err(backend)?;
+        for row in rows {
+            let (id, status_json, attempt_count, failure_count, lapse_count) =
+                row.map_err(backend)?;
+            let status: DeliverableStatus = serde_json::from_str(&status_json).map_err(backend)?;
+            statuses.insert(id.clone(), status);
+            if attempt_count > 0 {
+                attempt_counts.insert(id.clone(), attempt_count);
+            }
+            if failure_count > 0 {
+                failure_counts.insert(id.clone(), failure_count);
+            }
+            if lapse_count > 0 {
+                lapse_counts.insert(id, lapse_count);
+            }
+        }
+    }
+
+    let mut locks: HashMap<String, LockInfo> = HashMap::new();
+    {
+        let mut stmt = tx
+            .prepare(
+                "SELECT deliverable_id, caller_id, acquired_at_us, expires_at_us
+                 FROM locks WHERE plan_id = ?1",
+            )
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map(params![plan_id.0], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(backend)?;
+        for row in rows {
+            let (deliverable_id, caller_id, acquired_us, expires_us) = row.map_err(backend)?;
+            locks.insert(
+                deliverable_id.clone(),
+                LockInfo {
+                    plan_id: plan_id.clone(),
+                    deliverable_id,
+                    caller_id: CallerId(caller_id),
+                    acquired_at: dt_from_micros(acquired_us, "locks.acquired_at_us")?,
+                    expires_at: dt_from_micros(expires_us, "locks.expires_at_us")?,
+                },
+            );
+        }
+    }
+
+    // Rebuild the inverse file index from held locks + graph ownership.
+    let mut file_to_deliverable: HashMap<PathBuf, String> = HashMap::new();
+    for deliverable_id in locks.keys() {
+        if let Some(d) = graph.deliverables.iter().find(|d| &d.id == deliverable_id) {
+            for f in &d.owned_files {
+                file_to_deliverable.insert(f.clone(), deliverable_id.clone());
+            }
+        }
+    }
+
+    Ok(Some(PlanState {
+        graph,
+        statuses,
+        attempt_counts,
+        failure_counts,
+        lapse_counts,
+        locks,
+        file_to_deliverable,
+        cached_result,
+    }))
+}
+
+/// Persist the mutable parts of a [`PlanState`] (statuses + locks). The
+/// graph and cached CPM result are immutable after submit and are written
+/// once by [`SqlitePlanStore::submit_or_get`].
+fn save_plan_state(
+    tx: &Transaction<'_>,
+    plan_id: &PlanId,
+    state: &PlanState,
+) -> Result<(), PlannerError> {
+    {
+        let mut stmt = tx
+            .prepare(
+                "INSERT INTO deliverable_statuses
+                     (plan_id, deliverable_id, status, attempt_count, failure_count, lapse_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(plan_id, deliverable_id) DO UPDATE
+                     SET status = excluded.status,
+                         attempt_count = excluded.attempt_count,
+                         failure_count = excluded.failure_count,
+                         lapse_count = excluded.lapse_count",
+            )
+            .map_err(backend)?;
+        for (deliverable_id, status) in &state.statuses {
+            let status_json = serde_json::to_string(status).map_err(backend)?;
+            stmt.execute(params![
+                plan_id.0,
+                deliverable_id,
+                status_json,
+                state.attempt_count(deliverable_id),
+                state.failure_count(deliverable_id),
+                state.lapse_count(deliverable_id)
+            ])
+            .map_err(backend)?;
+        }
+    }
+
+    tx.execute("DELETE FROM locks WHERE plan_id = ?1", params![plan_id.0])
+        .map_err(backend)?;
+    {
+        let mut stmt = tx
+            .prepare(
+                "INSERT INTO locks
+                     (plan_id, deliverable_id, caller_id, acquired_at_us, expires_at_us)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )
+            .map_err(backend)?;
+        for (deliverable_id, lock) in &state.locks {
+            stmt.execute(params![
+                plan_id.0,
+                deliverable_id,
+                lock.caller_id.0,
+                lock.acquired_at.timestamp_micros(),
+                lock.expires_at.timestamp_micros(),
+            ])
+            .map_err(backend)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plan::Deliverable;
+    use crate::task::CriticalPathResult;
+
+    fn plan_state_with_one_ready() -> PlanState {
+        let graph = PlanGraph {
+            deliverables: vec![Deliverable {
+                id: "d1".to_string(),
+                owned_files: vec![PathBuf::from("src/a.rs")],
+                prerequisites: vec![],
+                estimated_effort_hours: Some(1.0),
+                metadata: serde_json::Value::Null,
+            }],
+            max_chained_dispatch: None,
+        };
+        let mut statuses = HashMap::new();
+        statuses.insert("d1".to_string(), DeliverableStatus::Ready);
+        PlanState::new(graph, statuses, CriticalPathResult::default())
+    }
+
+    #[test]
+    fn submit_or_get_is_idempotent_within_one_store() {
+        let store = SqlitePlanStore::open_in_memory().unwrap();
+        let first = store
+            .submit_or_get("hash-1", || {
+                Ok((PlanId("plan_a".into()), plan_state_with_one_ready()))
+            })
+            .unwrap();
+        let second = store
+            .submit_or_get("hash-1", || {
+                panic!("build must not run on a dedup hit");
+            })
+            .unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn mutate_plan_persists_statuses_and_locks() {
+        let store = SqlitePlanStore::open_in_memory().unwrap();
+        let plan_id = store
+            .submit_or_get("hash-1", || {
+                Ok((PlanId("plan_a".into()), plan_state_with_one_ready()))
+            })
+            .unwrap();
+
+        let now = Utc::now();
+        store
+            .mutate_plan(&plan_id, |state| {
+                state
+                    .statuses
+                    .insert("d1".to_string(), DeliverableStatus::InProgress);
+                state.locks.insert(
+                    "d1".to_string(),
+                    LockInfo {
+                        plan_id: plan_id.clone(),
+                        deliverable_id: "d1".to_string(),
+                        caller_id: CallerId("c1".to_string()),
+                        acquired_at: now,
+                        expires_at: now + chrono::Duration::seconds(60),
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        store
+            .read_plan(&plan_id, |state| {
+                assert_eq!(
+                    state.statuses.get("d1"),
+                    Some(&DeliverableStatus::InProgress)
+                );
+                let lock = state.locks.get("d1").expect("lock persisted");
+                assert_eq!(lock.caller_id, CallerId("c1".to_string()));
+                // Inverse file index rebuilt from locks + graph.
+                assert_eq!(
+                    state.file_to_deliverable.get(&PathBuf::from("src/a.rs")),
+                    Some(&"d1".to_string())
+                );
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn mutate_plan_error_rolls_back() {
+        let store = SqlitePlanStore::open_in_memory().unwrap();
+        let plan_id = store
+            .submit_or_get("hash-1", || {
+                Ok((PlanId("plan_a".into()), plan_state_with_one_ready()))
+            })
+            .unwrap();
+
+        let err = store.mutate_plan(&plan_id, |state| {
+            state
+                .statuses
+                .insert("d1".to_string(), DeliverableStatus::Complete);
+            Err::<(), _>(PlannerError::LockNotHeld {
+                caller_id: "c1".to_string(),
+                deliverable_id: "d1".to_string(),
+            })
+        });
+        assert!(matches!(err, Err(PlannerError::LockNotHeld { .. })));
+
+        store
+            .read_plan(&plan_id, |state| {
+                assert_eq!(state.statuses.get("d1"), Some(&DeliverableStatus::Ready));
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn unknown_plan_is_plan_not_found() {
+        let store = SqlitePlanStore::open_in_memory().unwrap();
+        let missing = PlanId("plan_missing".into());
+        let err = store.read_plan(&missing, |_| ());
+        assert!(matches!(err, Err(PlannerError::PlanNotFound { .. })));
+    }
+
+    #[test]
+    fn attempt_counts_round_trip_through_the_store() {
+        let store = SqlitePlanStore::open_in_memory().unwrap();
+        let plan_id = store
+            .submit_or_get("hash-1", || {
+                Ok((PlanId("plan_a".into()), plan_state_with_one_ready()))
+            })
+            .unwrap();
+
+        store
+            .mutate_plan(&plan_id, |state| {
+                *state.attempt_counts.entry("d1".to_string()).or_insert(0) += 1;
+                Ok(())
+            })
+            .unwrap();
+
+        store
+            .read_plan(&plan_id, |state| {
+                assert_eq!(state.attempt_count("d1"), 1);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn failure_and_lapse_counts_round_trip_through_the_store() {
+        let store = SqlitePlanStore::open_in_memory().unwrap();
+        let plan_id = store
+            .submit_or_get("hash-1", || {
+                Ok((PlanId("plan_a".into()), plan_state_with_one_ready()))
+            })
+            .unwrap();
+
+        store
+            .mutate_plan(&plan_id, |state| {
+                *state.failure_counts.entry("d1".to_string()).or_insert(0) += 1;
+                *state.lapse_counts.entry("d1".to_string()).or_insert(0) += 2;
+                Ok(())
+            })
+            .unwrap();
+
+        store
+            .read_plan(&plan_id, |state| {
+                assert_eq!(state.failure_count("d1"), 1);
+                assert_eq!(state.lapse_count("d1"), 2);
+            })
+            .unwrap();
+    }
+
+    /// Unique on-disk temp db removed (with WAL sidecars) on drop, so a
+    /// passing OR failing run leaves no litter behind.
+    struct TempDbFile {
+        path: PathBuf,
+    }
+
+    impl TempDbFile {
+        fn new(tag: &str) -> Self {
+            Self {
+                path: std::env::temp_dir().join(format!(
+                    "cpm-planner-store-test-{tag}-{}.db",
+                    uuid::Uuid::new_v4().simple()
+                )),
+            }
+        }
+    }
+
+    impl Drop for TempDbFile {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let mut p = self.path.clone().into_os_string();
+                p.push(suffix);
+                let _ = std::fs::remove_file(PathBuf::from(p));
+            }
+        }
+    }
+
+    /// Migration safety: a database created BEFORE the circuit-breaker
+    /// (no `attempt_count` column) must open without error, keep its
+    /// existing rows (defaulting attempt_count to 0), accept writes to
+    /// the migrated column, and tolerate a second open (the guarded
+    /// ALTER must be a no-op, not a duplicate-column error).
+    #[test]
+    fn opening_a_pre_attempt_count_database_migrates_in_place() {
+        let db = TempDbFile::new("migration");
+
+        // Hand-build the legacy schema + one live plan row, exactly as a
+        // pre-circuit-breaker binary would have left it.
+        {
+            let conn = Connection::open(&db.path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE plans (
+                     plan_id       TEXT PRIMARY KEY,
+                     graph         TEXT NOT NULL,
+                     cached_result TEXT NOT NULL,
+                     created_at_us INTEGER NOT NULL
+                 );
+                 CREATE TABLE deliverable_statuses (
+                     plan_id        TEXT NOT NULL REFERENCES plans(plan_id) ON DELETE CASCADE,
+                     deliverable_id TEXT NOT NULL,
+                     status         TEXT NOT NULL,
+                     PRIMARY KEY (plan_id, deliverable_id)
+                 );
+                 CREATE TABLE locks (
+                     plan_id        TEXT NOT NULL REFERENCES plans(plan_id) ON DELETE CASCADE,
+                     deliverable_id TEXT NOT NULL,
+                     caller_id      TEXT NOT NULL,
+                     acquired_at_us INTEGER NOT NULL,
+                     expires_at_us  INTEGER NOT NULL,
+                     PRIMARY KEY (plan_id, deliverable_id)
+                 );
+                 CREATE TABLE submit_dedup (
+                     graph_hash TEXT PRIMARY KEY,
+                     plan_id    TEXT NOT NULL REFERENCES plans(plan_id) ON DELETE CASCADE
+                 );",
+            )
+            .unwrap();
+
+            let legacy = plan_state_with_one_ready();
+            conn.execute(
+                "INSERT INTO plans (plan_id, graph, cached_result, created_at_us)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    "plan_legacy",
+                    serde_json::to_string(&legacy.graph).unwrap(),
+                    serde_json::to_string(&legacy.cached_result).unwrap(),
+                    0i64
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO deliverable_statuses (plan_id, deliverable_id, status)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    "plan_legacy",
+                    "d1",
+                    serde_json::to_string(&DeliverableStatus::Ready).unwrap()
+                ],
+            )
+            .unwrap();
+        }
+
+        let plan_id = PlanId("plan_legacy".into());
+
+        // Open migrates in place: legacy row readable, attempt_count = 0.
+        let store = SqlitePlanStore::open(&db.path).unwrap();
+        store
+            .read_plan(&plan_id, |state| {
+                assert_eq!(state.statuses.get("d1"), Some(&DeliverableStatus::Ready));
+                assert_eq!(state.attempt_count("d1"), 0);
+            })
+            .unwrap();
+
+        // The migrated column accepts and persists writes.
+        store
+            .mutate_plan(&plan_id, |state| {
+                state.attempt_counts.insert("d1".to_string(), 2);
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+
+        // Reopen: the guarded ALTER is a no-op, data intact.
+        let store2 = SqlitePlanStore::open(&db.path).unwrap();
+        store2
+            .read_plan(&plan_id, |state| {
+                assert_eq!(state.attempt_count("d1"), 2);
+            })
+            .unwrap();
+    }
+
+    /// Migration safety for the LIVE production schema: a database from
+    /// the lease-counting era (`attempt_count` present, no
+    /// `failure_count`/`lapse_count`) must open without error, and a
+    /// deliverable with acquire-derived attempt history — e.g.
+    /// attempt_count=2 accrued purely from environmental lapses — must be
+    /// exactly as far from BOTH breakers as a fresh one: legacy attempts
+    /// are telemetry, treated as neither failures nor lapses. A second
+    /// open must be a no-op (guarded ALTER, no duplicate-column error).
+    #[test]
+    fn opening_a_pre_lapse_count_database_treats_legacy_attempts_as_neither_failures_nor_lapses() {
+        let db = TempDbFile::new("lapse-migration");
+
+        // Hand-build the lease-counting-era schema + one in-flight plan
+        // row, exactly as the pre-fix binary would have left it after two
+        // environmental lease losses.
+        {
+            let conn = Connection::open(&db.path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE plans (
+                     plan_id       TEXT PRIMARY KEY,
+                     graph         TEXT NOT NULL,
+                     cached_result TEXT NOT NULL,
+                     created_at_us INTEGER NOT NULL
+                 );
+                 CREATE TABLE deliverable_statuses (
+                     plan_id        TEXT NOT NULL REFERENCES plans(plan_id) ON DELETE CASCADE,
+                     deliverable_id TEXT NOT NULL,
+                     status         TEXT NOT NULL,
+                     attempt_count  INTEGER NOT NULL DEFAULT 0,
+                     PRIMARY KEY (plan_id, deliverable_id)
+                 );
+                 CREATE TABLE locks (
+                     plan_id        TEXT NOT NULL REFERENCES plans(plan_id) ON DELETE CASCADE,
+                     deliverable_id TEXT NOT NULL,
+                     caller_id      TEXT NOT NULL,
+                     acquired_at_us INTEGER NOT NULL,
+                     expires_at_us  INTEGER NOT NULL,
+                     PRIMARY KEY (plan_id, deliverable_id)
+                 );
+                 CREATE TABLE submit_dedup (
+                     graph_hash TEXT PRIMARY KEY,
+                     plan_id    TEXT NOT NULL REFERENCES plans(plan_id) ON DELETE CASCADE
+                 );",
+            )
+            .unwrap();
+
+            let legacy = plan_state_with_one_ready();
+            conn.execute(
+                "INSERT INTO plans (plan_id, graph, cached_result, created_at_us)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    "plan_live",
+                    serde_json::to_string(&legacy.graph).unwrap(),
+                    serde_json::to_string(&legacy.cached_result).unwrap(),
+                    0i64
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO deliverable_statuses (plan_id, deliverable_id, status, attempt_count)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    "plan_live",
+                    "d1",
+                    serde_json::to_string(&DeliverableStatus::Ready).unwrap(),
+                    2u32
+                ],
+            )
+            .unwrap();
+        }
+
+        let plan_id = PlanId("plan_live".into());
+
+        // Open migrates in place: legacy lease history preserved as
+        // telemetry, both breaker counters start at zero.
+        let store = SqlitePlanStore::open(&db.path).unwrap();
+        store
+            .read_plan(&plan_id, |state| {
+                assert_eq!(state.statuses.get("d1"), Some(&DeliverableStatus::Ready));
+                assert_eq!(state.attempt_count("d1"), 2, "legacy history preserved");
+                assert_eq!(
+                    state.failure_count("d1"),
+                    0,
+                    "legacy leases are not failures"
+                );
+                assert_eq!(state.lapse_count("d1"), 0, "legacy leases are not lapses");
+            })
+            .unwrap();
+
+        // The migrated columns accept and persist writes.
+        store
+            .mutate_plan(&plan_id, |state| {
+                state.failure_counts.insert("d1".to_string(), 1);
+                state.lapse_counts.insert("d1".to_string(), 3);
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+
+        // Reopen: the guarded ALTER is a no-op, data intact.
+        let store2 = SqlitePlanStore::open(&db.path).unwrap();
+        store2
+            .read_plan(&plan_id, |state| {
+                assert_eq!(state.attempt_count("d1"), 2);
+                assert_eq!(state.failure_count("d1"), 1);
+                assert_eq!(state.lapse_count("d1"), 3);
+            })
+            .unwrap();
+    }
+}

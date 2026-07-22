@@ -18,7 +18,7 @@ use cpm_planner::{
     TOOL_MARK_STATUS, TOOL_STATUS, TOOL_SUBMIT,
 };
 use rmcp::model::{CallToolRequestParams, JsonObject};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -286,6 +286,51 @@ async fn plan_status_roundtrip() {
     );
 }
 
+// Wire shape of a status row: [id, status, attempt_count, failure_count,
+// lapse_count] — trailing counters appended so positional readers of the
+// historical 3-element rows keep working. An explicit mark_status failed
+// shows up in failure_count (index 3), never lapse_count (index 4).
+#[tokio::test]
+async fn plan_status_rows_expose_failure_and_lapse_counters() {
+    let server = server();
+    let plan_id = submit_plan(&server).await;
+
+    let _ = server
+        .dispatch_call(call_args(
+            TOOL_ACQUIRE_COHORT,
+            json!({ "plan_id": plan_id, "caller_id": "orch-1", "max_count": 1 }),
+        ))
+        .await
+        .expect("acquire ok");
+    let _ = server
+        .dispatch_call(call_args(
+            TOOL_MARK_STATUS,
+            json!({
+                "plan_id": plan_id,
+                "deliverable_id": "d1",
+                "caller_id": "orch-1",
+                "status": { "status": "failed", "reason": "real implementation failure" }
+            }),
+        ))
+        .await
+        .expect("mark failed ok");
+
+    let resp = server
+        .dispatch_call(call_args(TOOL_STATUS, json!({ "plan_id": plan_id })))
+        .await
+        .expect("status ok");
+    let d1 = resp["deliverables"]
+        .as_array()
+        .expect("deliverables array")
+        .iter()
+        .find(|row| row[0].as_str() == Some("d1"))
+        .expect("d1 row present");
+    assert_eq!(d1.as_array().map(|r| r.len()), Some(5), "five-element row");
+    assert_eq!(d1[2], json!(1), "one lease");
+    assert_eq!(d1[3], json!(1), "one explicit failed attempt");
+    assert_eq!(d1[4], json!(0), "no environmental lapse");
+}
+
 // ── Roundtrip: plan.force_release ───────────────────────────────────────────
 
 #[tokio::test]
@@ -468,4 +513,7 @@ async fn plan_mark_status_failed_carries_reason() {
         .expect("d1 entry present");
     assert_eq!(d1[1]["status"], json!("failed"));
     assert_eq!(d1[1]["reason"], json!("intentional test failure"));
+    // Third element of each status row is the lease attempt_count —
+    // d1 was leased exactly once before being marked failed.
+    assert_eq!(d1[2], json!(1));
 }

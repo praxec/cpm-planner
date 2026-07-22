@@ -1,8 +1,8 @@
 [package]
 name = "cpm-planner"
-version = "0.0.1"
-edition = "2021"
-rust-version = "1.83"
+version = "0.0.2"
+edition = "2024"
+rust-version = "1.85"
 license = "Apache-2.0"
 repository = "https://github.com/praxec/cpm-planner"
 description = "Critical Path Method (CPM) planner exposed as an MCP server: schedules a task graph (earliest/latest start, slack, critical path, bottlenecks) and coordinates lock-aware parallel execution over MCP."
@@ -22,8 +22,14 @@ path = "src/bin/server.rs"
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
+# Shared reliability vocabulary (retry / circuit-break). The durable, cross-process
+# deliverable-lease circuit breaker classifies + decides through this crate's
+# FailureClass / RetryDecision types so cpm-planner speaks the same reliability
+# language as the rest of praxec (rather than hand-rolling its own).
+execution-policy = { git = "https://github.com/matt-cochran/execution-policy" }
 chrono = { version = "0.4", features = ["serde"] }
 rmcp = { version = "1.7", default-features = false, features = ["server", "macros", "transport-io"] }
+rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

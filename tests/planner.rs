@@ -6,10 +6,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use cpm_planner::BasicCpmPlanner;
 use cpm_planner::audit::MemoryAuditSink;
 use cpm_planner::plan::{CallerId, Deliverable, DeliverableStatus, PlanGraph, PlannerError};
 use cpm_planner::ports::Planner;
-use cpm_planner::BasicCpmPlanner;
 
 fn deliverable(id: &str, files: &[&str], prereqs: &[&str], effort: Option<f32>) -> Deliverable {
     Deliverable {
@@ -257,8 +257,8 @@ async fn mark_status_complete_releases_lock_and_advances_dependents() {
     let leaf_status = status
         .deliverables
         .iter()
-        .find(|(id, _)| id == "leaf")
-        .map(|(_, s)| s.clone())
+        .find(|(id, _, _, _, _)| id == "leaf")
+        .map(|(_, s, _, _, _)| s.clone())
         .unwrap();
     assert_eq!(leaf_status, DeliverableStatus::Ready);
 
@@ -391,8 +391,8 @@ async fn force_release_reverts_to_ready_and_audits_reason() {
     let a_status = status
         .deliverables
         .iter()
-        .find(|(id, _)| id == "a")
-        .map(|(_, s)| s.clone())
+        .find(|(id, _, _, _, _)| id == "a")
+        .map(|(_, s, _, _, _)| s.clone())
         .unwrap();
     assert_eq!(a_status, DeliverableStatus::Ready);
     assert!(status.locks_held.is_empty());

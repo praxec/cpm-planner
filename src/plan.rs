@@ -299,10 +299,22 @@ impl TryFrom<FlatCohort> for Cohort {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanStatus {
     pub plan_id: PlanId,
-    /// Per-deliverable status. Order matches insertion order in the
-    /// originally submitted [`PlanGraph::deliverables`] so callers can
-    /// render a stable table.
-    pub deliverables: Vec<(String, DeliverableStatus)>,
+    /// Per-deliverable `(id, status, attempt_count, failure_count,
+    /// lapse_count)`. Order matches insertion order in the originally
+    /// submitted [`PlanGraph::deliverables`] so callers can render a
+    /// stable table. On the wire each row is a positional array —
+    /// trailing elements were appended, so readers indexing `[0..=2]`
+    /// keep working (backward-tolerant extension).
+    ///
+    /// - `attempt_count` — total leases handed out via
+    ///   [`crate::ports::Planner::acquire_cohort`] (telemetry).
+    /// - `failure_count` — explicit `mark_status(Failed)` outcomes; this
+    ///   is the retry pressure against the failure circuit-break cap
+    ///   ([`crate::planner::MAX_ATTEMPTS`]).
+    /// - `lapse_count` — leases lost environmentally (TTL expiry, no
+    ///   terminal mark); pressure against the lapse bound
+    ///   ([`crate::planner::MAX_LAPSES`]), never the failure breaker.
+    pub deliverables: Vec<(String, DeliverableStatus, u32, u32, u32)>,
     /// Ids on the longest dependency chain, in execution order. Empty
     /// when the plan has no deliverables.
     pub critical_path: Vec<String>,
@@ -386,6 +398,25 @@ pub enum PlannerError {
     DeliverableNotFound {
         plan_id: String,
         deliverable_id: String,
+    },
+
+    /// A deliverable's lease has lapsed via TTL (no terminal mark — the
+    /// driving process was killed or timed out) more times than the
+    /// runaway bound allows. These are ENVIRONMENTAL losses, not
+    /// implementation failures, so the deliverable is NOT auto-failed;
+    /// instead `acquire_cohort` refuses to re-lease until an operator
+    /// intervenes (fix the environment, then `mark_status` or
+    /// `force_release`).
+    #[error(
+        "LAPSE_LIMIT: deliverable {deliverable_id} lost {lapse_count} leases to environmental \
+         lapses (TTL expiry with no terminal mark — killed/timed-out drivers, NOT implementation \
+         failures; bound {max_lapses}); fix the environment, then mark_status the deliverable to \
+         proceed"
+    )]
+    LapseLimit {
+        deliverable_id: String,
+        lapse_count: u32,
+        max_lapses: u32,
     },
 
     /// The submitted graph fails a structural invariant: duplicate ids,

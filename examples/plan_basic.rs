@@ -26,10 +26,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use cpm_planner::BasicCpmPlanner;
 use cpm_planner::audit::{AuditEvent, AuditSink};
 use cpm_planner::plan::{CallerId, Deliverable, DeliverableStatus, PlanGraph};
 use cpm_planner::ports::Planner;
-use cpm_planner::BasicCpmPlanner;
 
 /// A trivial audit sink that buffers every event for inspection.
 #[derive(Debug, Default)]
@@ -138,7 +138,7 @@ async fn main() -> anyhow::Result<()> {
     let complete = status
         .deliverables
         .iter()
-        .filter(|(_, s)| matches!(s, DeliverableStatus::Complete))
+        .filter(|(_, s, _, _, _)| matches!(s, DeliverableStatus::Complete))
         .count();
     println!(
         "final state: {complete}/{total} deliverables complete; {locks} locks held",
