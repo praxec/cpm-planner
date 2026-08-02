@@ -39,6 +39,7 @@ jobs:
           bin: cpm-planner
           target: ${{ matrix.target }}
           archive: cpm-planner-${{ matrix.target }}
+          checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}
 
   image:
