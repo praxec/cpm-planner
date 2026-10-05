@@ -21,7 +21,7 @@ permissions:
 jobs:
     main-from-dev-only:
         name: main only accepts merges from dev
-        runs-on: ubuntu-latest
+        runs-on: ubuntu-22.04
         steps:
             - name: Verify a PR into main comes from dev
               env:
