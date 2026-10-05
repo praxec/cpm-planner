@@ -34,7 +34,8 @@ $DefaultBin  = 'cpm-planner'
 $Repo    = if ($env:PRAXEC_REPO) { $env:PRAXEC_REPO } else { $DefaultRepo }
 $Bin     = if ($env:PRAXEC_BIN)  { $env:PRAXEC_BIN }  else { $DefaultBin }
 $Version = if ($Version) { $Version } else { 'latest' }
-$InstallDir = if ($InstallDir) { $InstallDir } else { Join-Path $env:LOCALAPPDATA "Programs\${Bin}" }
+$LocalPrograms = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { [Environment]::GetFolderPath('UserProfile') }
+$InstallDir = if ($InstallDir) { $InstallDir } else { Join-Path $LocalPrograms "Programs\${Bin}" }
 $BaseUrl = if ($BaseUrl) { $BaseUrl } else { "https://github.com/$Repo/releases" }
 $MaxBytes = if ($env:PRAXEC_MAX_BYTES) { [int64]$env:PRAXEC_MAX_BYTES } else { 134217728 }
 
