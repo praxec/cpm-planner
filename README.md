@@ -18,23 +18,62 @@ purely over MCP.
 
 ## Install
 
-From crates.io:
+### Prebuilt binary (no Rust, Cargo, or Git required)
+
+```sh
+# Linux / macOS
+curl -fsSL https://github.com/praxec/cpm-planner/releases/latest/download/install.sh | sh
+
+# Windows (PowerShell)
+irm https://github.com/praxec/cpm-planner/releases/latest/download/install.ps1 | iex
+```
+
+The installer resolves your OS and CPU architecture, downloads the matching
+release asset, verifies its SHA-256 against the release's `checksums.sha256`,
+extracts it safely, and atomically installs the binary into a user-local
+managed directory (`$HOME/.local/bin` on Linux/macOS,
+`%LOCALAPPDATA%\Programs\cpm-planner` on Windows). It never compiles from
+source and fails loudly on an unsupported OS/architecture.
+
+Pin a specific release instead of the current latest stable:
+
+```sh
+curl -fsSL https://github.com/praxec/cpm-planner/releases/latest/download/install.sh \
+  | sh -s -- --version v0.0.3
+```
+
+The installer scripts are published as release assets alongside the binaries.
+
+Or download the archive directly. Every release publishes a `checksums.sha256`
+and a machine-readable `release-manifest.json` listing each target, asset,
+digest, version, and source SHA:
+
+| OS | Arch | Target triple | Asset | Build support | Runtime smoke tested |
+|----|------|---------------|-------|---------------|----------------------|
+| Linux | x86_64 | `x86_64-unknown-linux-gnu` | `cpm-planner-x86_64-unknown-linux-gnu.tar.gz` | native CI | native CI |
+| Linux | arm64 | `aarch64-unknown-linux-gnu` | `cpm-planner-aarch64-unknown-linux-gnu.tar.gz` | native CI | native CI |
+| macOS | x86_64 | `x86_64-apple-darwin` | `cpm-planner-x86_64-apple-darwin.tar.gz` | native CI | native CI |
+| macOS | Apple Silicon | `aarch64-apple-darwin` | `cpm-planner-aarch64-apple-darwin.tar.gz` | native CI | native CI |
+| Windows | x86_64 | `x86_64-pc-windows-msvc` | `cpm-planner-x86_64-pc-windows-msvc.zip` | native CI | native CI |
+| Windows | arm64 | `aarch64-pc-windows-msvc` | `cpm-planner-aarch64-pc-windows-msvc.zip` | native CI | native CI |
+
+"Native CI" means each asset is built and its MCP `initialize`/`tools/list`
+handshake smoke-tested on that platform's own runner. No other CPU/OS
+combination is claimed; unsupported platforms are rejected rather than
+silently cross-compiled.
+
+### Updates
+
+Re-run the installer to update. Only the binary in the managed install
+directory is replaced (atomically); application state and configuration live
+outside that directory and are never overwritten. The SQLite plan store lives
+at `~/.local/share/praxec/cpm-planner.db` (override with `CPM_PLANNER_DB`).
+
+### From source
 
 ```sh
 cargo install cpm-planner
 ```
-
-Or download a pre-built binary for your platform from the
-[latest release](https://github.com/praxec/cpm-planner/releases/latest)
-(verify against the release's `checksums.sha256`):
-
-| Platform | Download |
-|----------|----------|
-| Linux x86_64 | [`.tar.gz`](https://github.com/praxec/cpm-planner/releases/latest/download/cpm-planner-x86_64-unknown-linux-gnu.tar.gz) |
-| Linux ARM64 | [`.tar.gz`](https://github.com/praxec/cpm-planner/releases/latest/download/cpm-planner-aarch64-unknown-linux-gnu.tar.gz) |
-| macOS x86_64 | [`.tar.gz`](https://github.com/praxec/cpm-planner/releases/latest/download/cpm-planner-x86_64-apple-darwin.tar.gz) |
-| macOS Apple Silicon | [`.tar.gz`](https://github.com/praxec/cpm-planner/releases/latest/download/cpm-planner-aarch64-apple-darwin.tar.gz) |
-| Windows x86_64 | [`.zip`](https://github.com/praxec/cpm-planner/releases/latest/download/cpm-planner-x86_64-pc-windows-msvc.zip) |
 
 It speaks MCP over stdio (the standard transport). Wire it into your editor like
 any other MCP server:

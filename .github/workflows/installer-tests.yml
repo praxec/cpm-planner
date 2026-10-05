@@ -1,0 +1,21 @@
+name: Installer behavior
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  installer:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: node --test scripts/release.test.mjs
+  windows-target:
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+      - shell: pwsh
+        run: |
+          $target = ./scripts/install.ps1 -PrintTarget
+          if ($target -ne 'aarch64-pc-windows-msvc') { throw "Wrong target: $target" }
