@@ -28,6 +28,9 @@ use crate::plan::{
 /// - [`Planner::status`] is a cheap read-only snapshot and is safe to poll.
 /// - [`Planner::force_release`] is the operator escape hatch. Implementations
 ///   MUST emit an audit event carrying the supplied `reason`.
+// async_trait adds must_use to boxed futures; Rust 1.99 also marks Future
+// must_use. Scope this generated-attribute compatibility exception to the trait.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Planner: Send + Sync {
     /// Submit a [`PlanGraph`]. Idempotent on `(graph, caller_id)`; an
