@@ -12,7 +12,8 @@ env:
 
 jobs:
     test:
-        name: test (${{ matrix.os }})
+        # Preserve the required branch-protection check name while pinning its runner.
+        name: test (${{ matrix.os == 'ubuntu-22.04' && 'ubuntu-latest' || matrix.os }})
         strategy:
             fail-fast: false
             matrix:
