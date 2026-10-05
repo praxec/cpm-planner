@@ -78,6 +78,8 @@ impl AuditEvent {
 }
 
 /// A destination for [`AuditEvent`]s.
+// async_trait generates a redundant must_use on Future with current Clippy.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait AuditSink: Send + Sync {
     async fn record(&self, event: AuditEvent) -> anyhow::Result<()>;
