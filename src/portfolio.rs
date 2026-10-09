@@ -411,7 +411,8 @@ pub(crate) fn list(
                 selected: selected_variant.as_deref() == Some(variant.as_str()),
                 variant,
                 plan_id,
-                archived: v_archived,
+                // Effective: an archived line archives every variant.
+                archived: archived || v_archived,
                 head_revision,
                 source_path,
                 complete,
@@ -532,31 +533,38 @@ fn line_not_found(project: &str, name: &str) -> PlannerError {
     }
 }
 
-/// Execution gate for a named variant: `Err(ArchiveRefused)` when its line
-/// is archived, else `Err(VariantNotSelected)` when it is not its line's
-/// selected variant. A plan without a `variants` row (unnamed or legacy)
+/// Execution gate for a named variant: `Err(ArchiveRefused)` when it is
+/// effectively archived (its line or itself), else `Err(VariantNotSelected)`
+/// when it is not its line's selected variant. A plan without a `variants` row (unnamed or legacy)
 /// always passes, as does an unknown plan id (the caller reports
 /// `PLAN_NOT_FOUND`).
 pub(crate) fn ensure_executable(
     tx: &Transaction<'_>,
     plan_id: &PlanId,
 ) -> Result<(), PlannerError> {
-    let row: Option<(String, String, Option<String>, bool)> = tx
+    let row: Option<(String, String, Option<String>, bool, bool)> = tx
         .query_row(
-            "SELECT v.name, v.variant, l.selected_variant, COALESCE(l.archived, 0)
+            "SELECT v.name, v.variant, l.selected_variant, COALESCE(l.archived, 0), v.archived
              FROM variants v
              LEFT JOIN plan_lines l ON l.project = v.project AND l.name = v.name
              WHERE v.plan_id = ?1",
             params![plan_id.0],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()
         .map_err(backend)?;
     match row {
-        Some((name, _, _, true)) => Err(PlannerError::ArchiveRefused {
+        Some((name, _, _, true, _)) => Err(PlannerError::ArchiveRefused {
             reason: format!("'{name}' is archived; unarchive it to resume execution"),
         }),
-        Some((name, variant, selected, false)) if selected.as_deref() != Some(variant.as_str()) => {
+        Some((name, variant, _, false, true)) => Err(PlannerError::ArchiveRefused {
+            reason: format!(
+                "variant '{variant}' of '{name}' is archived; unarchive it to resume execution"
+            ),
+        }),
+        Some((name, variant, selected, false, false))
+            if selected.as_deref() != Some(variant.as_str()) =>
+        {
             Err(PlannerError::VariantNotSelected {
                 plan_id: plan_id.0.clone(),
                 name,
@@ -754,7 +762,8 @@ fn carry_progress(old: &PlanState, new: &mut PlanState) -> Vec<String> {
 
 /// A committed archive or unarchive.
 pub(crate) struct Archived {
-    /// The variants (with their plan ids) whose flag changed.
+    /// The variant (with its plan id) whose own flag changed; empty for a
+    /// line operation, which never touches variant flags.
     pub(crate) variants: Vec<(String, PlanId)>,
     /// True when the line's own flag changed.
     pub(crate) line: bool,
@@ -773,11 +782,13 @@ impl Archived {
 /// Set the archived flag (`archived`) of the line `(project, name)` with
 /// every variant (`variant: None`), or of one variant.
 ///
-/// Archiving one variant refuses the selected variant. Archiving a line
-/// first reaps the selected variant's expired locks; a live lock refuses
-/// with `LOCK_HELD` unless `force`, which releases it (an archived line is
-/// not executable, so nobody could complete the lease). Unarchiving a line
-/// clears the flag on the line and every variant; unarchiving one variant of
+/// The line flag and the variant flags are independent; a variant is
+/// effectively archived when `line.archived || variant.archived`. Archiving
+/// one variant refuses the selected variant. Archiving a line sets only the
+/// line flag, after reaping the selected variant's expired locks; a live
+/// lock refuses with `LOCK_HELD` unless `force`, which releases it (an
+/// archived line is not executable, so nobody could complete the lease).
+/// Unarchiving a line clears only the line flag; unarchiving one variant of
 /// an archived line is refused. Setting a flag to its current value changes
 /// nothing.
 pub(crate) fn archive(
@@ -790,31 +801,6 @@ pub(crate) fn archive(
     now: DateTime<Utc>,
 ) -> Result<Archived, PlannerError> {
     let line_row = line(tx, project, name)?.ok_or_else(|| line_not_found(project, name))?;
-    let flip = |only: Option<&str>| -> Result<Vec<(String, PlanId)>, PlannerError> {
-        let rows: Vec<(String, PlanId)> = {
-            let mut stmt = tx
-                .prepare(
-                    "SELECT variant, plan_id FROM variants
-                     WHERE project = ?1 AND name = ?2 AND archived = ?3
-                       AND (?4 IS NULL OR variant = ?4)
-                     ORDER BY variant",
-                )
-                .map_err(backend)?;
-            stmt.query_map(params![project, name, !archived, only], |r| {
-                Ok((r.get(0)?, PlanId(r.get(1)?)))
-            })
-            .map_err(backend)?
-            .collect::<Result<_, _>>()
-            .map_err(backend)?
-        };
-        tx.execute(
-            "UPDATE variants SET archived = ?1
-             WHERE project = ?2 AND name = ?3 AND (?4 IS NULL OR variant = ?4)",
-            params![archived, project, name, only],
-        )
-        .map_err(backend)?;
-        Ok(rows)
-    };
     let mut out = Archived {
         variants: Vec::new(),
         line: false,
@@ -826,7 +812,8 @@ pub(crate) fn archive(
             if archived && !line_row.archived {
                 release_selected_locks(tx, project, name, &line_row, force, now, &mut out)?;
             }
-            out.variants = flip(None)?;
+            // Only the line's own flag: variant flags are independent, so
+            // unarchiving the line restores each variant as it was.
             tx.execute(
                 "UPDATE plan_lines SET archived = ?1 WHERE project = ?2 AND name = ?3",
                 params![archived, project, name],
@@ -835,11 +822,11 @@ pub(crate) fn archive(
             out.line = line_row.archived != archived;
         }
         Some(v) => {
-            if variant_plan_id(tx, project, name, v)?.is_none() {
+            let Some(plan_id) = variant_plan_id(tx, project, name, v)? else {
                 return Err(PlannerError::PlanNotFound {
                     plan_id: format!("variant '{v}' of plan line '{name}' in project '{project}'"),
                 });
-            }
+            };
             if archived && line_row.selected_variant.as_deref() == Some(v) {
                 return Err(PlannerError::ArchiveRefused {
                     reason: format!(
@@ -853,7 +840,16 @@ pub(crate) fn archive(
                     reason: "unarchive the line first".to_string(),
                 });
             }
-            out.variants = flip(Some(v))?;
+            let changed = tx
+                .execute(
+                    "UPDATE variants SET archived = ?1
+                     WHERE project = ?2 AND name = ?3 AND variant = ?4 AND archived <> ?1",
+                    params![archived, project, name, v],
+                )
+                .map_err(backend)?;
+            if changed > 0 {
+                out.variants.push((v.to_string(), plan_id));
+            }
         }
     }
     Ok(out)

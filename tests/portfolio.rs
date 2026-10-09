@@ -1346,7 +1346,7 @@ async fn archiving_a_line_hides_it_from_list() {
 }
 
 #[tokio::test]
-async fn archiving_a_line_archives_every_variant() {
+async fn line_archive_hides_all_variants_from_list() {
     let planner = BasicCpmPlanner::new();
     main_and_alt(&planner).await;
     planner
@@ -1598,4 +1598,61 @@ async fn unarchive_emits_portfolio_unarchived_event() {
         sink.event_types()
             .contains(&"plan.portfolio.unarchived".to_string())
     );
+}
+
+#[tokio::test]
+async fn line_archive_leaves_variant_flags_untouched() {
+    let db = TempDb::new();
+    let planner = db.planner();
+    main_and_alt(&planner).await;
+    planner
+        .archive(PROJECT, "web", None, true, false)
+        .await
+        .unwrap();
+    let flagged: i64 = rusqlite::Connection::open(&db.path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM variants WHERE archived = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(flagged, 0);
+}
+
+#[tokio::test]
+async fn unarchiving_line_keeps_individually_archived_variant_archived() {
+    let planner = BasicCpmPlanner::new();
+    main_and_alt(&planner).await;
+    planner
+        .archive(PROJECT, "web", Some("alt"), true, false)
+        .await
+        .unwrap();
+    planner
+        .archive(PROJECT, "web", None, true, false)
+        .await
+        .unwrap();
+    planner
+        .archive(PROJECT, "web", None, false, false)
+        .await
+        .unwrap();
+    let lines = planner.list_plans(PROJECT, false).await.unwrap();
+    let variants: Vec<&str> = lines[0]
+        .variants
+        .iter()
+        .map(|v| v.variant.as_str())
+        .collect();
+    assert_eq!(variants, vec!["main"]);
+}
+
+#[tokio::test]
+async fn execution_on_archived_variant_is_archive_refused() {
+    let planner = BasicCpmPlanner::new();
+    let (_, alt) = main_and_alt(&planner).await;
+    planner
+        .archive(PROJECT, "web", Some("alt"), true, false)
+        .await
+        .unwrap();
+    let err = planner.acquire_cohort(acquire_req(&alt)).await.unwrap_err();
+    assert!(matches!(err, PlannerError::ArchiveRefused { .. }));
 }

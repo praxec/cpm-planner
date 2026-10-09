@@ -124,7 +124,9 @@ pub trait Planner: Send + Sync {
     ) -> Result<SelectOutcome, PlannerError>;
 
     /// Archive (`archived: true`) or unarchive a whole plan line
-    /// (`variant: None`: the line and all its variants) or one variant.
+    /// (`variant: None`) or one variant. The line flag and the variant flags
+    /// are independent: a variant is effectively archived when its line or
+    /// itself is, so unarchiving a line restores each variant as it was.
     /// Archived variants stay readable but are hidden from
     /// [`Planner::list_plans`] unless `include_archived`, and refuse sync and
     /// selection; every variant of an archived line refuses execution
