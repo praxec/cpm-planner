@@ -31,7 +31,7 @@ use rusqlite::{OptionalExtension, Transaction, params};
 use std::collections::{HashMap, HashSet};
 
 use crate::graph::prerequisite_ids;
-use crate::locks::{PlanState, rederive_status, release_file_claims};
+use crate::locks::{PlanState, rederive_status};
 use crate::plan::{
     Deliverable, DeliverableStatus, LockInfo, PlanGraph, PlanId, PlanLineSummary, PlannerError,
     SelectOutcome, SyncRequest, VariantSummary,
@@ -838,7 +838,7 @@ pub(crate) fn select(
                 });
             }
             for lock in &live {
-                release_lock(&mut old, &lock.deliverable_id);
+                release_lock(&mut old, &lock.deliverable_id, now);
             }
             selected.outcome.released_locks =
                 live.iter().map(|l| l.deliverable_id.clone()).collect();
@@ -870,16 +870,16 @@ pub(crate) fn select(
     Ok(selected)
 }
 
-/// Drop `deliverable_id`'s lock and file claims and re-derive its status.
-fn release_lock(state: &mut PlanState, deliverable_id: &str) {
-    state.locks.remove(deliverable_id);
+/// End `deliverable_id`'s lease at `now` (lock, file claims, leased hours)
+/// and re-derive its status.
+fn release_lock(state: &mut PlanState, deliverable_id: &str, now: DateTime<Utc>) {
+    state.end_lease(deliverable_id, now);
     if let Some(d) = state
         .graph
         .deliverables
         .iter()
         .find(|d| d.id == deliverable_id)
     {
-        release_file_claims(&mut state.file_claims, deliverable_id, &d.owned_files);
         let status = rederive_status(d, &state.statuses);
         state.statuses.insert(deliverable_id.to_string(), status);
     }
@@ -1104,7 +1104,7 @@ fn release_selected_locks(
         });
     }
     for lock in &live {
-        release_lock(&mut state, &lock.deliverable_id);
+        release_lock(&mut state, &lock.deliverable_id, now);
     }
     out.released = live;
     save_plan_state(tx, &plan_id, &state)

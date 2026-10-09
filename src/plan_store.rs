@@ -30,7 +30,8 @@
 //! lapsed: the lock row is deleted and the deliverable's status goes back
 //! to `ready` (its prerequisites were complete when it was acquired and
 //! TTL expiry does not unwind upstream work — the same rule as
-//! [`PlanState::reap_expired`]). A deliverable left `in_progress` with no
+//! [`PlanState::reap_expired`]), and the lease's hours up to expiry are
+//! added to `ev_actuals.leased_hours`. A deliverable left `in_progress` with no
 //! lock row at all (a crash between partial writes on a pre-WAL database,
 //! or manual surgery) is likewise reset to `ready`. Locks that are still
 //! within TTL are preserved: another process may legitimately be working
@@ -174,6 +175,34 @@ impl SqlitePlanStore {
             stmt.query_map(params![now_us], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<Result<_, _>>()?
         };
+        // Each expired lease is credited with its hours up to expiry (the
+        // in-memory reaper's rule). Orphans have no lock row, so no hours.
+        {
+            let mut stmt = tx.prepare(
+                "SELECT plan_id, deliverable_id, acquired_at_us, expires_at_us
+                 FROM locks WHERE expires_at_us < ?1",
+            )?;
+            let leases: Vec<(String, String, i64, i64)> = stmt
+                .query_map(params![now_us], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })?
+                .collect::<Result<_, _>>()?;
+            for (plan_id, deliverable_id, acquired_us, expires_us) in leases {
+                let start = dt_from_micros(acquired_us, "locks.acquired_at_us")
+                    .map_err(|e| anyhow!("{e}"))?;
+                let end = dt_from_micros(expires_us, "locks.expires_at_us")
+                    .map_err(|e| anyhow!("{e}"))?;
+                let hours = crate::locks::hours_between(start, end);
+                crate::ev_store::add_leased_hours(
+                    &tx,
+                    &PlanId(plan_id),
+                    &deliverable_id,
+                    hours,
+                    end,
+                )
+                .map_err(|e| anyhow!("{e}"))?;
+            }
+        }
         let orphans: Vec<(String, String)> = {
             let mut stmt = tx.prepare(
                 "SELECT plan_id, deliverable_id FROM deliverable_statuses
@@ -759,6 +788,8 @@ pub(crate) fn load_plan_state(
         locks,
         file_claims,
         cached_result,
+        leased_hours: HashMap::new(),
+        actuals_updated_at: None,
     }))
 }
 
@@ -814,7 +845,8 @@ pub(crate) fn replace_plan_state(
     save_plan_state(tx, plan_id, state)
 }
 
-/// Persist the mutable parts of a [`PlanState`] (statuses + locks). The
+/// Persist the mutable parts of a [`PlanState`] (statuses, locks, and the
+/// lease hours ended in this transaction, added to `ev_actuals`). The
 /// graph and cached CPM result are written by [`insert_plan`] and only
 /// replaced by a revision ([`replace_plan_state`]).
 pub(crate) fn save_plan_state(
@@ -868,6 +900,14 @@ pub(crate) fn save_plan_state(
                 lock.expires_at.timestamp_micros(),
             ])
             .map_err(backend)?;
+        }
+    }
+
+    // Lease hours ended in this transaction (a delta, see
+    // `PlanState::leased_hours`).
+    if let Some(at) = state.actuals_updated_at {
+        for (deliverable_id, hours) in &state.leased_hours {
+            crate::ev_store::add_leased_hours(tx, plan_id, deliverable_id, *hours, at)?;
         }
     }
     Ok(())

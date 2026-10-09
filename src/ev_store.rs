@@ -111,7 +111,6 @@ pub(crate) fn load_actuals(
 }
 
 /// Add `hours` of lease time to `deliverable_id`'s `leased_hours`.
-#[cfg_attr(not(test), allow(dead_code))] // TEMP-WIRING
 pub(crate) fn add_leased_hours(
     conn: &Connection,
     plan_id: &PlanId,

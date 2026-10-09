@@ -52,7 +52,7 @@ use execution_policy::classify::{FailureClass, RetryDecision};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::locks::{FileClaim, PlanState, add_file_claims, modes_conflict, release_file_claims};
+use crate::locks::{FileClaim, PlanState, add_file_claims, modes_conflict};
 
 /// Default TTL applied to newly acquired locks. Five minutes is the
 /// open-source default called out in SPEC §33 PA3.
@@ -219,6 +219,12 @@ impl BasicCpmPlanner {
     pub fn with_project_root(mut self, root: ProjectRoot) -> Self {
         self.project_root = Some(root);
         self
+    }
+
+    /// The backing store, for in-crate tests that inspect tables directly.
+    #[cfg(test)]
+    pub(crate) fn store(&self) -> &SqlitePlanStore {
+        &self.store
     }
 
     /// The project root given with [`Self::with_project_root`], if any. The
@@ -946,8 +952,8 @@ fn incomplete_prerequisites(state: &PlanState, deliverable_id: &str) -> Vec<Stri
         .unwrap_or_default()
 }
 
-/// Mark a deliverable `Complete`: release any lock (and its file index,
-/// emitting a released event), set the status, and promote dependents whose
+/// Mark a deliverable `Complete`: end any lease at `now` (dropping its file
+/// claims, crediting its hours, emitting a released event), set the status, and promote dependents whose
 /// prerequisites are now all complete. Shared by `mark_status` and `accept`.
 ///
 /// Returns true when this completion made every deliverable `Complete`
@@ -958,24 +964,10 @@ fn complete_deliverable(
     deliverable_id: &str,
     audit_buf: &mut Vec<AuditEvent>,
     release_reason: &str,
+    now: DateTime<Utc>,
 ) -> bool {
     let was_complete = all_complete(state);
-    if let Some(lock) = state.locks.remove(deliverable_id) {
-        // Callers verified the deliverable exists; a held lock implies the
-        // graph entry exists.
-        let owned_files: Vec<OwnedFile> = match state
-            .graph
-            .deliverables
-            .iter()
-            .find(|d| d.id == deliverable_id)
-        {
-            Some(d) => d.owned_files.clone(),
-            None => unreachable!(
-                "deliverable {deliverable_id} present in locks but missing from graph — \
-                 invariant broken"
-            ),
-        };
-        release_file_claims(&mut state.file_claims, deliverable_id, &owned_files);
+    if let Some(lock) = state.end_lease(deliverable_id, now) {
         audit_buf.push(make_released_event(&lock, release_reason));
     }
 
@@ -1662,6 +1654,7 @@ impl Planner for BasicCpmPlanner {
         } = req;
         let deliverable_id = deliverable_id.as_str();
         let caller_id = &caller_id;
+        let now = self.now();
         let mut audit_buf: Vec<AuditEvent> = Vec::new();
         self.store.mutate_executable_plan(&plan_id, |state| {
             // Deliverable existence.
@@ -1758,23 +1751,8 @@ impl Planner for BasicCpmPlanner {
 
             // Lock release on Failed.
             if matches!(status, DeliverableStatus::Failed { .. })
-                && let Some(lock) = state.locks.remove(deliverable_id)
+                && let Some(lock) = state.end_lease(deliverable_id, now)
             {
-                // Deliverable existence was verified at the top of
-                // `mark_status`; `.find()` is guaranteed to succeed.
-                let owned_files: Vec<OwnedFile> = match state
-                    .graph
-                    .deliverables
-                    .iter()
-                    .find(|d| d.id == deliverable_id)
-                {
-                    Some(d) => d.owned_files.clone(),
-                    None => unreachable!(
-                        "deliverable {deliverable_id} present in locks but missing from \
-                         graph — invariant broken"
-                    ),
-                };
-                release_file_claims(&mut state.file_claims, deliverable_id, &owned_files);
                 audit_buf.push(make_released_event(&lock, "failed"));
             }
 
@@ -1797,7 +1775,7 @@ impl Planner for BasicCpmPlanner {
             }
 
             if is_complete {
-                if complete_deliverable(state, deliverable_id, &mut audit_buf, "completed") {
+                if complete_deliverable(state, deliverable_id, &mut audit_buf, "completed", now) {
                     audit_buf.push(make_plan_completed_event(
                         &plan_id,
                         state.graph.deliverables.len(),
@@ -2023,7 +2001,8 @@ impl Planner for BasicCpmPlanner {
                 });
             }
 
-            let plan_done = complete_deliverable(state, deliverable_id, &mut audit_buf, "accepted");
+            let plan_done =
+                complete_deliverable(state, deliverable_id, &mut audit_buf, "accepted", now);
             audit_buf.push(make_accepted_event(
                 &req,
                 overrode.as_deref(),
@@ -2051,6 +2030,7 @@ impl Planner for BasicCpmPlanner {
         } = req;
         let deliverable_id = deliverable_id.as_str();
         let reason = reason.as_str();
+        let now = self.now();
         let mut audit_buf: Vec<AuditEvent> = Vec::new();
         self.store.mutate_executable_plan(&plan_id, |state| {
             if !state
@@ -2065,21 +2045,7 @@ impl Planner for BasicCpmPlanner {
                 });
             }
 
-            if let Some(lock) = state.locks.remove(deliverable_id) {
-                // Deliverable existence was verified above; the held lock
-                // implies the graph entry exists.
-                let owned_files: Vec<OwnedFile> = match state
-                    .graph
-                    .deliverables
-                    .iter()
-                    .find(|d| d.id == deliverable_id)
-                {
-                    Some(d) => d.owned_files.clone(),
-                    None => unreachable!(
-                        "deliverable {deliverable_id} present in locks but missing from graph"
-                    ),
-                };
-                release_file_claims(&mut state.file_claims, deliverable_id, &owned_files);
+            if let Some(lock) = state.end_lease(deliverable_id, now) {
                 state
                     .statuses
                     .insert(deliverable_id.to_string(), DeliverableStatus::Ready);

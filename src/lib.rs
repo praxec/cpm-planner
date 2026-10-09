@@ -50,6 +50,8 @@ pub mod edits;
 pub mod estimator;
 pub(crate) mod ev_store;
 mod graph;
+#[cfg(test)]
+mod lease_hours_tests;
 pub mod lint;
 mod locks;
 pub mod metrics;

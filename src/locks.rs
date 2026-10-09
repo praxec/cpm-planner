@@ -74,6 +74,16 @@ pub(crate) struct PlanState {
     /// drives priority in `acquire_cohort`; the duration is surfaced via
     /// `status`.
     pub(crate) cached_result: CriticalPathResult,
+
+    /// Lease hours ended during this transaction, keyed by deliverable id:
+    /// a DELTA (empty when loaded), added to `ev_actuals.leased_hours` by
+    /// [`crate::plan_store::save_plan_state`]. Written through
+    /// [`PlanState::record_lease_end`]; a plan revision carries it over.
+    pub(crate) leased_hours: HashMap<String, f32>,
+
+    /// Latest lease end recorded in `leased_hours`; stored as the actuals
+    /// rows' `updated_at_us`.
+    pub(crate) actuals_updated_at: Option<DateTime<Utc>>,
 }
 
 /// Who holds a locked path.
@@ -159,6 +169,12 @@ pub(crate) fn release_file_claims(
     }
 }
 
+/// Hours from `start` to `end`; 0 when `end` is earlier.
+pub(crate) fn hours_between(start: DateTime<Utc>, end: DateTime<Utc>) -> f32 {
+    let micros = (end - start).num_microseconds().unwrap_or(i64::MAX);
+    (micros.max(0) as f64 / 3_600_000_000.0) as f32
+}
+
 /// The single re-derivation rule: `Ready` if every prerequisite of `d` is
 /// `Complete` in `statuses`, else `Pending`. Used by the in-memory reaper, the
 /// startup reaper in the store, and plan revision.
@@ -190,7 +206,40 @@ impl PlanState {
             locks: HashMap::new(),
             file_claims: HashMap::new(),
             cached_result,
+            leased_hours: HashMap::new(),
+            actuals_updated_at: None,
         }
+    }
+
+    /// Credit `lock`'s holder with the hours from acquisition to `end`
+    /// (never negative) as leased time for earned value.
+    pub(crate) fn record_lease_end(&mut self, lock: &LockInfo, end: DateTime<Utc>) {
+        *self
+            .leased_hours
+            .entry(lock.deliverable_id.clone())
+            .or_insert(0.0) += hours_between(lock.acquired_at, end);
+        self.actuals_updated_at = Some(self.actuals_updated_at.map_or(end, |at| at.max(end)));
+    }
+
+    /// End `deliverable_id`'s lease at `end`: drop the lock and its file
+    /// claims and record the leased hours. The status is left to the caller.
+    /// Returns the ended lock, or `None` when none was held.
+    pub(crate) fn end_lease(
+        &mut self,
+        deliverable_id: &str,
+        end: DateTime<Utc>,
+    ) -> Option<LockInfo> {
+        let lock = self.locks.remove(deliverable_id)?;
+        if let Some(d) = self
+            .graph
+            .deliverables
+            .iter()
+            .find(|d| d.id == deliverable_id)
+        {
+            release_file_claims(&mut self.file_claims, deliverable_id, &d.owned_files);
+        }
+        self.record_lease_end(&lock, end);
+        Some(lock)
     }
 
     /// Lease count for `deliverable_id`. Missing entry = never leased.
@@ -229,6 +278,8 @@ impl PlanState {
     /// (NOT `failure_counts`: a killed driver is not an implementation
     /// failure). The lapse bound in `acquire_cohort` is what keeps an
     /// infinitely-crashing environment from re-leasing forever.
+    ///
+    /// Each reaped lease is credited with its hours up to `expires_at`.
     pub(crate) fn reap_expired(&mut self, now: DateTime<Utc>) -> Vec<LockInfo> {
         let expired_ids: Vec<String> = self
             .locks
@@ -239,11 +290,9 @@ impl PlanState {
 
         let mut reaped = Vec::with_capacity(expired_ids.len());
         for id in expired_ids {
-            if let Some(info) = self.locks.remove(&id) {
-                // Drop this deliverable's owned_files from the inverse index.
-                if let Some(deliverable) = self.graph.deliverables.iter().find(|d| d.id == id) {
-                    release_file_claims(&mut self.file_claims, &id, &deliverable.owned_files);
-                }
+            // The lease ended when it lapsed, not when it is noticed.
+            let end = self.locks.get(&id).map_or(now, |l| l.expires_at.min(now));
+            if let Some(info) = self.end_lease(&id, end) {
                 *self.lapse_counts.entry(id.clone()).or_insert(0) += 1;
                 // Re-derive rather than assume Ready: after a revision the
                 // lease can sit above a prerequisite that is no longer Complete.
