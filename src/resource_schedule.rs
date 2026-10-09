@@ -103,6 +103,17 @@ pub fn resource_schedule(
     req: &ScheduleRequest,
 ) -> Result<ResourceSchedule, PlannerError> {
     let cpm = crate::schedule::compute_cpm(graph)?;
+    if !req.project_buffer_pct.is_finite()
+        || req.project_buffer_pct < 0.0
+        || req.project_buffer_pct > 100.0
+    {
+        return Err(PlannerError::InvalidGraph {
+            reason: format!(
+                "project_buffer_pct must be between 0 and 100; got {}",
+                req.project_buffer_pct
+            ),
+        });
+    }
     let cpm_makespan = cpm.get_task(FINISH_ID).map_or(0.0, |t| t.earliest_finish);
 
     let nodes = build_nodes(graph, &req.resource_key)?;
@@ -110,10 +121,20 @@ pub fn resource_schedule(
     let n = nodes.len();
     let tail = tails(&nodes);
 
-    let mut units: BTreeMap<&str, Vec<f32>> = req
-        .capacities
-        .iter()
-        .map(|(k, &c)| (k.as_str(), vec![0.0; c as usize]))
+    // Allocate units only for resources that carry work, and never more than
+    // the number of work-bearing deliverables on that resource: extra units
+    // could never be occupied, and sizing by raw capacity can demand huge
+    // allocations for large (even u32::MAX) capacities.
+    let mut work_per_resource: BTreeMap<&str, usize> = BTreeMap::new();
+    for n in nodes.iter().filter(|n| n.len > 0.0) {
+        *work_per_resource.entry(n.resource.as_str()).or_insert(0) += 1;
+    }
+    let mut units: BTreeMap<&str, Vec<f32>> = work_per_resource
+        .into_iter()
+        .map(|(resource, work)| {
+            let capacity = req.capacities.get(resource).copied().unwrap_or(0) as usize;
+            (resource, vec![0.0; capacity.min(work)])
+        })
         .collect();
     let mut start = vec![f32::NAN; n];
     let mut finish = vec![f32::NAN; n];

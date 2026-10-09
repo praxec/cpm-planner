@@ -208,6 +208,26 @@ fn load_reports_utilisation_per_resource() {
 }
 
 #[test]
+fn huge_capacity_does_not_allocate_per_unit() {
+    let g = graph(vec![
+        d("a", 2.0, "agent", &[]),
+        d("b", 3.0, "agent", &[]),
+        d("c", 1.0, "agent", &[]),
+    ]);
+    let s = run(&g, &req(&[("agent", u32::MAX)]));
+    assert_eq!(s.makespan, s.cpm_makespan);
+}
+
+#[test]
+fn negative_project_buffer_pct_is_rejected() {
+    let g = graph(vec![d("a", 1.0, "x", &[])]);
+    let mut r = req(&[("x", 1)]);
+    r.project_buffer_pct = -1.0;
+    let err = resource_schedule(&g, &r).expect_err("must fail");
+    assert!(err.to_string().starts_with("INVALID_GRAPH"));
+}
+
+#[test]
 fn output_is_deterministic() {
     let g = graph(vec![
         d("a", 2.0, "x", &[]),
