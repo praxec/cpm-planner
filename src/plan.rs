@@ -281,7 +281,7 @@ pub struct Estimate {
 /// write-write conflicts; implementations of [`crate::ports::Planner`]
 /// must therefore reject any plan that contains a deliverable whose
 /// `owned_files` are not specified up front.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Deliverable {
     /// Unique identifier within the plan. The Planner rejects duplicate
     /// ids at submit time with [`PlannerError::InvalidGraph`].
