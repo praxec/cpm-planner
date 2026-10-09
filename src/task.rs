@@ -214,7 +214,7 @@ pub struct CriticalPathResult {
     /// Total number of tasks in the plan.
     pub total_tasks: usize,
     /// One longest prerequisite chain, in execution order: each element is a
-    /// prerequisite of the next. Ties resolve to the smallest id.
+    /// prerequisite of the next. Sink ties resolve to the later earliest start, then the smallest id; predecessor ties resolve to the smallest id.
     pub critical_path: Vec<String>,
     /// Every zero-float (critical) task, sorted by earliest start then id.
     /// Unlike `critical_path` this may contain several parallel chains.

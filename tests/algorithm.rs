@@ -172,8 +172,8 @@ fn critical_ids_lists_every_zero_float_task_by_start_then_id() {
 }
 
 #[test]
-fn unrelated_zero_float_task_is_not_chained_into_critical_path() {
-    // X stands alone (5h); Y -> Z also totals 5h. Both have zero float.
+fn equal_length_chains_prefer_the_later_starting_sink() {
+    // X(5) stands alone; Y(1) -> Z(4) also ends at 5h. Sinks tie on EF, so the later-starting sink Z wins and the path is the real chain Y -> Z (X is never chained in).
     let mut tasks = vec![
         make_task("X", 5.0, vec![]),
         make_task("Y", 1.0, vec![]),
