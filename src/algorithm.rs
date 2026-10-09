@@ -4,12 +4,22 @@
 //! 1. Forward pass: Calculate earliest start/finish times (ES/EF)
 //! 2. Backward pass: Calculate latest start/finish times (LS/LF)
 //! 3. Float calculation: slack = LS - ES
-//! 4. Critical path: Tasks where float = 0
+//! 4. Critical path: `critical_path` is one longest prerequisite chain in
+//!    execution order; `critical_ids` lists every zero-float (critical) task.
 //! 5. Batch identification: Group tasks by earliest start time
 //! 6. Bottleneck analysis: Identify tasks that block the most work
 
 use crate::task::{Bottleneck, CriticalPathResult, Task, TaskBatch};
 use std::collections::{HashMap, HashSet, VecDeque};
+
+/// Version of the CPM kernel's output semantics. Bump whenever a change
+/// alters any field of [`CriticalPathResult`] for the same input, so stored
+/// plans are recomputed on open (see `plan_store`). Bump also when
+/// `EffortEstimator` defaults change, since stored plans are recomputed with
+/// the current estimator.
+pub const CPM_VERSION: i64 = 1;
+
+const TIGHT_EPS: f32 = 1e-3;
 
 /// CPM Algorithm calculator
 pub struct CpmAlgorithm;
@@ -122,7 +132,8 @@ impl CpmAlgorithm {
         // Use Kahn's algorithm (topological sort) for forward pass
         let mut in_degree: HashMap<String, usize> = HashMap::new();
         for task in tasks.iter() {
-            in_degree.insert(task.id.clone(), task.dependencies.len());
+            let distinct: HashSet<&String> = task.dependencies.iter().collect();
+            in_degree.insert(task.id.clone(), distinct.len());
         }
 
         // Start with tasks that have no dependencies
@@ -423,6 +434,46 @@ impl CpmAlgorithm {
         visited
     }
 
+    /// Trace one longest chain backwards from the task with the maximum
+    /// earliest finish, following predecessors whose EF equals the
+    /// successor's ES. Sink ties resolve to the later earliest start, then the
+    /// smallest id; predecessor ties resolve to the smallest id. Bounded by the
+    /// task count so malformed (cyclic) input cannot loop.
+    fn trace_critical_path(tasks: &[Task]) -> Vec<String> {
+        let by_id: HashMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+        let Some(sink) = tasks.iter().max_by(|a, b| {
+            a.earliest_finish
+                .partial_cmp(&b.earliest_finish)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    a.earliest_start
+                        .partial_cmp(&b.earliest_start)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| b.id.cmp(&a.id))
+        }) else {
+            return Vec::new();
+        };
+        let mut path = vec![sink.id.clone()];
+        let mut current = sink;
+        let mut seen: HashSet<&str> = HashSet::from([sink.id.as_str()]);
+        while path.len() <= tasks.len() {
+            let next = current
+                .dependencies
+                .iter()
+                .filter_map(|d| by_id.get(d.as_str()).copied())
+                .filter(|p| (p.earliest_finish - current.earliest_start).abs() < TIGHT_EPS)
+                .filter(|p| !seen.contains(p.id.as_str()))
+                .min_by(|a, b| a.id.cmp(&b.id));
+            let Some(pred) = next else { break };
+            seen.insert(pred.id.as_str());
+            path.push(pred.id.clone());
+            current = pred;
+        }
+        path.reverse();
+        path
+    }
+
     /// Build the final result
     fn build_result(
         tasks: &[Task],
@@ -430,22 +481,23 @@ impl CpmAlgorithm {
         bottlenecks: Vec<Bottleneck>,
         unscheduled: Vec<String>,
     ) -> CriticalPathResult {
-        // Extract critical path (sorted by ES)
+        let critical_path = Self::trace_critical_path(tasks);
+        let project_length = tasks
+            .iter()
+            .map(|t| t.earliest_finish)
+            .fold(0.0_f32, f32::max);
+
         let mut critical_tasks: Vec<&Task> = tasks.iter().filter(|t| t.is_critical).collect();
         critical_tasks.sort_by(|a, b| {
             a.earliest_start
                 .partial_cmp(&b.earliest_start)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.id.cmp(&b.id))
         });
-
-        let critical_path: Vec<String> = critical_tasks.iter().map(|t| t.id.clone()).collect();
-
-        let critical_path_duration: f32 = critical_tasks.iter().map(|t| t.effort_hours).sum();
+        let critical_ids: Vec<String> = critical_tasks.iter().map(|t| t.id.clone()).collect();
 
         let total_duration_sequential: f32 = tasks.iter().map(|t| t.effort_hours).sum();
-
-        // Parallel duration is the sum of batch durations
-        let optimal_duration_parallel: f32 = batches.iter().map(|b| b.duration_hours).sum();
+        let optimal_duration_parallel = project_length;
 
         let speedup_factor = if optimal_duration_parallel > 0.0 {
             total_duration_sequential / optimal_duration_parallel
@@ -456,7 +508,8 @@ impl CpmAlgorithm {
         CriticalPathResult {
             total_tasks: tasks.len(),
             critical_path,
-            critical_path_duration,
+            critical_ids,
+            critical_path_duration: project_length,
             total_duration_sequential,
             optimal_duration_parallel,
             speedup_factor,

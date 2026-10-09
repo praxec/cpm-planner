@@ -8,7 +8,7 @@
 //! # Atomicity & persistence
 //!
 //! All state lives in a [`SqlitePlanStore`]. Every mutating method runs
-//! its entire body — load [`PlanState`], apply the existing in-memory
+//! its entire body — load `PlanState`, apply the existing in-memory
 //! scheduling logic, write back — inside ONE `BEGIN IMMEDIATE` SQLite
 //! transaction. That is what makes "acquire N disjoint deliverables
 //! together" a single observable step, and because the write lock is
@@ -35,8 +35,8 @@ use std::time::Duration;
 
 use crate::audit::{AuditEvent, AuditSink, NullAuditSink};
 use crate::plan::{
-    CallerId, Cohort, CohortRow, Deliverable, DeliverableStatus, LockInfo, PlanGraph, PlanId,
-    PlanStatus, PlannerError,
+    CallerId, Cohort, CohortRow, Deliverable, DeliverableStatus, LockInfo, PlanDefinition,
+    PlanGraph, PlanId, PlanStatus, PlannerError, ScheduleRow,
 };
 use crate::plan_store::SqlitePlanStore;
 use crate::ports::Planner;
@@ -46,10 +46,7 @@ use execution_policy::classify::{FailureClass, RetryDecision};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::algorithm::CpmAlgorithm;
-use crate::estimator::EffortEstimator;
 use crate::locks::PlanState;
-use crate::task::{Task, TaskKind};
 
 /// Default TTL applied to newly acquired locks. Five minutes is the
 /// open-source default called out in SPEC §33 PA3.
@@ -68,7 +65,7 @@ pub const DEFAULT_TTL: Duration = Duration::from_secs(5 * 60);
 /// This is the retry budget for the DURABLE, cross-process deliverable lease
 /// (distinct from `execution_policy`'s in-process async retry): the decision to
 /// keep leasing vs. circuit-break is expressed through that crate's
-/// [`RetryDecision`] ([`lease_retry_decision`]), and a broken deliverable is
+/// [`RetryDecision`] (`lease_retry_decision`), and a broken deliverable is
 /// classified [`FailureClass::Permanent`].
 pub const MAX_ATTEMPTS: u32 = 3;
 
@@ -98,8 +95,8 @@ fn lease_retry_decision(failure_count: u32) -> RetryDecision {
 /// Legacy flat fallback for missing effort estimates.
 ///
 /// As of CMP-016 the planner no longer uses this: when a deliverable omits
-/// `estimated_effort_hours`, [`deliverable_to_task`] asks an
-/// [`EffortEstimator`] for a kind-aware estimate instead of substituting a
+/// `estimated_effort_hours`, `crate::schedule::deliverable_to_task` asks an
+/// [`crate::estimator::EffortEstimator`] for a kind-aware estimate instead of substituting a
 /// flat one hour. The constant is retained as a documented reference value
 /// for callers that want the historical default.
 pub const DEFAULT_EFFORT_HOURS: f32 = 1.0;
@@ -264,6 +261,20 @@ fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
         }
     }
 
+    // Effort estimates, when present, must be finite and non-negative.
+    for d in &graph.deliverables {
+        if let Some(h) = d.estimated_effort_hours
+            && (h < 0.0 || !h.is_finite())
+        {
+            return Err(PlannerError::InvalidGraph {
+                reason: format!(
+                    "deliverable '{}' has invalid estimated_effort_hours {h}; must be a finite number >= 0",
+                    d.id
+                ),
+            });
+        }
+    }
+
     // Prerequisite references resolve.
     let id_set: HashSet<&str> = graph.deliverables.iter().map(|d| d.id.as_str()).collect();
     for d in &graph.deliverables {
@@ -350,47 +361,6 @@ fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
     Ok(())
 }
 
-/// Convert each [`Deliverable`] into a [`Task`] for the CPM kernel.
-///
-/// Effort precedence: an explicit `estimated_effort_hours` on the
-/// deliverable always wins. When it is absent we ask `estimator` to derive
-/// a kind-aware estimate rather than falling back to the flat
-/// [`DEFAULT_EFFORT_HOURS`] placeholder. A `complexity` hint can be carried
-/// in `metadata` (boolean `complexity`/`is_complex`) to opt a deliverable
-/// into the configured complexity multiplier.
-fn deliverable_to_task(d: &Deliverable, estimator: &EffortEstimator) -> Task {
-    let description = d
-        .metadata
-        .get("description")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let kind = TaskKind::Custom { description };
-
-    let effort_hours = match d.estimated_effort_hours {
-        Some(explicit) => explicit,
-        None => {
-            // Coarse complexity hint from metadata; defaults to false.
-            let is_complex = d
-                .metadata
-                .get("complexity")
-                .or_else(|| d.metadata.get("is_complex"))
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            estimator.estimate(&kind, is_complex)
-        }
-    };
-
-    Task {
-        id: d.id.clone(),
-        name: d.id.clone(),
-        kind,
-        effort_hours,
-        dependencies: d.prerequisites.clone(),
-        ..Task::default()
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Audit helpers
 // ---------------------------------------------------------------------------
@@ -463,34 +433,21 @@ fn make_force_released_event(lock: &LockInfo, reason: &str) -> AuditEvent {
 // Priority ordering for cohort selection
 // ---------------------------------------------------------------------------
 
-/// Sort key for the ready-set priority pass. Critical-path tasks come first
-/// (in CP execution order), then non-critical tasks by ascending
-/// `earliest_start`. Ties broken by `deliverable_id` for determinism.
+/// Sort key for the ready-set priority pass: least total float first
+/// (critical work leads), then earliest start, then id for determinism.
 fn priority_key(
     deliverable_id: &str,
-    cp_positions: &HashMap<&str, usize>,
-    es_by_id: &HashMap<&str, f32>,
-) -> (u8, i64, String) {
-    if let Some(pos) = cp_positions.get(deliverable_id) {
-        // Tier 0 = critical path; position drives order.
-        (0, *pos as i64, deliverable_id.to_string())
-    } else {
-        // Tier 1 = non-critical; ES drives order (scaled to integer for Ord).
-        // Every deliverable in the ready set was turned into a Task and fed
-        // through CPM, so its id MUST be present in `es_by_id`. A miss means
-        // the ready set and the cached CPM result have diverged — an
-        // invariant breach, not a "default to time 0" situation, since
-        // defaulting would confidently mis-order the cohort.
-        let es = match es_by_id.get(deliverable_id) {
-            Some(&es) => es,
-            None => unreachable!(
-                "deliverable '{deliverable_id}' is in the ready set but absent from the cached \
-                 CPM earliest-start table — ready set and CPM result are out of sync"
-            ),
-        };
-        let es_scaled = (es * 1000.0).round() as i64;
-        (1, es_scaled, deliverable_id.to_string())
-    }
+    sched_by_id: &HashMap<&str, (f32, f32)>,
+) -> (i64, i64, String) {
+    let (float, es) = match sched_by_id.get(deliverable_id) {
+        Some(&v) => v,
+        None => unreachable!(
+            "deliverable '{deliverable_id}' is in the ready set but absent from the cached \
+             CPM schedule — ready set and CPM result are out of sync"
+        ),
+    };
+    let scale = |h: f32| (h * 1000.0).round() as i64;
+    (scale(float), scale(es), deliverable_id.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -508,31 +465,7 @@ impl Planner for BasicCpmPlanner {
         // from different processes — resolve to a single PlanId. The build
         // closure only runs on a dedup miss.
         self.store.submit_or_get(&graph_hash, move || {
-            // Build the CPM kernel input and run the algorithm. A single
-            // default-config estimator fills in effort for deliverables that
-            // omit an explicit `estimated_effort_hours`.
-            let estimator = EffortEstimator::new();
-            let mut tasks: Vec<Task> = graph
-                .deliverables
-                .iter()
-                .map(|d| deliverable_to_task(d, &estimator))
-                .collect();
-            let cached_result = CpmAlgorithm::calculate(&mut tasks);
-
-            // `validate_graph` above already rejected cyclic graphs, so the CPM
-            // kernel must have scheduled every task. If `unscheduled` is non-empty
-            // here, the two cycle detectors disagree — a correctness bug, not bad
-            // input. Surface it as an InvalidGraph rather than caching and serving
-            // a confidently-wrong plan.
-            if !cached_result.unscheduled.is_empty() {
-                return Err(PlannerError::InvalidGraph {
-                    reason: format!(
-                        "internal CPM inconsistency: deliverables passed cycle validation but \
-                         could not be scheduled: [{}]",
-                        cached_result.unscheduled.join(", ")
-                    ),
-                });
-            }
+            let cached_result = crate::schedule::compute_cpm(&graph)?;
 
             // Initialise per-deliverable status: zero-prereq -> Ready, else Pending.
             let mut statuses: HashMap<String, DeliverableStatus> =
@@ -630,19 +563,12 @@ impl Planner for BasicCpmPlanner {
                     .insert(id, DeliverableStatus::Failed { reason });
             }
 
-            // 3. Build CP priority + ES lookup tables.
-            let cp_positions: HashMap<&str, usize> = state
-                .cached_result
-                .critical_path
-                .iter()
-                .enumerate()
-                .map(|(i, id)| (id.as_str(), i))
-                .collect();
-            let es_by_id: HashMap<&str, f32> = state
+            // 3. Build the (float, ES) lookup table.
+            let sched_by_id: HashMap<&str, (f32, f32)> = state
                 .cached_result
                 .tasks
                 .iter()
-                .map(|t| (t.id.as_str(), t.earliest_start))
+                .map(|t| (t.id.as_str(), (t.float, t.earliest_start)))
                 .collect();
 
             // 4. Build the ready set: status=Ready AND no lock currently held.
@@ -655,7 +581,7 @@ impl Planner for BasicCpmPlanner {
                         && !state.locks.contains_key(&d.id)
                 })
                 .collect();
-            ready.sort_by_key(|d| priority_key(&d.id, &cp_positions, &es_by_id));
+            ready.sort_by_key(|d| priority_key(&d.id, &sched_by_id));
 
             // 5. Greedy fill with file-disjointness check.
             let mut selected: Vec<Deliverable> = Vec::new();
@@ -891,6 +817,13 @@ impl Planner for BasicCpmPlanner {
         })
     }
 
+    async fn get_plan(&self, plan_id: &PlanId) -> Result<PlanDefinition, PlannerError> {
+        self.store.read_plan(plan_id, |state| PlanDefinition {
+            plan_id: plan_id.clone(),
+            graph: state.graph.clone(),
+        })
+    }
+
     async fn status(&self, plan_id: &PlanId) -> Result<PlanStatus, PlannerError> {
         self.store.read_plan(plan_id, |state| {
             // Preserve insertion order from the original graph for stable UI.
@@ -914,8 +847,46 @@ impl Planner for BasicCpmPlanner {
                 })
                 .collect();
 
+            let task_of = |id: &str| state.cached_result.tasks.iter().find(|t| t.id == id);
+            let schedule: Vec<ScheduleRow> = state
+                .graph
+                .deliverables
+                .iter()
+                .filter_map(|d| task_of(&d.id))
+                .map(|t| ScheduleRow {
+                    id: t.id.clone(),
+                    es: t.earliest_start,
+                    ef: t.earliest_finish,
+                    ls: t.latest_start,
+                    lf: t.latest_finish,
+                    float: t.float,
+                    critical: t.is_critical,
+                })
+                .collect();
+            let mut ready_rows: Vec<&ScheduleRow> = schedule
+                .iter()
+                .filter(|r| {
+                    matches!(state.statuses.get(&r.id), Some(DeliverableStatus::Ready))
+                        && !state.locks.contains_key(&r.id)
+                })
+                .collect();
+            // Same ordering as acquire_cohort (shared priority_key). Membership is a
+            // superset: acquire may still skip deliverables at the failure or lapse
+            // cap or whose files overlap a held lock.
+            let sched_by_id: HashMap<&str, (f32, f32)> = state
+                .cached_result
+                .tasks
+                .iter()
+                .map(|t| (t.id.as_str(), (t.float, t.earliest_start)))
+                .collect();
+            ready_rows.sort_by_key(|r| priority_key(&r.id, &sched_by_id));
+            let ready: Vec<String> = ready_rows.iter().map(|r| r.id.clone()).collect();
+
             PlanStatus {
                 plan_id: plan_id.clone(),
+                critical_ids: state.cached_result.critical_ids.clone(),
+                schedule,
+                ready,
                 deliverables,
                 critical_path: state.cached_result.critical_path.clone(),
                 critical_path_hours: state.cached_result.critical_path_duration,
@@ -979,6 +950,9 @@ impl Planner for BasicCpmPlanner {
 #[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
+    use crate::estimator::EffortEstimator;
+    use crate::schedule::deliverable_to_task;
+    use crate::task::TaskKind;
 
     fn deliverable(id: &str, effort: Option<f32>, metadata: serde_json::Value) -> Deliverable {
         Deliverable {
@@ -1026,36 +1000,26 @@ mod tests {
         assert!(complex.effort_hours > simple.effort_hours);
     }
 
-    #[test]
-    fn priority_key_critical_tier_orders_by_position() {
-        let mut cp = HashMap::new();
-        cp.insert("A", 0usize);
-        cp.insert("B", 1usize);
-        let es: HashMap<&str, f32> = HashMap::new();
-        let ka = priority_key("A", &cp, &es);
-        let kb = priority_key("B", &cp, &es);
-        assert!(ka < kb);
+    fn sched<'a>(entries: &[(&'a str, f32, f32)]) -> HashMap<&'a str, (f32, f32)> {
+        entries.iter().map(|&(id, f, e)| (id, (f, e))).collect()
     }
 
     #[test]
-    fn priority_key_noncritical_uses_es() {
-        let cp: HashMap<&str, usize> = HashMap::new();
-        let mut es = HashMap::new();
-        es.insert("X", 1.0_f32);
-        es.insert("Y", 3.0_f32);
-        let kx = priority_key("X", &cp, &es);
-        let ky = priority_key("Y", &cp, &es);
-        // Both tier 1, X has earlier ES so sorts first.
-        assert_eq!(kx.0, 1);
-        assert!(kx < ky);
+    fn priority_key_orders_lower_float_first() {
+        let s = sched(&[("A", 0.0, 5.0), ("B", 2.0, 0.0)]);
+        assert!(priority_key("A", &s) < priority_key("B", &s));
     }
 
     #[test]
-    #[should_panic(expected = "absent from the cached CPM earliest-start table")]
-    fn priority_key_missing_es_is_invariant_breach() {
-        let cp: HashMap<&str, usize> = HashMap::new();
-        let es: HashMap<&str, f32> = HashMap::new();
-        // Non-critical deliverable with no ES entry must panic, not default.
-        let _ = priority_key("ghost", &cp, &es);
+    fn priority_key_breaks_float_ties_by_es() {
+        let s = sched(&[("X", 1.0, 3.0), ("Y", 1.0, 1.0)]);
+        assert!(priority_key("Y", &s) < priority_key("X", &s));
+    }
+
+    #[test]
+    #[should_panic(expected = "absent from the cached CPM schedule")]
+    fn priority_key_missing_entry_is_invariant_breach() {
+        let s: HashMap<&str, (f32, f32)> = HashMap::new();
+        let _ = priority_key("ghost", &s);
     }
 }

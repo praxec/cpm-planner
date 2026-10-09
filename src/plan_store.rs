@@ -118,7 +118,7 @@ impl SqlitePlanStore {
         Ok(PathBuf::from(home).join(DEFAULT_DB_RELATIVE))
     }
 
-    fn init(conn: Connection) -> anyhow::Result<Self> {
+    fn init(mut conn: Connection) -> anyhow::Result<Self> {
         // WAL + busy_timeout: concurrent processes queue on the write
         // lock instead of failing; readers never block the writer.
         // (`execute_batch` tolerates pragmas that return a row.)
@@ -130,38 +130,7 @@ impl SqlitePlanStore {
         )
         .context("applying sqlite pragmas")?;
 
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS plans (
-                 plan_id       TEXT PRIMARY KEY,
-                 graph         TEXT NOT NULL,
-                 cached_result TEXT NOT NULL,
-                 created_at_us INTEGER NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS deliverable_statuses (
-                 plan_id        TEXT NOT NULL REFERENCES plans(plan_id) ON DELETE CASCADE,
-                 deliverable_id TEXT NOT NULL,
-                 status         TEXT NOT NULL,
-                 attempt_count  INTEGER NOT NULL DEFAULT 0,
-                 failure_count  INTEGER NOT NULL DEFAULT 0,
-                 lapse_count    INTEGER NOT NULL DEFAULT 0,
-                 PRIMARY KEY (plan_id, deliverable_id)
-             );
-             CREATE TABLE IF NOT EXISTS locks (
-                 plan_id        TEXT NOT NULL REFERENCES plans(plan_id) ON DELETE CASCADE,
-                 deliverable_id TEXT NOT NULL,
-                 caller_id      TEXT NOT NULL,
-                 acquired_at_us INTEGER NOT NULL,
-                 expires_at_us  INTEGER NOT NULL,
-                 PRIMARY KEY (plan_id, deliverable_id)
-             );
-             CREATE TABLE IF NOT EXISTS submit_dedup (
-                 graph_hash TEXT PRIMARY KEY,
-                 plan_id    TEXT NOT NULL REFERENCES plans(plan_id) ON DELETE CASCADE
-             );",
-        )
-        .context("creating planner tables")?;
-
-        migrate_counter_columns(&conn)?;
+        migrate(&mut conn)?;
 
         let store = Self {
             conn: Mutex::new(conn),
@@ -260,13 +229,14 @@ impl SqlitePlanStore {
         let graph_json = serde_json::to_string(&state.graph).map_err(backend)?;
         let result_json = serde_json::to_string(&state.cached_result).map_err(backend)?;
         tx.execute(
-            "INSERT INTO plans (plan_id, graph, cached_result, created_at_us)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO plans (plan_id, graph, cached_result, created_at_us, cpm_version)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 plan_id.0,
                 graph_json,
                 result_json,
-                Utc::now().timestamp_micros()
+                Utc::now().timestamp_micros(),
+                crate::algorithm::CPM_VERSION
             ],
         )
         .map_err(backend)?;
@@ -325,6 +295,127 @@ impl SqlitePlanStore {
             .lock()
             .map_err(|_| backend(anyhow!("planner store mutex poisoned")))
     }
+}
+
+/// Schema migrations, applied in order. `PRAGMA user_version` records the
+/// last one applied. Each step must be idempotent against databases created
+/// before versioning existed (user_version 0 but tables present).
+const MIGRATIONS: &[fn(&Connection) -> anyhow::Result<()>] = &[
+    migrate_v1_base_schema, // tables + counter columns (pre-versioning layout)
+    migrate_v2_cpm_version, // plans.cpm_version
+];
+
+/// Runs the whole ladder plus the stale sweep in one immediate transaction,
+/// so concurrent openers serialise instead of racing on `ALTER TABLE`.
+/// `user_version` is read only after the write lock is held.
+fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    let supported = MIGRATIONS.len() as i64;
+    if current > supported {
+        return Err(anyhow!(
+            "database schema version {current} is newer than this cpm-planner supports \
+             ({supported}); upgrade cpm-planner"
+        ));
+    }
+    for (i, step) in MIGRATIONS.iter().enumerate() {
+        let version = i as i64 + 1;
+        if version > current {
+            step(&tx).with_context(|| format!("applying schema migration v{version}"))?;
+            tx.pragma_update(None, "user_version", version)?;
+        }
+    }
+    recompute_stale_results(&tx)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn migrate_v1_base_schema(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS plans (
+             plan_id       TEXT PRIMARY KEY,
+             graph         TEXT NOT NULL,
+             cached_result TEXT NOT NULL,
+             created_at_us INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS deliverable_statuses (
+             plan_id        TEXT NOT NULL REFERENCES plans(plan_id) ON DELETE CASCADE,
+             deliverable_id TEXT NOT NULL,
+             status         TEXT NOT NULL,
+             attempt_count  INTEGER NOT NULL DEFAULT 0,
+             failure_count  INTEGER NOT NULL DEFAULT 0,
+             lapse_count    INTEGER NOT NULL DEFAULT 0,
+             PRIMARY KEY (plan_id, deliverable_id)
+         );
+         CREATE TABLE IF NOT EXISTS locks (
+             plan_id        TEXT NOT NULL REFERENCES plans(plan_id) ON DELETE CASCADE,
+             deliverable_id TEXT NOT NULL,
+             caller_id      TEXT NOT NULL,
+             acquired_at_us INTEGER NOT NULL,
+             expires_at_us  INTEGER NOT NULL,
+             PRIMARY KEY (plan_id, deliverable_id)
+         );
+         CREATE TABLE IF NOT EXISTS submit_dedup (
+             graph_hash TEXT PRIMARY KEY,
+             plan_id    TEXT NOT NULL REFERENCES plans(plan_id) ON DELETE CASCADE
+         );",
+    )
+    .context("creating planner tables")?;
+
+    migrate_counter_columns(conn)
+}
+
+fn migrate_v2_cpm_version(conn: &Connection) -> anyhow::Result<()> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(plans)")
+        .context("probing plans columns")?;
+    let has_column = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .context("reading plans column names")?
+        .collect::<Result<Vec<_>, _>>()
+        .context("reading plans column name")?
+        .iter()
+        .any(|c| c == "cpm_version");
+    if !has_column {
+        conn.execute_batch("ALTER TABLE plans ADD COLUMN cpm_version INTEGER NOT NULL DEFAULT 0")
+            .context("adding plans.cpm_version column")?;
+    }
+    Ok(())
+}
+
+/// Recompute `cached_result` for every plan stored by an older CPM kernel.
+/// A graph that no longer computes is left untouched and logged.
+fn recompute_stale_results(conn: &Connection) -> anyhow::Result<()> {
+    let stale: Vec<(String, String)> = {
+        let mut stmt = conn.prepare("SELECT plan_id, graph FROM plans WHERE cpm_version < ?1")?;
+        stmt.query_map([crate::algorithm::CPM_VERSION], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<Result<_, _>>()?
+    };
+    for (plan_id, graph_json) in stale {
+        let graph: PlanGraph = match serde_json::from_str(&graph_json) {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!(%plan_id, error = %e, "could not decode stored graph; leaving cached result as is");
+                continue;
+            }
+        };
+        match crate::schedule::compute_cpm(&graph) {
+            Ok(result) => {
+                conn.execute(
+                    "UPDATE plans SET cached_result = ?1, cpm_version = ?2 WHERE plan_id = ?3",
+                    params![
+                        serde_json::to_string(&result)?,
+                        crate::algorithm::CPM_VERSION,
+                        plan_id
+                    ],
+                )?;
+            }
+            Err(e) => tracing::warn!(%plan_id, error = %e, "could not recompute stored CPM result"),
+        }
+    }
+    Ok(())
 }
 
 /// Migration: add the per-deliverable counter columns to databases
