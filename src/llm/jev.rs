@@ -1,4 +1,15 @@
 //! [`JudgmentModel`] over Jev, via `rig-typesafeai`, pointed at OpenRouter.
+//!
+//! Error messages are tool-facing: scrubbed of the key, capped, and limited
+//! to the class plus an HTTP status or short reason. Upstream bodies are
+//! logged at `debug` only (scrubbed, then truncated).
+//!
+//! Follow-up (not implemented): the reply body size is not capped. rig's
+//! driver reads replies through `HttpClientExt::send_streaming`, so a cap
+//! needs a wrapper implementing all three `HttpClientExt` methods over a
+//! boxed byte stream (plus direct `rig-reqwest`/`bytes`/`futures` deps), and
+//! its overflow error would surface as a transport error rather than
+//! `Decode`. The per-call timeout bounds how long a large reply can stream.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -13,8 +24,8 @@ use super::{
     ApiKey, Decisions, JudgmentError, JudgmentErrorKind, JudgmentModel, LlmConfig, Question,
 };
 
-/// Longest slice of a provider error body carried into a message.
-const BODY_EXCERPT_CHARS: usize = 200;
+/// Longest slice of a provider error body written to the debug log.
+const BODY_LOG_CHARS: usize = 200;
 
 /// Jev on OpenRouter's System One endpoint. Every call is bounded by the
 /// configured timeout.
@@ -53,30 +64,64 @@ impl JevJudge {
         &self.endpoint
     }
 
+    /// A tool-facing error: scrubbed, then capped at
+    /// [`MAX_ERROR_MESSAGE_CHARS`](super::MAX_ERROR_MESSAGE_CHARS).
     fn error(&self, kind: JudgmentErrorKind, message: impl AsRef<str>) -> JudgmentError {
-        JudgmentError::new(kind, self.key.scrub(message.as_ref()))
+        JudgmentError::new(
+            kind,
+            self.key
+                .excerpt(message.as_ref(), super::MAX_ERROR_MESSAGE_CHARS),
+        )
+    }
+
+    /// The upstream body goes to the debug log only (scrubbed, then cut);
+    /// the tool-facing message carries the status alone.
+    fn reply_error(
+        &self,
+        kind: JudgmentErrorKind,
+        reply: &rig_core::ProviderResponseError,
+    ) -> JudgmentError {
+        let status = reply.status.map(|s| s.as_u16());
+        tracing::debug!(
+            ?status,
+            body = %self.key.excerpt(reply.body.trim(), BODY_LOG_CHARS),
+            "jev upstream error reply"
+        );
+        match status {
+            Some(code) => self.error(kind, format!("status {code}")),
+            None => self.error(kind, "provider error reply without an HTTP status"),
+        }
+    }
+
+    /// A failure whose text may be provider-authored: logged at debug,
+    /// replaced by `summary` in the tool-facing message.
+    fn opaque_error(
+        &self,
+        kind: JudgmentErrorKind,
+        summary: &str,
+        error: &ProviderError,
+    ) -> JudgmentError {
+        tracing::debug!(
+            detail = %self.key.excerpt(&error.to_string(), BODY_LOG_CHARS),
+            "jev provider failure"
+        );
+        self.error(kind, summary)
     }
 
     fn classify(&self, error: &ProviderError) -> JudgmentError {
         use JudgmentErrorKind as K;
         match error {
-            ProviderError::InvalidAuthentication(reply) => {
-                self.error(K::Unauthorized, describe_reply(reply))
-            }
+            ProviderError::InvalidAuthentication(reply) => self.reply_error(K::Unauthorized, reply),
             ProviderError::ProviderResponse(reply) => {
                 let kind = match reply.status.map(|s| s.as_u16()) {
                     Some(401 | 403) => K::Unauthorized,
                     Some(429) => K::RateLimited,
                     _ => K::Upstream,
                 };
-                self.error(kind, describe_reply(reply))
+                self.reply_error(kind, reply)
             }
-            ProviderError::CacheExpired { response, .. } => {
-                self.error(K::Upstream, describe_reply(response))
-            }
-            ProviderError::Provider(_) | ProviderError::Relayed(_) => {
-                self.error(K::Upstream, error.to_string())
-            }
+            ProviderError::CacheExpired { response, .. } => self.reply_error(K::Upstream, response),
+            // rig-authored, short reasons (serde position, id mismatch).
             ProviderError::Json(_)
             | ProviderError::Response(_)
             | ProviderError::Truncated
@@ -89,18 +134,12 @@ impl JevJudge {
             | ProviderError::UnsupportedOption(_) => {
                 self.error(K::InvalidRequest, error.to_string())
             }
+            ProviderError::Provider(_) | ProviderError::Relayed(_) => {
+                self.opaque_error(K::Upstream, "provider reported a failure", error)
+            }
             // `ProviderError` is `#[non_exhaustive]`.
-            _ => self.error(K::Upstream, error.to_string()),
+            _ => self.opaque_error(K::Upstream, "unclassified provider failure", error),
         }
-    }
-}
-
-/// `status N: <body excerpt>` — the excerpt is scrubbed by the caller.
-fn describe_reply(reply: &rig_core::ProviderResponseError) -> String {
-    let body: String = reply.body.chars().take(BODY_EXCERPT_CHARS).collect();
-    match reply.status {
-        Some(status) => format!("status {}: {}", status.as_u16(), body.trim()),
-        None => body.trim().to_string(),
     }
 }
 

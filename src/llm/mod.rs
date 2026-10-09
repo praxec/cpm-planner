@@ -54,6 +54,12 @@ pub const DEFAULT_LLM_MODEL: &str = "openai/gpt-5-mini";
 
 /// Redaction marker used wherever the key would otherwise appear.
 pub const REDACTED: &str = "[redacted]";
+/// Upper bound on [`JudgmentError::message`], in chars (it becomes tool output).
+pub const MAX_ERROR_MESSAGE_CHARS: usize = 300;
+/// Largest key file accepted, in bytes.
+pub const MAX_KEY_FILE_BYTES: u64 = 4096;
+/// Shortest key prefix treated as a leak when it ends a truncated excerpt.
+const MIN_KEY_FRAGMENT_CHARS: usize = 8;
 
 /// The OpenRouter key. `Debug` is redacted; there is deliberately no
 /// `Display` or `Serialize`.
@@ -75,6 +81,24 @@ impl ApiKey {
             text.replace(&self.0, REDACTED)
         }
     }
+
+    /// At most `max_chars` of `text`, safe to show: the WHOLE text is
+    /// scrubbed first, then truncated, and a trailing key prefix of
+    /// [`MIN_KEY_FRAGMENT_CHARS`]+ chars (a key cut by the boundary, or a
+    /// partial key in the input) is dropped.
+    pub fn excerpt(&self, text: &str, max_chars: usize) -> String {
+        let scrubbed = self.scrub(text);
+        let mut out: Vec<char> = scrubbed.chars().take(max_chars).collect();
+        let key: Vec<char> = self.0.chars().collect();
+        let longest = key.len().min(out.len());
+        if let Some(len) = (MIN_KEY_FRAGMENT_CHARS..=longest)
+            .rev()
+            .find(|&len| out[out.len() - len..] == key[..len])
+        {
+            out.truncate(out.len() - len);
+        }
+        out.into_iter().collect()
+    }
 }
 
 impl fmt::Debug for ApiKey {
@@ -89,12 +113,42 @@ pub enum ConfigError {
     /// `CPM_LLM_TIMEOUT_SECS` is not an integer in 1..=300.
     #[error("{LLM_TIMEOUT_ENV} must be an integer number of seconds in 1..=300; got '{value}'")]
     InvalidTimeout { value: String },
-    /// `CPM_JEV_ENDPOINT` is not an http(s) URL.
-    #[error("{JEV_ENDPOINT_ENV} must be an http:// or https:// URL; got '{value}'")]
-    InvalidEndpoint { value: String },
-    /// `CPM_OPENROUTER_KEY_FILE` names a file that cannot be read.
+    /// `CPM_JEV_ENDPOINT` is not an acceptable URL. The value itself is not
+    /// echoed (it may carry credentials).
+    #[error(
+        "{JEV_ENDPOINT_ENV} must be an https:// URL (http:// only for a loopback host) \
+         without credentials: {reason}"
+    )]
+    InvalidEndpoint { reason: String },
+    /// `CPM_OPENROUTER_KEY_FILE` names something that cannot be used as a
+    /// key file (missing, unreadable, not a regular file, too large).
     #[error("{OPENROUTER_KEY_FILE_ENV} '{}' cannot be read: {reason}", path.display())]
     KeyFile { path: PathBuf, reason: String },
+    /// The key file was read but deliberately ignored (a warning is logged
+    /// too). Distinct from "no key configured" so callers can say why.
+    #[error("{OPENROUTER_KEY_FILE_ENV} '{}': key file ignored: {reason}", path.display())]
+    KeyFileIgnored {
+        path: PathBuf,
+        reason: KeyFileIgnoredReason,
+    },
+}
+
+/// Why a key file was ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyFileIgnoredReason {
+    /// Other users can read it (unix mode `o+r`); `chmod 600` to use it.
+    WorldReadable,
+    /// It holds only whitespace.
+    Empty,
+}
+
+impl fmt::Display for KeyFileIgnoredReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::WorldReadable => "world-readable",
+            Self::Empty => "empty",
+        })
+    }
 }
 
 /// OpenRouter / Jev settings. Only constructed when a key is configured.
@@ -127,9 +181,10 @@ impl LlmConfig {
     /// [`Self::from_env`] over an arbitrary variable lookup (tests).
     ///
     /// The key comes from `OPENROUTER_API_KEY`, else from the file named by
-    /// `CPM_OPENROUTER_KEY_FILE` (contents trimmed). On unix a key file that
-    /// is world-readable is ignored with a warning. Blank keys count as
-    /// absent.
+    /// `CPM_OPENROUTER_KEY_FILE` (contents trimmed). A world-readable (unix)
+    /// or empty key file is [`ConfigError::KeyFileIgnored`] plus a warning.
+    /// A blank env key counts as absent. The endpoint is validated here:
+    /// https, or http to a loopback host, with no credentials.
     pub fn from_lookup(
         lookup: impl Fn(&str) -> Option<String>,
     ) -> Result<Option<Self>, ConfigError> {
@@ -166,7 +221,9 @@ impl LlmConfig {
         Ok(Some(config))
     }
 
-    /// Replace the Jev endpoint (complete URL including the route).
+    /// Replace the Jev endpoint (complete URL including the route). Not
+    /// validated: programmatic callers (tests) own it; the env path is
+    /// validated by [`Self::from_lookup`].
     pub fn with_jev_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.jev_endpoint = endpoint.into();
         self
@@ -223,49 +280,80 @@ fn parse_timeout(raw: &str) -> Result<Duration, ConfigError> {
 }
 
 fn parse_endpoint(raw: &str) -> Result<String, ConfigError> {
-    let rest = raw
-        .strip_prefix("https://")
-        .or_else(|| raw.strip_prefix("http://"));
-    match rest {
-        Some(rest) if !rest.is_empty() && !rest.starts_with('/') => Ok(raw.to_string()),
-        _ => Err(ConfigError::InvalidEndpoint {
-            value: raw.to_string(),
-        }),
+    let invalid = |reason: &str| ConfigError::InvalidEndpoint {
+        reason: reason.to_string(),
+    };
+    // url's ParseError messages are generic ("invalid port number") and
+    // never echo the input.
+    let url = url::Url::parse(raw).map_err(|e| invalid(&e.to_string()))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(invalid("credentials in the URL are not allowed"));
+    }
+    let loopback = match url.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => return Err(invalid("missing host")),
+    };
+    match url.scheme() {
+        "https" => Ok(raw.to_string()),
+        "http" if loopback => Ok(raw.to_string()),
+        "http" => Err(invalid("http:// is only allowed for a loopback host")),
+        _ => Err(invalid("unsupported scheme")),
     }
 }
 
-/// Read and trim the key file. `Ok(None)` when it is world-readable (unix)
-/// or empty; both log a warning. The warning names the path, never the key.
+/// Read and trim the key file. It must be a regular file of at most
+/// [`MAX_KEY_FILE_BYTES`]; a world-readable (unix) or empty file is
+/// [`ConfigError::KeyFileIgnored`] with a warning. Messages name the path,
+/// never the key.
 fn read_key_file(path: &Path) -> Result<Option<String>, ConfigError> {
-    let key_file_error = |e: std::io::Error| ConfigError::KeyFile {
+    use std::io::Read;
+    let key_file_error = |reason: String| ConfigError::KeyFile {
         path: path.to_path_buf(),
-        reason: e.kind().to_string(),
+        reason,
     };
-    // One handle for both the permission check and the read, so the file
-    // checked is the file read.
-    let mut file = std::fs::File::open(path).map_err(key_file_error)?;
+    let io_error = |e: std::io::Error| key_file_error(e.kind().to_string());
+    let ignored = |reason: KeyFileIgnoredReason| {
+        tracing::warn!(path = %path.display(), %reason, "{OPENROUTER_KEY_FILE_ENV}: key file ignored");
+        ConfigError::KeyFileIgnored {
+            path: path.to_path_buf(),
+            reason,
+        }
+    };
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    // Non-blocking open so a FIFO cannot hang startup; the handle is then
+    // checked to be a regular file, so the file checked is the file read.
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
+    let file = options.open(path).map_err(io_error)?;
+    let metadata = file.metadata().map_err(io_error)?;
+    if !metadata.is_file() {
+        return Err(key_file_error("not a regular file".to_string()));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = file
-            .metadata()
-            .map_err(key_file_error)?
-            .permissions()
-            .mode();
-        if mode & 0o004 != 0 {
-            tracing::warn!(
-                path = %path.display(),
-                "{OPENROUTER_KEY_FILE_ENV} is world-readable; ignoring it (chmod 600 to use it)"
-            );
-            return Ok(None);
+        if metadata.permissions().mode() & 0o004 != 0 {
+            return Err(ignored(KeyFileIgnoredReason::WorldReadable));
         }
     }
-    let mut contents = String::new();
-    std::io::Read::read_to_string(&mut file, &mut contents).map_err(key_file_error)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_KEY_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(io_error)?;
+    if bytes.len() as u64 > MAX_KEY_FILE_BYTES {
+        return Err(key_file_error(format!(
+            "larger than {MAX_KEY_FILE_BYTES} bytes"
+        )));
+    }
+    let contents =
+        String::from_utf8(bytes).map_err(|_| key_file_error("not valid UTF-8".to_string()))?;
     let key = contents.trim();
     if key.is_empty() {
-        tracing::warn!(path = %path.display(), "{OPENROUTER_KEY_FILE_ENV} is empty; ignoring it");
-        return Ok(None);
+        return Err(ignored(KeyFileIgnoredReason::Empty));
     }
     Ok(Some(key.to_string()))
 }
@@ -321,7 +409,9 @@ impl fmt::Display for JudgmentErrorKind {
     }
 }
 
-/// A classed judgment failure. `message` never contains the key.
+/// A classed judgment failure. `message` never contains the key, is at most
+/// [`MAX_ERROR_MESSAGE_CHARS`] chars, and carries only a short reason (an
+/// HTTP status, a decode reason) — never the upstream body.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{kind}: {message}")]
 pub struct JudgmentError {
@@ -332,11 +422,16 @@ pub struct JudgmentError {
 }
 
 impl JudgmentError {
-    /// Build an error. Callers must pass an already-scrubbed message.
+    /// Build an error. Callers must pass an already-scrubbed message; it is
+    /// cut to [`MAX_ERROR_MESSAGE_CHARS`].
     pub fn new(kind: JudgmentErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
-            message: message.into(),
+            message: message
+                .into()
+                .chars()
+                .take(MAX_ERROR_MESSAGE_CHARS)
+                .collect(),
         }
     }
 }

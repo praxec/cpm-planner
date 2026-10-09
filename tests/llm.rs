@@ -8,8 +8,8 @@ use std::time::Duration;
 use cpm_planner::llm::jev::JevJudge;
 use cpm_planner::llm::openrouter::chat_client;
 use cpm_planner::llm::{
-    ConfigError, DEFAULT_JEV_ENDPOINT, DEFAULT_JEV_MODEL, DEFAULT_LLM_MODEL, JudgmentErrorKind,
-    JudgmentModel, LlmConfig,
+    ApiKey, ConfigError, DEFAULT_JEV_ENDPOINT, DEFAULT_JEV_MODEL, DEFAULT_LLM_MODEL,
+    JudgmentErrorKind, JudgmentModel, KeyFileIgnoredReason, LlmConfig, MAX_ERROR_MESSAGE_CHARS,
 };
 use rig_typesafeai::types::{Answer, Question};
 use serde_json::json;
@@ -187,12 +187,18 @@ fn config_owner_only_key_file_is_used_and_trimmed() {
 #[test]
 fn config_world_readable_key_file_is_ignored() {
     let (_dir, file) = key_file(0o644, SENTINEL);
-    let cfg = LlmConfig::from_lookup(lookup(&[(
+    let err = LlmConfig::from_lookup(lookup(&[(
         "CPM_OPENROUTER_KEY_FILE",
         file.to_str().unwrap(),
     )]))
-    .unwrap();
-    assert!(cfg.is_none());
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        ConfigError::KeyFileIgnored {
+            reason: KeyFileIgnoredReason::WorldReadable,
+            ..
+        }
+    ));
 }
 
 #[cfg(unix)]
@@ -457,4 +463,182 @@ fn judgment_error_display_names_its_class() {
 fn openrouter_chat_client_debug_redacts_key() {
     let client = chat_client(&config_with_key());
     assert!(!format!("{client:?}").contains(SENTINEL));
+}
+
+// ---------------------------------------------------------------- fix round 1
+
+fn endpoint_result(endpoint: &str) -> Result<Option<LlmConfig>, ConfigError> {
+    LlmConfig::from_lookup(lookup(&[
+        ("OPENROUTER_API_KEY", SENTINEL),
+        ("CPM_JEV_ENDPOINT", endpoint),
+    ]))
+}
+
+#[test]
+fn http_endpoint_to_remote_host_is_rejected() {
+    let err = endpoint_result("http://openrouter.ai/api/v1/systemone").unwrap_err();
+    assert!(matches!(err, ConfigError::InvalidEndpoint { .. }));
+}
+
+#[test]
+fn http_loopback_endpoint_is_accepted() {
+    let ok = [
+        "http://127.0.0.1:8080/v1/systemone",
+        "http://[::1]:8080/x",
+        "http://localhost/x",
+    ]
+    .iter()
+    .all(|e| matches!(endpoint_result(e), Ok(Some(_))));
+    assert!(ok);
+}
+
+#[test]
+fn https_remote_endpoint_is_accepted() {
+    assert!(matches!(
+        endpoint_result("https://example.com/v1/systemone"),
+        Ok(Some(_))
+    ));
+}
+
+#[test]
+fn endpoint_with_credentials_is_rejected() {
+    let err = endpoint_result("https://user:pw@example.com/v1/systemone").unwrap_err();
+    assert!(matches!(err, ConfigError::InvalidEndpoint { .. }));
+}
+
+#[test]
+fn endpoint_rejection_never_echoes_credentials() {
+    let err = endpoint_result("https://user:hunter2secret@example.com/v1").unwrap_err();
+    assert!(!format!("{err} {err:?}").contains("hunter2secret"));
+}
+
+#[test]
+fn malformed_endpoint_is_rejected_at_config_time() {
+    let err = endpoint_result("https://exa mple.com:99999/x").unwrap_err();
+    assert!(matches!(err, ConfigError::InvalidEndpoint { .. }));
+}
+
+#[test]
+fn key_excerpt_straddling_truncation_boundary_drops_key_prefix() {
+    let key = config_with_key().api_key().clone();
+    let text = format!("{}{SENTINEL}", "x".repeat(190));
+    let excerpt = key.excerpt(&text, 200);
+    assert!(!contains_key_fragment(&excerpt, &key));
+}
+
+fn contains_key_fragment(text: &str, key: &ApiKey) -> bool {
+    let k: Vec<char> = key.expose().chars().collect();
+    k.windows(8)
+        .any(|w| text.contains(&w.iter().collect::<String>()))
+}
+
+#[tokio::test]
+async fn key_straddling_truncation_boundary_is_not_leaked() {
+    let key = config_with_key().api_key().clone();
+    let mut rendered = String::new();
+    for pad in [128, 180, 190, 195, 199, 290, 295] {
+        let body = format!("{}{SENTINEL} tail", "x".repeat(pad));
+        let err = decide_with(ResponseTemplate::new(500).set_body_string(body))
+            .await
+            .unwrap_err();
+        rendered.push_str(&format!("{err} {err:?}\n"));
+    }
+    assert!(!contains_key_fragment(&rendered, &key), "{rendered}");
+}
+
+#[tokio::test]
+async fn upstream_body_is_not_in_error_message() {
+    let err = decide_with(ResponseTemplate::new(502).set_body_string("UPSTREAM-BODY-MARKER"))
+        .await
+        .unwrap_err();
+    assert!(!err.to_string().contains("UPSTREAM-BODY-MARKER"));
+}
+
+#[tokio::test]
+async fn upstream_error_message_names_status() {
+    let err = decide_with(ResponseTemplate::new(503).set_body_string("down"))
+        .await
+        .unwrap_err();
+    assert!(err.message.contains("503"));
+}
+
+#[tokio::test]
+async fn error_message_is_capped() {
+    let err = decide_with(ResponseTemplate::new(200).set_body_string("y".repeat(5000)))
+        .await
+        .unwrap_err();
+    assert!(err.message.chars().count() <= MAX_ERROR_MESSAGE_CHARS);
+}
+
+#[test]
+fn oversized_key_file_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("big.key");
+    std::fs::write(&file, "k".repeat(4097)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let err = LlmConfig::from_lookup(lookup(&[(
+        "CPM_OPENROUTER_KEY_FILE",
+        file.to_str().unwrap(),
+    )]))
+    .unwrap_err();
+    assert!(matches!(err, ConfigError::KeyFile { .. }));
+}
+
+#[cfg(unix)]
+#[test]
+fn fifo_key_file_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("key.fifo");
+    let status = std::process::Command::new("mkfifo")
+        .arg("-m")
+        .arg("600")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(status.success(), "mkfifo failed");
+    let err = LlmConfig::from_lookup(lookup(&[(
+        "CPM_OPENROUTER_KEY_FILE",
+        fifo.to_str().unwrap(),
+    )]))
+    .unwrap_err();
+    assert!(matches!(err, ConfigError::KeyFile { .. }));
+}
+
+#[cfg(unix)]
+#[test]
+fn empty_key_file_is_reported_as_ignored() {
+    let (_dir, file) = key_file(0o600, "  \n");
+    let err = LlmConfig::from_lookup(lookup(&[(
+        "CPM_OPENROUTER_KEY_FILE",
+        file.to_str().unwrap(),
+    )]))
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        ConfigError::KeyFileIgnored {
+            reason: KeyFileIgnoredReason::Empty,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn key_file_ignored_error_names_reason() {
+    let err = ConfigError::KeyFileIgnored {
+        path: "/tmp/k".into(),
+        reason: KeyFileIgnoredReason::WorldReadable,
+    };
+    assert!(err.to_string().contains("key file ignored: world-readable"));
+}
+
+#[test]
+fn partial_key_cut_by_truncation_boundary_is_dropped() {
+    let key = config_with_key().api_key().clone();
+    let partial: String = SENTINEL.chars().take(20).collect();
+    let text = format!("{}{partial}", "x".repeat(190));
+    assert!(!contains_key_fragment(&key.excerpt(&text, 200), &key));
 }

@@ -45,6 +45,7 @@ cap-std = "4.0.3"
 cap-fs-ext = "4.0.3"
 rig-core = { version = "0.44", default-features = false, features = ["reqwest", "rustls"] }
 rig-typesafeai = { version = "0.44", default-features = false, features = ["reqwest", "rustls"] }
+url = "2.5"
 
 [target.'cfg(unix)'.dependencies]
 # errno constants for classifying unsupported hard links (write_new_graph).
