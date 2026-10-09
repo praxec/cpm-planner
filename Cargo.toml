@@ -44,5 +44,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 cap-std = "4.0.3"
 cap-fs-ext = "4.0.3"
 
+[target.'cfg(unix)'.dependencies]
+# errno constants for classifying unsupported hard links (write_new_graph).
+libc = "0.2.190"
+
 [dev-dependencies]
 tempfile = "3.27.0"

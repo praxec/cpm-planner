@@ -593,3 +593,17 @@ fn file_hash_does_not_parse_the_file() {
     std::fs::write(d.join(&f.rel_path), b"not json").unwrap();
     assert!(r.file_hash(&f).is_ok());
 }
+
+#[test]
+fn plan_file_over_8_mib_is_rejected() {
+    let (d, r) = root_with_git("oversized");
+    let dir = d.join(".cpm-planner/plans/web");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("main.json"), vec![b' '; 8 * 1024 * 1024 + 1]).unwrap();
+    let f = r.plan_file("web", "main").unwrap();
+    let err = r.read_graph(&f).unwrap_err();
+    assert!(
+        matches!(&err, PlannerError::InvalidPath { reason } if reason == "plan file exceeds 8 MiB"),
+        "got {err}"
+    );
+}

@@ -19,7 +19,16 @@
 //! renamed over `<variant>.json`; the directory is fsynced afterwards.
 //! Metadata errors other than NotFound fail closed. On unix, reads open the
 //! file with `O_NONBLOCK` so a FIFO cannot block the open, then verify via
-//! `fstat` that the handle is a regular file before reading it.
+//! `fstat` that the handle is a regular file before reading it. Plan files
+//! larger than [`MAX_PLAN_FILE_BYTES`] (8 MiB) are refused.
+//!
+//! [`ProjectRoot::write_new_graph`] links the fsynced temp file into place
+//! with `link(2)`, which fails instead of replacing. On filesystems without
+//! hard links (`EPERM`, `EOPNOTSUPP`/`ENOTSUP`, `EXDEV`, or the Windows
+//! equivalents) it falls back to an exclusive create of the target
+//! (`O_CREAT|O_EXCL`, no-follow), write, fsync, then a directory fsync. The
+//! fallback still never replaces an existing file, but it is not atomic: a
+//! crash or a concurrent reader mid-write can observe a partial file.
 //!
 //! # Residual limitations
 //!
@@ -54,6 +63,9 @@ use crate::plan::{PlanGraph, PlannerError};
 
 /// Environment variable overriding repo-root discovery.
 pub const PROJECT_ROOT_ENV: &str = "CPM_PROJECT_ROOT";
+
+/// Largest plan file read (`INVALID_PATH: plan file exceeds 8 MiB`).
+pub const MAX_PLAN_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 const PLANNER_DIR: &str = ".cpm-planner";
 const PLANS_SUBDIR: &str = "plans";
@@ -351,7 +363,10 @@ impl ProjectRoot {
         Ok(hash_hex(&self.read_bytes(f)?))
     }
 
-    fn read_bytes(&self, f: &PlanFileRef) -> Result<Vec<u8>, PlannerError> {
+    /// The exact bytes of a plan file, read no-follow from a regular file.
+    /// A file larger than [`MAX_PLAN_FILE_BYTES`] is
+    /// `INVALID_PATH: plan file exceeds 8 MiB`.
+    pub fn read_bytes(&self, f: &PlanFileRef) -> Result<Vec<u8>, PlannerError> {
         validate_slug("name", &f.name)?;
         validate_slug("variant", &f.variant)?;
         let dir = self
@@ -366,7 +381,7 @@ impl ProjectRoot {
         // rejected below.
         #[cfg(unix)]
         opts.nonblock(true);
-        let mut file = match dir.open_with(&fname, &opts) {
+        let file = match dir.open_with(&fname, &opts) {
             Ok(file) => file,
             Err(e) => {
                 return Err(match dir.symlink_metadata(&fname) {
@@ -377,12 +392,35 @@ impl ProjectRoot {
                 });
             }
         };
-        if !file.metadata().map_err(backend)?.is_file() {
+        let meta = file.metadata().map_err(backend)?;
+        if !meta.is_file() {
             return Err(invalid(format!("{} is not a regular file", f.rel_path)));
         }
+        if meta.len() > MAX_PLAN_FILE_BYTES {
+            return Err(too_large());
+        }
         let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).map_err(backend)?;
+        // Bounded even if the file grows after the fstat.
+        file.take(MAX_PLAN_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(backend)?;
+        if bytes.len() as u64 > MAX_PLAN_FILE_BYTES {
+            return Err(too_large());
+        }
         Ok(bytes)
+    }
+
+    /// Best-effort removal of a plan file this process just wrote: removed
+    /// only while its bytes still hash to `expected_hash`, walking the same
+    /// no-follow handles as every other operation. Errors are ignored.
+    pub fn remove_plan_file_if_unchanged(&self, f: &PlanFileRef, expected_hash: &str) {
+        if !matches!(self.file_hash(f), Ok(h) if h == expected_hash) {
+            return;
+        }
+        if let Ok(Some(dir)) = self.open_chain(Some(&f.name), false) {
+            let _ = dir.remove_file(format!("{}.json", f.variant));
+            let _ = sync_dir(&dir);
+        }
     }
 
     /// Atomically write pretty JSON plus a trailing newline; returns the
@@ -439,7 +477,10 @@ impl ProjectRoot {
                 // link(2) fails with EEXIST instead of replacing.
                 let linked = dir.hard_link(&tmp, &dir, &target);
                 let _ = dir.remove_file(&tmp);
-                linked
+                match linked {
+                    Err(e) if link_unsupported(&e) => create_exclusive(&dir, &target, &bytes),
+                    other => other,
+                }
             }
         })();
         if let Err(e) = result {
@@ -454,6 +495,74 @@ impl ProjectRoot {
     }
 }
 
+fn too_large() -> PlannerError {
+    invalid("plan file exceeds 8 MiB")
+}
+
+/// True when `link(2)` failed because the filesystem cannot hard-link (not
+/// because the target exists or access was denied for another reason).
+fn link_unsupported(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    if matches!(e.kind(), ErrorKind::Unsupported | ErrorKind::CrossesDevices) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        matches!(
+            e.raw_os_error(),
+            Some(c) if c == libc::EPERM || c == libc::EOPNOTSUPP || c == libc::ENOTSUP || c == libc::EXDEV
+        )
+    }
+    #[cfg(windows)]
+    {
+        // ERROR_INVALID_FUNCTION, ERROR_ACCESS_DENIED, ERROR_NOT_SAME_DEVICE,
+        // ERROR_NOT_SUPPORTED.
+        matches!(e.raw_os_error(), Some(1 | 5 | 17 | 50))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
+/// Non-atomic create-only write used when hard links are unsupported:
+/// exclusive no-follow create of `target` (an existing file is
+/// `AlreadyExists`), write, fsync, then fsync the directory. A failed write
+/// removes the partially written file.
+fn create_exclusive(dir: &Dir, target: &str, bytes: &[u8]) -> std::io::Result<()> {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true).follow(FollowSymlinks::No);
+    let mut file = dir.open_with(target, &opts)?;
+    if let Err(e) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = dir.remove_file(target);
+        return Err(e);
+    }
+    drop(file);
+    #[cfg(unix)]
+    dir.open(".")?.sync_all()?;
+    Ok(())
+}
+
+/// The sha256 hex of `bytes`: the content hash of a plan file.
+pub fn content_hash(bytes: &[u8]) -> String {
+    hash_hex(bytes)
+}
+
 fn hash_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_new_graph_fallback_creates_exclusively() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = Dir::open_ambient_dir(tmp.path(), ambient_authority()).unwrap();
+        create_exclusive(&dir, "v.json", b"{}").expect("first create");
+        let second = create_exclusive(&dir, "v.json", b"[]").unwrap_err();
+        assert_eq!(second.kind(), std::io::ErrorKind::AlreadyExists);
+    }
 }
