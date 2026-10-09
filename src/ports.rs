@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use crate::plan::{
     AcceptRequest, AcquireRequest, Cohort, ForceReleaseRequest, HeartbeatRequest,
     MarkStatusRequest, PlanDefinition, PlanGraph, PlanId, PlanLineSummary, PlanStatus,
-    PlannerError, ReviseRequest, SyncOutcome, SyncRequest,
+    PlannerError, ReviseRequest, SelectOutcome, SyncOutcome, SyncRequest,
 };
 use crate::revise::RevisionDiff;
 
@@ -32,6 +32,10 @@ use crate::revise::RevisionDiff;
 /// - [`Planner::status`] is a cheap read-only snapshot and is safe to poll.
 /// - [`Planner::force_release`] is the operator escape hatch. Implementations
 ///   MUST emit an audit event carrying the supplied `reason`.
+/// - Execution methods (`acquire_cohort`, `heartbeat`, `mark_status`,
+///   `accept`, `force_release`) on a named variant that is not its line's
+///   selected variant return [`PlannerError::VariantNotSelected`]; unnamed
+///   plans and read/analysis methods are never gated.
 #[async_trait]
 pub trait Planner: Send + Sync {
     /// Submit a [`PlanGraph`]. Idempotent on `(graph, caller_id)`; an
@@ -102,4 +106,31 @@ pub trait Planner: Send + Sync {
     /// [`crate::revise`]). Returns the new revision number and the diff.
     /// Works on named and unnamed plans alike.
     async fn revise_plan(&self, req: ReviseRequest) -> Result<(u32, RevisionDiff), PlannerError>;
+
+    /// Make the named variant owning `plan_id` its line's selected (the only
+    /// executable) variant. Progress carries over from the previously
+    /// selected variant: every deliverable present in both with an identical
+    /// canonical definition gets its `Complete` status and counters copied,
+    /// then the new variant's open deliverables are re-derived. Expired
+    /// locks on the previous variant are reaped first; live ones refuse the
+    /// selection with `LOCK_HELD` unless `force`, which releases them
+    /// (audited). Selecting the selected variant is a no-op. An unnamed plan
+    /// is `PLAN_NOT_FOUND`; an archived variant or line is `ARCHIVE_REFUSED`.
+    async fn select_variant(
+        &self,
+        plan_id: &PlanId,
+        force: bool,
+    ) -> Result<SelectOutcome, PlannerError>;
+
+    /// Archive a whole plan line (`variant: None`: the line and all its
+    /// variants) or one variant. Archived variants stay readable but are
+    /// hidden from [`Planner::list_plans`] unless `include_archived`, and
+    /// refuse sync and selection. Archiving the selected variant alone is
+    /// `ARCHIVE_REFUSED`. Unknown line/variant is `PLAN_NOT_FOUND`.
+    async fn archive(
+        &self,
+        project: &str,
+        name: &str,
+        variant: Option<&str>,
+    ) -> Result<(), PlannerError>;
 }

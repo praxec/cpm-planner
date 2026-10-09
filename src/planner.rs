@@ -38,10 +38,11 @@ use crate::plan::{
     AcceptRequest, AcquireRequest, BlockedDeliverable, CallerId, Cohort, CohortRow, Deliverable,
     DeliverableStatus, FINISH_ID, FileMode, ForceReleaseRequest, HeartbeatRequest, LockInfo,
     MarkStatusRequest, MilestoneRow, OwnedFile, PlanDefinition, PlanGraph, PlanId, PlanLineSummary,
-    PlanStatus, PlannerError, ReviseRequest, START_ID, ScheduleRow, SyncOutcome, SyncRequest,
+    PlanStatus, PlannerError, ReviseRequest, START_ID, ScheduleRow, SelectOutcome, SyncOutcome,
+    SyncRequest,
 };
 use crate::plan_store::SqlitePlanStore;
-use crate::portfolio::{Revised, Synced};
+use crate::portfolio::{Archived, Revised, Selected, Synced};
 use crate::ports::Planner;
 use crate::revise::RevisionDiff;
 use async_trait::async_trait;
@@ -566,6 +567,64 @@ fn revision_events(plan_id: &PlanId, revised: &Revised, now: DateTime<Utc>) -> V
     events
 }
 
+fn make_portfolio_selected_event(outcome: &SelectOutcome) -> AuditEvent {
+    AuditEvent::new("plan.portfolio.selected").with_payload(json!({
+        "plan_id": outcome.plan_id.as_str(),
+        "project": outcome.project,
+        "name": outcome.name,
+        "from": outcome.previous,
+        "to": outcome.variant,
+        "carried": outcome.carried,
+        "released": outcome.released_locks,
+    }))
+}
+
+/// Audit trail of a committed selection: reaped (expired) locks, locks the
+/// forced selection released, the selection itself, then `plan.completed`
+/// when the carry-over completed the newly selected plan. A no-op selection
+/// is not audited.
+fn selection_events(selected: &Selected, now: DateTime<Utc>) -> Vec<AuditEvent> {
+    if !selected.outcome.changed {
+        return Vec::new();
+    }
+    let mut events: Vec<AuditEvent> = selected
+        .reaped
+        .iter()
+        .map(|lock| make_expired_event(lock, now))
+        .collect();
+    events.extend(
+        selected
+            .released
+            .iter()
+            .map(|lock| make_released_event(lock, "variant deselected")),
+    );
+    events.push(make_portfolio_selected_event(&selected.outcome));
+    if let Some(count) = selected.completed {
+        events.push(make_plan_completed_event(&selected.outcome.plan_id, count));
+    }
+    events
+}
+
+fn make_portfolio_archived_event(
+    project: &str,
+    name: &str,
+    variant: Option<&str>,
+    archived: &Archived,
+) -> AuditEvent {
+    let variants: Vec<serde_json::Value> = archived
+        .variants
+        .iter()
+        .map(|(v, plan_id)| json!({ "variant": v, "plan_id": plan_id.as_str() }))
+        .collect();
+    AuditEvent::new("plan.portfolio.archived").with_payload(json!({
+        "project": project,
+        "name": name,
+        "variant": variant,
+        "line": archived.line,
+        "variants": variants,
+    }))
+}
+
 /// Longest `project` key accepted by `sync_plan` (a path-derived key, not a
 /// slug).
 const MAX_PROJECT_LEN: usize = 512;
@@ -923,6 +982,37 @@ impl Planner for BasicCpmPlanner {
         Ok((revised.revision, revised.diff))
     }
 
+    async fn select_variant(
+        &self,
+        plan_id: &PlanId,
+        force: bool,
+    ) -> Result<SelectOutcome, PlannerError> {
+        let now = self.now();
+        let selected = self
+            .store
+            .write_tx(|tx| crate::portfolio::select(tx, plan_id, force, now))?;
+        self.flush_audit(selection_events(&selected, now)).await;
+        Ok(selected.outcome)
+    }
+
+    async fn archive(
+        &self,
+        project: &str,
+        name: &str,
+        variant: Option<&str>,
+    ) -> Result<(), PlannerError> {
+        let archived = self
+            .store
+            .write_tx(|tx| crate::portfolio::archive(tx, project, name, variant))?;
+        if archived.changed() {
+            self.flush_audit(vec![make_portfolio_archived_event(
+                project, name, variant, &archived,
+            )])
+            .await;
+        }
+        Ok(())
+    }
+
     async fn acquire_cohort(&self, req: AcquireRequest) -> Result<Cohort, PlannerError> {
         let AcquireRequest {
             plan_id,
@@ -941,7 +1031,7 @@ impl Planner for BasicCpmPlanner {
         // that's what gives us atomicity against concurrent acquirers,
         // including acquirers in other OS processes.
         let mut audit_buf: Vec<AuditEvent> = Vec::new();
-        let cohort = self.store.mutate_plan(&plan_id, |state| {
+        let cohort = self.store.mutate_executable_plan(&plan_id, |state| {
             // 1. Reap expired locks, emitting expiry events.
             let reaped = state.reap_expired(now);
             for lock in &reaped {
@@ -1227,7 +1317,7 @@ impl Planner for BasicCpmPlanner {
         let deliverable_id = deliverable_id.as_str();
         let caller_id = &caller_id;
         let mut audit_buf: Vec<AuditEvent> = Vec::new();
-        self.store.mutate_plan(&plan_id, |state| {
+        self.store.mutate_executable_plan(&plan_id, |state| {
             // Deliverable existence.
             if !state
                 .graph
@@ -1402,7 +1492,7 @@ impl Planner for BasicCpmPlanner {
             + chrono::Duration::from_std(self.effective_ttl(ttl))
                 .expect("INVARIANT: planner TTL fits in chrono::Duration");
 
-        self.store.mutate_plan(&plan_id, |state| {
+        self.store.mutate_executable_plan(&plan_id, |state| {
             let lock =
                 state
                     .locks
@@ -1559,7 +1649,7 @@ impl Planner for BasicCpmPlanner {
         let plan_id = req.plan_id.clone();
         let deliverable_id = req.deliverable_id.as_str();
         let now = self.now();
-        self.store.mutate_plan(&plan_id, |state| {
+        self.store.mutate_executable_plan(&plan_id, |state| {
             if !state
                 .graph
                 .deliverables
@@ -1639,7 +1729,7 @@ impl Planner for BasicCpmPlanner {
         let deliverable_id = deliverable_id.as_str();
         let reason = reason.as_str();
         let mut audit_buf: Vec<AuditEvent> = Vec::new();
-        self.store.mutate_plan(&plan_id, |state| {
+        self.store.mutate_executable_plan(&plan_id, |state| {
             if !state
                 .graph
                 .deliverables

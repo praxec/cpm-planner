@@ -16,17 +16,27 @@
 //! Revision numbering: a variant is created at revision 1. A legacy
 //! (unnamed) plan has no `revisions` rows until its first revision, which
 //! backfills revision 1 with the original graph.
+//!
+//! Selection: exactly one variant per line is selected, and only it is
+//! executable ([`ensure_executable`], checked inside the execution
+//! operation's own transaction). Plans without a `variants` row (unnamed or
+//! legacy) are always executable. Archived variants and lines stay readable
+//! but refuse sync and selection.
 
 use chrono::{DateTime, Utc};
 use rusqlite::{OptionalExtension, Transaction, params};
 
-use crate::locks::PlanState;
+use std::collections::HashMap;
+
+use crate::locks::{PlanState, rederive_status, release_file_claims};
 use crate::plan::{
-    DeliverableStatus, LockInfo, PlanGraph, PlanId, PlanLineSummary, PlannerError, SyncRequest,
-    VariantSummary,
+    Deliverable, DeliverableStatus, LockInfo, PlanGraph, PlanId, PlanLineSummary, PlannerError,
+    SelectOutcome, SyncRequest, VariantSummary,
 };
-use crate::plan_store::{backend, insert_plan, load_plan_state, replace_plan_state};
-use crate::planner::{all_complete, hash_graph};
+use crate::plan_store::{
+    backend, insert_plan, load_plan_state, replace_plan_state, save_plan_state,
+};
+use crate::planner::{all_complete, canonical_deliverable, hash_graph};
 use crate::revise::{RevisionDiff, plan_revision};
 
 /// A committed revision, with what the planner needs to audit it.
@@ -55,6 +65,7 @@ pub(crate) enum Synced {
 struct VariantRow {
     plan_id: PlanId,
     head_revision: u32,
+    archived: bool,
 }
 
 fn find_variant(
@@ -62,13 +73,14 @@ fn find_variant(
     req: &SyncRequest,
 ) -> Result<Option<VariantRow>, PlannerError> {
     tx.query_row(
-        "SELECT plan_id, head_revision FROM variants
+        "SELECT plan_id, head_revision, archived FROM variants
          WHERE project = ?1 AND name = ?2 AND variant = ?3",
         params![req.project, req.name, req.variant],
         |r| {
             Ok(VariantRow {
                 plan_id: PlanId(r.get(0)?),
                 head_revision: r.get(1)?,
+                archived: r.get(2)?,
             })
         },
     )
@@ -135,9 +147,15 @@ pub(crate) fn sync(
         .content_hash
         .clone()
         .unwrap_or_else(|| graph_hash.to_string());
+    if line(tx, &req.project, &req.name)?.is_some_and(|l| l.archived) {
+        return Err(line_archived(&req.name));
+    }
     let Some(row) = find_variant(tx, &req)? else {
         return create(tx, req, &content_hash, now, build);
     };
+    if row.archived {
+        return Err(variant_archived(&req.variant, &req.name));
+    }
 
     // Unchanged means the same canonical graph, whatever the file bytes.
     if stored_graph(tx, &row.plan_id)?.is_some_and(|g| hash_graph(&g) == graph_hash) {
@@ -440,4 +458,372 @@ pub(crate) fn revision_graph(
         plan_id: format!("{} (revision {wanted})", plan_id.0),
     })?;
     Ok((wanted, serde_json::from_str(&json).map_err(backend)?))
+}
+
+// ---------------------------------------------------------------------------
+// Selection, archiving and execution gating
+// ---------------------------------------------------------------------------
+
+/// A `plan_lines` row.
+struct LineRow {
+    selected_variant: Option<String>,
+    archived: bool,
+}
+
+fn line(tx: &Transaction<'_>, project: &str, name: &str) -> Result<Option<LineRow>, PlannerError> {
+    tx.query_row(
+        "SELECT selected_variant, archived FROM plan_lines WHERE project = ?1 AND name = ?2",
+        params![project, name],
+        |r| {
+            Ok(LineRow {
+                selected_variant: r.get(0)?,
+                archived: r.get(1)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(backend)
+}
+
+/// The `variants` row owning `plan_id`: `(project, name, variant, archived)`.
+fn variant_of(
+    tx: &Transaction<'_>,
+    plan_id: &PlanId,
+) -> Result<Option<(String, String, String, bool)>, PlannerError> {
+    tx.query_row(
+        "SELECT project, name, variant, archived FROM variants WHERE plan_id = ?1",
+        params![plan_id.0],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )
+    .optional()
+    .map_err(backend)
+}
+
+fn variant_plan_id(
+    tx: &Transaction<'_>,
+    project: &str,
+    name: &str,
+    variant: &str,
+) -> Result<Option<PlanId>, PlannerError> {
+    tx.query_row(
+        "SELECT plan_id FROM variants WHERE project = ?1 AND name = ?2 AND variant = ?3",
+        params![project, name, variant],
+        |r| Ok(PlanId(r.get(0)?)),
+    )
+    .optional()
+    .map_err(backend)
+}
+
+fn line_archived(name: &str) -> PlannerError {
+    PlannerError::ArchiveRefused {
+        reason: format!("plan line '{name}' is archived"),
+    }
+}
+
+fn variant_archived(variant: &str, name: &str) -> PlannerError {
+    PlannerError::ArchiveRefused {
+        reason: format!("variant '{variant}' of '{name}' is archived"),
+    }
+}
+
+fn line_not_found(project: &str, name: &str) -> PlannerError {
+    PlannerError::PlanNotFound {
+        plan_id: format!("plan line '{name}' in project '{project}'"),
+    }
+}
+
+/// Execution gate: `Err(VariantNotSelected)` when `plan_id` is a named
+/// variant that is not its line's selected variant. A plan without a
+/// `variants` row (unnamed or legacy) always passes, as does an unknown plan
+/// id (the caller reports `PLAN_NOT_FOUND`).
+pub(crate) fn ensure_executable(
+    tx: &Transaction<'_>,
+    plan_id: &PlanId,
+) -> Result<(), PlannerError> {
+    let row: Option<(String, String, Option<String>)> = tx
+        .query_row(
+            "SELECT v.name, v.variant, l.selected_variant FROM variants v
+             LEFT JOIN plan_lines l ON l.project = v.project AND l.name = v.name
+             WHERE v.plan_id = ?1",
+            params![plan_id.0],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(backend)?;
+    match row {
+        Some((name, variant, selected)) if selected.as_deref() != Some(variant.as_str()) => {
+            Err(PlannerError::VariantNotSelected {
+                plan_id: plan_id.0.clone(),
+                name,
+                variant,
+                selected: selected.unwrap_or_else(|| "none".to_string()),
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// A committed selection, with what the planner needs to audit it.
+pub(crate) struct Selected {
+    pub(crate) outcome: SelectOutcome,
+    /// Expired locks reaped (each one a lapse) on the previous variant, then
+    /// on the newly selected one.
+    pub(crate) reaped: Vec<LockInfo>,
+    /// The previous variant's live locks released by a forced selection.
+    pub(crate) released: Vec<LockInfo>,
+    /// `Some(deliverable count)` when the carry-over made the newly selected
+    /// plan all-complete (audited as `plan.completed`).
+    pub(crate) completed: Option<usize>,
+}
+
+/// Select the variant owning `plan_id` (see
+/// [`crate::ports::Planner::select_variant`]). The previous variant's
+/// expired locks are reaped first; its live locks refuse the selection with
+/// `LOCK_HELD` unless `force`, which releases them and re-derives the
+/// released deliverables. Progress then carries over to the new variant:
+/// for every deliverable in both with an identical canonical definition the
+/// counters are copied (the larger of each pair, so no lapse or failure
+/// pressure is lost) and a `Complete` status is copied onto a deliverable
+/// that is not `Complete` and not leased; finally every unleased
+/// `Ready`/`Pending` deliverable of the new variant is re-derived.
+pub(crate) fn select(
+    tx: &Transaction<'_>,
+    plan_id: &PlanId,
+    force: bool,
+    now: DateTime<Utc>,
+) -> Result<Selected, PlannerError> {
+    let (project, name, variant, v_archived) =
+        variant_of(tx, plan_id)?.ok_or_else(|| PlannerError::PlanNotFound {
+            plan_id: format!("{} (not a named plan variant)", plan_id.0),
+        })?;
+    let line_row = line(tx, &project, &name)?.ok_or_else(|| line_not_found(&project, &name))?;
+    if line_row.archived {
+        return Err(line_archived(&name));
+    }
+    if v_archived {
+        return Err(variant_archived(&variant, &name));
+    }
+    let previous = line_row.selected_variant;
+    let mut selected = Selected {
+        outcome: SelectOutcome {
+            plan_id: plan_id.clone(),
+            project: project.clone(),
+            name: name.clone(),
+            variant: variant.clone(),
+            previous: previous.clone(),
+            changed: false,
+            carried: Vec::new(),
+            released_locks: Vec::new(),
+        },
+        reaped: Vec::new(),
+        released: Vec::new(),
+        completed: None,
+    };
+    if previous.as_deref() == Some(variant.as_str()) {
+        return Ok(selected);
+    }
+
+    let old_plan_id = match &previous {
+        Some(prev) => variant_plan_id(tx, &project, &name, prev)?,
+        None => None,
+    };
+    let old_state = match &old_plan_id {
+        Some(old_id) => {
+            let mut old =
+                load_plan_state(tx, old_id)?.ok_or_else(|| PlannerError::PlanNotFound {
+                    plan_id: old_id.0.clone(),
+                })?;
+            selected.reaped = old.reap_expired(now);
+            let mut live: Vec<LockInfo> = old.locks.values().cloned().collect();
+            live.sort_by(|a, b| a.deliverable_id.cmp(&b.deliverable_id));
+            if let Some(lock) = live.first()
+                && !force
+            {
+                return Err(PlannerError::LockHeld {
+                    plan_id: old_id.0.clone(),
+                    deliverable_id: lock.deliverable_id.clone(),
+                    holder: lock.caller_id.0.clone(),
+                });
+            }
+            for lock in &live {
+                release_lock(&mut old, &lock.deliverable_id);
+            }
+            selected.outcome.released_locks =
+                live.iter().map(|l| l.deliverable_id.clone()).collect();
+            selected.released = live;
+            save_plan_state(tx, old_id, &old)?;
+            Some(old)
+        }
+        None => None,
+    };
+
+    let mut new = load_plan_state(tx, plan_id)?.ok_or_else(|| PlannerError::PlanNotFound {
+        plan_id: plan_id.0.clone(),
+    })?;
+    selected.reaped.extend(new.reap_expired(now));
+    let was_complete = all_complete(&new);
+    if let Some(old) = &old_state {
+        selected.outcome.carried = carry_progress(old, &mut new);
+    }
+    selected.completed =
+        (!was_complete && all_complete(&new)).then_some(new.graph.deliverables.len());
+    save_plan_state(tx, plan_id, &new)?;
+
+    tx.execute(
+        "UPDATE plan_lines SET selected_variant = ?1 WHERE project = ?2 AND name = ?3",
+        params![variant, project, name],
+    )
+    .map_err(backend)?;
+    selected.outcome.changed = true;
+    Ok(selected)
+}
+
+/// Drop `deliverable_id`'s lock and file claims and re-derive its status.
+fn release_lock(state: &mut PlanState, deliverable_id: &str) {
+    state.locks.remove(deliverable_id);
+    if let Some(d) = state
+        .graph
+        .deliverables
+        .iter()
+        .find(|d| d.id == deliverable_id)
+    {
+        release_file_claims(&mut state.file_claims, deliverable_id, &d.owned_files);
+        let status = rederive_status(d, &state.statuses);
+        state.statuses.insert(deliverable_id.to_string(), status);
+    }
+}
+
+/// Copy progress from `old` onto `new` (see [`select`]); returns the sorted
+/// ids whose `Complete` status was carried.
+fn carry_progress(old: &PlanState, new: &mut PlanState) -> Vec<String> {
+    let old_by_id: HashMap<&str, &Deliverable> = old
+        .graph
+        .deliverables
+        .iter()
+        .map(|d| (d.id.as_str(), d))
+        .collect();
+    let mut carried = Vec::new();
+    for d in &new.graph.deliverables {
+        let Some(o) = old_by_id.get(d.id.as_str()) else {
+            continue;
+        };
+        if canonical_deliverable(o) != canonical_deliverable(d) {
+            continue;
+        }
+        let id = d.id.as_str();
+        for (counts, old_count) in [
+            (&mut new.attempt_counts, old.attempt_count(id)),
+            (&mut new.failure_counts, old.failure_count(id)),
+            (&mut new.lapse_counts, old.lapse_count(id)),
+        ] {
+            if old_count > 0 {
+                let c = counts.entry(id.to_string()).or_insert(0);
+                *c = (*c).max(old_count);
+            }
+        }
+        let old_complete = old.statuses.get(id) == Some(&DeliverableStatus::Complete);
+        let new_open = new.statuses.get(id) != Some(&DeliverableStatus::Complete)
+            && !new.locks.contains_key(id);
+        if old_complete && new_open {
+            new.statuses
+                .insert(id.to_string(), DeliverableStatus::Complete);
+            carried.push(id.to_string());
+        }
+    }
+    let rederived: Vec<(String, DeliverableStatus)> = new
+        .graph
+        .deliverables
+        .iter()
+        .filter(|d| {
+            matches!(
+                new.statuses.get(&d.id),
+                Some(DeliverableStatus::Ready | DeliverableStatus::Pending)
+            ) && !new.locks.contains_key(&d.id)
+        })
+        .map(|d| (d.id.clone(), rederive_status(d, &new.statuses)))
+        .collect();
+    new.statuses.extend(rederived);
+    carried.sort();
+    carried
+}
+
+/// A committed archive: the variants (with their plan ids) newly archived.
+pub(crate) struct Archived {
+    pub(crate) variants: Vec<(String, PlanId)>,
+    /// True when the line itself was newly archived.
+    pub(crate) line: bool,
+}
+
+impl Archived {
+    pub(crate) fn changed(&self) -> bool {
+        self.line || !self.variants.is_empty()
+    }
+}
+
+/// Archive the line `(project, name)` with every variant (`variant: None`),
+/// or one variant, which must not be the selected one. Archiving what is
+/// already archived changes nothing.
+pub(crate) fn archive(
+    tx: &Transaction<'_>,
+    project: &str,
+    name: &str,
+    variant: Option<&str>,
+) -> Result<Archived, PlannerError> {
+    let line_row = line(tx, project, name)?.ok_or_else(|| line_not_found(project, name))?;
+    let unarchived = |only: Option<&str>| -> Result<Vec<(String, PlanId)>, PlannerError> {
+        let mut stmt = tx
+            .prepare(
+                "SELECT variant, plan_id FROM variants
+                 WHERE project = ?1 AND name = ?2 AND archived = 0
+                   AND (?3 IS NULL OR variant = ?3)
+                 ORDER BY variant",
+            )
+            .map_err(backend)?;
+        stmt.query_map(params![project, name, only], |r| {
+            Ok((r.get(0)?, PlanId(r.get(1)?)))
+        })
+        .map_err(backend)?
+        .collect::<Result<_, _>>()
+        .map_err(backend)
+    };
+    let archived = match variant {
+        None => {
+            let variants = unarchived(None)?;
+            tx.execute(
+                "UPDATE plan_lines SET archived = 1 WHERE project = ?1 AND name = ?2",
+                params![project, name],
+            )
+            .map_err(backend)?;
+            Archived {
+                variants,
+                line: !line_row.archived,
+            }
+        }
+        Some(v) => {
+            if variant_plan_id(tx, project, name, v)?.is_none() {
+                return Err(PlannerError::PlanNotFound {
+                    plan_id: format!("variant '{v}' of plan line '{name}' in project '{project}'"),
+                });
+            }
+            if line_row.selected_variant.as_deref() == Some(v) {
+                return Err(PlannerError::ArchiveRefused {
+                    reason: format!(
+                        "cannot archive the selected variant '{v}' of '{name}'; select another \
+                         variant first"
+                    ),
+                });
+            }
+            Archived {
+                variants: unarchived(Some(v))?,
+                line: false,
+            }
+        }
+    };
+    tx.execute(
+        "UPDATE variants SET archived = 1
+         WHERE project = ?1 AND name = ?2 AND (?3 IS NULL OR variant = ?3)",
+        params![project, name, variant],
+    )
+    .map_err(backend)?;
+    Ok(archived)
 }

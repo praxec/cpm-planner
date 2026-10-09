@@ -675,6 +675,28 @@ pub struct SyncOutcome {
     pub diff: Option<crate::revise::RevisionDiff>,
 }
 
+/// Result of [`crate::ports::Planner::select_variant`]. Selection does not
+/// change any graph, so this is a dedicated summary rather than a
+/// [`crate::revise::RevisionDiff`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SelectOutcome {
+    pub plan_id: PlanId,
+    pub project: String,
+    pub name: String,
+    /// The variant now selected (the one `plan_id` belongs to).
+    pub variant: String,
+    /// The previously selected variant; `None` when the line had none.
+    pub previous: Option<String>,
+    /// False when `variant` was already selected (a no-op).
+    pub changed: bool,
+    /// Sorted ids whose `Complete` status was copied from the previously
+    /// selected variant (identical canonical definition in both).
+    pub carried: Vec<String>,
+    /// Sorted ids of the previous variant's live locks released by a forced
+    /// selection.
+    pub released_locks: Vec<String>,
+}
+
 /// Snapshot of a held lock. The Planner records one [`LockInfo`] per
 /// acquired deliverable and surfaces them in [`Cohort::locks`] and
 /// [`PlanStatus::locks_held`].
@@ -1043,6 +1065,26 @@ pub enum PlannerError {
     /// one or more resources that scheduled work needs. `missing` is sorted.
     #[error("INVALID_CAPACITIES: no capacity for resources [{}]", missing.join(", "))]
     InvalidCapacities { missing: Vec<String> },
+
+    /// An execution operation (`acquire_cohort`, `heartbeat`, `mark_status`,
+    /// `accept`, `force_release`) targeted a named plan variant that is not
+    /// its line's selected variant. Read and analysis tools are never gated.
+    #[error(
+        "VARIANT_NOT_SELECTED: plan {plan_id} is variant '{variant}' of '{name}'; selected is \
+         '{selected}'"
+    )]
+    VariantNotSelected {
+        plan_id: String,
+        name: String,
+        variant: String,
+        selected: String,
+    },
+
+    /// A portfolio operation was refused because of archiving: archiving the
+    /// selected variant alone, or syncing into / selecting an archived
+    /// variant or line.
+    #[error("ARCHIVE_REFUSED: {reason}")]
+    ArchiveRefused { reason: String },
 
     /// Catch-all for backend failures (DB unavailable, serialization
     /// errors against the persistence layer, etc.). Wraps the underlying

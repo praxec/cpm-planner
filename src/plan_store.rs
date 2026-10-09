@@ -294,15 +294,43 @@ impl SqlitePlanStore {
     /// `BEGIN IMMEDIATE` transaction. An `Err` from `f` rolls the
     /// transaction back, so failed operations never persist partial
     /// mutations.
+    ///
+    /// Ungated; production execution paths use
+    /// [`Self::mutate_executable_plan`].
+    #[cfg(test)]
     pub(crate) fn mutate_plan<R>(
         &self,
         plan_id: &PlanId,
+        f: impl FnOnce(&mut PlanState) -> Result<R, PlannerError>,
+    ) -> Result<R, PlannerError> {
+        self.mutate_plan_inner(plan_id, false, f)
+    }
+
+    /// [`Self::mutate_plan`] for an execution operation: inside the same
+    /// transaction, first refuse a named variant that is not its line's
+    /// selected variant (`VARIANT_NOT_SELECTED`, see
+    /// [`crate::portfolio::ensure_executable`]).
+    pub(crate) fn mutate_executable_plan<R>(
+        &self,
+        plan_id: &PlanId,
+        f: impl FnOnce(&mut PlanState) -> Result<R, PlannerError>,
+    ) -> Result<R, PlannerError> {
+        self.mutate_plan_inner(plan_id, true, f)
+    }
+
+    fn mutate_plan_inner<R>(
+        &self,
+        plan_id: &PlanId,
+        gated: bool,
         f: impl FnOnce(&mut PlanState) -> Result<R, PlannerError>,
     ) -> Result<R, PlannerError> {
         let mut conn = self.lock_conn()?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(backend)?;
+        if gated {
+            crate::portfolio::ensure_executable(&tx, plan_id)?;
+        }
         let mut state =
             load_plan_state(&tx, plan_id)?.ok_or_else(|| PlannerError::PlanNotFound {
                 plan_id: plan_id.0.clone(),
@@ -731,7 +759,7 @@ pub(crate) fn replace_plan_state(
 /// Persist the mutable parts of a [`PlanState`] (statuses + locks). The
 /// graph and cached CPM result are written by [`insert_plan`] and only
 /// replaced by a revision ([`replace_plan_state`]).
-fn save_plan_state(
+pub(crate) fn save_plan_state(
     tx: &Transaction<'_>,
     plan_id: &PlanId,
     state: &PlanState,

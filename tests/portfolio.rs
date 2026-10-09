@@ -1,5 +1,6 @@
 //! Portfolio integration tests: named plan lines and variants (`sync_plan`,
-//! `list_plans`, `revision_graph`) and in-place revision (`revise_plan`).
+//! `list_plans`, `revision_graph`), in-place revision (`revise_plan`), variant
+//! selection, archiving and `VARIANT_NOT_SELECTED` execution gating.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -8,8 +9,9 @@ use std::time::Duration;
 use chrono::{DateTime, TimeZone, Utc};
 use cpm_planner::audit::MemoryAuditSink;
 use cpm_planner::plan::{
-    AcquireRequest, CallerId, Deliverable, DeliverableStatus, MarkStatusRequest, PlanGraph, PlanId,
-    PlannerError, ReviseRequest, SyncRequest,
+    AcceptRequest, AcquireRequest, CallerId, Deliverable, DeliverableStatus, ForceReleaseRequest,
+    HeartbeatRequest, MarkStatusRequest, PlanGraph, PlanId, PlannerError, ReviseRequest,
+    SyncRequest,
 };
 use cpm_planner::ports::Planner;
 use cpm_planner::{BasicCpmPlanner, SqlitePlanStore};
@@ -900,4 +902,504 @@ async fn unnamed_plan_without_dedup_row_regains_it_on_revise() {
         .unwrap();
     let dedup = planner.submit_plan(only_c).await.unwrap();
     assert_eq!(dedup, first);
+}
+
+// ---------------------------------------------------------------------
+// select_variant / archive / VARIANT_NOT_SELECTED gating
+// ---------------------------------------------------------------------
+
+async fn complete_a(planner: &BasicCpmPlanner, plan_id: &PlanId) {
+    acquire_a(planner, plan_id).await;
+    planner
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
+            "a",
+            CallerId("w1".into()),
+            DeliverableStatus::Complete,
+        ))
+        .await
+        .expect("harness: complete a");
+}
+
+async fn status_of(planner: &BasicCpmPlanner, plan_id: &PlanId, id: &str) -> DeliverableStatus {
+    planner
+        .status(plan_id)
+        .await
+        .unwrap()
+        .deliverables
+        .into_iter()
+        .find(|row| row.0 == id)
+        .map(|row| row.1)
+        .expect("harness: deliverable present")
+}
+
+/// `main` (selected, `chain`) and draft `alt` (`chain_plus_c`) of line `web`.
+async fn main_and_alt(planner: &BasicCpmPlanner) -> (PlanId, PlanId) {
+    let main = sync(planner, "web", "main", chain()).await;
+    let alt = sync(planner, "web", "alt", chain_plus_c()).await;
+    (main, alt)
+}
+
+fn acquire_req(plan_id: &PlanId) -> AcquireRequest {
+    AcquireRequest::new(plan_id.clone(), CallerId("w1".into()), 1)
+}
+
+#[tokio::test]
+async fn acquire_on_draft_variant_is_variant_not_selected() {
+    let planner = BasicCpmPlanner::new();
+    let (_, alt) = main_and_alt(&planner).await;
+    let err = planner.acquire_cohort(acquire_req(&alt)).await.unwrap_err();
+    assert!(matches!(err, PlannerError::VariantNotSelected { .. }));
+}
+
+#[tokio::test]
+async fn variant_not_selected_message_names_variant_and_selection() {
+    let planner = BasicCpmPlanner::new();
+    let (_, alt) = main_and_alt(&planner).await;
+    let err = planner.acquire_cohort(acquire_req(&alt)).await.unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "VARIANT_NOT_SELECTED: plan {} is variant 'alt' of 'web'; selected is 'main'",
+            alt.as_str()
+        )
+    );
+}
+
+#[tokio::test]
+async fn mark_status_on_draft_variant_is_variant_not_selected() {
+    let planner = BasicCpmPlanner::new();
+    let (_, alt) = main_and_alt(&planner).await;
+    let err = planner
+        .mark_status(MarkStatusRequest::new(
+            alt,
+            "a",
+            CallerId("w1".into()),
+            DeliverableStatus::Complete,
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PlannerError::VariantNotSelected { .. }));
+}
+
+#[tokio::test]
+async fn heartbeat_on_draft_variant_is_variant_not_selected() {
+    let planner = BasicCpmPlanner::new();
+    let (_, alt) = main_and_alt(&planner).await;
+    let err = planner
+        .heartbeat(HeartbeatRequest::new(alt, "a", CallerId("w1".into())))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PlannerError::VariantNotSelected { .. }));
+}
+
+#[tokio::test]
+async fn accept_on_draft_variant_is_variant_not_selected() {
+    let planner = BasicCpmPlanner::new();
+    let (_, alt) = main_and_alt(&planner).await;
+    let err = planner
+        .accept(AcceptRequest::new(alt, "a", "owner", "looks good"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PlannerError::VariantNotSelected { .. }));
+}
+
+#[tokio::test]
+async fn force_release_on_draft_variant_is_variant_not_selected() {
+    let planner = BasicCpmPlanner::new();
+    let (_, alt) = main_and_alt(&planner).await;
+    let err = planner
+        .force_release(ForceReleaseRequest::new(alt, "a", "ops"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PlannerError::VariantNotSelected { .. }));
+}
+
+#[tokio::test]
+async fn status_of_draft_variant_is_not_gated() {
+    let planner = BasicCpmPlanner::new();
+    let (_, alt) = main_and_alt(&planner).await;
+    assert!(planner.status(&alt).await.is_ok());
+}
+
+#[tokio::test]
+async fn acquire_on_selected_variant_succeeds() {
+    let planner = BasicCpmPlanner::new();
+    let (main, _) = main_and_alt(&planner).await;
+    assert!(planner.acquire_cohort(acquire_req(&main)).await.is_ok());
+}
+
+#[tokio::test]
+async fn unnamed_plans_are_never_gated() {
+    let planner = BasicCpmPlanner::new();
+    main_and_alt(&planner).await;
+    let unnamed = planner.submit_plan(chain_plus_c()).await.unwrap();
+    assert!(planner.acquire_cohort(acquire_req(&unnamed)).await.is_ok());
+}
+
+#[tokio::test]
+async fn acquire_after_select_succeeds() {
+    let planner = BasicCpmPlanner::new();
+    let (_, alt) = main_and_alt(&planner).await;
+    planner.select_variant(&alt, false).await.unwrap();
+    assert!(planner.acquire_cohort(acquire_req(&alt)).await.is_ok());
+}
+
+#[tokio::test]
+async fn select_gates_the_previously_selected_variant() {
+    let planner = BasicCpmPlanner::new();
+    let (main, alt) = main_and_alt(&planner).await;
+    planner.select_variant(&alt, false).await.unwrap();
+    let err = planner
+        .acquire_cohort(acquire_req(&main))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PlannerError::VariantNotSelected { .. }));
+}
+
+#[tokio::test]
+async fn select_marks_variant_selected_in_list() {
+    let planner = BasicCpmPlanner::new();
+    let (_, alt) = main_and_alt(&planner).await;
+    planner.select_variant(&alt, false).await.unwrap();
+    let lines = planner.list_plans(PROJECT, false).await.unwrap();
+    assert_eq!(lines[0].selected_variant.as_deref(), Some("alt"));
+}
+
+#[tokio::test]
+async fn select_carries_complete_status_for_identical_deliverables() {
+    let planner = BasicCpmPlanner::new();
+    let (main, alt) = main_and_alt(&planner).await;
+    complete_a(&planner, &main).await;
+    planner.select_variant(&alt, false).await.unwrap();
+    assert_eq!(
+        status_of(&planner, &alt, "a").await,
+        DeliverableStatus::Complete
+    );
+}
+
+#[tokio::test]
+async fn select_rederives_dependents_of_carried_deliverables() {
+    let planner = BasicCpmPlanner::new();
+    let (main, alt) = main_and_alt(&planner).await;
+    complete_a(&planner, &main).await;
+    planner.select_variant(&alt, false).await.unwrap();
+    assert_eq!(
+        status_of(&planner, &alt, "b").await,
+        DeliverableStatus::Ready
+    );
+}
+
+#[tokio::test]
+async fn select_carries_counters_for_identical_deliverables() {
+    let planner = BasicCpmPlanner::new();
+    let (main, alt) = main_and_alt(&planner).await;
+    complete_a(&planner, &main).await;
+    planner.select_variant(&alt, false).await.unwrap();
+    let rows = planner.status(&alt).await.unwrap().deliverables;
+    let attempts = rows.iter().find(|r| r.0 == "a").map(|r| r.2);
+    assert_eq!(attempts, Some(1));
+}
+
+#[tokio::test]
+async fn select_reports_carried_ids() {
+    let planner = BasicCpmPlanner::new();
+    let (main, alt) = main_and_alt(&planner).await;
+    complete_a(&planner, &main).await;
+    let out = planner.select_variant(&alt, false).await.unwrap();
+    assert_eq!(out.carried, vec!["a".to_string()]);
+}
+
+#[tokio::test]
+async fn select_does_not_carry_status_for_changed_deliverable() {
+    let planner = BasicCpmPlanner::new();
+    let main = sync(&planner, "web", "main", chain()).await;
+    let changed = graph(vec![
+        deliverable("a", &["src/a.rs"], &[], 5.0),
+        deliverable("b", &["src/b.rs"], &["a"], 2.0),
+    ]);
+    let alt = sync(&planner, "web", "alt", changed).await;
+    complete_a(&planner, &main).await;
+    planner.select_variant(&alt, false).await.unwrap();
+    assert_eq!(
+        status_of(&planner, &alt, "a").await,
+        DeliverableStatus::Ready
+    );
+}
+
+#[tokio::test]
+async fn select_refuses_when_old_variant_holds_locks() {
+    let planner = BasicCpmPlanner::new();
+    let (main, alt) = main_and_alt(&planner).await;
+    acquire_a(&planner, &main).await;
+    let err = planner.select_variant(&alt, false).await.unwrap_err();
+    assert!(matches!(err, PlannerError::LockHeld { .. }));
+}
+
+#[tokio::test]
+async fn refused_select_keeps_the_selection() {
+    let planner = BasicCpmPlanner::new();
+    let (main, alt) = main_and_alt(&planner).await;
+    acquire_a(&planner, &main).await;
+    let _ = planner.select_variant(&alt, false).await;
+    let lines = planner.list_plans(PROJECT, false).await.unwrap();
+    assert_eq!(lines[0].selected_variant.as_deref(), Some("main"));
+}
+
+#[tokio::test]
+async fn select_with_force_releases_old_locks() {
+    let planner = BasicCpmPlanner::new();
+    let (main, alt) = main_and_alt(&planner).await;
+    acquire_a(&planner, &main).await;
+    planner.select_variant(&alt, true).await.unwrap();
+    assert!(planner.status(&main).await.unwrap().locks_held.is_empty());
+}
+
+#[tokio::test]
+async fn forced_select_reports_released_locks() {
+    let planner = BasicCpmPlanner::new();
+    let (main, alt) = main_and_alt(&planner).await;
+    acquire_a(&planner, &main).await;
+    let out = planner.select_variant(&alt, true).await.unwrap();
+    assert_eq!(out.released_locks, vec!["a".to_string()]);
+}
+
+#[tokio::test]
+async fn forced_select_emits_released_event() {
+    let (planner, sink) = audited();
+    let (main, alt) = main_and_alt(&planner).await;
+    acquire_a(&planner, &main).await;
+    planner.select_variant(&alt, true).await.unwrap();
+    assert!(
+        sink.event_types()
+            .contains(&"plan.lock.released".to_string())
+    );
+}
+
+#[tokio::test]
+async fn forced_select_returns_released_deliverable_to_ready() {
+    let planner = BasicCpmPlanner::new();
+    let (main, alt) = main_and_alt(&planner).await;
+    acquire_a(&planner, &main).await;
+    planner.select_variant(&alt, true).await.unwrap();
+    assert_eq!(
+        status_of(&planner, &main, "a").await,
+        DeliverableStatus::Ready
+    );
+}
+
+#[tokio::test]
+async fn select_reaps_expired_old_locks_instead_of_refusing() {
+    let start = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let clock = TestClock::at(start);
+    let reader = clock.clone();
+    let planner = BasicCpmPlanner::with_parts(
+        Arc::new(MemoryAuditSink::new()),
+        Duration::from_secs(60),
+        Arc::new(move || *reader.now.lock().unwrap()),
+    );
+    let (main, alt) = main_and_alt(&planner).await;
+    acquire_a(&planner, &main).await;
+    clock.set(start + chrono::Duration::seconds(120));
+    assert!(planner.select_variant(&alt, false).await.is_ok());
+}
+
+#[tokio::test]
+async fn select_counts_reaped_lock_as_a_lapse() {
+    let start = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let clock = TestClock::at(start);
+    let reader = clock.clone();
+    let planner = BasicCpmPlanner::with_parts(
+        Arc::new(MemoryAuditSink::new()),
+        Duration::from_secs(60),
+        Arc::new(move || *reader.now.lock().unwrap()),
+    );
+    let (main, alt) = main_and_alt(&planner).await;
+    acquire_a(&planner, &main).await;
+    clock.set(start + chrono::Duration::seconds(120));
+    planner.select_variant(&alt, false).await.unwrap();
+    let rows = planner.status(&main).await.unwrap().deliverables;
+    let lapses = rows.iter().find(|r| r.0 == "a").map(|r| r.4);
+    assert_eq!(lapses, Some(1));
+}
+
+#[tokio::test]
+async fn select_emits_portfolio_selected_event() {
+    let (planner, sink) = audited();
+    let (_, alt) = main_and_alt(&planner).await;
+    planner.select_variant(&alt, false).await.unwrap();
+    assert!(
+        sink.event_types()
+            .contains(&"plan.portfolio.selected".to_string())
+    );
+}
+
+#[tokio::test]
+async fn selected_event_names_from_and_to() {
+    let (planner, sink) = audited();
+    let (_, alt) = main_and_alt(&planner).await;
+    planner.select_variant(&alt, false).await.unwrap();
+    let event = sink
+        .snapshot()
+        .into_iter()
+        .find(|e| e.event_type == "plan.portfolio.selected")
+        .unwrap();
+    assert_eq!(
+        (&event.payload["from"], &event.payload["to"]),
+        (&serde_json::json!("main"), &serde_json::json!("alt"))
+    );
+}
+
+#[tokio::test]
+async fn selecting_the_selected_variant_is_a_no_op() {
+    let (planner, sink) = audited();
+    let (main, _) = main_and_alt(&planner).await;
+    planner.select_variant(&main, false).await.unwrap();
+    assert!(
+        !sink
+            .event_types()
+            .contains(&"plan.portfolio.selected".to_string())
+    );
+}
+
+#[tokio::test]
+async fn selecting_the_selected_variant_keeps_its_locks() {
+    let planner = BasicCpmPlanner::new();
+    let (main, _) = main_and_alt(&planner).await;
+    acquire_a(&planner, &main).await;
+    planner.select_variant(&main, true).await.unwrap();
+    assert_eq!(planner.status(&main).await.unwrap().locks_held.len(), 1);
+}
+
+#[tokio::test]
+async fn select_of_unnamed_plan_is_plan_not_found() {
+    let planner = BasicCpmPlanner::new();
+    let unnamed = planner.submit_plan(chain()).await.unwrap();
+    let err = planner.select_variant(&unnamed, false).await.unwrap_err();
+    assert!(matches!(err, PlannerError::PlanNotFound { .. }));
+}
+
+#[tokio::test]
+async fn archive_hides_variant_from_list() {
+    let planner = BasicCpmPlanner::new();
+    main_and_alt(&planner).await;
+    planner.archive(PROJECT, "web", Some("alt")).await.unwrap();
+    let lines = planner.list_plans(PROJECT, false).await.unwrap();
+    let variants: Vec<&str> = lines[0]
+        .variants
+        .iter()
+        .map(|v| v.variant.as_str())
+        .collect();
+    assert_eq!(variants, vec!["main"]);
+}
+
+#[tokio::test]
+async fn archived_variant_is_listed_on_request() {
+    let planner = BasicCpmPlanner::new();
+    main_and_alt(&planner).await;
+    planner.archive(PROJECT, "web", Some("alt")).await.unwrap();
+    let lines = planner.list_plans(PROJECT, true).await.unwrap();
+    assert!(lines[0].variants.iter().any(|v| v.archived));
+}
+
+#[tokio::test]
+async fn archived_variant_stays_readable() {
+    let planner = BasicCpmPlanner::new();
+    let (_, alt) = main_and_alt(&planner).await;
+    planner.archive(PROJECT, "web", Some("alt")).await.unwrap();
+    assert!(planner.get_plan(&alt).await.is_ok());
+}
+
+#[tokio::test]
+async fn archiving_selected_variant_alone_is_refused() {
+    let planner = BasicCpmPlanner::new();
+    main_and_alt(&planner).await;
+    let err = planner
+        .archive(PROJECT, "web", Some("main"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "ARCHIVE_REFUSED: cannot archive the selected variant 'main' of 'web'; select another \
+         variant first"
+    );
+}
+
+#[tokio::test]
+async fn archiving_a_line_hides_it_from_list() {
+    let planner = BasicCpmPlanner::new();
+    main_and_alt(&planner).await;
+    planner.archive(PROJECT, "web", None).await.unwrap();
+    assert!(planner.list_plans(PROJECT, false).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn archiving_a_line_archives_every_variant() {
+    let planner = BasicCpmPlanner::new();
+    main_and_alt(&planner).await;
+    planner.archive(PROJECT, "web", None).await.unwrap();
+    let lines = planner.list_plans(PROJECT, true).await.unwrap();
+    assert!(lines[0].variants.iter().all(|v| v.archived));
+}
+
+#[tokio::test]
+async fn archive_of_unknown_variant_is_plan_not_found() {
+    let planner = BasicCpmPlanner::new();
+    main_and_alt(&planner).await;
+    let err = planner
+        .archive(PROJECT, "web", Some("nope"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PlannerError::PlanNotFound { .. }));
+}
+
+#[tokio::test]
+async fn archive_of_unknown_line_is_plan_not_found() {
+    let planner = BasicCpmPlanner::new();
+    let err = planner.archive(PROJECT, "nope", None).await.unwrap_err();
+    assert!(matches!(err, PlannerError::PlanNotFound { .. }));
+}
+
+#[tokio::test]
+async fn archive_emits_portfolio_archived_event() {
+    let (planner, sink) = audited();
+    main_and_alt(&planner).await;
+    planner.archive(PROJECT, "web", Some("alt")).await.unwrap();
+    assert!(
+        sink.event_types()
+            .contains(&"plan.portfolio.archived".to_string())
+    );
+}
+
+#[tokio::test]
+async fn sync_into_archived_variant_is_refused() {
+    let planner = BasicCpmPlanner::new();
+    main_and_alt(&planner).await;
+    planner.archive(PROJECT, "web", Some("alt")).await.unwrap();
+    let err = planner
+        .sync_plan(sync_req("web", "alt", chain()))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PlannerError::ArchiveRefused { .. }));
+}
+
+#[tokio::test]
+async fn sync_new_variant_into_archived_line_is_refused() {
+    let planner = BasicCpmPlanner::new();
+    main_and_alt(&planner).await;
+    planner.archive(PROJECT, "web", None).await.unwrap();
+    let err = planner
+        .sync_plan(sync_req("web", "third", chain()))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PlannerError::ArchiveRefused { .. }));
+}
+
+#[tokio::test]
+async fn select_of_archived_variant_is_refused() {
+    let planner = BasicCpmPlanner::new();
+    let (_, alt) = main_and_alt(&planner).await;
+    planner.archive(PROJECT, "web", Some("alt")).await.unwrap();
+    let err = planner.select_variant(&alt, false).await.unwrap_err();
+    assert!(matches!(err, PlannerError::ArchiveRefused { .. }));
 }
