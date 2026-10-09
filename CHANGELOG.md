@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Prerequisites may be objects `{id, consumes?, kind?: artifact|interface, lag_hours?}` (#21).
 - `duration_hours` (calendar time) per deliverable and `lag_hours` per prerequisite edge drive the schedule; effort stays the cost basis (#27).
 - `milestone: true` deliverables; `plan.status` reports per-milestone critical path and hours (#22).
+- `owned_files` entries may be `{path, mode: "append"}`; append claims may be co-leased and are reported in the cohort's `shared_paths` (#28).
 
 ### Fixed
 
@@ -46,6 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Completing a deliverable without a lease now requires its prerequisites to be complete and is audited.
 - `plan.acquire_cohort` no longer returns the `LAPSE_LIMIT` error; lapse-limited deliverables appear in `blocked[]` with code `LAPSE_LIMIT` and the response sets `needs_operator: true` (drivers matching on the error must read `blocked`).
 - Library: `Deliverable.prerequisites` is `Vec<Prerequisite>`.
+- Library: `Deliverable.owned_files` is `Vec<OwnedFile>`; `Cohort` gains `shared_paths`.
 - Library: `Planner` gains required method `accept`; `Cohort` gains public field `blocked`; `PlannerError` gains `PrerequisitesIncomplete` (breaks exhaustive matches); new `DEFAULT_MAX_TTL` / `BasicCpmPlanner::with_max_ttl`.
 - Library: `Planner` methods `acquire_cohort`, `mark_status`, `heartbeat`,
   `force_release` take request structs (`AcquireRequest`, `MarkStatusRequest`,

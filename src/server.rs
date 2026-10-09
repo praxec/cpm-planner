@@ -233,7 +233,13 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                                     "type": "object",
                                     "properties": {
                                         "id":                    { "type": "string" },
-                                        "owned_files":           { "type": "array", "items": { "type": "string" } },
+                                        "owned_files":           { "type": "array", "description": "Each item is a path string (exclusive) or an object {path, mode?: exclusive|append}. Append claims on the same path may be leased together.", "items": { "oneOf": [
+                                            { "type": "string" },
+                                            { "type": "object", "properties": {
+                                                "path": { "type": "string" },
+                                                "mode": { "type": "string", "enum": ["exclusive", "append"] }
+                                            }, "required": ["path"] }
+                                        ] } },
                                         "prerequisites":         { "type": "array", "description": "Each item is a deliverable id string, or an object {id, consumes?, kind?: artifact|interface, lag_hours?}.", "items": { "oneOf": [
                                             { "type": "string" },
                                             { "type": "object", "properties": {
@@ -769,7 +775,7 @@ fn instructions() -> &'static str {
 Tools (eight total, all `plan.<verb>`):
   plan.submit          — submit a PlanGraph, get a plan_id (idempotent on identical graphs)
                         a prerequisite is an id string or {id, consumes?, kind?: artifact|interface, lag_hours?}; a deliverable's duration_hours (calendar time, default = estimated_effort_hours) and lag_hours (minimum wait after a prerequisite finishes) drive the schedule
-  plan.acquire_cohort  — atomically acquire ready, file-disjoint deliverables
+  plan.acquire_cohort  — atomically acquire ready, file-disjoint deliverables (an owned_files entry may be {path, mode: "append"}: append claims on one path may be co-leased and are listed in the response's shared_paths; exclusive claims never overlap anything)
   plan.heartbeat       — refresh a held lock's TTL
   plan.mark_status     — set a deliverable's status (Complete/Failed releases the lock); lockless Complete requires complete prerequisites (PREREQUISITES_INCOMPLETE) and is audited
   plan.status          — read-only snapshot ([id, status, attempt_count, failure_count, lapse_count] rows, critical_path (one real chain, always __start__ to __finish__), critical_ids, per-deliverable schedule (es/ef/ls/lf/float, hours; synthetic __start__/__finish__ endpoint rows have synthetic=true), the ready set ordered by float, plan_complete, milestones (one row per `milestone: true` deliverable, or metadata.milestone == true: id, critical_path from __start__ to it, hours = its earliest finish, complete), held locks). __start__ and __finish__ are reserved deliverable ids (INVALID_GRAPH)

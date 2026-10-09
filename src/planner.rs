@@ -29,16 +29,16 @@
 //! A slow sink therefore never holds up concurrent acquirers.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::audit::{AuditEvent, AuditSink, NullAuditSink};
 use crate::plan::{
     AcceptRequest, AcquireRequest, BlockedDeliverable, CallerId, Cohort, CohortRow, Deliverable,
-    DeliverableStatus, FINISH_ID, ForceReleaseRequest, HeartbeatRequest, LockInfo,
-    MarkStatusRequest, MilestoneRow, PlanDefinition, PlanGraph, PlanId, PlanStatus, PlannerError,
-    START_ID, ScheduleRow,
+    DeliverableStatus, FINISH_ID, FileMode, ForceReleaseRequest, HeartbeatRequest, LockInfo,
+    MarkStatusRequest, MilestoneRow, OwnedFile, PlanDefinition, PlanGraph, PlanId, PlanStatus,
+    PlannerError, START_ID, ScheduleRow,
 };
 use crate::plan_store::SqlitePlanStore;
 use crate::ports::Planner;
@@ -49,7 +49,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::algorithm::CpmAlgorithm;
-use crate::locks::PlanState;
+use crate::locks::{FileClaim, PlanState, add_file_claims, release_file_claims};
 
 /// Default TTL applied to newly acquired locks. Five minutes is the
 /// open-source default called out in SPEC §33 PA3.
@@ -255,12 +255,12 @@ fn hash_graph(graph: &PlanGraph) -> String {
             // Full-key order (serialised form) so duplicate-id edges hash
             // independently of submission order.
             prereqs.sort_by_cached_key(ToString::to_string);
-            let mut files: Vec<String> = d
+            let mut files: Vec<serde_json::Value> = d
                 .owned_files
                 .iter()
-                .map(|p| p.to_string_lossy().into_owned())
+                .map(|f| json!({ "path": f.path().to_string_lossy(), "mode": f.mode() }))
                 .collect();
-            files.sort();
+            files.sort_by_cached_key(ToString::to_string);
             json!({
                 "id": d.id,
                 "owned_files": files,
@@ -368,14 +368,18 @@ fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
     }
 
     // Disjoint owned_files at graph level.
-    let mut file_owner: HashMap<&PathBuf, &str> = HashMap::new();
+    // Append/append sharing is allowed; any exclusive overlap is not.
+    let mut file_owner: HashMap<&Path, (&str, FileMode)> = HashMap::new();
     for d in &graph.deliverables {
         for f in &d.owned_files {
-            if let Some(other) = file_owner.insert(f, d.id.as_str()) {
+            if let Some((other, other_mode)) =
+                file_owner.insert(f.path(), (d.id.as_str(), f.mode()))
+                && !(other_mode == FileMode::Append && f.mode() == FileMode::Append)
+            {
                 return Err(PlannerError::InvalidGraph {
                     reason: format!(
                         "file '{}' is owned by both '{}' and '{}'",
-                        f.display(),
+                        f.path().display(),
                         other,
                         d.id
                     ),
@@ -442,7 +446,7 @@ fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
 // Audit helpers
 // ---------------------------------------------------------------------------
 
-fn make_acquired_event(lock: &LockInfo, owned_files: &[PathBuf]) -> AuditEvent {
+fn make_acquired_event(lock: &LockInfo, owned_files: &[OwnedFile]) -> AuditEvent {
     AuditEvent::new("plan.lock.acquired")
         .with_actor(lock.caller_id.as_str())
         .with_payload(json!({
@@ -528,7 +532,7 @@ fn complete_deliverable(
     if let Some(lock) = state.locks.remove(deliverable_id) {
         // Callers verified the deliverable exists; a held lock implies the
         // graph entry exists.
-        let owned_files: Vec<PathBuf> = match state
+        let owned_files: Vec<OwnedFile> = match state
             .graph
             .deliverables
             .iter()
@@ -540,9 +544,7 @@ fn complete_deliverable(
                  invariant broken"
             ),
         };
-        for f in &owned_files {
-            state.file_to_deliverable.remove(f);
-        }
+        release_file_claims(&mut state.file_claims, deliverable_id, &owned_files);
         audit_buf.push(make_released_event(&lock, release_reason));
     }
 
@@ -914,7 +916,7 @@ impl Planner for BasicCpmPlanner {
             // 5. Greedy fill with file-disjointness check. Requested ids that
             //    are skipped are reported as FILE_CONFLICT / MAX_COUNT.
             let mut selected: Vec<Deliverable> = Vec::new();
-            let mut selected_files: HashSet<PathBuf> = HashSet::new();
+            let mut selected_files: HashMap<PathBuf, FileMode> = HashMap::new();
             for candidate in ready {
                 if selected.len() == max_count {
                     if ids.is_none() {
@@ -928,7 +930,17 @@ impl Planner for BasicCpmPlanner {
                     continue;
                 }
                 let conflict = candidate.owned_files.iter().any(|f| {
-                    selected_files.contains(f) || state.file_to_deliverable.contains_key(f)
+                    let taken = |m: Option<&FileMode>| {
+                        !matches!(
+                            (f.mode(), m),
+                            (_, None) | (FileMode::Append, Some(FileMode::Append))
+                        )
+                    };
+                    taken(selected_files.get(f.path()))
+                        || taken(state.file_claims.get(f.path()).map(|c| match c {
+                            FileClaim::Exclusive(_) => &FileMode::Exclusive,
+                            FileClaim::Append(_) => &FileMode::Append,
+                        }))
                 });
                 if conflict {
                     if ids.is_some() {
@@ -942,7 +954,13 @@ impl Planner for BasicCpmPlanner {
                     continue;
                 }
                 for f in &candidate.owned_files {
-                    selected_files.insert(f.clone());
+                    // Exclusive wins if a path is somehow listed twice.
+                    let e = selected_files
+                        .entry(f.path().to_path_buf())
+                        .or_insert(f.mode());
+                    if f.mode() == FileMode::Exclusive {
+                        *e = FileMode::Exclusive;
+                    }
                 }
                 selected.push(candidate.clone());
             }
@@ -971,9 +989,7 @@ impl Planner for BasicCpmPlanner {
                 // deliverable actually handed to a driver counts as an
                 // attempt (a file-conflict skip above does not).
                 *state.attempt_counts.entry(d.id.clone()).or_insert(0) += 1;
-                for f in &d.owned_files {
-                    state.file_to_deliverable.insert(f.clone(), d.id.clone());
-                }
+                add_file_claims(&mut state.file_claims, &d.id, &d.owned_files);
                 state.locks.insert(d.id.clone(), lock.clone());
                 audit_buf.push(make_acquired_event(&lock, &d.owned_files));
                 rows.push(CohortRow {
@@ -982,10 +998,26 @@ impl Planner for BasicCpmPlanner {
                 });
             }
 
+            // Append paths in this cohort that two or more deliverables hold
+            // (claims were just recorded, so the set includes cohort members).
+            let mut shared_paths: Vec<PathBuf> = rows
+                .iter()
+                .flat_map(|r| r.deliverable.owned_files.iter())
+                .filter(|f| f.mode() == FileMode::Append)
+                .filter(|f| {
+                    matches!(state.file_claims.get(f.path()),
+                        Some(FileClaim::Append(set)) if set.len() >= 2)
+                })
+                .map(|f| f.path().to_path_buf())
+                .collect();
+            shared_paths.sort();
+            shared_paths.dedup();
+
             Ok(Cohort {
                 plan_id: plan_id.clone(),
                 rows,
                 blocked,
+                shared_paths,
             })
         })?;
 
@@ -1087,7 +1119,7 @@ impl Planner for BasicCpmPlanner {
             {
                 // Deliverable existence was verified at the top of
                 // `mark_status`; `.find()` is guaranteed to succeed.
-                let owned_files: Vec<PathBuf> = match state
+                let owned_files: Vec<OwnedFile> = match state
                     .graph
                     .deliverables
                     .iter()
@@ -1099,9 +1131,7 @@ impl Planner for BasicCpmPlanner {
                          graph — invariant broken"
                     ),
                 };
-                for f in &owned_files {
-                    state.file_to_deliverable.remove(f);
-                }
+                release_file_claims(&mut state.file_claims, deliverable_id, &owned_files);
                 audit_buf.push(make_released_event(&lock, "failed"));
             }
 
@@ -1418,7 +1448,7 @@ impl Planner for BasicCpmPlanner {
             if let Some(lock) = state.locks.remove(deliverable_id) {
                 // Deliverable existence was verified above; the held lock
                 // implies the graph entry exists.
-                let owned_files: Vec<PathBuf> = match state
+                let owned_files: Vec<OwnedFile> = match state
                     .graph
                     .deliverables
                     .iter()
@@ -1429,9 +1459,7 @@ impl Planner for BasicCpmPlanner {
                         "deliverable {deliverable_id} present in locks but missing from graph"
                     ),
                 };
-                for f in &owned_files {
-                    state.file_to_deliverable.remove(f);
-                }
+                release_file_claims(&mut state.file_claims, deliverable_id, &owned_files);
                 state
                     .statuses
                     .insert(deliverable_id.to_string(), DeliverableStatus::Ready);

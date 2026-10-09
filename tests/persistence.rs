@@ -92,7 +92,10 @@ impl TestClock {
 fn deliverable(id: &str, files: &[&str], prereqs: &[&str]) -> Deliverable {
     Deliverable {
         id: id.to_string(),
-        owned_files: files.iter().map(PathBuf::from).collect(),
+        owned_files: files
+            .iter()
+            .map(|f| cpm_planner::plan::OwnedFile::from(*f))
+            .collect(),
         prerequisites: prereqs.iter().map(|s| (*s).into()).collect(),
         estimated_effort_hours: Some(1.0),
         metadata: serde_json::Value::Null,
@@ -267,7 +270,7 @@ async fn concurrent_acquires_across_connections_never_overlap() {
             );
             for f in &row.deliverable.owned_files {
                 assert!(
-                    seen_files.insert(f.clone()),
+                    seen_files.insert(f.path().to_path_buf()),
                     "file {f:?} granted to two connections"
                 );
             }

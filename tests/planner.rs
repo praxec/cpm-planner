@@ -3,7 +3,6 @@
 //! Covers the trait surface from outside the crate; for lock-lifecycle
 //! and TTL behaviour see `tests/locks.rs`.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use cpm_planner::BasicCpmPlanner;
@@ -17,7 +16,10 @@ use cpm_planner::ports::Planner;
 fn deliverable(id: &str, files: &[&str], prereqs: &[&str], effort: Option<f32>) -> Deliverable {
     Deliverable {
         id: id.to_string(),
-        owned_files: files.iter().map(PathBuf::from).collect(),
+        owned_files: files
+            .iter()
+            .map(|f| cpm_planner::plan::OwnedFile::from(*f))
+            .collect(),
         prerequisites: prereqs.iter().map(|s| (*s).into()).collect(),
         estimated_effort_hours: effort,
         metadata: serde_json::Value::Null,
@@ -1584,4 +1586,27 @@ async fn submit_rejects_negative_duration() {
     };
     let err = planner.submit_plan(graph).await.unwrap_err();
     assert!(matches!(err, PlannerError::InvalidGraph { .. }));
+}
+
+#[tokio::test]
+async fn path_and_object_file_forms_hash_identically() {
+    let planner = BasicCpmPlanner::new();
+    let plain = deliverable("a", &["x"], &[], Some(1.0));
+    let mut object = deliverable("a", &[], &[], Some(1.0));
+    object.owned_files = vec![serde_json::from_value(serde_json::json!({ "path": "x" })).unwrap()];
+    let first = planner
+        .submit_plan(PlanGraph {
+            deliverables: vec![plain],
+            max_chained_dispatch: None,
+        })
+        .await
+        .unwrap();
+    let second = planner
+        .submit_plan(PlanGraph {
+            deliverables: vec![object],
+            max_chained_dispatch: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(first, second);
 }

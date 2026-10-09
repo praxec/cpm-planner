@@ -34,7 +34,7 @@
 //! - [`crate::ports::Planner::force_release`] is the operator escape hatch.
 //!   Implementations MUST emit an audit event carrying the supplied `reason`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -174,6 +174,63 @@ impl From<String> for Prerequisite {
     }
 }
 
+/// How a deliverable claims a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FileMode {
+    /// Sole writer; conflicts with every other claim on the path.
+    #[default]
+    Exclusive,
+    /// Append-only; may be co-leased with other append claims.
+    Append,
+}
+
+impl FileMode {
+    fn is_exclusive(&self) -> bool {
+        *self == Self::Exclusive
+    }
+}
+
+/// One entry of `owned_files`: a bare path (exclusive) or `{path, mode}`.
+/// A bare path round-trips as a plain string.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum OwnedFile {
+    Path(PathBuf),
+    Claim {
+        path: PathBuf,
+        #[serde(default, skip_serializing_if = "FileMode::is_exclusive")]
+        mode: FileMode,
+    },
+}
+
+impl OwnedFile {
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Path(p) | Self::Claim { path: p, .. } => p,
+        }
+    }
+
+    pub fn mode(&self) -> FileMode {
+        match self {
+            Self::Path(_) => FileMode::Exclusive,
+            Self::Claim { mode, .. } => *mode,
+        }
+    }
+}
+
+impl From<&str> for OwnedFile {
+    fn from(s: &str) -> Self {
+        Self::Path(PathBuf::from(s))
+    }
+}
+
+impl From<PathBuf> for OwnedFile {
+    fn from(p: PathBuf) -> Self {
+        Self::Path(p)
+    }
+}
+
 /// A single unit of work scheduled by the Planner.
 ///
 /// `owned_files` is the load-bearing field for concurrent dispatch: the
@@ -192,7 +249,7 @@ pub struct Deliverable {
     /// Exact file paths the implementer is going to write while completing
     /// this deliverable. Disjointness across this set is the lock-contention
     /// invariant; see [`crate::ports::Planner::acquire_cohort`] semantics.
-    pub owned_files: Vec<PathBuf>,
+    pub owned_files: Vec<OwnedFile>,
 
     /// Ids of other deliverables in the same plan that must reach
     /// [`DeliverableStatus::Complete`] before this one becomes eligible
@@ -489,6 +546,9 @@ pub struct Cohort {
     pub rows: Vec<CohortRow>,
     /// Deliverables the acquire considered but did not lease, and why.
     pub blocked: Vec<BlockedDeliverable>,
+    /// Paths in this cohort claimed in append mode by two or more
+    /// deliverables (in the cohort or against held locks).
+    pub shared_paths: Vec<PathBuf>,
 }
 
 /// A deliverable the acquire considered but did not lease, and why.
@@ -536,6 +596,8 @@ struct FlatCohort {
     locks: Vec<LockInfo>,
     #[serde(default)]
     blocked: Vec<BlockedDeliverable>,
+    #[serde(default)]
+    shared_paths: Vec<PathBuf>,
 }
 
 impl From<Cohort> for FlatCohort {
@@ -551,6 +613,7 @@ impl From<Cohort> for FlatCohort {
             deliverables,
             locks,
             blocked: cohort.blocked,
+            shared_paths: cohort.shared_paths,
         }
     }
 }
@@ -579,6 +642,7 @@ impl TryFrom<FlatCohort> for Cohort {
             plan_id: flat.plan_id,
             rows,
             blocked: flat.blocked,
+            shared_paths: flat.shared_paths,
         })
     }
 }
@@ -810,7 +874,7 @@ mod tests {
         let graph = PlanGraph {
             deliverables: vec![Deliverable {
                 id: "d1".to_string(),
-                owned_files: vec![PathBuf::from("src/foo.rs"), PathBuf::from("src/bar.rs")],
+                owned_files: vec!["src/foo.rs".into(), "src/bar.rs".into()],
                 prerequisites: vec!["d0".into()],
                 estimated_effort_hours: Some(1.5),
                 metadata: serde_json::json!({"description": "smoke test"}),
@@ -828,7 +892,7 @@ mod tests {
         assert_eq!(d.id, "d1");
         assert_eq!(
             d.owned_files,
-            vec![PathBuf::from("src/foo.rs"), PathBuf::from("src/bar.rs")]
+            vec![OwnedFile::from("src/foo.rs"), OwnedFile::from("src/bar.rs")]
         );
         assert_eq!(d.prerequisites, vec![Prerequisite::from("d0")]);
         assert_eq!(d.estimated_effort_hours, Some(1.5));
@@ -866,11 +930,12 @@ mod tests {
         let cohort = Cohort {
             plan_id: plan_id.clone(),
             blocked: vec![],
+            shared_paths: vec![],
             rows: vec![
                 CohortRow {
                     deliverable: Deliverable {
                         id: "d1".to_string(),
-                        owned_files: vec![PathBuf::from("a.rs")],
+                        owned_files: vec!["a.rs".into()],
                         prerequisites: vec![],
                         estimated_effort_hours: Some(1.0),
                         metadata: serde_json::Value::Null,
@@ -888,7 +953,7 @@ mod tests {
                 CohortRow {
                     deliverable: Deliverable {
                         id: "d2".to_string(),
-                        owned_files: vec![PathBuf::from("b.rs")],
+                        owned_files: vec!["b.rs".into()],
                         prerequisites: vec![],
                         estimated_effort_hours: Some(2.0),
                         metadata: serde_json::Value::Null,

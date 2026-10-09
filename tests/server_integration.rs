@@ -471,6 +471,29 @@ async fn plan_get_round_trips_mixed_prerequisite_forms() {
 }
 
 #[tokio::test]
+async fn plan_get_round_trips_mixed_file_forms() {
+    let server = server();
+    let files = json!(["a.rs", { "path": "b.rs", "mode": "append" }, { "path": "c.rs" }]);
+    let submitted = server
+        .dispatch_call(call_args(
+            TOOL_SUBMIT,
+            json!({ "graph": { "deliverables": [
+                { "id": "a", "owned_files": files, "prerequisites": [] }
+            ] } }),
+        ))
+        .await
+        .unwrap();
+    let got = server
+        .dispatch_call(call_args(
+            "plan.get",
+            json!({ "plan_id": submitted["plan_id"] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(got["graph"]["deliverables"][0]["owned_files"], files);
+}
+
+#[tokio::test]
 async fn submit_rejects_unknown_prerequisite_field() {
     let server = server();
     let graph = json!({ "deliverables": [
