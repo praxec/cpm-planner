@@ -1,15 +1,38 @@
 //! Project-root discovery and confined plan-file paths.
 //!
 //! Plan files live at `<root>/.cpm-planner/plans/<name>/<variant>.json`.
-//! Every caller-supplied path is relative to the root and is validated
-//! component by component: no `..`, no absolute paths, no backslashes, no
-//! extra components, slug-checked name/variant, and no symlinks anywhere on
-//! the plan path. Writes are atomic (temp file in the same directory, then
-//! rename) and never follow a symlink.
+//! Caller-supplied paths are relative to the root and validated component by
+//! component: no `..`, no absolute paths, no backslashes, no extra
+//! components, slug-checked name/variant.
+//!
+//! # Guarantees
+//!
+//! All filesystem access walks from a handle on the canonical root through
+//! `.cpm-planner` -> `plans` -> `<name>` using `cap-std` directories opened
+//! with no-follow semantics (`O_NOFOLLOW` on unix; reparse points are not
+//! followed on Windows). A symlink at any step is rejected with
+//! `INVALID_PATH`, and every later operation (create temp file, write, fsync,
+//! rename, read) is performed relative to the opened directory handle, never
+//! by path string, so swapping a parent for a symlink after the check cannot
+//! redirect I/O outside the root. Writes are atomic: a create-new temp file in
+//! the final directory is fsynced and renamed over `<variant>.json`; the
+//! directory is fsynced afterwards. Metadata errors other than NotFound fail
+//! closed.
+//!
+//! # Residual limitations
+//!
+//! - Directory fsync is best-effort on Windows (opening a directory for sync
+//!   is not supported there), so crash-durability of the rename is not
+//!   guaranteed on Windows. Atomicity of the rename is unaffected.
+//! - The canonical root itself is resolved once (symlinks in the root path
+//!   above the project are legitimate and followed at that point).
 
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
+use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, OpenOptions};
 use sha2::{Digest, Sha256};
 
 use crate::plan::{PlanGraph, PlannerError};
@@ -45,28 +68,85 @@ fn backend(err: impl Into<anyhow::Error>) -> PlannerError {
     PlannerError::BackendError(err.into())
 }
 
-/// Validate a `name` / `variant`: `^[a-z0-9][a-z0-9._-]{0,63}$`.
+const WINDOWS_RESERVED: &[&str] = &[
+    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+    "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+];
+
+/// Validate a `name` / `variant`: `^[a-z0-9][a-z0-9._-]{0,62}[a-z0-9]$` (or a
+/// single `[a-z0-9]`), at most 64 chars, and not a Windows reserved device
+/// name (`con`, `nul`, `com1`...; also with an extension, e.g. `con.x`),
+/// enforced on every platform so plans are portable.
 pub fn validate_slug(kind: &str, s: &str) -> Result<(), PlannerError> {
-    let ok = !s.is_empty()
-        && s.len() <= 64
-        && s.bytes().enumerate().all(|(i, b)| {
-            b.is_ascii_lowercase()
-                || b.is_ascii_digit()
-                || (i > 0 && matches!(b, b'.' | b'_' | b'-'))
-        });
-    if ok {
-        Ok(())
-    } else {
-        Err(invalid(format!(
-            "{kind} {s:?} must match ^[a-z0-9][a-z0-9._-]{{0,63}}$"
-        )))
+    let alnum = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    let bytes = s.as_bytes();
+    let shape_ok = !bytes.is_empty()
+        && bytes.len() <= 64
+        && alnum(bytes[0])
+        && alnum(bytes[bytes.len() - 1])
+        && bytes
+            .iter()
+            .all(|&b| alnum(b) || matches!(b, b'.' | b'_' | b'-'));
+    if !shape_ok {
+        return Err(invalid(format!(
+            "{kind} {s:?} must match ^[a-z0-9][a-z0-9._-]{{0,63}}$ and end in [a-z0-9]"
+        )));
+    }
+    let stem = s.split('.').next().unwrap_or(s);
+    if WINDOWS_RESERVED.contains(&stem) {
+        return Err(invalid(format!("{kind} {s:?} is a reserved device name")));
+    }
+    Ok(())
+}
+
+/// Open `name` under `parent` without following symlinks. `Ok(None)` only on
+/// NotFound; a symlink is `INVALID_PATH`; anything else fails closed.
+fn open_subdir(parent: &Dir, name: &str) -> Result<Option<Dir>, PlannerError> {
+    match parent.symlink_metadata(name) {
+        Ok(m) if m.file_type().is_symlink() => {
+            return Err(invalid(format!(
+                "{name} is a symlink; symlinks are not allowed"
+            )));
+        }
+        Ok(m) if !m.is_dir() => {
+            return Err(invalid(format!("{name} is not a directory")));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(backend(e)),
+    }
+    match parent.open_dir_nofollow(name) {
+        Ok(d) => Ok(Some(d)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        // Raced into a symlink / non-directory between lstat and open.
+        Err(e) => Err(invalid(format!(
+            "cannot open {name} without following links: {e}"
+        ))),
     }
 }
 
-fn is_symlink(p: &Path) -> bool {
-    std::fs::symlink_metadata(p)
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false)
+/// Like [`open_subdir`] but creates the directory when absent (mkdirat,
+/// EEXIST ignored) and fsyncs the parent when it was created.
+fn ensure_subdir(parent: &Dir, name: &str) -> Result<Dir, PlannerError> {
+    match parent.create_dir(name) {
+        Ok(()) => sync_dir(parent)?,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(backend(e)),
+    }
+    open_subdir(parent, name)?.ok_or_else(|| invalid(format!("{name} vanished while being opened")))
+}
+
+/// fsync a directory handle. Best-effort (ignored) on non-unix platforms.
+fn sync_dir(dir: &Dir) -> Result<(), PlannerError> {
+    #[cfg(unix)]
+    {
+        dir.open(".").and_then(|f| f.sync_all()).map_err(backend)?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+    Ok(())
 }
 
 impl ProjectRoot {
@@ -154,77 +234,118 @@ impl ProjectRoot {
         Ok(f)
     }
 
-    /// No component of the plan path may be a symlink, and whatever part of
-    /// it exists must canonicalize to a location inside the plans dir.
-    fn check_confined(&self, f: &PlanFileRef) -> Result<(), PlannerError> {
-        let planner = self.root.join(PLANNER_DIR);
-        let plans = planner.join(PLANS_SUBDIR);
-        let dir = plans.join(&f.name);
-        let file = self.abs(f);
-        for p in [&planner, &plans, &dir, &file] {
-            if is_symlink(p) {
-                return Err(invalid(format!(
-                    "{} is a symlink; symlinks are not allowed",
-                    p.display()
-                )));
-            }
-        }
-        for (p, anchor) in [(&planner, &self.root), (&plans, &self.root), (&dir, &plans)] {
-            if let Ok(c) = p.canonicalize() {
-                let anchor_c = anchor.canonicalize().map_err(backend)?;
-                if !c.starts_with(&anchor_c) {
-                    return Err(invalid(format!("{} escapes the project root", p.display())));
+    /// Walk root -> `.cpm-planner` -> `plans` -> (`name`) with no-follow
+    /// opens. `create` makes missing directories. `Ok(None)` when a directory
+    /// is missing (only possible without `create`).
+    fn open_chain(&self, name: Option<&str>, create: bool) -> Result<Option<Dir>, PlannerError> {
+        let root = Dir::open_ambient_dir(&self.root, ambient_authority()).map_err(backend)?;
+        let mut cur = root;
+        let mut parts = vec![PLANNER_DIR, PLANS_SUBDIR];
+        parts.extend(name);
+        for part in parts {
+            cur = if create {
+                ensure_subdir(&cur, part)?
+            } else {
+                match open_subdir(&cur, part)? {
+                    Some(d) => d,
+                    None => return Ok(None),
                 }
+            };
+        }
+        Ok(Some(cur))
+    }
+
+    /// Confinement check: no symlink anywhere on the path (including the
+    /// file itself, if it exists).
+    fn check_confined(&self, f: &PlanFileRef) -> Result<(), PlannerError> {
+        if let Some(dir) = self.open_chain(Some(&f.name), false)? {
+            match dir.symlink_metadata(format!("{}.json", f.variant)) {
+                Ok(m) if m.file_type().is_symlink() => {
+                    return Err(invalid(format!(
+                        "{} is a symlink; symlinks are not allowed",
+                        f.rel_path
+                    )));
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(backend(e)),
             }
         }
         Ok(())
     }
 
-    fn abs(&self, f: &PlanFileRef) -> PathBuf {
-        self.root.join(&f.rel_path)
-    }
-
     /// All plan files, sorted by (name, variant). Non-conforming entries and
-    /// symlinks are ignored.
+    /// symlinks are ignored. Empty only when the plans dir does not exist;
+    /// other errors propagate.
     pub fn list_plan_files(&self) -> Result<Vec<PlanFileRef>, PlannerError> {
-        let plans = self.plans_dir();
         let mut out = Vec::new();
-        let Ok(names) = std::fs::read_dir(&plans) else {
+        let Some(plans) = self.open_chain(None, false)? else {
             return Ok(out);
         };
-        for n in names.flatten() {
+        for n in plans.entries().map_err(backend)? {
+            let n = n.map_err(backend)?;
             let Some(name) = n.file_name().to_str().map(str::to_string) else {
                 continue;
             };
-            if !n.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            if !n.file_type().map_err(backend)?.is_dir() || validate_slug("name", &name).is_err() {
                 continue;
             }
-            let Ok(files) = std::fs::read_dir(n.path()) else {
+            let Some(dir) = open_subdir(&plans, &name)? else {
                 continue;
             };
-            for f in files.flatten() {
+            for f in dir.entries().map_err(backend)? {
+                let f = f.map_err(backend)?;
                 let Some(file) = f.file_name().to_str().map(str::to_string) else {
                     continue;
                 };
                 let Some(variant) = file.strip_suffix(".json") else {
                     continue;
                 };
-                if !f.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                if !f.file_type().map_err(backend)?.is_file()
+                    || validate_slug("variant", variant).is_err()
+                {
                     continue;
                 }
-                if let Ok(r) = self.plan_file(&name, variant) {
-                    out.push(r);
-                }
+                out.push(PlanFileRef {
+                    name: name.clone(),
+                    variant: variant.to_string(),
+                    rel_path: format!("{PLANNER_DIR}/{PLANS_SUBDIR}/{name}/{variant}.json"),
+                });
             }
         }
         out.sort_by(|a, b| (&a.name, &a.variant).cmp(&(&b.name, &b.variant)));
         Ok(out)
     }
 
-    /// Read a plan and the sha256 hex of its exact bytes.
+    /// Read a plan and the sha256 hex of the exact bytes parsed. Directories
+    /// are walked with no-follow handles; the file is opened no-follow
+    /// relative to the final directory handle, fstat'd to be a regular file,
+    /// and read from that same handle.
     pub fn read_graph(&self, f: &PlanFileRef) -> Result<(PlanGraph, String), PlannerError> {
-        let f = self.plan_file(&f.name, &f.variant)?;
-        let bytes = std::fs::read(self.abs(&f)).map_err(backend)?;
+        validate_slug("name", &f.name)?;
+        validate_slug("variant", &f.variant)?;
+        let dir = self
+            .open_chain(Some(&f.name), false)?
+            .ok_or_else(|| invalid(format!("{} does not exist", f.rel_path)))?;
+        let fname = format!("{}.json", f.variant);
+        let mut opts = OpenOptions::new();
+        opts.read(true).follow(FollowSymlinks::No);
+        let mut file = match dir.open_with(&fname, &opts) {
+            Ok(file) => file,
+            Err(e) => {
+                return Err(match dir.symlink_metadata(&fname) {
+                    Ok(m) if m.file_type().is_symlink() => {
+                        invalid(format!("{} is a symlink", f.rel_path))
+                    }
+                    _ => backend(e),
+                });
+            }
+        };
+        if !file.metadata().map_err(backend)?.is_file() {
+            return Err(invalid(format!("{} is not a regular file", f.rel_path)));
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(backend)?;
         let graph = serde_json::from_slice(&bytes).map_err(|e| PlannerError::InvalidGraph {
             reason: format!("{}: {e}", f.rel_path),
         })?;
@@ -232,30 +353,44 @@ impl ProjectRoot {
     }
 
     /// Atomically write pretty JSON plus a trailing newline; returns the
-    /// content hash. Never follows a symlink.
+    /// content hash. All directory steps use no-follow handles and every file
+    /// operation is relative to the final directory handle, so a parent
+    /// swapped for a symlink mid-call cannot redirect the write.
     pub fn write_graph(&self, f: &PlanFileRef, g: &PlanGraph) -> Result<String, PlannerError> {
-        let f = self.plan_file(&f.name, &f.variant)?;
+        validate_slug("name", &f.name)?;
+        validate_slug("variant", &f.variant)?;
         let mut bytes = serde_json::to_vec_pretty(g).map_err(backend)?;
         bytes.push(b'\n');
-        let target = self.abs(&f);
-        let dir = self.plans_dir().join(&f.name);
-        std::fs::create_dir_all(&dir).map_err(backend)?;
-        // Re-check after creating directories (narrows the race window).
-        self.check_confined(&f)?;
-        let tmp = dir.join(format!(".{}.tmp-{}", f.variant, uuid::Uuid::new_v4()));
+        let dir = self
+            .open_chain(Some(&f.name), true)?
+            .ok_or_else(|| invalid("plan directory vanished"))?;
+        let target = format!("{}.json", f.variant);
+        match dir.symlink_metadata(&target) {
+            Ok(m) if m.file_type().is_symlink() => {
+                return Err(invalid(format!(
+                    "{} is a symlink; symlinks are not allowed",
+                    f.rel_path
+                )));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(backend(e)),
+        }
+        let tmp = format!(".{}.tmp-{}", f.variant, uuid::Uuid::new_v4());
         let result = (|| -> std::io::Result<()> {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)?;
+            let mut opts = OpenOptions::new();
+            opts.write(true).create_new(true).follow(FollowSymlinks::No);
+            let mut file = dir.open_with(&tmp, &opts)?;
             file.write_all(&bytes)?;
             file.sync_all()?;
-            std::fs::rename(&tmp, &target)
+            drop(file);
+            dir.rename(&tmp, &dir, &target)
         })();
         if let Err(e) = result {
-            let _ = std::fs::remove_file(&tmp);
+            let _ = dir.remove_file(&tmp);
             return Err(backend(e));
         }
+        sync_dir(&dir)?;
         Ok(hash_hex(&bytes))
     }
 }

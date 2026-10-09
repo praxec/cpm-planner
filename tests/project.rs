@@ -7,13 +7,29 @@ use cpm_planner::project::{ProjectRoot, validate_slug};
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 const ENV: &str = "CPM_PROJECT_ROOT";
 
-fn tmp(label: &str) -> PathBuf {
-    let p = std::env::temp_dir().join(format!("cpm-project-{label}-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&p).unwrap();
-    p.canonicalize().unwrap()
+/// Temp dir removed on drop; derefs to the canonical path.
+struct Tmp {
+    _dir: tempfile::TempDir,
+    path: PathBuf,
 }
 
-fn root_with_git(label: &str) -> (PathBuf, ProjectRoot) {
+impl std::ops::Deref for Tmp {
+    type Target = PathBuf;
+    fn deref(&self) -> &PathBuf {
+        &self.path
+    }
+}
+
+fn tmp(label: &str) -> Tmp {
+    let dir = tempfile::Builder::new()
+        .prefix(&format!("cpm-project-{label}-"))
+        .tempdir()
+        .unwrap();
+    let path = dir.path().canonicalize().unwrap();
+    Tmp { _dir: dir, path }
+}
+
+fn root_with_git(label: &str) -> (Tmp, ProjectRoot) {
     let d = tmp(label);
     std::fs::create_dir_all(d.join(".git")).unwrap();
     let r = ProjectRoot::from_path(&d).unwrap();
@@ -43,38 +59,51 @@ fn is_invalid_path<T: std::fmt::Debug>(r: Result<T, PlannerError>) -> bool {
     matches!(r, Err(PlannerError::InvalidPath { .. }))
 }
 
+struct EnvGuard {
+    old: Option<std::ffi::OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: serialized by ENV_LOCK, which this guard still holds.
+        unsafe {
+            match self.old.take() {
+                Some(v) => std::env::set_var(ENV, v),
+                None => std::env::remove_var(ENV),
+            }
+        }
+    }
+}
+
 fn with_env<R>(value: Option<&Path>, f: impl FnOnce() -> R) -> R {
-    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let old = std::env::var_os(ENV);
-    // SAFETY: serialized by ENV_LOCK; no other test thread touches this var.
+    let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = EnvGuard {
+        old: std::env::var_os(ENV),
+        _lock: lock,
+    };
+    // SAFETY: serialized by ENV_LOCK.
     unsafe {
         match value {
             Some(v) => std::env::set_var(ENV, v),
             None => std::env::remove_var(ENV),
         }
     }
-    let out = f();
-    unsafe {
-        match old {
-            Some(v) => std::env::set_var(ENV, v),
-            None => std::env::remove_var(ENV),
-        }
-    }
-    out
+    f()
 }
 
 #[test]
 fn discover_finds_git_root_from_nested_dir() {
-    let (d, _) = root_with_git("git");
+    let (d, _r) = root_with_git("git");
     let nested = d.join("a/b/c");
     std::fs::create_dir_all(&nested).unwrap();
     let found = with_env(None, || ProjectRoot::discover(&nested));
-    assert_eq!(found.unwrap().root(), d);
+    assert_eq!(found.unwrap().root(), *d);
 }
 
 #[test]
 fn discover_prefers_cpm_planner_dir() {
-    let (d, _) = root_with_git("pref");
+    let (d, _r) = root_with_git("pref");
     let inner = d.join("sub");
     std::fs::create_dir_all(inner.join(".cpm-planner")).unwrap();
     let found = with_env(None, || ProjectRoot::discover(&inner.join(".cpm-planner")));
@@ -83,15 +112,15 @@ fn discover_prefers_cpm_planner_dir() {
 
 #[test]
 fn env_override_wins() {
-    let (d, _) = root_with_git("envgit");
+    let (d, _r) = root_with_git("envgit");
     let other = tmp("envother");
     let found = with_env(Some(&other), || ProjectRoot::discover(&d));
-    assert_eq!(found.unwrap().root(), other);
+    assert_eq!(found.unwrap().root(), *other);
 }
 
 #[test]
 fn resolve_rejects_parent_traversal() {
-    let (_, r) = root_with_git("dots");
+    let (_d, r) = root_with_git("dots");
     assert!(is_invalid_path(
         r.resolve_plan_file(".cpm-planner/plans/../../etc/x.json")
     ));
@@ -110,7 +139,7 @@ fn resolve_rejects_symlink_escaping_root() {
     let (d, r) = root_with_git("sym");
     let outside = tmp("symout");
     std::fs::create_dir_all(d.join(".cpm-planner/plans")).unwrap();
-    std::os::unix::fs::symlink(&outside, d.join(".cpm-planner/plans/evil")).unwrap();
+    std::os::unix::fs::symlink(&*outside, d.join(".cpm-planner/plans/evil")).unwrap();
     assert!(is_invalid_path(
         r.resolve_plan_file(".cpm-planner/plans/evil/x.json")
     ));
@@ -147,13 +176,13 @@ fn write_leaves_symlink_target_untouched() {
 
 #[test]
 fn resolve_rejects_path_outside_plans_dir() {
-    let (_, r) = root_with_git("outside");
+    let (_d, r) = root_with_git("outside");
     assert!(is_invalid_path(r.resolve_plan_file("src/lib.rs")));
 }
 
 #[test]
 fn resolve_rejects_missing_json_extension() {
-    let (_, r) = root_with_git("noext");
+    let (_d, r) = root_with_git("noext");
     assert!(is_invalid_path(
         r.resolve_plan_file(".cpm-planner/plans/a/b.txt")
     ));
@@ -161,7 +190,7 @@ fn resolve_rejects_missing_json_extension() {
 
 #[test]
 fn resolve_rejects_extra_path_components() {
-    let (_, r) = root_with_git("extra");
+    let (_d, r) = root_with_git("extra");
     assert!(is_invalid_path(
         r.resolve_plan_file(".cpm-planner/plans/a/b/c.json")
     ));
@@ -169,7 +198,7 @@ fn resolve_rejects_extra_path_components() {
 
 #[test]
 fn resolve_rejects_missing_variant_component() {
-    let (_, r) = root_with_git("short");
+    let (_d, r) = root_with_git("short");
     assert!(is_invalid_path(
         r.resolve_plan_file(".cpm-planner/plans/a.json")
     ));
@@ -177,7 +206,7 @@ fn resolve_rejects_missing_variant_component() {
 
 #[test]
 fn resolve_rejects_backslash_separators() {
-    let (_, r) = root_with_git("bslash");
+    let (_d, r) = root_with_git("bslash");
     assert!(is_invalid_path(
         r.resolve_plan_file(".cpm-planner\\plans\\a\\b.json")
     ));
@@ -185,7 +214,7 @@ fn resolve_rejects_backslash_separators() {
 
 #[test]
 fn resolve_rejects_nul_byte() {
-    let (_, r) = root_with_git("nul");
+    let (_d, r) = root_with_git("nul");
     assert!(is_invalid_path(
         r.resolve_plan_file(".cpm-planner/plans/a/b\0.json")
     ));
@@ -193,7 +222,7 @@ fn resolve_rejects_nul_byte() {
 
 #[test]
 fn resolve_parses_name_and_variant() {
-    let (_, r) = root_with_git("parse");
+    let (_d, r) = root_with_git("parse");
     let f = r
         .resolve_plan_file(".cpm-planner/plans/my-plan/base.json")
         .unwrap();
@@ -202,7 +231,7 @@ fn resolve_parses_name_and_variant() {
 
 #[test]
 fn plan_file_builds_canonical_rel_path() {
-    let (_, r) = root_with_git("relpath");
+    let (_d, r) = root_with_git("relpath");
     let f = r.plan_file("p", "v1").unwrap();
     assert_eq!(f.rel_path, ".cpm-planner/plans/p/v1.json");
 }
@@ -234,7 +263,7 @@ fn empty_slug_is_rejected() {
 
 #[test]
 fn write_then_read_round_trips_graph() {
-    let (_, r) = root_with_git("rt");
+    let (_d, r) = root_with_git("rt");
     let f = r.plan_file("p", "v").unwrap();
     r.write_graph(&f, &graph()).unwrap();
     let (g, _) = r.read_graph(&f).unwrap();
@@ -243,7 +272,7 @@ fn write_then_read_round_trips_graph() {
 
 #[test]
 fn read_hash_matches_write_hash() {
-    let (_, r) = root_with_git("hash");
+    let (_d, r) = root_with_git("hash");
     let f = r.plan_file("p", "v").unwrap();
     let w = r.write_graph(&f, &graph()).unwrap();
     let (_, h) = r.read_graph(&f).unwrap();
@@ -294,7 +323,7 @@ fn write_leaves_no_temp_files_behind() {
 
 #[test]
 fn list_plan_files_is_sorted() {
-    let (_, r) = root_with_git("list");
+    let (_d, r) = root_with_git("list");
     for (n, v) in [("b", "x"), ("a", "z"), ("a", "y")] {
         let f = r.plan_file(n, v).unwrap();
         r.write_graph(&f, &graph()).unwrap();
@@ -314,7 +343,7 @@ fn list_plan_files_is_sorted() {
 
 #[test]
 fn list_plan_files_is_empty_without_plans_dir() {
-    let (_, r) = root_with_git("nolist");
+    let (_d, r) = root_with_git("nolist");
     assert!(r.list_plan_files().unwrap().is_empty());
 }
 
@@ -348,4 +377,131 @@ fn plan_file_rejects_symlinked_plan_file() {
     std::fs::create_dir_all(&dir).unwrap();
     std::os::unix::fs::symlink(d.join("elsewhere.json"), dir.join("b.json")).unwrap();
     assert!(is_invalid_path(r.plan_file("a", "b")));
+}
+
+#[test]
+fn invalid_project_root_env_returns_none() {
+    let (d, _r) = root_with_git("badenv");
+    let bogus = d.join("does-not-exist");
+    let found = with_env(Some(&bogus), || ProjectRoot::discover(&d));
+    assert!(found.is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_cpm_planner_dir_is_rejected() {
+    let (d, r) = root_with_git("symplanner");
+    let outside = tmp("symplannerout");
+    std::os::unix::fs::symlink(&*outside, d.join(".cpm-planner")).unwrap();
+    assert!(is_invalid_path(
+        r.write_graph(&forged_ref("a", "b"), &graph())
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_plans_dir_is_rejected() {
+    let (d, r) = root_with_git("symplans");
+    let outside = tmp("symplansout");
+    std::fs::create_dir_all(d.join(".cpm-planner")).unwrap();
+    std::os::unix::fs::symlink(&*outside, d.join(".cpm-planner/plans")).unwrap();
+    assert!(is_invalid_path(
+        r.write_graph(&forged_ref("a", "b"), &graph())
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn write_through_symlinked_plans_dir_creates_nothing_outside() {
+    let (d, r) = root_with_git("symplansnone");
+    let outside = tmp("symplansnoneout");
+    std::fs::create_dir_all(d.join(".cpm-planner")).unwrap();
+    std::os::unix::fs::symlink(&*outside, d.join(".cpm-planner/plans")).unwrap();
+    let _ = r.write_graph(&forged_ref("a", "b"), &graph());
+    assert_eq!(std::fs::read_dir(&*outside).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn read_rejects_symlinked_file() {
+    let (d, r) = root_with_git("readsym");
+    let outside = tmp("readsymout");
+    std::fs::write(outside.join("x.json"), "{}").unwrap();
+    let dir = d.join(".cpm-planner/plans/a");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::os::unix::fs::symlink(outside.join("x.json"), dir.join("b.json")).unwrap();
+    assert!(is_invalid_path(r.read_graph(&forged_ref("a", "b"))));
+}
+
+#[test]
+fn traversal_with_four_components_is_rejected() {
+    let (_d, r) = root_with_git("four");
+    assert!(is_invalid_path(
+        r.resolve_plan_file(".cpm-planner/plans/../x.json")
+    ));
+}
+
+#[test]
+fn trailing_dot_slug_is_rejected() {
+    assert!(is_invalid_path(validate_slug("name", "abc.")));
+}
+
+#[test]
+fn windows_reserved_slug_is_rejected() {
+    assert!(is_invalid_path(validate_slug("name", "con.x")));
+}
+
+#[test]
+fn windows_reserved_com_port_slug_is_rejected() {
+    assert!(is_invalid_path(validate_slug("variant", "com1")));
+}
+
+#[test]
+fn slug_merely_containing_reserved_word_is_accepted() {
+    assert!(validate_slug("name", "console").is_ok());
+}
+
+#[test]
+fn write_is_atomic_and_creates_directories() {
+    let (d, r) = root_with_git("umbrella");
+    let f = r.plan_file("p", "v").unwrap();
+    r.write_graph(&f, &graph()).unwrap();
+    let names: Vec<_> = std::fs::read_dir(d.join(".cpm-planner/plans/p"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(names, vec!["v.json".to_string()]);
+}
+
+#[cfg(unix)]
+#[test]
+fn concurrent_parent_swap_never_writes_outside_root() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (d, r) = root_with_git("race");
+    let outside = tmp("raceout");
+    let done = Arc::new(AtomicBool::new(false));
+    let swapper = {
+        let (d, outside, done) = (d.path.clone(), outside.path.clone(), done.clone());
+        std::thread::spawn(move || {
+            let planner = d.join(".cpm-planner");
+            for _ in 0..500 {
+                let _ = std::fs::remove_file(&planner);
+                let _ = std::fs::remove_dir_all(&planner);
+                let _ = std::os::unix::fs::symlink(&*outside, &planner);
+                std::thread::yield_now();
+                let _ = std::fs::remove_file(&planner);
+                let _ = std::fs::create_dir_all(planner.join("plans"));
+                std::thread::yield_now();
+            }
+            done.store(true, Ordering::SeqCst);
+        })
+    };
+    let f = forged_ref("a", "v");
+    let g = graph();
+    while !done.load(Ordering::SeqCst) {
+        let _ = r.write_graph(&f, &g);
+    }
+    swapper.join().unwrap();
+    assert_eq!(std::fs::read_dir(&*outside).unwrap().count(), 0);
 }
