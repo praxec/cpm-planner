@@ -35,8 +35,9 @@ use std::time::Duration;
 
 use crate::audit::{AuditEvent, AuditSink, NullAuditSink};
 use crate::plan::{
-    CallerId, Cohort, CohortRow, Deliverable, DeliverableStatus, LockInfo, PlanDefinition,
-    PlanGraph, PlanId, PlanStatus, PlannerError, ScheduleRow,
+    AcquireRequest, Cohort, CohortRow, Deliverable, DeliverableStatus, ForceReleaseRequest,
+    HeartbeatRequest, LockInfo, MarkStatusRequest, PlanDefinition, PlanGraph, PlanId, PlanStatus,
+    PlannerError, ScheduleRow,
 };
 use crate::plan_store::SqlitePlanStore;
 use crate::ports::Planner;
@@ -484,12 +485,12 @@ impl Planner for BasicCpmPlanner {
         })
     }
 
-    async fn acquire_cohort(
-        &self,
-        plan_id: &PlanId,
-        caller_id: &CallerId,
-        max_count: usize,
-    ) -> Result<Cohort, PlannerError> {
+    async fn acquire_cohort(&self, req: AcquireRequest) -> Result<Cohort, PlannerError> {
+        let AcquireRequest {
+            plan_id,
+            caller_id,
+            max_count,
+        } = req;
         let now = self.now();
         let expires_at = now
             + chrono::Duration::from_std(self.ttl)
@@ -499,7 +500,7 @@ impl Planner for BasicCpmPlanner {
         // that's what gives us atomicity against concurrent acquirers,
         // including acquirers in other OS processes.
         let mut audit_buf: Vec<AuditEvent> = Vec::new();
-        let cohort = self.store.mutate_plan(plan_id, |state| {
+        let cohort = self.store.mutate_plan(&plan_id, |state| {
             // 1. Reap expired locks, emitting expiry events.
             let reaped = state.reap_expired(now);
             for lock in &reaped {
@@ -552,7 +553,7 @@ impl Planner for BasicCpmPlanner {
                 // execution_policy's classification — the deliverable is out.
                 let reason = format!("circuit-break: exceeded {MAX_ATTEMPTS} failed attempts");
                 audit_buf.push(make_circuit_break_event(
-                    plan_id,
+                    &plan_id,
                     &id,
                     failures,
                     FailureClass::Permanent,
@@ -647,15 +648,17 @@ impl Planner for BasicCpmPlanner {
         Ok(cohort)
     }
 
-    async fn mark_status(
-        &self,
-        plan_id: &PlanId,
-        deliverable_id: &str,
-        caller_id: &CallerId,
-        status: DeliverableStatus,
-    ) -> Result<(), PlannerError> {
+    async fn mark_status(&self, req: MarkStatusRequest) -> Result<(), PlannerError> {
+        let MarkStatusRequest {
+            plan_id,
+            deliverable_id,
+            caller_id,
+            status,
+        } = req;
+        let deliverable_id = deliverable_id.as_str();
+        let caller_id = &caller_id;
         let mut audit_buf: Vec<AuditEvent> = Vec::new();
-        self.store.mutate_plan(plan_id, |state| {
+        self.store.mutate_plan(&plan_id, |state| {
             // Deliverable existence.
             if !state
                 .graph
@@ -775,18 +778,20 @@ impl Planner for BasicCpmPlanner {
         Ok(())
     }
 
-    async fn heartbeat(
-        &self,
-        plan_id: &PlanId,
-        deliverable_id: &str,
-        caller_id: &CallerId,
-    ) -> Result<(), PlannerError> {
+    async fn heartbeat(&self, req: HeartbeatRequest) -> Result<(), PlannerError> {
+        let HeartbeatRequest {
+            plan_id,
+            deliverable_id,
+            caller_id,
+        } = req;
+        let deliverable_id = deliverable_id.as_str();
+        let caller_id = &caller_id;
         let now = self.now();
         let expires_at = now
             + chrono::Duration::from_std(self.ttl)
                 .expect("INVARIANT: planner TTL fits in chrono::Duration");
 
-        self.store.mutate_plan(plan_id, |state| {
+        self.store.mutate_plan(&plan_id, |state| {
             let lock =
                 state
                     .locks
@@ -895,14 +900,16 @@ impl Planner for BasicCpmPlanner {
         })
     }
 
-    async fn force_release(
-        &self,
-        plan_id: &PlanId,
-        deliverable_id: &str,
-        reason: &str,
-    ) -> Result<(), PlannerError> {
+    async fn force_release(&self, req: ForceReleaseRequest) -> Result<(), PlannerError> {
+        let ForceReleaseRequest {
+            plan_id,
+            deliverable_id,
+            reason,
+        } = req;
+        let deliverable_id = deliverable_id.as_str();
+        let reason = reason.as_str();
         let mut audit_buf: Vec<AuditEvent> = Vec::new();
-        self.store.mutate_plan(plan_id, |state| {
+        self.store.mutate_plan(&plan_id, |state| {
             if !state
                 .graph
                 .deliverables

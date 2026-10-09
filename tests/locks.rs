@@ -10,7 +10,10 @@ use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
 use cpm_planner::audit::MemoryAuditSink;
-use cpm_planner::plan::{CallerId, Deliverable, DeliverableStatus, PlanGraph, PlannerError};
+use cpm_planner::plan::{
+    AcquireRequest, CallerId, Deliverable, DeliverableStatus, ForceReleaseRequest,
+    MarkStatusRequest, PlanGraph, PlannerError,
+};
 use cpm_planner::ports::Planner;
 use cpm_planner::{BasicCpmPlanner, MAX_ATTEMPTS, MAX_LAPSES};
 
@@ -67,7 +70,11 @@ async fn ttl_expiry_test() {
     };
     let plan_id = planner.submit_plan(graph).await.unwrap();
     let cohort = planner
-        .acquire_cohort(&plan_id, &caller("c1"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("c1").clone(),
+            1,
+        ))
         .await
         .unwrap();
     assert_eq!(cohort.rows[0].deliverable.id, "a");
@@ -77,7 +84,11 @@ async fn ttl_expiry_test() {
     clock.set(Utc.with_ymd_and_hms(2026, 1, 1, 0, 5, 0).unwrap());
 
     let cohort2 = planner
-        .acquire_cohort(&plan_id, &caller("c2"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("c2").clone(),
+            1,
+        ))
         .await
         .unwrap();
     assert_eq!(cohort2.rows.len(), 1);
@@ -121,7 +132,11 @@ async fn environmental_lapses_do_not_trip_the_failure_circuit_breaker() {
     // deliverable to Ready.
     for lapse in 1..=MAX_ATTEMPTS {
         let cohort = planner
-            .acquire_cohort(&plan_id, &caller(&format!("killed-{lapse}")), 1)
+            .acquire_cohort(AcquireRequest::new(
+                plan_id.clone(),
+                caller(&format!("killed-{lapse}")).clone(),
+                1,
+            ))
             .await
             .unwrap();
         assert_eq!(cohort.rows.len(), 1, "lease {lapse} must be granted");
@@ -130,7 +145,11 @@ async fn environmental_lapses_do_not_trip_the_failure_circuit_breaker() {
 
     // The next acquire must STILL lease it: lapses are not failed attempts.
     let cohort = planner
-        .acquire_cohort(&plan_id, &caller("fresh"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("fresh").clone(),
+            1,
+        ))
         .await
         .unwrap();
     assert_eq!(
@@ -172,43 +191,55 @@ async fn poison_deliverable_circuit_breaks_after_max_failed_attempts() {
     // deliverable ready for another try.
     for attempt in 1..=MAX_ATTEMPTS {
         let who = caller(&format!("builder-{attempt}"));
-        let cohort = planner.acquire_cohort(&plan_id, &who, 1).await.unwrap();
+        let cohort = planner
+            .acquire_cohort(AcquireRequest::new(plan_id.clone(), who.clone(), 1))
+            .await
+            .unwrap();
         assert_eq!(cohort.rows.len(), 1, "attempt {attempt} must lease");
         assert_eq!(cohort.rows[0].deliverable.id, "poison");
         planner
-            .mark_status(
-                &plan_id,
+            .mark_status(MarkStatusRequest::new(
+                plan_id.clone(),
                 "poison",
-                &who,
+                who.clone(),
                 DeliverableStatus::Failed {
                     reason: format!("build attempt {attempt} broke"),
                 },
-            )
+            ))
             .await
             .unwrap();
         if attempt < MAX_ATTEMPTS {
             // Orchestrator retry: back into the pool.
             planner
-                .mark_status(&plan_id, "poison", &who, DeliverableStatus::Ready)
+                .mark_status(MarkStatusRequest::new(
+                    plan_id.clone(),
+                    "poison",
+                    who.clone(),
+                    DeliverableStatus::Ready,
+                ))
                 .await
                 .unwrap();
         }
     }
     // Final retry attempt puts it back to Ready with the budget spent.
     planner
-        .mark_status(
-            &plan_id,
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
             "poison",
-            &caller("orchestrator"),
+            caller("orchestrator").clone(),
             DeliverableStatus::Ready,
-        )
+        ))
         .await
         .unwrap();
 
     // The next acquire must NOT lease it a fourth time: it circuit-breaks
     // to Failed and the cohort comes back empty.
     let cohort = planner
-        .acquire_cohort(&plan_id, &caller("fresh"), 10)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("fresh").clone(),
+            10,
+        ))
         .await
         .unwrap();
     assert!(
@@ -266,7 +297,11 @@ async fn poison_deliverable_circuit_breaks_after_max_failed_attempts() {
 
     // And it is never handed out again on later acquires either.
     let again = planner
-        .acquire_cohort(&plan_id, &caller("much-later"), 10)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("much-later").clone(),
+            10,
+        ))
         .await
         .unwrap();
     assert!(again.rows.is_empty(), "failed deliverable re-leased later");
@@ -298,7 +333,11 @@ async fn lapse_limit_stops_releasing_with_stable_prefix_error() {
     // MAX_LAPSES leases, every one lost to the environment.
     for lapse in 1..=MAX_LAPSES {
         let cohort = planner
-            .acquire_cohort(&plan_id, &caller(&format!("killed-{lapse}")), 1)
+            .acquire_cohort(AcquireRequest::new(
+                plan_id.clone(),
+                caller(&format!("killed-{lapse}")).clone(),
+                1,
+            ))
             .await
             .unwrap();
         assert_eq!(cohort.rows.len(), 1, "lease {lapse} must be granted");
@@ -307,7 +346,11 @@ async fn lapse_limit_stops_releasing_with_stable_prefix_error() {
 
     // The next acquire must fail loudly instead of leasing an 11th time.
     let err = planner
-        .acquire_cohort(&plan_id, &caller("fresh"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("fresh").clone(),
+            1,
+        ))
         .await
         .expect_err("lapse limit must stop the re-lease loop");
     assert!(
@@ -341,7 +384,11 @@ async fn lapse_limit_stops_releasing_with_stable_prefix_error() {
 
     // Every subsequent acquire keeps failing the same way (stable, loud).
     let err2 = planner
-        .acquire_cohort(&plan_id, &caller("again"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("again").clone(),
+            1,
+        ))
         .await
         .expect_err("still lapse-limited");
     assert!(err2.to_string().starts_with("LAPSE_LIMIT:"));
@@ -350,26 +397,30 @@ async fn lapse_limit_stops_releasing_with_stable_prefix_error() {
     // explicitly mark the deliverable terminal to unblock the plan
     // (here: give up on it).
     planner
-        .force_release(
-            &plan_id,
+        .force_release(ForceReleaseRequest::new(
+            plan_id.clone(),
             "doomed-env",
             "operator: environment unrecoverable",
-        )
+        ))
         .await
         .unwrap();
     planner
-        .mark_status(
-            &plan_id,
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
             "doomed-env",
-            &caller("operator"),
+            caller("operator").clone(),
             DeliverableStatus::Failed {
                 reason: "operator: environment unrecoverable".to_string(),
             },
-        )
+        ))
         .await
         .unwrap();
     let cohort = planner
-        .acquire_cohort(&plan_id, &caller("after-triage"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("after-triage").clone(),
+            1,
+        ))
         .await
         .expect("plan proceeds after operator triage");
     assert!(cohort.rows.is_empty(), "nothing else to lease");
@@ -387,11 +438,20 @@ async fn completed_deliverable_attempt_count_stops_at_one() {
     let plan_id = planner.submit_plan(graph).await.unwrap();
 
     planner
-        .acquire_cohort(&plan_id, &caller("c1"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("c1").clone(),
+            1,
+        ))
         .await
         .unwrap();
     planner
-        .mark_status(&plan_id, "a", &caller("c1"), DeliverableStatus::Complete)
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
+            "a",
+            caller("c1").clone(),
+            DeliverableStatus::Complete,
+        ))
         .await
         .unwrap();
 
@@ -403,7 +463,11 @@ async fn completed_deliverable_attempt_count_stops_at_one() {
 
     // A further acquire neither re-leases it nor bumps the counter.
     let cohort = planner
-        .acquire_cohort(&plan_id, &caller("c2"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("c2").clone(),
+            1,
+        ))
         .await
         .unwrap();
     assert!(cohort.rows.is_empty());
@@ -427,7 +491,11 @@ async fn unleased_candidate_is_not_charged_an_attempt() {
 
     // max_count = 1: exactly one of the two Ready candidates is leased.
     let cohort = planner
-        .acquire_cohort(&plan_id, &caller("c1"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("c1").clone(),
+            1,
+        ))
         .await
         .unwrap();
     assert_eq!(cohort.rows.len(), 1);
@@ -472,7 +540,11 @@ async fn concurrent_acquire_race_test() {
             let plan_id_c = plan_id.clone();
             handles.push(tokio::spawn(async move {
                 planner_c
-                    .acquire_cohort(&plan_id_c, &caller(&format!("c{c}")), 2)
+                    .acquire_cohort(AcquireRequest::new(
+                        plan_id_c.clone(),
+                        caller(&format!("c{c}")).clone(),
+                        2,
+                    ))
                     .await
                     .expect("acquire_cohort should not error")
             }));
@@ -538,13 +610,22 @@ async fn audit_emission_on_lock_lifecycle() {
 
     // Acquire -> acquired event.
     planner
-        .acquire_cohort(&plan_id, &caller("c1"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("c1").clone(),
+            1,
+        ))
         .await
         .unwrap();
 
     // Complete -> released event.
     planner
-        .mark_status(&plan_id, "a", &caller("c1"), DeliverableStatus::Complete)
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
+            "a",
+            caller("c1").clone(),
+            DeliverableStatus::Complete,
+        ))
         .await
         .unwrap();
 
@@ -575,19 +656,23 @@ async fn failed_status_emits_released_with_reason_failed() {
     };
     let plan_id = planner.submit_plan(graph).await.unwrap();
     planner
-        .acquire_cohort(&plan_id, &caller("c1"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("c1").clone(),
+            1,
+        ))
         .await
         .unwrap();
 
     planner
-        .mark_status(
-            &plan_id,
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
             "a",
-            &caller("c1"),
+            caller("c1").clone(),
             DeliverableStatus::Failed {
                 reason: "compilation broke".to_string(),
             },
-        )
+        ))
         .await
         .unwrap();
 
@@ -609,12 +694,19 @@ async fn force_release_audit_includes_reason() {
     };
     let plan_id = planner.submit_plan(graph).await.unwrap();
     planner
-        .acquire_cohort(&plan_id, &caller("c1"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("c1").clone(),
+            1,
+        ))
         .await
         .unwrap();
 
     let reason = "operator escape: caller wedged";
-    planner.force_release(&plan_id, "a", reason).await.unwrap();
+    planner
+        .force_release(ForceReleaseRequest::new(plan_id.clone(), "a", reason))
+        .await
+        .unwrap();
 
     let evt = audit
         .snapshot()

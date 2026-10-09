@@ -8,7 +8,10 @@ use std::sync::Arc;
 
 use cpm_planner::BasicCpmPlanner;
 use cpm_planner::audit::MemoryAuditSink;
-use cpm_planner::plan::{CallerId, Deliverable, DeliverableStatus, PlanGraph, PlannerError};
+use cpm_planner::plan::{
+    AcquireRequest, CallerId, Deliverable, DeliverableStatus, ForceReleaseRequest,
+    HeartbeatRequest, MarkStatusRequest, PlanGraph, PlannerError,
+};
 use cpm_planner::ports::Planner;
 
 fn deliverable(id: &str, files: &[&str], prereqs: &[&str], effort: Option<f32>) -> Deliverable {
@@ -124,7 +127,11 @@ async fn acquire_cohort_returns_critical_path_first() {
     };
     let plan_id = planner.submit_plan(graph).await.unwrap();
     let cohort = planner
-        .acquire_cohort(&plan_id, &caller("c1"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("c1").clone(),
+            1,
+        ))
         .await
         .unwrap();
     assert_eq!(cohort.rows.len(), 1);
@@ -144,7 +151,11 @@ async fn acquire_cohort_skips_deliverables_with_unmet_prerequisites() {
     };
     let plan_id = planner.submit_plan(graph).await.unwrap();
     let cohort = planner
-        .acquire_cohort(&plan_id, &caller("c1"), 10)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("c1").clone(),
+            10,
+        ))
         .await
         .unwrap();
     // Only root is Ready; leaf is Pending until root completes.
@@ -175,7 +186,11 @@ async fn acquire_cohort_filters_overlapping_files_within_cohort() {
     };
     let plan_id = planner.submit_plan(graph).await.unwrap();
     let cohort = planner
-        .acquire_cohort(&plan_id, &caller("c1"), 5)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("c1").clone(),
+            5,
+        ))
         .await
         .unwrap();
     // All three are file-disjoint, so all three should land in the cohort.
@@ -211,14 +226,22 @@ async fn acquire_cohort_excludes_files_locked_by_other_callers() {
     };
     let plan_id = planner.submit_plan(graph).await.unwrap();
     let c1 = planner
-        .acquire_cohort(&plan_id, &caller("c1"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("c1").clone(),
+            1,
+        ))
         .await
         .unwrap();
     assert_eq!(c1.rows.len(), 1);
     let first_id = c1.rows[0].deliverable.id.clone();
 
     let c2 = planner
-        .acquire_cohort(&plan_id, &caller("c2"), 10)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("c2").clone(),
+            10,
+        ))
         .await
         .unwrap();
     for row in &c2.rows {
@@ -242,13 +265,22 @@ async fn mark_status_complete_releases_lock_and_advances_dependents() {
     };
     let plan_id = planner.submit_plan(graph).await.unwrap();
     let cohort = planner
-        .acquire_cohort(&plan_id, &caller("c1"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("c1").clone(),
+            1,
+        ))
         .await
         .unwrap();
     assert_eq!(cohort.rows[0].deliverable.id, "root");
 
     planner
-        .mark_status(&plan_id, "root", &caller("c1"), DeliverableStatus::Complete)
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
+            "root",
+            caller("c1").clone(),
+            DeliverableStatus::Complete,
+        ))
         .await
         .unwrap();
 
@@ -264,7 +296,11 @@ async fn mark_status_complete_releases_lock_and_advances_dependents() {
 
     // Re-acquire should now offer leaf.
     let next = planner
-        .acquire_cohort(&plan_id, &caller("c1"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("c1").clone(),
+            1,
+        ))
         .await
         .unwrap();
     assert_eq!(next.rows.len(), 1);
@@ -280,12 +316,21 @@ async fn mark_status_with_wrong_caller_id_fails_with_lock_not_held() {
     };
     let plan_id = planner.submit_plan(graph).await.unwrap();
     planner
-        .acquire_cohort(&plan_id, &caller("c1"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("c1").clone(),
+            1,
+        ))
         .await
         .unwrap();
 
     let err = planner
-        .mark_status(&plan_id, "a", &caller("c2"), DeliverableStatus::Complete)
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
+            "a",
+            caller("c2").clone(),
+            DeliverableStatus::Complete,
+        ))
         .await
         .unwrap_err();
     match err {
@@ -309,7 +354,11 @@ async fn heartbeat_extends_ttl() {
     };
     let plan_id = planner.submit_plan(graph).await.unwrap();
     let cohort = planner
-        .acquire_cohort(&plan_id, &caller("c1"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("c1").clone(),
+            1,
+        ))
         .await
         .unwrap();
     let original_expiry = cohort.rows[0].lock.expires_at;
@@ -318,7 +367,11 @@ async fn heartbeat_extends_ttl() {
     tokio::task::yield_now().await;
 
     planner
-        .heartbeat(&plan_id, "a", &caller("c1"))
+        .heartbeat(HeartbeatRequest::new(
+            plan_id.clone(),
+            "a",
+            caller("c1").clone(),
+        ))
         .await
         .unwrap();
 
@@ -339,11 +392,19 @@ async fn heartbeat_with_wrong_caller_fails() {
     };
     let plan_id = planner.submit_plan(graph).await.unwrap();
     planner
-        .acquire_cohort(&plan_id, &caller("c1"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("c1").clone(),
+            1,
+        ))
         .await
         .unwrap();
     let err = planner
-        .heartbeat(&plan_id, "a", &caller("c2"))
+        .heartbeat(HeartbeatRequest::new(
+            plan_id.clone(),
+            "a",
+            caller("c2").clone(),
+        ))
         .await
         .unwrap_err();
     assert!(matches!(err, PlannerError::LockNotHeld { .. }));
@@ -377,12 +438,20 @@ async fn force_release_reverts_to_ready_and_audits_reason() {
     };
     let plan_id = planner.submit_plan(graph).await.unwrap();
     planner
-        .acquire_cohort(&plan_id, &caller("c1"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("c1").clone(),
+            1,
+        ))
         .await
         .unwrap();
 
     planner
-        .force_release(&plan_id, "a", "operator override: caller offline")
+        .force_release(ForceReleaseRequest::new(
+            plan_id.clone(),
+            "a",
+            "operator override: caller offline",
+        ))
         .await
         .unwrap();
 
@@ -457,7 +526,11 @@ async fn status_ready_is_sorted_by_float_ascending() {
 async fn status_ready_excludes_locked_deliverables() {
     let (planner, plan_id) = submit_diamond_with_spare().await;
     planner
-        .acquire_cohort(&plan_id, &caller("w1"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("w1").clone(),
+            1,
+        ))
         .await
         .unwrap();
     let status = planner.status(&plan_id).await.unwrap();
@@ -468,7 +541,11 @@ async fn status_ready_excludes_locked_deliverables() {
 async fn acquire_cohort_prefers_lowest_float() {
     let (planner, plan_id) = submit_diamond_with_spare().await;
     let cohort = planner
-        .acquire_cohort(&plan_id, &caller("w1"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("w1").clone(),
+            1,
+        ))
         .await
         .unwrap();
     let ids: Vec<&str> = cohort

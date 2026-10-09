@@ -30,6 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Library: `Planner` methods `acquire_cohort`, `mark_status`, `heartbeat`,
+  `force_release` take request structs (`AcquireRequest`, `MarkStatusRequest`,
+  `HeartbeatRequest`, `ForceReleaseRequest`).
 - `plan.acquire_cohort` prefers the least-float ready deliverables (then
   earliest start, then id).
 - `plan.submit` rejects negative `estimated_effort_hours` with `INVALID_GRAPH`.

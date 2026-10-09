@@ -45,8 +45,8 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::plan::{
-    CallerId, Cohort, DeliverableStatus, PlanDefinition, PlanGraph, PlanId, PlanStatus,
-    PlannerError,
+    AcquireRequest, CallerId, Cohort, DeliverableStatus, ForceReleaseRequest, HeartbeatRequest,
+    MarkStatusRequest, PlanDefinition, PlanGraph, PlanId, PlanStatus, PlannerError,
 };
 use crate::ports::Planner;
 use rmcp::ErrorData as McpError;
@@ -435,11 +435,11 @@ impl PlanServer {
         let parsed: AcquireCohortArgs = parse_args(args)?;
         let cohort: Cohort = self
             .planner
-            .acquire_cohort(
-                &PlanId(parsed.plan_id),
-                &CallerId(parsed.caller_id),
+            .acquire_cohort(AcquireRequest::new(
+                PlanId(parsed.plan_id),
+                CallerId(parsed.caller_id),
                 parsed.max_count,
-            )
+            ))
             .await
             .map_err(planner_error_to_mcp)?;
         // A SCALAR termination signal for declarative cohort drivers: a
@@ -459,11 +459,11 @@ impl PlanServer {
     async fn handle_heartbeat(&self, args: Value) -> Result<Value, McpError> {
         let parsed: HeartbeatArgs = parse_args(args)?;
         self.planner
-            .heartbeat(
-                &PlanId(parsed.plan_id),
-                &parsed.deliverable_id,
-                &CallerId(parsed.caller_id),
-            )
+            .heartbeat(HeartbeatRequest::new(
+                PlanId(parsed.plan_id),
+                parsed.deliverable_id,
+                CallerId(parsed.caller_id),
+            ))
             .await
             .map_err(planner_error_to_mcp)?;
         to_value(&OkResponse::new())
@@ -472,12 +472,12 @@ impl PlanServer {
     async fn handle_mark_status(&self, args: Value) -> Result<Value, McpError> {
         let parsed: MarkStatusArgs = parse_args(args)?;
         self.planner
-            .mark_status(
-                &PlanId(parsed.plan_id),
-                &parsed.deliverable_id,
-                &CallerId(parsed.caller_id),
+            .mark_status(MarkStatusRequest::new(
+                PlanId(parsed.plan_id),
+                parsed.deliverable_id,
+                CallerId(parsed.caller_id),
                 parsed.status,
-            )
+            ))
             .await
             .map_err(planner_error_to_mcp)?;
         to_value(&OkResponse::new())
@@ -506,11 +506,11 @@ impl PlanServer {
     async fn handle_force_release(&self, args: Value) -> Result<Value, McpError> {
         let parsed: ForceReleaseArgs = parse_args(args)?;
         self.planner
-            .force_release(
-                &PlanId(parsed.plan_id),
-                &parsed.deliverable_id,
-                &parsed.reason,
-            )
+            .force_release(ForceReleaseRequest::new(
+                PlanId(parsed.plan_id),
+                parsed.deliverable_id,
+                parsed.reason,
+            ))
             .await
             .map_err(planner_error_to_mcp)?;
         to_value(&OkResponse::new())

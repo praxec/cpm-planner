@@ -5,8 +5,8 @@
 use async_trait::async_trait;
 
 use crate::plan::{
-    CallerId, Cohort, DeliverableStatus, PlanDefinition, PlanGraph, PlanId, PlanStatus,
-    PlannerError,
+    AcquireRequest, Cohort, ForceReleaseRequest, HeartbeatRequest, MarkStatusRequest,
+    PlanDefinition, PlanGraph, PlanId, PlanStatus, PlannerError,
 };
 
 /// Lock-aware planner.
@@ -39,33 +39,17 @@ pub trait Planner: Send + Sync {
     /// mutually disjoint `owned_files` (within the cohort and against all
     /// currently held locks). The returned [`Cohort`] carries one
     /// [`crate::plan::LockInfo`] per acquired deliverable, in the same order.
-    async fn acquire_cohort(
-        &self,
-        plan_id: &PlanId,
-        caller_id: &CallerId,
-        max_count: usize,
-    ) -> Result<Cohort, PlannerError>;
+    async fn acquire_cohort(&self, req: AcquireRequest) -> Result<Cohort, PlannerError>;
 
     /// Update the lifecycle state of a deliverable. Setting `Complete` or
     /// `Failed` releases the lock; `caller_id` MUST be the lock holder or the
     /// call is rejected with [`PlannerError::LockNotHeld`].
-    async fn mark_status(
-        &self,
-        plan_id: &PlanId,
-        deliverable_id: &str,
-        caller_id: &CallerId,
-        status: DeliverableStatus,
-    ) -> Result<(), PlannerError>;
+    async fn mark_status(&self, req: MarkStatusRequest) -> Result<(), PlannerError>;
 
     /// Refresh the TTL on a held lock. Rejected with
     /// [`PlannerError::LockNotHeld`] if `caller_id` is not the holder, or with
     /// [`PlannerError::LockExpired`] if the lock already lapsed.
-    async fn heartbeat(
-        &self,
-        plan_id: &PlanId,
-        deliverable_id: &str,
-        caller_id: &CallerId,
-    ) -> Result<(), PlannerError>;
+    async fn heartbeat(&self, req: HeartbeatRequest) -> Result<(), PlannerError>;
 
     /// Cheap read-only snapshot. Safe to poll on a timer.
     async fn status(&self, plan_id: &PlanId) -> Result<PlanStatus, PlannerError>;
@@ -76,10 +60,5 @@ pub trait Planner: Send + Sync {
 
     /// Operator escape hatch: forcibly release a lock regardless of holder or
     /// TTL. Implementations MUST emit an audit event carrying `reason`.
-    async fn force_release(
-        &self,
-        plan_id: &PlanId,
-        deliverable_id: &str,
-        reason: &str,
-    ) -> Result<(), PlannerError>;
+    async fn force_release(&self, req: ForceReleaseRequest) -> Result<(), PlannerError>;
 }

@@ -167,6 +167,92 @@ pub enum DeliverableStatus {
     },
 }
 
+/// Request bundle for [`crate::ports::Planner::acquire_cohort`].
+///
+/// Public fields mirror the historical positional arguments so callers can
+/// construct it directly or via [`AcquireRequest::new`].
+#[derive(Debug, Clone)]
+pub struct AcquireRequest {
+    pub plan_id: PlanId,
+    pub caller_id: CallerId,
+    pub max_count: usize,
+}
+
+impl AcquireRequest {
+    pub fn new(plan_id: PlanId, caller_id: CallerId, max_count: usize) -> Self {
+        Self {
+            plan_id,
+            caller_id,
+            max_count,
+        }
+    }
+}
+
+/// Request bundle for [`crate::ports::Planner::mark_status`].
+#[derive(Debug, Clone)]
+pub struct MarkStatusRequest {
+    pub plan_id: PlanId,
+    pub deliverable_id: String,
+    pub caller_id: CallerId,
+    pub status: DeliverableStatus,
+}
+
+impl MarkStatusRequest {
+    pub fn new(
+        plan_id: PlanId,
+        deliverable_id: impl Into<String>,
+        caller_id: CallerId,
+        status: DeliverableStatus,
+    ) -> Self {
+        Self {
+            plan_id,
+            deliverable_id: deliverable_id.into(),
+            caller_id,
+            status,
+        }
+    }
+}
+
+/// Request bundle for [`crate::ports::Planner::heartbeat`].
+#[derive(Debug, Clone)]
+pub struct HeartbeatRequest {
+    pub plan_id: PlanId,
+    pub deliverable_id: String,
+    pub caller_id: CallerId,
+}
+
+impl HeartbeatRequest {
+    pub fn new(plan_id: PlanId, deliverable_id: impl Into<String>, caller_id: CallerId) -> Self {
+        Self {
+            plan_id,
+            deliverable_id: deliverable_id.into(),
+            caller_id,
+        }
+    }
+}
+
+/// Request bundle for [`crate::ports::Planner::force_release`].
+#[derive(Debug, Clone)]
+pub struct ForceReleaseRequest {
+    pub plan_id: PlanId,
+    pub deliverable_id: String,
+    pub reason: String,
+}
+
+impl ForceReleaseRequest {
+    pub fn new(
+        plan_id: PlanId,
+        deliverable_id: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            plan_id,
+            deliverable_id: deliverable_id.into(),
+            reason: reason.into(),
+        }
+    }
+}
+
 /// Snapshot of a held lock. The Planner records one [`LockInfo`] per
 /// acquired deliverable and surfaces them in [`Cohort::locks`] and
 /// [`PlanStatus::locks_held`].
