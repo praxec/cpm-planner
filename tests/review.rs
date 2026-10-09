@@ -30,6 +30,8 @@ struct FakeJudge {
     fail: Option<JudgmentError>,
     host: Option<String>,
     usage: Option<Usage>,
+    model: Option<String>,
+    omit: Vec<(String, Vec<String>)>,
 }
 
 fn instructions(q: &Question) -> &Value {
@@ -154,6 +156,7 @@ impl JudgmentModel for FakeJudge {
         }
         let answers = questions
             .iter()
+            .filter(|(_, q)| !self.omit.contains(&key_of(q)))
             .map(|(id, q)| {
                 let answer = self
                     .script
@@ -165,7 +168,7 @@ impl JudgmentModel for FakeJudge {
             .collect();
         Ok(Decisions {
             answers,
-            model: "fake/jev".to_string(),
+            model: self.model.clone().unwrap_or_else(|| "fake/jev".to_string()),
             usage: self.usage,
         })
     }
@@ -356,17 +359,46 @@ async fn review_of_a_small_graph_is_not_truncated() {
     assert!(!r.truncated);
 }
 
+/// [`large_graph`] plus a 20h free deliverable (a split candidate) and two
+/// unordered deliverables sharing an owner (a missing-dependency pair).
+fn every_kind_graph() -> PlanGraph {
+    let mut g = large_graph();
+    let extra: Vec<Value> = vec![
+        dv("big", &[], 20.0),
+        json!({"id": "own1", "owned_files": [], "prerequisites": [],
+               "estimated_effort_hours": 1.0, "metadata": {"owner": "ana"}}),
+        json!({"id": "own2", "owned_files": [], "prerequisites": [],
+               "estimated_effort_hours": 1.0, "metadata": {"owner": "ana"}}),
+    ];
+    for v in extra {
+        g.deliverables.push(serde_json::from_value(v).unwrap());
+    }
+    g
+}
+
 #[tokio::test]
 async fn review_truncation_keeps_every_candidate_kind() {
     let judge = FakeJudge::new();
     let req = ReviewRequest {
-        max_questions: Some(8),
+        max_questions: Some(10),
         ..ReviewRequest::default()
     };
-    run_with(&large_graph(), &req, &judge).await;
+    run_with(&every_kind_graph(), &req, &judge).await;
     let kinds: std::collections::BTreeSet<String> =
         judge.kinds_sent().into_iter().map(|(k, _)| k).collect();
-    assert!(kinds.contains("false_dependency") && kinds.contains("crash_option"));
+    assert_eq!(
+        kinds,
+        [
+            "crash_option",
+            "false_dependency",
+            "interface_split",
+            "missing_dependency",
+            "split_candidate"
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
+    );
 }
 
 #[tokio::test]
@@ -767,5 +799,220 @@ async fn review_report_serializes_status_in_snake_case() {
     assert_eq!(
         serde_json::to_value(&r).unwrap()["status"],
         json!("review_unavailable")
+    );
+}
+
+// ---------------------------------------------------------------- fix round 1
+
+#[tokio::test]
+async fn lint_errors_without_judge_return_invalid_graph() {
+    let r = review(&cyclic(), &ReviewRequest::default(), Judge::NotConfigured)
+        .await
+        .unwrap();
+    assert_eq!(r.status, ReviewStatus::InvalidGraph);
+}
+
+#[tokio::test]
+async fn lint_errors_with_a_config_error_return_invalid_graph() {
+    let r = review(
+        &cyclic(),
+        &ReviewRequest::default(),
+        Judge::ConfigError("key file ignored: world-readable"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.status, ReviewStatus::InvalidGraph);
+}
+
+#[tokio::test]
+async fn unasked_choice_label_is_ignored() {
+    let judge = FakeJudge::new().with(
+        "crash_option",
+        &["a"],
+        Answer::Choice {
+            choice: "teleport".to_string(),
+            probabilities: BTreeMap::from([("teleport".to_string(), 1.0)]),
+            confidence: 1.0,
+        },
+    );
+    let r = run(&long_head(), &judge).await;
+    assert!(r.findings.is_empty());
+}
+
+#[tokio::test]
+async fn out_of_range_probability_is_ignored() {
+    let judge = FakeJudge::new().noul("false_dependency", &["a", "c"], 1.5);
+    let r = run(&two_chains(), &judge).await;
+    assert!(r.findings.is_empty());
+}
+
+#[tokio::test]
+async fn wrong_answer_type_is_ignored() {
+    let judge = FakeJudge::new().with(
+        "false_dependency",
+        &["a", "c"],
+        Answer::Score {
+            score: 4.0,
+            probabilities: BTreeMap::from([("4".to_string(), 1.0)]),
+            legend: BTreeMap::new(),
+            confidence: 1.0,
+        },
+    );
+    let r = run(&two_chains(), &judge).await;
+    assert!(r.findings.is_empty());
+}
+
+#[tokio::test]
+async fn missing_answer_yields_no_finding() {
+    let mut judge = FakeJudge::new().noul("false_dependency", &["a", "c"], 0.9);
+    judge
+        .omit
+        .push(("false_dependency".to_string(), vec!["a".into(), "c".into()]));
+    let r = run(&two_chains(), &judge).await;
+    assert!(r.findings.is_empty());
+}
+
+fn split_answer(score: f64, probabilities: &[(&str, f64)]) -> Answer {
+    Answer::Score {
+        score,
+        probabilities: probabilities
+            .iter()
+            .map(|(k, p)| (k.to_string(), *p))
+            .collect(),
+        legend: BTreeMap::new(),
+        confidence: 1.0,
+    }
+}
+
+#[tokio::test]
+async fn score_with_unknown_level_keys_is_ignored() {
+    let judge = FakeJudge::new().with(
+        "split_candidate",
+        &["a"],
+        split_answer(4.0, &[("4", 0.5), ("9", 0.5)]),
+    );
+    let r = run(&long_head(), &judge).await;
+    assert!(r.findings.is_empty());
+}
+
+#[tokio::test]
+async fn score_out_of_range_is_ignored() {
+    let judge = FakeJudge::new().with("split_candidate", &["a"], split_answer(5.0, &[("4", 1.0)]));
+    let r = run(&long_head(), &judge).await;
+    assert!(r.findings.is_empty());
+}
+
+#[tokio::test]
+async fn likely_split_is_reported_as_a_finding() {
+    let judge = FakeJudge::new().with("split_candidate", &["a"], split_answer(4.0, &[("4", 1.0)]));
+    let r = run(&long_head(), &judge).await;
+    assert!(
+        r.findings
+            .iter()
+            .any(|f| f.kind == FindingKind::SplitCandidate && f.ids == ["a"])
+    );
+}
+
+#[tokio::test]
+async fn long_model_name_is_truncated() {
+    let judge = FakeJudge {
+        model: Some("m".repeat(200)),
+        ..FakeJudge::new()
+    };
+    let r = run(&two_chains(), &judge).await;
+    assert_eq!(r.model.map(|m| m.chars().count()), Some(64));
+}
+
+#[tokio::test]
+async fn crash_proposal_saves_time_under_resource_leveling() {
+    // a(10, dev) -> c(2, dev); b(1, ops). Leveled 12h; reduce_scope a -> 9h.
+    let with_owner = |mut v: Value, owner: &str| {
+        v["metadata"] = json!({ "owner": owner });
+        v
+    };
+    let g = graph(vec![
+        with_owner(dv("a", &[], 10.0), "dev"),
+        with_owner(dv("b", &[], 1.0), "ops"),
+        with_owner(dv("c", &["a"], 2.0), "dev"),
+    ]);
+    let req = ReviewRequest {
+        capacities: Some(ScheduleRequest {
+            capacities: BTreeMap::from([("dev".to_string(), 1), ("ops".to_string(), 1)]),
+            resource_key: "owner".to_string(),
+            project_buffer_pct: 0.0,
+        }),
+        ..ReviewRequest::default()
+    };
+    let judge = FakeJudge::new().choice(&["a"], "reduce_scope", 0.9);
+    let r = run_with(&g, &req, &judge).await;
+    assert_eq!(r.proposals.first().map(|p| p.hours_saved), Some(3.0));
+}
+
+fn owning(id: &str, path: &str) -> Value {
+    json!({"id": id, "owned_files": [path], "prerequisites": [],
+           "estimated_effort_hours": 1.0})
+}
+
+#[tokio::test]
+async fn nested_directories_signal_missing_dependency() {
+    let judge = FakeJudge::new();
+    run(
+        &graph(vec![
+            owning("x", "src/api/x.rs"),
+            owning("y", "src/api/v2/y.rs"),
+        ]),
+        &judge,
+    )
+    .await;
+    assert!(judge.kinds_sent().contains(&(
+        "missing_dependency".to_string(),
+        vec!["x".into(), "y".into()]
+    )));
+}
+
+#[tokio::test]
+async fn string_prefix_directories_do_not_signal_missing_dependency() {
+    let judge = FakeJudge::new();
+    run(
+        &graph(vec![
+            owning("x", "src/ap/x.rs"),
+            owning("y", "src/api/y.rs"),
+        ]),
+        &judge,
+    )
+    .await;
+    assert!(
+        !judge
+            .kinds_sent()
+            .iter()
+            .any(|(k, _)| k == "missing_dependency")
+    );
+}
+
+#[tokio::test]
+async fn crash_hours_round_to_the_nearest_hundredth() {
+    // 0.7 x 3.3 = 2.31 (f32 arithmetic alone drifts off the hundredth).
+    let g = graph(vec![dv("a", &[], 3.3)]);
+    let judge = FakeJudge::new().choice(&["a"], "reduce_scope", 0.9);
+    let r = run(&g, &judge).await;
+    assert_eq!(
+        r.proposals.first().map(|p| p.edits.clone()),
+        Some(vec![GraphEdit::SetEffort {
+            id: "a".into(),
+            hours: 2.31
+        }])
+    );
+}
+
+#[tokio::test]
+async fn add_capacity_proposal_shortens_duration_not_effort() {
+    let judge = FakeJudge::new().choice(&["a"], "add_capacity", 0.9);
+    let r = run(&long_head(), &judge).await;
+    assert_eq!(
+        r.proposals.first().map(|p| p.edits.clone()),
+        Some(vec![GraphEdit::SetDuration {
+            id: "a".into(),
+            hours: Some(7.0)
+        }])
     );
 }

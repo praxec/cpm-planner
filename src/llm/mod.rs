@@ -84,7 +84,7 @@ impl ApiKey {
 
     /// At most `max_chars` of `text`, safe to show: the WHOLE text is
     /// scrubbed first, then truncated, and a trailing key prefix of
-    /// [`MIN_KEY_FRAGMENT_CHARS`]+ chars (a key cut by the boundary, or a
+    /// `MIN_KEY_FRAGMENT_CHARS` (8)+ chars (a key cut by the boundary, or a
     /// partial key in the input) is dropped.
     pub fn excerpt(&self, text: &str, max_chars: usize) -> String {
         let scrubbed = self.scrub(text);

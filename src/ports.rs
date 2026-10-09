@@ -26,8 +26,8 @@ use crate::revise::RevisionDiff;
 ///   conflicting claims against every currently held lock (exclusive
 ///   conflicts with anything; append/append may share). The implementation MUST lock the returned
 ///   deliverables atomically.
-/// - [`Planner::mark_status`] with [`DeliverableStatus::Complete`] or
-///   [`DeliverableStatus::Failed`] releases the lock. If the supplied
+/// - [`Planner::mark_status`] with [`DeliverableStatus::Complete`](crate::plan::DeliverableStatus::Complete) or
+///   [`DeliverableStatus::Failed`](crate::plan::DeliverableStatus::Failed) releases the lock. If the supplied
 ///   `caller_id` does not match the lock holder, the call returns
 ///   [`PlannerError::LockNotHeld`].
 /// - [`Planner::heartbeat`] refreshes the TTL on a held lock.

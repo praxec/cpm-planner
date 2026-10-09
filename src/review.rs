@@ -7,12 +7,13 @@
 //!    (else [`PlannerError::InvalidGraph`]); `capacities` is checked by the
 //!    resource scheduler when the base plan is simulated.
 //! 2. **Lint** ([`crate::lint::lint`]), always reported.
-//! 3. **Judge availability.** [`Judge::NotConfigured`] returns
+//! 3. **Lint short-circuit.** Any lint `error` finding returns
+//!    `invalid_graph` whatever the judge (configured, missing or
+//!    misconfigured); the judge is never called.
+//! 4. **Judge availability.** [`Judge::NotConfigured`] returns
 //!    `review_unavailable` with [`NO_KEY_REASON`]; [`Judge::ConfigError`]
 //!    returns `review_unavailable` with the caller's reason (cut to
 //!    [`MAX_ERROR_MESSAGE_CHARS`]). No questions are built.
-//! 4. **Lint short-circuit.** Any lint `error` finding returns
-//!    `invalid_graph`; the judge is never called.
 //! 5. **Base simulation** ([`simulate`], leveled when `capacities` is
 //!    given). Its makespan is the "before" of every proposal.
 //! 6. **Candidate generation** (deterministic, see below), then
@@ -40,7 +41,10 @@
 //! The missing-dependency score adds [`MENTION_WEIGHT`] when either
 //! deliverable's `metadata.description` contains the other's id as a token
 //! (whitespace-separated, outer punctuation trimmed), [`SHARED_DIR_WEIGHT`]
-//! when they own files in the same directory, and [`SHARED_OWNER_WEIGHT`]
+//! when they own files sharing a path prefix (one file's parent directory
+//! equals, or is an ancestor of, the other's, compared component-wise so
+//! `src/ap` is not a prefix of `src/api`; top-level files have no
+//! directory), and [`SHARED_OWNER_WEIGHT`]
 //! when their `metadata.owner` strings are equal. Directory and owner groups
 //! larger than [`MAX_SIGNAL_GROUP`] carry no signal (and are not expanded
 //! into pairs), which also bounds the pair count.
@@ -69,20 +73,29 @@
 //! - `crash_option`: the probability of the chosen label, unless it is
 //!   `none`.
 //!
-//! A non-finite or out-of-`[0, 1]` probability, a missing answer or an
-//! answer of the wrong type yields no finding. Findings sort by kind, then
+//! Answers are validated defensively; each of these yields nothing (no
+//! finding, no proposal, nothing echoed): a missing answer, an answer of the
+//! wrong type, a non-finite or out-of-`[0, 1]` probability or confidence, a
+//! Choice whose `choice` or probability keys are not labels the question
+//! asked, and a Score outside `0..=4` or with probability keys other than
+//! `"0"`..`"4"`. The provider's model id is cut to [`MAX_MODEL_CHARS`]. Findings sort by kind, then
 //! ids.
 //!
 //! # Proposals
 //!
 //! - `false_dependency` with probability `>= `[`FALSE_DEPENDENCY_PROPOSAL_P`]
 //!   → `RemoveEdge`, cost `0`.
-//! - `crash_option` choosing `add_capacity` or `reduce_scope` with answer
-//!   confidence `>= `[`CRASH_PROPOSAL_CONFIDENCE`] → the scheduled length
-//!   set to [`CRASH_LENGTH_FACTOR`]` × L` (`SetDuration` when the
-//!   deliverable has `duration_hours`, else `SetEffort`). Cost is `0` for
-//!   `reduce_scope` and [`ADD_CAPACITY_COST_FACTOR`]` × L` added effort
-//!   hours for `add_capacity`. `fast_track` and `none` propose nothing.
+//! - `crash_option` with answer confidence
+//!   `>= `[`CRASH_PROPOSAL_CONFIDENCE`]:
+//!   - `add_capacity` → `SetDuration` to [`CRASH_LENGTH_FACTOR`]` × L`,
+//!     effort unchanged (more hands shorten calendar time, not the work;
+//!     `duration_hours` replaces effort as the scheduled length in CPM,
+//!     leveling and simulate, while effort stays the cost basis). Cost
+//!     [`ADD_CAPACITY_COST_FACTOR`]` × L` hours of coordination overhead.
+//!   - `reduce_scope` → `SetEffort` to [`CRASH_LENGTH_FACTOR`]` × L`
+//!     (`SetDuration` instead when the deliverable has `duration_hours`,
+//!     since effort would not change its scheduled length). Cost `0`.
+//!   - `fast_track` and `none` propose nothing.
 //! - Splits, interface splits and missing dependencies are findings only:
 //!   the calling agent designs those edits.
 //!
@@ -92,14 +105,15 @@
 //! base lint, or when `hours_saved` is below [`MIN_HOURS_SAVED`].
 //! `hours_saved = makespan(before) − makespan(after)`, using the leveled
 //! makespan when capacities are given and the CPM makespan otherwise.
-//! Edit hours, `hours_saved` and `cost` are rounded to [`HOURS_PRECISION`]
-//! hours. `score = hours_saved / max(cost, 1)`; proposals sort by score
+//! Edit hours, `hours_saved` and `cost` are rounded to `1 / `[`HOURS_SCALE`]
+//! hours, computed in f64. `score = hours_saved / max(cost, 1)`; proposals sort by score
 //! descending, then id.
 //!
 //! Output is a pure function of the graph, the request and the judge's
 //! answers, and never contains NaN or infinity.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -156,8 +170,10 @@ pub const MAX_SIGNAL_GROUP: usize = 32;
 pub const MAX_STATE_TEXT_CHARS: usize = 500;
 /// Smallest saving that keeps a proposal, in hours.
 pub const MIN_HOURS_SAVED: f32 = 0.01;
-/// Granularity hours are rounded to in proposals.
-pub const HOURS_PRECISION: f32 = 0.01;
+/// Proposal hours are rounded to `1 / HOURS_SCALE` (0.01 h).
+pub const HOURS_SCALE: f64 = 100.0;
+/// Longest provider-reported model id kept in the report, in chars.
+pub const MAX_MODEL_CHARS: usize = 64;
 
 /// Crash technique labels, as asked.
 const ADD_CAPACITY: &str = "add_capacity";
@@ -326,6 +342,17 @@ pub async fn review(
     let cap = req.max_questions.unwrap_or(MAX_QUESTIONS);
     check_max_questions(cap).map_err(|reason| PlannerError::InvalidGraph { reason })?;
     let lint_report = lint(graph);
+    if lint_report
+        .findings
+        .iter()
+        .any(|f| f.severity == Severity::Error)
+    {
+        return Ok(ReviewReport::new(
+            ReviewStatus::InvalidGraph,
+            Some("lint reported errors; fix them before review".to_string()),
+            lint_report,
+        ));
+    }
 
     let model = match judge {
         Judge::Model(model) => model,
@@ -344,17 +371,6 @@ pub async fn review(
             ));
         }
     };
-    if lint_report
-        .findings
-        .iter()
-        .any(|f| f.severity == Severity::Error)
-    {
-        return Ok(ReviewReport::new(
-            ReviewStatus::InvalidGraph,
-            Some("lint reported errors; fix them before review".to_string()),
-            lint_report,
-        ));
-    }
 
     let sim_req = SimulateRequest {
         schedule: req.capacities.clone(),
@@ -410,7 +426,7 @@ pub async fn review(
             return Ok(report);
         }
     };
-    report.model = Some(decisions.model);
+    report.model = Some(decisions.model.chars().take(MAX_MODEL_CHARS).collect());
     report.usage = decisions.usage.map(sanitize_usage);
 
     let mut drafts = Vec::new();
@@ -748,21 +764,21 @@ impl Context<'_> {
             pairs
         };
         let mut owners: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
-        let mut dirs: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
+        let mut dirs: BTreeMap<PathBuf, BTreeSet<usize>> = BTreeMap::new();
         for (i, d) in ds.iter().enumerate() {
             if let Some(owner) = d.metadata.get("owner").and_then(Value::as_str) {
                 owners.entry(owner.to_string()).or_default().insert(i);
             }
             for f in &d.owned_files {
-                if let Some(dir) = f.path().parent().map(|p| p.to_string_lossy().into_owned())
-                    && !dir.is_empty()
+                if let Some(dir) = f.path().parent()
+                    && dir.parent().is_some()
                 {
-                    dirs.entry(dir).or_default().insert(i);
+                    dirs.entry(dir.to_path_buf()).or_default().insert(i);
                 }
             }
         }
         let owner_pairs = group_pairs(owners);
-        let dir_pairs = group_pairs(dirs);
+        let dir_pairs = prefix_pairs(&dirs, pair);
 
         let mut scores: BTreeMap<(usize, usize), u32> = BTreeMap::new();
         for (pairs, weight) in [
@@ -912,7 +928,10 @@ impl Context<'_> {
                 let d = self.deliverable(id)?;
                 let length = self.length(id);
                 let hours = round_hours(length * CRASH_LENGTH_FACTOR);
-                let edit = if d.duration_hours.is_some() {
+                // add_capacity shortens calendar time, not the work: the
+                // duration replaces effort as the scheduled length while
+                // effort stays the cost basis.
+                let edit = if judged.choice == ADD_CAPACITY || d.duration_hours.is_some() {
                     GraphEdit::SetDuration {
                         id: id.clone(),
                         hours: Some(hours),
@@ -1031,15 +1050,22 @@ fn interpret(candidate: &Candidate, answer: &Answer) -> Option<Judged> {
                 ..
             },
         ) => {
+            let top = SPLIT_LEVELS.len() - 1;
+            let score =
+                (score.is_finite() && (0.0..=top as f64).contains(score)).then_some(*score)?;
             let mut mass = 0.0f64;
             for (level, p) in probabilities {
                 let p = probability(*p)?;
-                if level.parse::<usize>().ok()? >= SPLIT_LIKELY_LEVEL {
+                // Only the asked levels, spelled canonically ("0".."4").
+                let index = level.parse::<usize>().ok().filter(|i| *i <= top)?;
+                if index.to_string() != *level {
+                    return None;
+                }
+                if index >= SPLIT_LIKELY_LEVEL {
                     mass += f64::from(p);
                 }
             }
             let p = probability(mass.min(1.0))?;
-            let score = score.is_finite().then_some(*score)?;
             Some(Judged {
                 probability: p,
                 choice: String::new(),
@@ -1058,6 +1084,14 @@ fn interpret(candidate: &Candidate, answer: &Answer) -> Option<Judged> {
                 confidence,
             },
         ) => {
+            let Question::Choice { criteria, .. } = &candidate.question else {
+                return None;
+            };
+            if !criteria.contains_key(choice)
+                || probabilities.keys().any(|k| !criteria.contains_key(k))
+            {
+                return None;
+            }
             let p = probability(*probabilities.get(choice)?)?;
             let confidence = probability(*confidence)?;
             Some(Judged {
@@ -1137,8 +1171,35 @@ fn verify(
 
 // ---------------------------------------------------------------- helpers
 
+/// Round to `1 / HOURS_SCALE` hours, in f64 so the f32 input's binary error
+/// cannot push a value across a rounding boundary.
 fn round_hours(hours: f32) -> f32 {
-    (hours / HOURS_PRECISION).round() * HOURS_PRECISION
+    ((f64::from(hours) * HOURS_SCALE).round() / HOURS_SCALE) as f32
+}
+
+/// Pairs of deliverables owning files in the same directory or in a
+/// directory and one of its descendants (compared component-wise). Groups
+/// larger than [`MAX_SIGNAL_GROUP`] are skipped.
+fn prefix_pairs(
+    dirs: &BTreeMap<PathBuf, BTreeSet<usize>>,
+    pair: impl Fn(usize, usize) -> (usize, usize),
+) -> BTreeSet<(usize, usize)> {
+    let mut pairs = BTreeSet::new();
+    for (dir, members) in dirs.iter().filter(|(_, m)| m.len() <= MAX_SIGNAL_GROUP) {
+        for ancestor in dir.ancestors().filter(|a| a.parent().is_some()) {
+            let Some(others) = dirs.get(ancestor).filter(|m| m.len() <= MAX_SIGNAL_GROUP) else {
+                continue;
+            };
+            for &a in members {
+                for &b in others {
+                    if a != b {
+                        pairs.insert(pair(a, b));
+                    }
+                }
+            }
+        }
+    }
+    pairs
 }
 
 fn fmt_hours(hours: f32) -> String {

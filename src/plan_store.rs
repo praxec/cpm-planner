@@ -5,7 +5,7 @@
 //! cohort locks, the submit-dedup map, and (schema v3) the portfolio tables
 //! — named plan lines, variants and revisions, queried by
 //! `crate::portfolio`. Every planner operation loads
-//! the relevant [`PlanState`] from SQLite, runs the in-memory scheduling
+//! the relevant `PlanState` from SQLite, runs the in-memory scheduling
 //! logic, and writes the result back — all inside ONE
 //! `BEGIN IMMEDIATE` transaction.
 //!
@@ -29,7 +29,7 @@
 //! lapsed: the lock row is deleted and the deliverable's status goes back
 //! to `ready` (its prerequisites were complete when it was acquired and
 //! TTL expiry does not unwind upstream work — the same rule as
-//! [`PlanState::reap_expired`]). A deliverable left `in_progress` with no
+//! `PlanState::reap_expired`). A deliverable left `in_progress` with no
 //! lock row at all (a crash between partial writes on a pre-WAL database,
 //! or manual surgery) is likewise reset to `ready`. Locks that are still
 //! within TTL are preserved: another process may legitimately be working
