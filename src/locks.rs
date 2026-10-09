@@ -83,6 +83,23 @@ pub(crate) enum FileClaim {
     Append(BTreeSet<String>),
 }
 
+/// Two claims on one path conflict unless both are append.
+pub(crate) fn modes_conflict(requested: FileMode, held: FileMode) -> bool {
+    !(requested == FileMode::Append && held == FileMode::Append)
+}
+
+impl FileClaim {
+    /// Whether a request for this path in `requested` mode conflicts with
+    /// this held claim.
+    pub(crate) fn conflicts_with(&self, requested: FileMode) -> bool {
+        let held = match self {
+            FileClaim::Exclusive(_) => FileMode::Exclusive,
+            FileClaim::Append(_) => FileMode::Append,
+        };
+        modes_conflict(requested, held)
+    }
+}
+
 /// Record `deliverable_id`'s claims in the index.
 pub(crate) fn add_file_claims(
     claims: &mut HashMap<PathBuf, FileClaim>,
@@ -230,5 +247,15 @@ mod tests {
             claims.get(&PathBuf::from("R.md")),
             Some(&FileClaim::Append(BTreeSet::from(["b".to_string()])))
         );
+    }
+
+    #[test]
+    fn file_claim_conflicts_unless_both_sides_append() {
+        let ex = FileClaim::Exclusive("a".into());
+        let ap = FileClaim::Append(BTreeSet::from(["a".to_string()]));
+        assert!(ex.conflicts_with(FileMode::Exclusive));
+        assert!(ex.conflicts_with(FileMode::Append));
+        assert!(ap.conflicts_with(FileMode::Exclusive));
+        assert!(!ap.conflicts_with(FileMode::Append));
     }
 }

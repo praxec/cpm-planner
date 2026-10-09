@@ -1635,3 +1635,118 @@ async fn prerequisite_lag_hours_flows_into_schedule() {
     let es = b_start_with_edges(vec![edge("a", None, Some(3.0))]).await;
     assert!((es - 5.0).abs() < 1e-3);
 }
+
+fn overlap_reason(result: Result<PlanId, PlannerError>) -> String {
+    match result.unwrap_err() {
+        PlannerError::InvalidGraph { reason } => reason,
+        other => panic!("expected InvalidGraph, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn ordered_deliverables_may_share_an_exclusive_file() {
+    let planner = BasicCpmPlanner::new();
+    let graph = PlanGraph {
+        deliverables: vec![
+            deliverable("a", &["src/x.rs"], &[], Some(1.0)),
+            deliverable("b", &["src/x.rs"], &["a"], Some(1.0)),
+        ],
+        max_chained_dispatch: None,
+    };
+    assert!(planner.submit_plan(graph).await.is_ok());
+}
+
+#[tokio::test]
+async fn transitively_ordered_deliverables_may_share_a_file() {
+    let planner = BasicCpmPlanner::new();
+    let graph = PlanGraph {
+        deliverables: vec![
+            deliverable("a", &["src/x.rs"], &[], Some(1.0)),
+            deliverable("m", &["src/m.rs"], &["a"], Some(1.0)),
+            deliverable("b", &["src/x.rs"], &["m"], Some(1.0)),
+        ],
+        max_chained_dispatch: None,
+    };
+    assert!(planner.submit_plan(graph).await.is_ok());
+}
+
+#[tokio::test]
+async fn unordered_deliverables_sharing_an_exclusive_file_are_rejected() {
+    let planner = BasicCpmPlanner::new();
+    let graph = PlanGraph {
+        deliverables: vec![
+            deliverable("a", &["src/x.rs"], &[], Some(1.0)),
+            deliverable("b", &["src/x.rs"], &[], Some(1.0)),
+        ],
+        max_chained_dispatch: None,
+    };
+    let reason = overlap_reason(planner.submit_plan(graph).await);
+    assert_eq!(
+        reason,
+        "file 'src/x.rs' is claimed by 'a' and 'b', which are not ordered by prerequisites (one could run while the other holds it)"
+    );
+}
+
+#[tokio::test]
+async fn unordered_append_and_exclusive_claims_are_rejected() {
+    let planner = BasicCpmPlanner::new();
+    let mut a = deliverable("a", &[], &[], Some(1.0));
+    a.owned_files = vec![cpm_planner::plan::OwnedFile::Claim {
+        path: "REGISTRY.md".into(),
+        mode: cpm_planner::plan::FileMode::Append,
+    }];
+    let graph = PlanGraph {
+        deliverables: vec![a, deliverable("b", &["REGISTRY.md"], &[], Some(1.0))],
+        max_chained_dispatch: None,
+    };
+    let reason = overlap_reason(planner.submit_plan(graph).await);
+    assert!(reason.contains("'a' and 'b'"), "got: {reason}");
+}
+
+#[tokio::test]
+async fn ordering_must_hold_between_every_claiming_pair() {
+    // a -> b ordered, but c shares the file and is unordered with both.
+    let planner = BasicCpmPlanner::new();
+    let graph = PlanGraph {
+        deliverables: vec![
+            deliverable("a", &["src/x.rs"], &[], Some(1.0)),
+            deliverable("b", &["src/x.rs"], &["a"], Some(1.0)),
+            deliverable("c", &["src/x.rs"], &[], Some(1.0)),
+        ],
+        max_chained_dispatch: None,
+    };
+    let reason = overlap_reason(planner.submit_plan(graph).await);
+    assert!(reason.contains("'c'"), "got: {reason}");
+}
+
+#[tokio::test]
+async fn ordered_sharers_are_leased_one_after_the_other() {
+    let planner = BasicCpmPlanner::new();
+    let graph = PlanGraph {
+        deliverables: vec![
+            deliverable("a", &["src/x.rs"], &[], Some(1.0)),
+            deliverable("b", &["src/x.rs"], &["a"], Some(1.0)),
+        ],
+        max_chained_dispatch: None,
+    };
+    let plan_id = planner.submit_plan(graph).await.unwrap();
+    let first = planner
+        .acquire_cohort(AcquireRequest::new(plan_id.clone(), caller("w"), 5))
+        .await
+        .unwrap();
+    assert_eq!(cohort_ids(&first), vec!["a".to_string()]);
+    planner
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
+            "a",
+            caller("w"),
+            DeliverableStatus::Complete,
+        ))
+        .await
+        .unwrap();
+    let second = planner
+        .acquire_cohort(AcquireRequest::new(plan_id, caller("w"), 5))
+        .await
+        .unwrap();
+    assert_eq!(cohort_ids(&second), vec!["b".to_string()]);
+}

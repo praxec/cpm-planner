@@ -49,7 +49,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::algorithm::CpmAlgorithm;
-use crate::locks::{FileClaim, PlanState, add_file_claims, release_file_claims};
+use crate::locks::{FileClaim, PlanState, add_file_claims, modes_conflict, release_file_claims};
 
 /// Default TTL applied to newly acquired locks. Five minutes is the
 /// open-source default called out in SPEC §33 PA3.
@@ -367,23 +367,38 @@ fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
         }
     }
 
-    // Disjoint owned_files at graph level.
-    // Append/append sharing is allowed; any exclusive overlap is not.
-    let mut file_owner: HashMap<&Path, (&str, FileMode)> = HashMap::new();
+    // Shared files: any pair of claimants where at least one claim is
+    // exclusive must be ordered by prerequisites, so one can never run
+    // while the other holds the file. Append/append needs no ordering.
+    let reach = crate::graph::reachability(graph);
+    let mut claimants: HashMap<&Path, Vec<(&str, FileMode)>> = HashMap::new();
+    let mut path_order: Vec<&Path> = Vec::new();
     for d in &graph.deliverables {
         for f in &d.owned_files {
-            if let Some((other, other_mode)) =
-                file_owner.insert(f.path(), (d.id.as_str(), f.mode()))
-                && !(other_mode == FileMode::Append && f.mode() == FileMode::Append)
-            {
-                return Err(PlannerError::InvalidGraph {
-                    reason: format!(
-                        "file '{}' is owned by both '{}' and '{}'",
-                        f.path().display(),
-                        other,
-                        d.id
-                    ),
-                });
+            let entry = claimants.entry(f.path()).or_insert_with(|| {
+                path_order.push(f.path());
+                Vec::new()
+            });
+            entry.push((d.id.as_str(), f.mode()));
+        }
+    }
+    for path in path_order {
+        let list = &claimants[path];
+        for (i, &(x, xm)) in list.iter().enumerate() {
+            for &(y, ym) in &list[i + 1..] {
+                if x == y || (xm == FileMode::Append && ym == FileMode::Append) {
+                    continue;
+                }
+                let ordered = reach.get(x).is_some_and(|r| r.contains(y))
+                    || reach.get(y).is_some_and(|r| r.contains(x));
+                if !ordered {
+                    return Err(PlannerError::InvalidGraph {
+                        reason: format!(
+                            "file '{}' is claimed by '{x}' and '{y}', which are not ordered by prerequisites (one could run while the other holds it)",
+                            path.display(),
+                        ),
+                    });
+                }
             }
         }
     }
@@ -930,17 +945,13 @@ impl Planner for BasicCpmPlanner {
                     continue;
                 }
                 let conflict = candidate.owned_files.iter().any(|f| {
-                    let taken = |m: Option<&FileMode>| {
-                        !matches!(
-                            (f.mode(), m),
-                            (_, None) | (FileMode::Append, Some(FileMode::Append))
-                        )
-                    };
-                    taken(selected_files.get(f.path()))
-                        || taken(state.file_claims.get(f.path()).map(|c| match c {
-                            FileClaim::Exclusive(_) => &FileMode::Exclusive,
-                            FileClaim::Append(_) => &FileMode::Append,
-                        }))
+                    selected_files
+                        .get(f.path())
+                        .is_some_and(|m| modes_conflict(f.mode(), *m))
+                        || state
+                            .file_claims
+                            .get(f.path())
+                            .is_some_and(|c| c.conflicts_with(f.mode()))
                 });
                 if conflict {
                     if ids.is_some() {
