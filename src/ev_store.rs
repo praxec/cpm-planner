@@ -20,7 +20,6 @@ use crate::plan_store::backend;
 
 /// A stored baseline with its bookkeeping columns.
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))] // read by plan.baseline / plan.ev (P5 Task 3)
 pub(crate) struct StoredBaseline {
     pub(crate) baseline: Baseline,
     /// Why this baseline was taken; `None` for a first baseline without one.
@@ -30,7 +29,6 @@ pub(crate) struct StoredBaseline {
 
 /// One stored EV snapshot.
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))] // read by plan.snapshot / plan.ev (P5 Task 3)
 pub(crate) struct EvSnapshot {
     pub(crate) taken_at: DateTime<Utc>,
     pub(crate) as_of: DateTime<Utc>,
@@ -57,7 +55,6 @@ fn dt(us: i64, column: &str) -> Result<DateTime<Utc>, PlannerError> {
 }
 
 /// Every `ev_actuals` row of `plan_id`, keyed by deliverable id.
-#[cfg_attr(not(test), allow(dead_code))] // read by plan.ev (P5 Task 3)
 pub(crate) fn load_actuals(
     conn: &Connection,
     plan_id: &PlanId,
@@ -248,7 +245,6 @@ pub(crate) fn carry_actuals(
 }
 
 /// Store `baseline` under its own `number` (which must be unused for the plan).
-#[cfg_attr(not(test), allow(dead_code))] // written by plan.baseline (P5 Task 3)
 pub(crate) fn insert_baseline(
     conn: &Connection,
     plan_id: &PlanId,
@@ -291,7 +287,6 @@ type BaselineColumns = (u32, i64, Option<String>, String, f64, Option<String>, i
 /// a `BACKEND_ERROR` naming the plan. `finish_hours` is not stored; it is
 /// the largest baseline row `ef` (0 for no rows), which equals the
 /// `__finish__` earliest finish because lags are never negative.
-#[cfg_attr(not(test), allow(dead_code))] // read by plan.baseline / plan.ev (P5 Task 3)
 pub(crate) fn latest_baseline(
     conn: &Connection,
     plan_id: &PlanId,
@@ -352,7 +347,6 @@ pub(crate) fn latest_baseline(
 
 /// Store one snapshot. Two snapshots of one plan at the same `taken_at`
 /// microsecond are refused (`BACKEND_ERROR`).
-#[cfg_attr(not(test), allow(dead_code))] // written by plan.snapshot (P5 Task 3)
 pub(crate) fn insert_snapshot(
     conn: &Connection,
     plan_id: &PlanId,
@@ -380,7 +374,6 @@ pub(crate) fn insert_snapshot(
 }
 
 /// Every snapshot of `plan_id`, oldest `taken_at` first.
-#[cfg_attr(not(test), allow(dead_code))] // read by plan.snapshot / plan.ev (P5 Task 3)
 pub(crate) fn snapshots(
     conn: &Connection,
     plan_id: &PlanId,

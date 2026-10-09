@@ -1270,6 +1270,12 @@ pub enum PlannerError {
     #[error("INVALID_ACTUALS: {reason}")]
     InvalidActuals { reason: String },
 
+    /// An earned-value read or snapshot (`plan.ev`, `plan.snapshot`)
+    /// targeted a plan that has no baseline yet; take one with
+    /// `plan.baseline` first.
+    #[error("NOT_BASELINED: plan {plan_id} has no baseline; take one with plan.baseline")]
+    NotBaselined { plan_id: String },
+
     /// Catch-all for backend failures (DB unavailable, serialization
     /// errors against the persistence layer, etc.). Wraps the underlying
     /// `anyhow::Error` so the caller can introspect via `source()`.

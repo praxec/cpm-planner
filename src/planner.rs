@@ -54,6 +54,8 @@ use sha2::{Digest, Sha256};
 
 use crate::locks::{FileClaim, PlanState, add_file_claims, modes_conflict};
 
+mod ev;
+
 /// Default TTL applied to newly acquired locks. Five minutes is the
 /// open-source default called out in SPEC §33 PA3.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(5 * 60);

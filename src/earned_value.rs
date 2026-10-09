@@ -14,7 +14,9 @@
 
 use crate::estimator::EffortEstimator;
 pub use crate::plan::EarningRule;
-use crate::plan::{Deliverable, DeliverableStatus, FINISH_ID, PlanGraph, PlannerError, START_ID};
+use crate::plan::{
+    Deliverable, DeliverableStatus, FINISH_ID, PlanGraph, PlanId, PlannerError, START_ID,
+};
 use crate::schedule::{compute_cpm, effort_basis};
 use crate::task::CriticalPathResult;
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc, Weekday};
@@ -537,6 +539,117 @@ pub fn compute_ev(
         },
     };
     Ok(report)
+}
+
+/// Longest accepted `plan.baseline` reason, in characters (the evidence
+/// limit, [`crate::plan::MAX_EVIDENCE_CHARS`]).
+pub const MAX_BASELINE_REASON_CHARS: usize = crate::plan::MAX_EVIDENCE_CHARS;
+
+/// Most snapshots a `plan.snapshot` export lists (the newest ones).
+pub const SNAPSHOT_EXPORT_LIMIT: usize = 100;
+
+/// Take a baseline of a plan (`plan.baseline`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BaselineRequest {
+    pub plan_id: PlanId,
+    /// Baseline start; defaults to the planner clock's now.
+    pub start: Option<DateTime<Utc>>,
+    /// Working-time calendar; `None` counts wall-clock hours.
+    pub calendar: Option<Calendar>,
+    /// Why the plan is re-baselined. Required (non-blank) when the plan
+    /// already has a baseline; at most [`MAX_BASELINE_REASON_CHARS`].
+    pub reason: Option<String>,
+}
+
+impl BaselineRequest {
+    pub fn new(plan_id: PlanId) -> Self {
+        Self {
+            plan_id,
+            start: None,
+            calendar: None,
+            reason: None,
+        }
+    }
+
+    pub fn with_start(mut self, start: DateTime<Utc>) -> Self {
+        self.start = Some(start);
+        self
+    }
+
+    pub fn with_calendar(mut self, calendar: Calendar) -> Self {
+        self.calendar = Some(calendar);
+        self
+    }
+
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
+        self
+    }
+}
+
+/// A stored baseline, as `plan.baseline` reports it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BaselineOutcome {
+    pub plan_id: String,
+    pub baseline_number: u32,
+    pub start: DateTime<Utc>,
+    pub calendar: Option<Calendar>,
+    pub bac: f32,
+    pub finish_hours: f32,
+    pub deliverable_count: usize,
+    pub reason: Option<String>,
+}
+
+/// Export format of `plan.snapshot`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotFormat {
+    /// `export` is the list of snapshot summaries, oldest first.
+    #[default]
+    Json,
+    /// `export` is a Markdown table ([`render_snapshots_markdown`]).
+    Markdown,
+}
+
+/// Append an EV snapshot (`plan.snapshot`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SnapshotRequest {
+    pub plan_id: PlanId,
+    /// Status date of the reading; defaults to the planner clock's now.
+    pub as_of: Option<DateTime<Utc>>,
+    pub format: SnapshotFormat,
+}
+
+impl SnapshotRequest {
+    pub fn new(plan_id: PlanId) -> Self {
+        Self {
+            plan_id,
+            as_of: None,
+            format: SnapshotFormat::default(),
+        }
+    }
+
+    pub fn with_as_of(mut self, as_of: DateTime<Utc>) -> Self {
+        self.as_of = Some(as_of);
+        self
+    }
+
+    pub fn with_format(mut self, format: SnapshotFormat) -> Self {
+        self.format = format;
+        self
+    }
+}
+
+/// The snapshot just taken plus the rendered history.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SnapshotOutcome {
+    pub summary: SnapshotSummary,
+    pub format: SnapshotFormat,
+    /// The newest [`SNAPSHOT_EXPORT_LIMIT`] snapshots (this one last): a
+    /// list of summaries for `json`, a Markdown table string for `markdown`.
+    pub export: serde_json::Value,
+    /// Snapshots stored for the plan, this one included.
+    pub snapshot_count: usize,
 }
 
 /// Trend alerts over chronological snapshot ratios: `SPI_BELOW_0_9` /
