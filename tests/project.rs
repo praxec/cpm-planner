@@ -477,31 +477,74 @@ fn write_is_atomic_and_creates_directories() {
 #[test]
 fn concurrent_parent_swap_never_writes_outside_root() {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    const ATTEMPTS: usize = 3000;
     let (d, r) = root_with_git("race");
     let outside = tmp("raceout");
+    // Pre-create `.cpm-planner/plans/a` so both directory levels can be
+    // swapped for symlinks by the racing thread.
+    std::fs::create_dir_all(d.join(".cpm-planner/plans/a")).unwrap();
+
     let done = Arc::new(AtomicBool::new(false));
+    let made = Arc::new(AtomicUsize::new(0));
     let swapper = {
         let (d, outside, done) = (d.path.clone(), outside.path.clone(), done.clone());
         std::thread::spawn(move || {
             let planner = d.join(".cpm-planner");
-            for _ in 0..500 {
+            let name_dir = planner.join("plans").join("a");
+            while !done.load(Ordering::SeqCst) {
+                // Level 1: swap `.cpm-planner` itself for an outside symlink,
+                // then restore a real tree before touching the level below.
                 let _ = std::fs::remove_file(&planner);
                 let _ = std::fs::remove_dir_all(&planner);
                 let _ = std::os::unix::fs::symlink(&*outside, &planner);
                 std::thread::yield_now();
                 let _ = std::fs::remove_file(&planner);
-                let _ = std::fs::create_dir_all(planner.join("plans"));
+                let _ = std::fs::create_dir_all(&name_dir);
+                std::thread::yield_now();
+
+                // Level 2: swap the `<name>` directory for an outside symlink.
+                let _ = std::fs::remove_file(&name_dir);
+                let _ = std::fs::remove_dir_all(&name_dir);
+                let _ = std::os::unix::fs::symlink(&*outside, &name_dir);
+                std::thread::yield_now();
+                let _ = std::fs::remove_file(&name_dir);
+                let _ = std::fs::create_dir_all(&name_dir);
                 std::thread::yield_now();
             }
-            done.store(true, Ordering::SeqCst);
         })
     };
+
     let f = forged_ref("a", "v");
     let g = graph();
-    while !done.load(Ordering::SeqCst) {
+    while made.fetch_add(1, Ordering::SeqCst) < ATTEMPTS {
         let _ = r.write_graph(&f, &g);
     }
+    done.store(true, Ordering::SeqCst);
     swapper.join().unwrap();
     assert_eq!(std::fs::read_dir(&*outside).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn read_rejects_fifo_without_hanging() {
+    let (d, r) = root_with_git("fifo");
+    let dir = d.join(".cpm-planner/plans/a");
+    std::fs::create_dir_all(&dir).unwrap();
+    let fifo = dir.join("b.json");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(status.success(), "mkfifo failed");
+    let f = forged_ref("a", "b");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(r.read_graph(&f));
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(res) => assert!(is_invalid_path(res)),
+        Err(_) => panic!("read_graph blocked on a FIFO instead of rejecting it"),
+    }
 }

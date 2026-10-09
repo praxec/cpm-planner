@@ -12,12 +12,14 @@
 //! with no-follow semantics (`O_NOFOLLOW` on unix; reparse points are not
 //! followed on Windows). A symlink at any step is rejected with
 //! `INVALID_PATH`, and every later operation (create temp file, write, fsync,
-//! rename, read) is performed relative to the opened directory handle, never
-//! by path string, so swapping a parent for a symlink after the check cannot
-//! redirect I/O outside the root. Writes are atomic: a create-new temp file in
-//! the final directory is fsynced and renamed over `<variant>.json`; the
-//! directory is fsynced afterwards. Metadata errors other than NotFound fail
-//! closed.
+//! rename, read) is performed relative to the opened directory handle rather
+//! than by re-resolving the original path string, so swapping a parent for a
+//! symlink after the check cannot redirect I/O outside the root. Writes are
+//! atomic: a create-new temp file in the final directory is fsynced and
+//! renamed over `<variant>.json`; the directory is fsynced afterwards.
+//! Metadata errors other than NotFound fail closed. On unix, reads open the
+//! file with `O_NONBLOCK` so a FIFO cannot block the open, then verify via
+//! `fstat` that the handle is a regular file before reading it.
 //!
 //! # Residual limitations
 //!
@@ -26,10 +28,23 @@
 //!   guaranteed on Windows. Atomicity of the rename is unaffected.
 //! - The canonical root itself is resolved once (symlinks in the root path
 //!   above the project are legitimate and followed at that point).
+//!
+//! # Residual limitations (Windows)
+//!
+//! On Windows, `create_dir`, `remove_file`/`remove_dir`, and `rename` are
+//! path-based: `cap-std` rebuilds the target path from the directory handle
+//! via `GetFinalPathNameByHandle` before issuing the Win32 call. A parent that
+//! is swapped for a reparse point inside that window can therefore make those
+//! calls act on the wrong location. The worst observable effect is an empty
+//! directory created outside the root (or a rename that fails); no plan bytes
+//! can be written outside the root, because file creation, writes, and fsync
+//! all occur on handles opened relative to the confined directory.
 
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use cap_fs_ext::OpenOptionsSyncExt as _;
 use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
@@ -330,6 +345,12 @@ impl ProjectRoot {
         let fname = format!("{}.json", f.variant);
         let mut opts = OpenOptions::new();
         opts.read(true).follow(FollowSymlinks::No);
+        // Opening a FIFO read-only blocks until a writer appears. O_NONBLOCK
+        // makes the open return immediately; regular files ignore it, so the
+        // subsequent fstat + read behave as before. Non-regular handles are
+        // rejected below.
+        #[cfg(unix)]
+        opts.nonblock(true);
         let mut file = match dir.open_with(&fname, &opts) {
             Ok(file) => file,
             Err(e) => {
