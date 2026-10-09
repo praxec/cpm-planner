@@ -4,8 +4,7 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 env:
   BIN: cpm-planner
@@ -14,6 +13,8 @@ jobs:
   create-release:
     name: validate + draft release
     runs-on: ubuntu-22.04
+    permissions:
+      contents: write
     outputs:
       version: ${{ steps.meta.outputs.version }}
       source_sha: ${{ steps.meta.outputs.source_sha }}
@@ -62,6 +63,9 @@ jobs:
     name: build (${{ matrix.target }})
     needs: create-release
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -134,6 +138,8 @@ jobs:
     name: aggregate metadata + publish
     needs: [create-release, binaries]
     runs-on: ubuntu-22.04
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - name: download all packaged assets
@@ -176,6 +182,10 @@ jobs:
     name: container image
     needs: finalize
     runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3
@@ -193,7 +203,21 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest
-      - uses: docker/build-push-action@v6
+      - name: build amd64 image for smoke test
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: cpm-planner:smoke
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: MCP protocol smoke on the container image (before push)
+        run: node scripts/mcp-smoke.mjs docker run -i --rm cpm-planner:smoke
+      - name: push multi-arch image
+        uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -214,7 +238,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: publish to MCP registry (best-effort)
         continue-on-error: true
+        env:
+          # Pinned release + checksum (from the release's published asset digest).
+          MCP_PUBLISHER_VERSION: v1.8.1
+          MCP_PUBLISHER_SHA256: a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc
         run: |
-          os=$(uname -s | tr '[:upper:]' '[:lower:]')
-          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_${os}_amd64.tar.gz" -o mcp-publisher.tgz && tar xzf mcp-publisher.tgz mcp-publisher
+          set -euo pipefail
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/mcp-publisher_linux_amd64.tar.gz" -o mcp-publisher.tgz
+          echo "${MCP_PUBLISHER_SHA256}  mcp-publisher.tgz" | sha256sum -c -
+          tar xzf mcp-publisher.tgz mcp-publisher
           ./mcp-publisher login github-oidc && ./mcp-publisher publish

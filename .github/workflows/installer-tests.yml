@@ -5,6 +5,9 @@ on:
   pull_request:
 permissions:
   contents: read
+concurrency:
+  group: installer-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   installer:
     runs-on: ubuntu-22.04
@@ -22,3 +25,13 @@ jobs:
         run: |
           $target = ./scripts/install.ps1 -PrintTarget
           if ($target -ne 'aarch64-pc-windows-msvc') { throw "Wrong target: $target" }
+  windows-x64-target:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - shell: pwsh
+        env:
+          PRAXEC_ARCH: x86_64
+        run: |
+          $target = ./scripts/install.ps1 -PrintTarget
+          if ($target -ne 'x86_64-pc-windows-msvc') { throw "Wrong target: $target" }
