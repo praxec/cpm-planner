@@ -49,6 +49,7 @@ pub mod edits;
 pub mod estimator;
 mod graph;
 pub mod lint;
+pub mod llm;
 mod locks;
 pub mod metrics;
 pub mod monte_carlo;
