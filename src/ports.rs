@@ -5,8 +5,8 @@
 use async_trait::async_trait;
 
 use crate::plan::{
-    AcquireRequest, Cohort, ForceReleaseRequest, HeartbeatRequest, MarkStatusRequest,
-    PlanDefinition, PlanGraph, PlanId, PlanStatus, PlannerError,
+    AcceptRequest, AcquireRequest, Cohort, ForceReleaseRequest, HeartbeatRequest,
+    MarkStatusRequest, PlanDefinition, PlanGraph, PlanId, PlanStatus, PlannerError,
 };
 
 /// Lock-aware planner.
@@ -61,4 +61,10 @@ pub trait Planner: Send + Sync {
     /// Operator escape hatch: forcibly release a lock regardless of holder or
     /// TTL. Implementations MUST emit an audit event carrying `reason`.
     async fn force_release(&self, req: ForceReleaseRequest) -> Result<(), PlannerError>;
+
+    /// Manager/owner acceptance: mark a deliverable `Complete` without
+    /// holding its lease. Requires all prerequisites `Complete`; a live
+    /// lease held by another caller is refused (`LOCK_HELD`) unless
+    /// `override_lock` is set. Always audited.
+    async fn accept(&self, req: AcceptRequest) -> Result<(), PlannerError>;
 }

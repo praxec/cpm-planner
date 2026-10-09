@@ -6,7 +6,7 @@
 
 //! MCP tool surface for the open-source CPM planner.
 //!
-//! [`PlanServer`] wraps an `Arc<BasicCpmPlanner>` and exposes the seven
+//! [`PlanServer`] wraps an `Arc<BasicCpmPlanner>` and exposes the eight
 //! [`Planner`] trait methods as MCP tools so any MCP-speaking agent
 //! (Claude Code, Cursor, custom orchestrator, or the §33 LLM executor)
 //! can drive the planner over the standard MCP protocol.
@@ -22,6 +22,7 @@
 //! | `plan.status`            | [`Planner::status`]           |
 //! | `plan.get`               | [`Planner::get_plan`]         |
 //! | `plan.force_release`     | [`Planner::force_release`]    |
+//! | `plan.accept`            | [`Planner::accept`]           |
 //!
 //! # Error mapping
 //!
@@ -45,8 +46,9 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::plan::{
-    AcquireRequest, CallerId, Cohort, DeliverableStatus, ForceReleaseRequest, HeartbeatRequest,
-    MarkStatusRequest, PlanDefinition, PlanGraph, PlanId, PlanStatus, PlannerError,
+    AcceptRequest, AcquireRequest, CallerId, Cohort, DeliverableStatus, ForceReleaseRequest,
+    HeartbeatRequest, MarkStatusRequest, PlanDefinition, PlanGraph, PlanId, PlanStatus,
+    PlannerError,
 };
 use crate::ports::Planner;
 use rmcp::ErrorData as McpError;
@@ -73,8 +75,9 @@ pub const TOOL_MARK_STATUS: &str = "plan.mark_status";
 pub const TOOL_STATUS: &str = "plan.status";
 pub const TOOL_GET: &str = "plan.get";
 pub const TOOL_FORCE_RELEASE: &str = "plan.force_release";
+pub const TOOL_ACCEPT: &str = "plan.accept";
 
-/// All seven MCP tool names exposed by [`PlanServer`], in declaration order.
+/// All eight MCP tool names exposed by [`PlanServer`], in declaration order.
 pub const PLAN_TOOL_NAMES: &[&str] = &[
     TOOL_SUBMIT,
     TOOL_ACQUIRE_COHORT,
@@ -83,6 +86,7 @@ pub const PLAN_TOOL_NAMES: &[&str] = &[
     TOOL_STATUS,
     TOOL_GET,
     TOOL_FORCE_RELEASE,
+    TOOL_ACCEPT,
 ];
 
 // ---------------------------------------------------------------------------
@@ -116,6 +120,17 @@ struct AcquireCohortArgs {
 struct AcquireFilter {
     #[serde(default)]
     metadata: Option<serde_json::Map<String, Value>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcceptArgs {
+    plan_id: String,
+    deliverable_id: String,
+    accepted_by: String,
+    evidence: String,
+    #[serde(default)]
+    override_lock: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -184,7 +199,7 @@ impl OkResponse {
 // Tool-list construction
 // ---------------------------------------------------------------------------
 
-/// Build the seven `Tool` definitions advertised in `list_tools`.
+/// Build the eight `Tool` definitions advertised in `list_tools`.
 ///
 /// Each tool carries an inline JSON Schema describing its arguments. The
 /// schemas are hand-written rather than derived because the workspace's
@@ -344,6 +359,29 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                 "required": ["plan_id", "deliverable_id", "reason"]
             })),
         ),
+        Tool::new(
+            Cow::Borrowed(TOOL_ACCEPT),
+            Cow::Borrowed(
+                "Manager/owner acceptance: mark a deliverable Complete without \
+                 holding its lease. Requires all prerequisites Complete and \
+                 evidence; audited. A live lease held by someone else is refused \
+                 (LOCK_HELD) unless override_lock is true.",
+            ),
+            schema_object(json!({
+                "type": "object",
+                "properties": {
+                    "plan_id":        { "type": "string" },
+                    "deliverable_id": { "type": "string" },
+                    "accepted_by":    { "type": "string" },
+                    "evidence":       { "type": "string" },
+                    "override_lock": {
+                        "type": "boolean",
+                        "description": "Take over a live lease held by another caller."
+                    }
+                },
+                "required": ["plan_id", "deliverable_id", "accepted_by", "evidence"]
+            })),
+        ),
     ]
 }
 
@@ -369,7 +407,7 @@ fn schema_object(value: Value) -> Arc<rmcp::model::JsonObject> {
 // PlanServer
 // ---------------------------------------------------------------------------
 
-/// MCP server façade exposing a [`BasicCpmPlanner`] over seven tools.
+/// MCP server façade exposing a [`BasicCpmPlanner`] over eight tools.
 #[derive(Clone)]
 pub struct PlanServer {
     planner: Arc<BasicCpmPlanner>,
@@ -433,6 +471,7 @@ impl PlanServer {
             TOOL_STATUS => self.handle_status(args).await,
             TOOL_GET => self.handle_get(args).await,
             TOOL_FORCE_RELEASE => self.handle_force_release(args).await,
+            TOOL_ACCEPT => self.handle_accept(args).await,
             other => Err(McpError::invalid_params(
                 format!(
                     "Unknown tool '{other}'. Available: {}.",
@@ -536,6 +575,23 @@ impl PlanServer {
         to_value(&definition)
     }
 
+    async fn handle_accept(&self, args: Value) -> Result<Value, McpError> {
+        let parsed: AcceptArgs = parse_args(args)?;
+        self.planner
+            .accept(
+                AcceptRequest::new(
+                    PlanId(parsed.plan_id),
+                    parsed.deliverable_id,
+                    parsed.accepted_by,
+                    parsed.evidence,
+                )
+                .override_lock(parsed.override_lock),
+            )
+            .await
+            .map_err(planner_error_to_mcp)?;
+        to_value(&OkResponse::new())
+    }
+
     async fn handle_force_release(&self, args: Value) -> Result<Value, McpError> {
         let parsed: ForceReleaseArgs = parse_args(args)?;
         self.planner
@@ -563,7 +619,7 @@ impl ServerHandler for PlanServer {
             Implementation::new(self.server_name.clone(), self.server_version.clone());
         server_info.title = Some("cpm-planner".to_string());
         server_info.description = Some(
-            "MCP server exposing the open-source Praxec CPM planner via seven tools.".to_string(),
+            "MCP server exposing the open-source Praxec CPM planner via eight tools.".to_string(),
         );
 
         let mut info = InitializeResult::default();
@@ -648,7 +704,7 @@ fn planner_error_to_mcp(err: PlannerError) -> McpError {
 fn instructions() -> &'static str {
     r#"This is the cpm-planner MCP server — the open-source CPM planner.
 
-Tools (seven total, all `plan.<verb>`):
+Tools (eight total, all `plan.<verb>`):
   plan.submit          — submit a PlanGraph, get a plan_id (idempotent on identical graphs)
   plan.acquire_cohort  — atomically acquire ready, file-disjoint deliverables
   plan.heartbeat       — refresh a held lock's TTL
@@ -656,10 +712,12 @@ Tools (seven total, all `plan.<verb>`):
   plan.status          — read-only snapshot ([id, status, attempt_count, failure_count, lapse_count] rows, critical_path (one real chain), critical_ids, per-deliverable schedule (es/ef/ls/lf/float, hours), the ready set ordered by float, held locks)
   plan.get             — return the submitted PlanGraph (deliverables, estimates, files, metadata) for a plan_id
   plan.force_release   — operator escape hatch; emits audit event with `reason`; optional reset_counters:true also clears lapse/failure counters and revives a circuit-broken deliverable
+  plan.accept          — a manager/owner marks a deliverable Complete without a lease (audited; evidence required; override_lock to take over a live lease)
 
 Errors carry stable prefixes: LOCK_HELD, LOCK_NOT_HELD, LOCK_EXPIRED,
 OVERLAP_DETECTED, MISSING_PREREQUISITE, PLAN_NOT_FOUND,
-DELIVERABLE_NOT_FOUND, LAPSE_LIMIT, INVALID_GRAPH, BACKEND_ERROR.
+DELIVERABLE_NOT_FOUND, LAPSE_LIMIT, PREREQUISITES_INCOMPLETE, INVALID_GRAPH,
+BACKEND_ERROR.
 
 DeliverableStatus is internally tagged on `status`:
   {"status":"pending"} | {"status":"ready"} | {"status":"in_progress"} |

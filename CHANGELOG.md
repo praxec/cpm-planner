@@ -10,6 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `plan.acquire_cohort` accepts `ids` and `filter.metadata`; deliverables with `metadata.kind = "manual"` are never leased; requested ids that cannot be leased are reported in `blocked` with a code (#14).
+- `plan.accept` for manager/owner acceptance without a lease (#24).
+- `plan.force_release` `reset_counters: true` clears lapse/failure counters and revives circuit-broken deliverables.
+- `plan.status` returns `critical_ids` (every zero-float deliverable),
+  `schedule` (per-deliverable es/ef/ls/lf/float/critical, in hours) and
+  `ready` (ready, unlocked deliverables in cohort priority order) (#15).
+- `plan.get` returns the submitted plan graph for a `plan_id`.
+- Versioned SQLite schema (`PRAGMA user_version` = 2) with a `cpm_version`
+  column; databases newer than the running binary are rejected.
 
 ### Fixed
 
@@ -24,18 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Plans stored by older versions are recomputed automatically when the store
   opens.
 
-### Added
-
-- `plan.force_release` `reset_counters: true` clears lapse/failure counters and revives circuit-broken deliverables.
-- `plan.status` returns `critical_ids` (every zero-float deliverable),
-  `schedule` (per-deliverable es/ef/ls/lf/float/critical, in hours) and
-  `ready` (ready, unlocked deliverables in cohort priority order) (#15).
-- `plan.get` returns the submitted plan graph for a `plan_id`.
-- Versioned SQLite schema (`PRAGMA user_version` = 2) with a `cpm_version`
-  column; databases newer than the running binary are rejected.
-
 ### Changed
 
+- Completing a deliverable without a lease now requires its prerequisites to be complete and is audited.
 - Library: `Planner` methods `acquire_cohort`, `mark_status`, `heartbeat`,
   `force_release` take request structs (`AcquireRequest`, `MarkStatusRequest`,
   `HeartbeatRequest`, `ForceReleaseRequest`).

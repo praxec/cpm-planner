@@ -286,6 +286,40 @@ impl ForceReleaseRequest {
     }
 }
 
+/// Request bundle for [`crate::ports::Planner::accept`].
+#[derive(Debug, Clone)]
+pub struct AcceptRequest {
+    pub plan_id: PlanId,
+    pub deliverable_id: String,
+    pub accepted_by: String,
+    pub evidence: String,
+    /// Take over a live lease held by someone else. Defaults to `false`.
+    pub override_lock: bool,
+}
+
+impl AcceptRequest {
+    pub fn new(
+        plan_id: PlanId,
+        deliverable_id: impl Into<String>,
+        accepted_by: impl Into<String>,
+        evidence: impl Into<String>,
+    ) -> Self {
+        Self {
+            plan_id,
+            deliverable_id: deliverable_id.into(),
+            accepted_by: accepted_by.into(),
+            evidence: evidence.into(),
+            override_lock: false,
+        }
+    }
+
+    /// Set whether a live lease held by another caller may be taken over.
+    pub fn override_lock(mut self, yes: bool) -> Self {
+        self.override_lock = yes;
+        self
+    }
+}
+
 /// Snapshot of a held lock. The Planner records one [`LockInfo`] per
 /// acquired deliverable and surfaces them in [`Cohort::locks`] and
 /// [`PlanStatus::locks_held`].
@@ -585,6 +619,19 @@ pub enum PlannerError {
         deliverable_id: String,
         lapse_count: u32,
         max_lapses: u32,
+    },
+
+    /// A deliverable cannot be completed without a lease (or accepted)
+    /// while some of its prerequisites are not yet `Complete`.
+    #[error(
+        "PREREQUISITES_INCOMPLETE: {deliverable_id} in plan {plan_id} has incomplete \
+         prerequisites [{}]",
+        missing.join(", ")
+    )]
+    PrerequisitesIncomplete {
+        plan_id: String,
+        deliverable_id: String,
+        missing: Vec<String>,
     },
 
     /// The submitted graph fails a structural invariant: duplicate ids,

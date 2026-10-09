@@ -35,9 +35,9 @@ use std::time::Duration;
 
 use crate::audit::{AuditEvent, AuditSink, NullAuditSink};
 use crate::plan::{
-    AcquireRequest, BlockedDeliverable, Cohort, CohortRow, Deliverable, DeliverableStatus,
-    ForceReleaseRequest, HeartbeatRequest, LockInfo, MarkStatusRequest, PlanDefinition, PlanGraph,
-    PlanId, PlanStatus, PlannerError, ScheduleRow,
+    AcceptRequest, AcquireRequest, BlockedDeliverable, CallerId, Cohort, CohortRow, Deliverable,
+    DeliverableStatus, ForceReleaseRequest, HeartbeatRequest, LockInfo, MarkStatusRequest,
+    PlanDefinition, PlanGraph, PlanId, PlanStatus, PlannerError, ScheduleRow,
 };
 use crate::plan_store::SqlitePlanStore;
 use crate::ports::Planner;
@@ -419,6 +419,109 @@ fn make_circuit_break_event(
     }))
 }
 
+/// Missing (non-Complete) prerequisites of `deliverable_id`.
+fn incomplete_prerequisites(state: &PlanState, deliverable_id: &str) -> Vec<String> {
+    state
+        .graph
+        .deliverables
+        .iter()
+        .find(|d| d.id == deliverable_id)
+        .map(|d| {
+            d.prerequisites
+                .iter()
+                .filter(|p| !matches!(state.statuses.get(*p), Some(DeliverableStatus::Complete)))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Mark a deliverable `Complete`: release any lock (and its file index,
+/// emitting a released event), set the status, and promote dependents whose
+/// prerequisites are now all complete. Shared by `mark_status` and `accept`.
+fn complete_deliverable(
+    state: &mut PlanState,
+    deliverable_id: &str,
+    audit_buf: &mut Vec<AuditEvent>,
+    release_reason: &str,
+) {
+    if let Some(lock) = state.locks.remove(deliverable_id) {
+        // Callers verified the deliverable exists; a held lock implies the
+        // graph entry exists.
+        let owned_files: Vec<PathBuf> = match state
+            .graph
+            .deliverables
+            .iter()
+            .find(|d| d.id == deliverable_id)
+        {
+            Some(d) => d.owned_files.clone(),
+            None => unreachable!(
+                "deliverable {deliverable_id} present in locks but missing from graph — \
+                 invariant broken"
+            ),
+        };
+        for f in &owned_files {
+            state.file_to_deliverable.remove(f);
+        }
+        audit_buf.push(make_released_event(&lock, release_reason));
+    }
+
+    state
+        .statuses
+        .insert(deliverable_id.to_string(), DeliverableStatus::Complete);
+
+    let dependents: Vec<String> = state
+        .graph
+        .deliverables
+        .iter()
+        .filter(|d| d.prerequisites.iter().any(|p| p == deliverable_id))
+        .map(|d| d.id.clone())
+        .collect();
+    for dep_id in dependents {
+        let dep = match state.graph.deliverables.iter().find(|d| d.id == dep_id) {
+            Some(d) => d,
+            None => unreachable!("dependent id {dep_id} present in graph but not findable"),
+        };
+        let all_done = dep
+            .prerequisites
+            .iter()
+            .all(|p| matches!(state.statuses.get(p), Some(DeliverableStatus::Complete)));
+        let currently_pending = matches!(
+            state.statuses.get(&dep_id),
+            Some(DeliverableStatus::Pending)
+        );
+        if all_done && currently_pending {
+            state.statuses.insert(dep_id, DeliverableStatus::Ready);
+        }
+    }
+}
+
+fn make_accepted_event(req: &AcceptRequest, overrode_lock_of: Option<&str>) -> AuditEvent {
+    AuditEvent::new("accepted")
+        .with_actor(req.accepted_by.as_str())
+        .with_payload(json!({
+            "plan_id": req.plan_id.as_str(),
+            "deliverable_id": req.deliverable_id,
+            "accepted_by": req.accepted_by,
+            "evidence": req.evidence,
+            "overrode_lock_of": overrode_lock_of,
+        }))
+}
+
+fn make_completed_without_lease_event(
+    plan_id: &PlanId,
+    deliverable_id: &str,
+    caller_id: &CallerId,
+) -> AuditEvent {
+    AuditEvent::new("completed_without_lease")
+        .with_actor(caller_id.as_str())
+        .with_payload(json!({
+            "plan_id": plan_id.as_str(),
+            "deliverable_id": deliverable_id,
+            "caller_id": caller_id.as_str(),
+        }))
+}
+
 fn make_force_released_event(lock: &LockInfo, reason: &str) -> AuditEvent {
     AuditEvent::new("plan.lock.force_released")
         .with_actor(lock.caller_id.as_str())
@@ -797,14 +900,28 @@ impl Planner for BasicCpmPlanner {
                 });
             }
 
-            // Lock release on terminal status.
-            let release_reason: Option<&'static str> = match &status {
-                DeliverableStatus::Complete => Some("completed"),
-                DeliverableStatus::Failed { .. } => Some("failed"),
-                _ => None,
-            };
+            let is_complete = matches!(status, DeliverableStatus::Complete);
 
-            if let Some(reason) = release_reason
+            // Completing without a lease: every prerequisite must be done,
+            // and the bypass is audited.
+            if is_complete && !state.locks.contains_key(deliverable_id) {
+                let missing = incomplete_prerequisites(state, deliverable_id);
+                if !missing.is_empty() {
+                    return Err(PlannerError::PrerequisitesIncomplete {
+                        plan_id: plan_id.0.clone(),
+                        deliverable_id: deliverable_id.to_string(),
+                        missing,
+                    });
+                }
+                audit_buf.push(make_completed_without_lease_event(
+                    &plan_id,
+                    deliverable_id,
+                    caller_id,
+                ));
+            }
+
+            // Lock release on Failed.
+            if matches!(status, DeliverableStatus::Failed { .. })
                 && let Some(lock) = state.locks.remove(deliverable_id)
             {
                 // Deliverable existence was verified at the top of
@@ -824,7 +941,7 @@ impl Planner for BasicCpmPlanner {
                 for f in &owned_files {
                     state.file_to_deliverable.remove(f);
                 }
-                audit_buf.push(make_released_event(&lock, reason));
+                audit_buf.push(make_released_event(&lock, "failed"));
             }
 
             // An EXPLICIT Failed mark is a real implementation attempt —
@@ -845,38 +962,12 @@ impl Planner for BasicCpmPlanner {
                     .or_insert(0) += 1;
             }
 
-            // Set status.
-            state
-                .statuses
-                .insert(deliverable_id.to_string(), status.clone());
-
-            // Advance dependents to Ready if all their prereqs are Complete.
-            if matches!(status, DeliverableStatus::Complete) {
-                let dependents: Vec<String> = state
-                    .graph
-                    .deliverables
-                    .iter()
-                    .filter(|d| d.prerequisites.iter().any(|p| p == deliverable_id))
-                    .map(|d| d.id.clone())
-                    .collect();
-                for dep_id in dependents {
-                    let dep = match state.graph.deliverables.iter().find(|d| d.id == dep_id) {
-                        Some(d) => d,
-                        None => {
-                            unreachable!("dependent id {dep_id} present in graph but not findable")
-                        }
-                    };
-                    let all_done = dep.prerequisites.iter().all(|p| {
-                        matches!(state.statuses.get(p), Some(DeliverableStatus::Complete))
-                    });
-                    let currently_pending = matches!(
-                        state.statuses.get(&dep_id),
-                        Some(DeliverableStatus::Pending)
-                    );
-                    if all_done && currently_pending {
-                        state.statuses.insert(dep_id, DeliverableStatus::Ready);
-                    }
-                }
+            if is_complete {
+                complete_deliverable(state, deliverable_id, &mut audit_buf, "completed");
+            } else {
+                state
+                    .statuses
+                    .insert(deliverable_id.to_string(), status.clone());
             }
 
             Ok(())
@@ -1013,6 +1104,56 @@ impl Planner for BasicCpmPlanner {
                 locks_held: state.locks.values().cloned().collect(),
             }
         })
+    }
+
+    async fn accept(&self, req: AcceptRequest) -> Result<(), PlannerError> {
+        let mut audit_buf: Vec<AuditEvent> = Vec::new();
+        let plan_id = req.plan_id.clone();
+        let deliverable_id = req.deliverable_id.as_str();
+        self.store.mutate_plan(&plan_id, |state| {
+            if !state
+                .graph
+                .deliverables
+                .iter()
+                .any(|d| d.id == deliverable_id)
+            {
+                return Err(PlannerError::DeliverableNotFound {
+                    plan_id: plan_id.0.clone(),
+                    deliverable_id: deliverable_id.to_string(),
+                });
+            }
+
+            // A live lease held by someone else needs an explicit override.
+            let mut overrode: Option<String> = None;
+            if let Some(lock) = state.locks.get(deliverable_id)
+                && lock.caller_id.as_str() != req.accepted_by
+            {
+                if !req.override_lock {
+                    return Err(PlannerError::LockHeld {
+                        plan_id: plan_id.0.clone(),
+                        deliverable_id: deliverable_id.to_string(),
+                        holder: lock.caller_id.0.clone(),
+                    });
+                }
+                overrode = Some(lock.caller_id.0.clone());
+            }
+
+            let missing = incomplete_prerequisites(state, deliverable_id);
+            if !missing.is_empty() {
+                return Err(PlannerError::PrerequisitesIncomplete {
+                    plan_id: plan_id.0.clone(),
+                    deliverable_id: deliverable_id.to_string(),
+                    missing,
+                });
+            }
+
+            complete_deliverable(state, deliverable_id, &mut audit_buf, "accepted");
+            audit_buf.push(make_accepted_event(&req, overrode.as_deref()));
+            Ok(())
+        })?;
+
+        self.flush_audit(audit_buf).await;
+        Ok(())
     }
 
     async fn force_release(&self, req: ForceReleaseRequest) -> Result<(), PlannerError> {

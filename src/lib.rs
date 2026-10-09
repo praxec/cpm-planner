@@ -56,13 +56,15 @@ pub mod task;
 pub use algorithm::CpmAlgorithm;
 pub use drag::{DragResult, diameter, drag};
 pub use estimator::{EffortEstimator, EstimationConfig};
-pub use plan::{AcquireRequest, ForceReleaseRequest, HeartbeatRequest, MarkStatusRequest};
+pub use plan::{
+    AcceptRequest, AcquireRequest, ForceReleaseRequest, HeartbeatRequest, MarkStatusRequest,
+};
 pub use plan_store::{DB_PATH_ENV, SqlitePlanStore};
 pub use planner::{
     BasicCpmPlanner, ClockFn, DEFAULT_EFFORT_HOURS, DEFAULT_TTL, MAX_ATTEMPTS, MAX_LAPSES,
 };
 pub use server::{
-    PLAN_TOOL_NAMES, PlanServer, TOOL_ACQUIRE_COHORT, TOOL_FORCE_RELEASE, TOOL_HEARTBEAT,
-    TOOL_MARK_STATUS, TOOL_STATUS, TOOL_SUBMIT, plan_tool_definitions,
+    PLAN_TOOL_NAMES, PlanServer, TOOL_ACCEPT, TOOL_ACQUIRE_COHORT, TOOL_FORCE_RELEASE,
+    TOOL_HEARTBEAT, TOOL_MARK_STATUS, TOOL_STATUS, TOOL_SUBMIT, plan_tool_definitions,
 };
 pub use task::{Bottleneck, CriticalPathResult, Task, TaskBatch, TaskKind, TaskStatus};

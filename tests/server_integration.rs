@@ -14,8 +14,8 @@
 use std::sync::Arc;
 
 use cpm_planner::{
-    BasicCpmPlanner, PlanServer, TOOL_ACQUIRE_COHORT, TOOL_FORCE_RELEASE, TOOL_HEARTBEAT,
-    TOOL_MARK_STATUS, TOOL_STATUS, TOOL_SUBMIT,
+    BasicCpmPlanner, PlanServer, TOOL_ACCEPT, TOOL_ACQUIRE_COHORT, TOOL_FORCE_RELEASE,
+    TOOL_HEARTBEAT, TOOL_MARK_STATUS, TOOL_STATUS, TOOL_SUBMIT,
 };
 use rmcp::model::{CallToolRequestParams, JsonObject};
 use serde_json::{Value, json};
@@ -395,6 +395,27 @@ async fn plan_force_release_accepts_reset_counters() {
         .await
         .expect("plan.force_release accepts reset_counters");
     assert_eq!(result["ok"], true);
+}
+
+// ── Roundtrip: plan.accept ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn plan_accept_roundtrip() {
+    let server = server();
+    let plan_id = submit_plan(&server).await;
+    let resp = server
+        .dispatch_call(call_args(
+            TOOL_ACCEPT,
+            json!({
+                "plan_id": plan_id,
+                "deliverable_id": "d1",
+                "accepted_by": "owner",
+                "evidence": "reviewed"
+            }),
+        ))
+        .await
+        .expect("plan.accept returns Ok");
+    assert_eq!(resp["ok"], true);
 }
 
 // ── Roundtrip: plan.get ─────────────────────────────────────────────────────

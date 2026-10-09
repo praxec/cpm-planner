@@ -54,6 +54,7 @@ any other MCP server:
 | `plan.status` | Read-only snapshot of the plan and its locks. |
 | `plan.get` | Return the stored plan graph for a plan_id (read back what was submitted). |
 | `plan.force_release` | Operator escape hatch: release a lock regardless of holder/TTL. |
+| `plan.accept` | Manager/owner acceptance: complete a deliverable without holding its lease (audited, with evidence). |
 
 ## Use as a library
 
