@@ -52,6 +52,7 @@ any other MCP server:
 | `plan.heartbeat` | Refresh the TTL on a held lock. |
 | `plan.mark_status` | Mark a deliverable complete/failed; releases its lock. |
 | `plan.status` | Read-only snapshot of the plan and its locks. |
+| `plan.get` | Return the stored plan graph for a plan_id (read back what was submitted). |
 | `plan.force_release` | Operator escape hatch: release a lock regardless of holder/TTL. |
 
 ## Use as a library

@@ -5,7 +5,8 @@
 use async_trait::async_trait;
 
 use crate::plan::{
-    CallerId, Cohort, DeliverableStatus, PlanGraph, PlanId, PlanStatus, PlannerError,
+    CallerId, Cohort, DeliverableStatus, PlanDefinition, PlanGraph, PlanId, PlanStatus,
+    PlannerError,
 };
 
 /// Lock-aware planner.
@@ -68,6 +69,10 @@ pub trait Planner: Send + Sync {
 
     /// Cheap read-only snapshot. Safe to poll on a timer.
     async fn status(&self, plan_id: &PlanId) -> Result<PlanStatus, PlannerError>;
+
+    /// Return the stored definition for `plan_id` — the [`PlanGraph`]
+    /// exactly as submitted.
+    async fn get_plan(&self, plan_id: &PlanId) -> Result<PlanDefinition, PlannerError>;
 
     /// Operator escape hatch: forcibly release a lock regardless of holder or
     /// TTL. Implementations MUST emit an audit event carrying `reason`.

@@ -213,13 +213,20 @@ pub struct Bottleneck {
 pub struct CriticalPathResult {
     /// Total number of tasks in the plan.
     pub total_tasks: usize,
-    /// Tasks on the critical path (ordered by execution sequence).
+    /// One longest prerequisite chain, in execution order: each element is a
+    /// prerequisite of the next. Sink ties resolve to the later earliest start,
+    /// then the smallest id; predecessor ties resolve to the smallest id.
     pub critical_path: Vec<String>,
-    /// Duration of critical path in hours.
+    /// Every zero-float (critical) task, sorted by earliest start then id.
+    /// Unlike `critical_path` this may contain several parallel chains.
+    #[serde(default)]
+    pub critical_ids: Vec<String>,
+    /// Project length: the maximum earliest finish (equals the effort summed
+    /// along `critical_path`).
     pub critical_path_duration: f32,
     /// Total duration if done sequentially.
     pub total_duration_sequential: f32,
-    /// Optimal duration with parallelization.
+    /// Makespan with unlimited parallelism (maximum earliest finish).
     pub optimal_duration_parallel: f32,
     /// Speedup factor (sequential / parallel).
     pub speedup_factor: f32,

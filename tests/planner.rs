@@ -408,3 +408,84 @@ async fn force_release_reverts_to_ready_and_audits_reason() {
         "operator override: caller offline"
     );
 }
+
+async fn submit_diamond_with_spare() -> (BasicCpmPlanner, cpm_planner::plan::PlanId) {
+    let planner = BasicCpmPlanner::new();
+    let graph = PlanGraph {
+        deliverables: vec![
+            deliverable("A", &["src/a.rs"], &[], Some(1.0)),
+            deliverable("B", &["src/b.rs"], &["A"], Some(2.0)),
+            deliverable("C", &["src/c.rs"], &["A"], Some(4.0)),
+            deliverable("D", &["src/d.rs"], &["B", "C"], Some(1.0)),
+            deliverable("E", &["src/e.rs"], &[], Some(1.0)),
+        ],
+        max_chained_dispatch: None,
+    };
+    let plan_id = planner.submit_plan(graph).await.unwrap();
+    (planner, plan_id)
+}
+
+#[tokio::test]
+async fn status_schedule_reports_float_for_non_critical_branch() {
+    let (planner, plan_id) = submit_diamond_with_spare().await;
+    let status = planner.status(&plan_id).await.unwrap();
+    let b = status.schedule.iter().find(|r| r.id == "B").unwrap();
+    assert!((b.float - 2.0).abs() < 1e-3);
+}
+
+#[tokio::test]
+async fn status_schedule_marks_critical_rows() {
+    let (planner, plan_id) = submit_diamond_with_spare().await;
+    let status = planner.status(&plan_id).await.unwrap();
+    let critical: Vec<&str> = status
+        .schedule
+        .iter()
+        .filter(|r| r.critical)
+        .map(|r| r.id.as_str())
+        .collect();
+    assert_eq!(critical, vec!["A", "C", "D"]);
+}
+
+#[tokio::test]
+async fn status_ready_is_sorted_by_float_ascending() {
+    let (planner, plan_id) = submit_diamond_with_spare().await;
+    let status = planner.status(&plan_id).await.unwrap();
+    assert_eq!(status.ready, vec!["A", "E"]);
+}
+
+#[tokio::test]
+async fn status_ready_excludes_locked_deliverables() {
+    let (planner, plan_id) = submit_diamond_with_spare().await;
+    planner
+        .acquire_cohort(&plan_id, &caller("w1"), 1)
+        .await
+        .unwrap();
+    let status = planner.status(&plan_id).await.unwrap();
+    assert_eq!(status.ready, vec!["E"]);
+}
+
+#[tokio::test]
+async fn acquire_cohort_prefers_lowest_float() {
+    let (planner, plan_id) = submit_diamond_with_spare().await;
+    let cohort = planner
+        .acquire_cohort(&plan_id, &caller("w1"), 1)
+        .await
+        .unwrap();
+    let ids: Vec<&str> = cohort
+        .rows
+        .iter()
+        .map(|r| r.deliverable.id.as_str())
+        .collect();
+    assert_eq!(ids, vec!["A"]);
+}
+
+#[tokio::test]
+async fn submit_rejects_negative_effort() {
+    let planner = BasicCpmPlanner::new();
+    let graph = PlanGraph {
+        deliverables: vec![deliverable("a", &["src/a.rs"], &[], Some(-1.0))],
+        max_chained_dispatch: None,
+    };
+    let err = planner.submit_plan(graph).await.unwrap_err();
+    assert!(err.to_string().starts_with("INVALID_GRAPH"), "got: {err}");
+}

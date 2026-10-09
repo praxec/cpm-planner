@@ -109,3 +109,131 @@ fn integration_bottleneck_roi_ordering() {
     // ROI = 8 blocked hours / 1 effort hour = 8
     assert!(first.roi >= 7.9);
 }
+
+fn assert_chain_is_prerequisite_path(result: &cpm_planner::task::CriticalPathResult) {
+    for pair in result.critical_path.windows(2) {
+        let succ = result.tasks.iter().find(|t| t.id == pair[1]).expect("succ");
+        assert!(
+            succ.dependencies.contains(&pair[0]),
+            "{} -> {} is not a prerequisite edge",
+            pair[0],
+            pair[1]
+        );
+    }
+}
+
+#[test]
+fn critical_path_of_parallel_equal_chains_is_one_real_chain() {
+    // Two independent, equally long chains: both fully zero-float.
+    let mut tasks = vec![
+        make_task("P0a", 2.0, vec![]),
+        make_task("P0b", 3.0, vec!["P0a"]),
+        make_task("P1a", 2.0, vec![]),
+        make_task("P1b", 3.0, vec!["P1a"]),
+    ];
+    let result = CpmAlgorithm::calculate(&mut tasks);
+    assert_eq!(result.critical_path, vec!["P0a", "P0b"]);
+}
+
+#[test]
+fn critical_path_pairs_are_prerequisite_edges_for_parallel_chains() {
+    let mut tasks = vec![
+        make_task("P0a", 2.0, vec![]),
+        make_task("P0b", 3.0, vec!["P0a"]),
+        make_task("P1a", 2.0, vec![]),
+        make_task("P1b", 3.0, vec!["P1a"]),
+    ];
+    let result = CpmAlgorithm::calculate(&mut tasks);
+    assert_chain_is_prerequisite_path(&result);
+}
+
+#[test]
+fn critical_path_duration_is_project_length_not_sum_of_zero_float_tasks() {
+    let mut tasks = vec![
+        make_task("P0a", 2.0, vec![]),
+        make_task("P0b", 3.0, vec!["P0a"]),
+        make_task("P1a", 2.0, vec![]),
+        make_task("P1b", 3.0, vec!["P1a"]),
+    ];
+    let result = CpmAlgorithm::calculate(&mut tasks);
+    assert!((result.critical_path_duration - 5.0).abs() < 1e-3);
+}
+
+#[test]
+fn critical_ids_lists_every_zero_float_task_by_start_then_id() {
+    let mut tasks = vec![
+        make_task("P0a", 2.0, vec![]),
+        make_task("P0b", 3.0, vec!["P0a"]),
+        make_task("P1a", 2.0, vec![]),
+        make_task("P1b", 3.0, vec!["P1a"]),
+    ];
+    let result = CpmAlgorithm::calculate(&mut tasks);
+    assert_eq!(result.critical_ids, vec!["P0a", "P1a", "P0b", "P1b"]);
+}
+
+#[test]
+fn equal_length_chains_prefer_the_later_starting_sink() {
+    // X(5) stands alone; Y(1) -> Z(4) also ends at 5h. Sinks tie on EF, so the
+    // later-starting sink Z wins and the path is the real chain Y -> Z (X is
+    // never chained in).
+    let mut tasks = vec![
+        make_task("X", 5.0, vec![]),
+        make_task("Y", 1.0, vec![]),
+        make_task("Z", 4.0, vec!["Y"]),
+    ];
+    let result = CpmAlgorithm::calculate(&mut tasks);
+    assert_eq!(result.critical_path, vec!["Y", "Z"]);
+}
+
+#[test]
+fn optimal_parallel_duration_is_max_earliest_finish() {
+    // A(1) -> B(2), A -> C(4), B,C -> D(1): makespan 6, batches would sum higher.
+    let mut tasks = vec![
+        make_task("A", 1.0, vec![]),
+        make_task("B", 2.0, vec!["A"]),
+        make_task("C", 4.0, vec!["A"]),
+        make_task("D", 1.0, vec!["B", "C"]),
+    ];
+    let result = CpmAlgorithm::calculate(&mut tasks);
+    assert!((result.optimal_duration_parallel - 6.0).abs() < 1e-3);
+}
+
+#[test]
+fn duplicate_prerequisite_ids_still_schedule() {
+    let mut tasks = vec![
+        make_task("A", 1.0, vec![]),
+        make_task("B", 2.0, vec!["A", "A"]),
+    ];
+    let result = CpmAlgorithm::calculate(&mut tasks);
+    assert!(result.unscheduled.is_empty());
+}
+
+#[test]
+fn zero_effort_milestone_stays_on_critical_path() {
+    let mut tasks = vec![
+        make_task("A", 3.0, vec![]),
+        make_task("M", 0.0, vec!["A"]),
+        make_task("B", 2.0, vec!["M"]),
+    ];
+    let result = CpmAlgorithm::calculate(&mut tasks);
+    assert_eq!(result.critical_path, vec!["A", "M", "B"]);
+}
+
+#[test]
+fn tight_predecessor_tie_picks_smallest_id() {
+    // B and C both finish at 2 and both feed D.
+    let mut tasks = vec![
+        make_task("C", 2.0, vec![]),
+        make_task("B", 2.0, vec![]),
+        make_task("D", 1.0, vec!["C", "B"]),
+    ];
+    let result = CpmAlgorithm::calculate(&mut tasks);
+    assert_eq!(result.critical_path, vec!["B", "D"]);
+}
+
+#[test]
+fn zero_effort_final_milestone_ends_the_critical_path() {
+    let mut tasks = vec![make_task("A", 3.0, vec![]), make_task("M", 0.0, vec!["A"])];
+    let result = CpmAlgorithm::calculate(&mut tasks);
+    assert_eq!(result.critical_path, vec!["A", "M"]);
+}

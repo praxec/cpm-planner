@@ -129,9 +129,8 @@ pub struct Deliverable {
     pub prerequisites: Vec<String>,
 
     /// Estimated wall-clock effort, used by critical-path math in
-    /// [`PlanStatus::critical_path`]. `None` means the implementation
-    /// should treat the duration as one unit when computing the longest
-    /// chain.
+    /// [`PlanStatus::critical_path`]. `None` means the planner derives an
+    /// estimate with `EffortEstimator`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_effort_hours: Option<f32>,
 
@@ -318,11 +317,44 @@ pub struct PlanStatus {
     /// Ids on the longest dependency chain, in execution order. Empty
     /// when the plan has no deliverables.
     pub critical_path: Vec<String>,
-    /// Sum of `estimated_effort_hours` along `critical_path`. Deliverables
-    /// without an estimate contribute zero.
+    /// Project length in hours: the maximum earliest finish, equal to the
+    /// effort summed along `critical_path`.
     pub critical_path_hours: f32,
     /// Every lock currently active across the plan.
     pub locks_held: Vec<LockInfo>,
+    /// Every zero-float deliverable, sorted by `(es, id)`.
+    #[serde(default)]
+    pub critical_ids: Vec<String>,
+    /// Per-deliverable CPM schedule, in graph insertion order.
+    #[serde(default)]
+    pub schedule: Vec<ScheduleRow>,
+    /// Deliverables with status `Ready` and no live lock, sorted by
+    /// `(float, es, id)` ascending. Same ordering as
+    /// [`crate::ports::Planner::acquire_cohort`] (shared `priority_key`);
+    /// membership is a superset: acquire may still skip deliverables at the
+    /// failure or lapse cap or whose files overlap a held lock.
+    #[serde(default)]
+    pub ready: Vec<String>,
+}
+
+/// The stored definition of a plan: the [`PlanGraph`] exactly as submitted,
+/// returned by [`crate::ports::Planner::get_plan`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanDefinition {
+    pub plan_id: PlanId,
+    pub graph: PlanGraph,
+}
+
+/// One deliverable's CPM schedule, in hours from plan start.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScheduleRow {
+    pub id: String,
+    pub es: f32,
+    pub ef: f32,
+    pub ls: f32,
+    pub lf: f32,
+    pub float: f32,
+    pub critical: bool,
 }
 
 /// Errors returned by [`crate::ports::Planner`] methods.

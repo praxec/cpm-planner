@@ -6,7 +6,7 @@
 
 //! MCP tool surface for the open-source CPM planner.
 //!
-//! [`PlanServer`] wraps an `Arc<BasicCpmPlanner>` and exposes the six
+//! [`PlanServer`] wraps an `Arc<BasicCpmPlanner>` and exposes the seven
 //! [`Planner`] trait methods as MCP tools so any MCP-speaking agent
 //! (Claude Code, Cursor, custom orchestrator, or the §33 LLM executor)
 //! can drive the planner over the standard MCP protocol.
@@ -20,6 +20,7 @@
 //! | `plan.heartbeat`         | [`Planner::heartbeat`]        |
 //! | `plan.mark_status`       | [`Planner::mark_status`]      |
 //! | `plan.status`            | [`Planner::status`]           |
+//! | `plan.get`               | [`Planner::get_plan`]         |
 //! | `plan.force_release`     | [`Planner::force_release`]    |
 //!
 //! # Error mapping
@@ -44,7 +45,8 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::plan::{
-    CallerId, Cohort, DeliverableStatus, PlanGraph, PlanId, PlanStatus, PlannerError,
+    CallerId, Cohort, DeliverableStatus, PlanDefinition, PlanGraph, PlanId, PlanStatus,
+    PlannerError,
 };
 use crate::ports::Planner;
 use rmcp::ErrorData as McpError;
@@ -69,15 +71,17 @@ pub const TOOL_ACQUIRE_COHORT: &str = "plan.acquire_cohort";
 pub const TOOL_HEARTBEAT: &str = "plan.heartbeat";
 pub const TOOL_MARK_STATUS: &str = "plan.mark_status";
 pub const TOOL_STATUS: &str = "plan.status";
+pub const TOOL_GET: &str = "plan.get";
 pub const TOOL_FORCE_RELEASE: &str = "plan.force_release";
 
-/// All six MCP tool names exposed by [`PlanServer`], in declaration order.
+/// All seven MCP tool names exposed by [`PlanServer`], in declaration order.
 pub const PLAN_TOOL_NAMES: &[&str] = &[
     TOOL_SUBMIT,
     TOOL_ACQUIRE_COHORT,
     TOOL_HEARTBEAT,
     TOOL_MARK_STATUS,
     TOOL_STATUS,
+    TOOL_GET,
     TOOL_FORCE_RELEASE,
 ];
 
@@ -128,6 +132,12 @@ struct StatusArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct GetArgs {
+    plan_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ForceReleaseArgs {
     plan_id: String,
     deliverable_id: String,
@@ -161,7 +171,7 @@ impl OkResponse {
 // Tool-list construction
 // ---------------------------------------------------------------------------
 
-/// Build the six `Tool` definitions advertised in `list_tools`.
+/// Build the seven `Tool` definitions advertised in `list_tools`.
 ///
 /// Each tool carries an inline JSON Schema describing its arguments. The
 /// schemas are hand-written rather than derived because the workspace's
@@ -266,7 +276,23 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
             Cow::Borrowed(TOOL_STATUS),
             Cow::Borrowed(
                 "Read-only snapshot: per-deliverable [id, status, attempt_count, \
-                 failure_count, lapse_count] rows, critical path, held locks.",
+                 failure_count, lapse_count] rows, critical_path (one real chain), \
+                 critical_ids, per-deliverable schedule (es/ef/ls/lf/float, hours), \
+                 the ready set in cohort priority order, and held locks.",
+            ),
+            schema_object(json!({
+                "type": "object",
+                "properties": {
+                    "plan_id": { "type": "string" }
+                },
+                "required": ["plan_id"]
+            })),
+        ),
+        Tool::new(
+            Cow::Borrowed(TOOL_GET),
+            Cow::Borrowed(
+                "Return the stored PlanGraph (deliverables, estimates, files, \
+                 metadata) for a plan_id.",
             ),
             schema_object(json!({
                 "type": "object",
@@ -317,7 +343,7 @@ fn schema_object(value: Value) -> Arc<rmcp::model::JsonObject> {
 // PlanServer
 // ---------------------------------------------------------------------------
 
-/// MCP server façade exposing a [`BasicCpmPlanner`] over six tools.
+/// MCP server façade exposing a [`BasicCpmPlanner`] over seven tools.
 #[derive(Clone)]
 pub struct PlanServer {
     planner: Arc<BasicCpmPlanner>,
@@ -379,6 +405,7 @@ impl PlanServer {
             TOOL_HEARTBEAT => self.handle_heartbeat(args).await,
             TOOL_MARK_STATUS => self.handle_mark_status(args).await,
             TOOL_STATUS => self.handle_status(args).await,
+            TOOL_GET => self.handle_get(args).await,
             TOOL_FORCE_RELEASE => self.handle_force_release(args).await,
             other => Err(McpError::invalid_params(
                 format!(
@@ -466,6 +493,16 @@ impl PlanServer {
         to_value(&status)
     }
 
+    async fn handle_get(&self, args: Value) -> Result<Value, McpError> {
+        let parsed: GetArgs = parse_args(args)?;
+        let definition: PlanDefinition = self
+            .planner
+            .get_plan(&PlanId(parsed.plan_id))
+            .await
+            .map_err(planner_error_to_mcp)?;
+        to_value(&definition)
+    }
+
     async fn handle_force_release(&self, args: Value) -> Result<Value, McpError> {
         let parsed: ForceReleaseArgs = parse_args(args)?;
         self.planner
@@ -490,7 +527,7 @@ impl ServerHandler for PlanServer {
             Implementation::new(self.server_name.clone(), self.server_version.clone());
         server_info.title = Some("cpm-planner".to_string());
         server_info.description = Some(
-            "MCP server exposing the open-source Praxec CPM planner via six tools.".to_string(),
+            "MCP server exposing the open-source Praxec CPM planner via seven tools.".to_string(),
         );
 
         let mut info = InitializeResult::default();
@@ -575,12 +612,13 @@ fn planner_error_to_mcp(err: PlannerError) -> McpError {
 fn instructions() -> &'static str {
     r#"This is the cpm-planner MCP server — the open-source CPM planner.
 
-Tools (six total, all `plan.<verb>`):
+Tools (seven total, all `plan.<verb>`):
   plan.submit          — submit a PlanGraph, get a plan_id (idempotent on identical graphs)
   plan.acquire_cohort  — atomically acquire ready, file-disjoint deliverables
   plan.heartbeat       — refresh a held lock's TTL
   plan.mark_status     — set a deliverable's status (Complete/Failed releases the lock)
-  plan.status          — read-only snapshot ([id, status, attempt_count, failure_count, lapse_count] rows, critical path, held locks)
+  plan.status          — read-only snapshot ([id, status, attempt_count, failure_count, lapse_count] rows, critical_path (one real chain), critical_ids, per-deliverable schedule (es/ef/ls/lf/float, hours), the ready set ordered by float, held locks)
+  plan.get             — return the submitted PlanGraph (deliverables, estimates, files, metadata) for a plan_id
   plan.force_release   — operator escape hatch; emits audit event with `reason`
 
 Errors carry stable prefixes: LOCK_HELD, LOCK_NOT_HELD, LOCK_EXPIRED,
