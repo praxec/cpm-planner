@@ -1,5 +1,6 @@
 use cpm_planner::monte_carlo::{MonteCarloRequest, monte_carlo};
 use cpm_planner::plan::{PlanGraph, PlannerError};
+use cpm_planner::{CpmAlgorithm, Task};
 use serde_json::json;
 
 fn graph(v: serde_json::Value) -> PlanGraph {
@@ -118,4 +119,39 @@ fn duration_hours_overrides_estimate_and_is_not_sampled() {
     );
     let s = monte_carlo(&g, &req(50, 1)).unwrap();
     assert_eq!((s.p95, s.sensitivity.len()), (6.0, 0));
+}
+
+#[test]
+fn deterministic_graph_with_lag_and_parallel_sinks_matches_cpm() {
+    let g = graph(json!([
+        fixed("a", &[], 3.0),
+        json!({"id": "b", "owned_files": [], "estimated_effort_hours": 2.0,
+               "prerequisites": [{"id": "a", "lag_hours": 4.0}]}),
+        fixed("c", &["a"], 5.0),
+    ]));
+    let s = monte_carlo(&g, &req(20, 1)).unwrap();
+    // b finishes at 3 + 4 + 2 = 9, c at 8: two sinks, lag decides the makespan.
+    let mut b = Task {
+        id: "b".into(),
+        effort_hours: 2.0,
+        dependencies: vec!["a".into()],
+        ..Task::default()
+    };
+    b.lag_by_dependency.insert("a".into(), 4.0);
+    let mut tasks = vec![
+        Task {
+            id: "a".into(),
+            effort_hours: 3.0,
+            ..Task::default()
+        },
+        b,
+        Task {
+            id: "c".into(),
+            effort_hours: 5.0,
+            dependencies: vec!["a".into()],
+            ..Task::default()
+        },
+    ];
+    let cpm = CpmAlgorithm::calculate(&mut tasks).critical_path_duration;
+    assert_eq!((s.p50, s.deterministic_makespan, cpm), (9.0, 9.0, 9.0));
 }
