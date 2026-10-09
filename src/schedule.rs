@@ -40,7 +40,7 @@ pub(crate) fn compute_cpm(graph: &PlanGraph) -> Result<CriticalPathResult, Plann
 /// Every root deliverable depends on `__start__`; `__finish__` depends on
 /// every sink (a deliverable no other deliverable lists as a prerequisite).
 /// Only the CPM input is touched; the stored graph never contains them.
-fn add_endpoints(graph: &PlanGraph, tasks: &mut Vec<Task>) {
+pub(crate) fn add_endpoints(graph: &PlanGraph, tasks: &mut Vec<Task>) {
     let referenced: HashSet<&str> = graph
         .deliverables
         .iter()

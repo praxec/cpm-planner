@@ -45,6 +45,7 @@ pub mod estimator;
 mod graph;
 pub mod lint;
 mod locks;
+pub mod monte_carlo;
 pub mod network_health;
 pub mod plan;
 pub mod plan_store;
