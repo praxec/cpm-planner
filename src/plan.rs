@@ -902,6 +902,12 @@ pub enum PlannerError {
     #[error("INVALID_GRAPH: {reason}")]
     InvalidGraph { reason: String },
 
+    /// A project/plan-file path failed validation: not a valid slug, not of the
+    /// form `.cpm-planner/plans/<name>/<variant>.json`, absolute, contains `..`,
+    /// or resolves (e.g. via a symlink) outside the plans directory.
+    #[error("INVALID_PATH: {reason}")]
+    InvalidPath { reason: String },
+
     /// `plan.schedule` was given no usable capacity (missing or zero) for
     /// one or more resources that scheduled work needs. `missing` is sorted.
     #[error("INVALID_CAPACITIES: no capacity for resources [{}]", missing.join(", "))]
