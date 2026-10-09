@@ -384,6 +384,25 @@ fn lapse_count_of(status: &cpm_planner::plan::PlanStatus, id: &str) -> u32 {
 }
 
 #[tokio::test]
+async fn requested_lapse_limited_id_is_blocked_lapse_limit() {
+    let (planner, _audit, _clock, plan_id) = planner_with_lapse_limited_stuck().await;
+    let cohort = planner
+        .acquire_cohort(
+            AcquireRequest::new(plan_id, caller("fresh"), 5).with_ids(vec!["stuck".to_string()]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        cohort
+            .blocked
+            .iter()
+            .map(|b| (b.id.as_str(), b.code.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("stuck", "LAPSE_LIMIT")]
+    );
+}
+
+#[tokio::test]
 async fn acquire_skips_lapse_limited_deliverable_and_leases_the_rest() {
     let (planner, _audit, _clock, plan_id) = planner_with_lapse_limited_stuck().await;
     let cohort = planner

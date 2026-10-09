@@ -256,7 +256,8 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                  that breaker but are bounded separately (LAPSE_LIMIT at 10). \
                  Optional ids targets specific deliverables and filter.metadata \
                  narrows by metadata equality; deliverables with \
-                 metadata.kind = \"manual\" are never leased.",
+                 metadata.kind = \"manual\" are never leased. ids that do not \
+                 match filter.metadata are ignored (not reported in blocked).",
             ),
             schema_object(json!({
                 "type": "object",
@@ -498,6 +499,12 @@ impl PlanServer {
 
     async fn handle_acquire_cohort(&self, args: Value) -> Result<Value, McpError> {
         let parsed: AcquireCohortArgs = parse_args(args)?;
+        if parsed.ids.as_ref().is_some_and(Vec::is_empty) {
+            return Err(McpError::invalid_params(
+                "ids must be non-empty when provided",
+                None,
+            ));
+        }
         let mut request = AcquireRequest::new(
             PlanId(parsed.plan_id),
             CallerId(parsed.caller_id),
@@ -738,7 +745,8 @@ environment, then clear it with plan.force_release {reset_counters: true}.
 Targeted acquire: plan.acquire_cohort accepts optional `ids` (only those
 deliverables are considered; unknown id -> DELIVERABLE_NOT_FOUND) and
 `filter: {"metadata": {key: value}}` (only deliverables whose metadata
-equals every pair; others are silently skipped). Deliverables with
+equals every pair; others are silently skipped). ids that do not match
+filter.metadata are ignored (not reported in blocked). Deliverables with
 metadata.kind = "manual" are never leased. With `ids`, each requested id
 that is not leased appears in `blocked` with code MANUAL, NOT_READY,
 LOCKED, LAPSE_LIMIT, FILE_CONFLICT or MAX_COUNT.

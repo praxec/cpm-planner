@@ -791,13 +791,14 @@ impl Planner for BasicCpmPlanner {
             let mut selected_files: HashSet<PathBuf> = HashSet::new();
             for candidate in ready {
                 if selected.len() == max_count {
-                    if ids.is_some() {
-                        blocked.push(BlockedDeliverable {
-                            id: candidate.id.clone(),
-                            code: "MAX_COUNT".to_string(),
-                            reason: format!("cohort already holds max_count ({max_count})"),
-                        });
+                    if ids.is_none() {
+                        break;
                     }
+                    blocked.push(BlockedDeliverable {
+                        id: candidate.id.clone(),
+                        code: "MAX_COUNT".to_string(),
+                        reason: format!("cohort already holds max_count ({max_count})"),
+                    });
                     continue;
                 }
                 let conflict = candidate.owned_files.iter().any(|f| {

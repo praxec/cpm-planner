@@ -624,3 +624,17 @@ async fn plan_acquire_cohort_rejects_unknown_filter_keys() {
         .await;
     assert!(result.is_err());
 }
+
+#[tokio::test]
+async fn plan_acquire_cohort_rejects_empty_ids() {
+    let server = server();
+    let plan_id = submit_plan(&server).await;
+    let err = server
+        .dispatch_call(call_args(
+            TOOL_ACQUIRE_COHORT,
+            json!({"plan_id": plan_id, "caller_id": "w", "max_count": 1, "ids": []}),
+        ))
+        .await
+        .expect_err("empty ids must be rejected");
+    assert_eq!(err.message, "ids must be non-empty when provided");
+}

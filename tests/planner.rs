@@ -629,7 +629,7 @@ async fn unfiltered_acquire_never_leases_manual_deliverables() {
         .acquire_cohort(AcquireRequest::new(id, caller("a"), 10))
         .await
         .unwrap();
-    assert!(!cohort_ids(&cohort).contains(&"ownerTask".to_string()));
+    assert_eq!(sorted(cohort_ids(&cohort)), vec!["code1", "code2", "jun"]);
 }
 
 #[tokio::test]
@@ -671,7 +671,8 @@ async fn requested_pending_deliverable_is_blocked_not_ready() {
         .acquire_cohort(AcquireRequest::new(id, caller("a"), 10).with_ids(strs(&["later"])))
         .await
         .unwrap();
-    assert_eq!(codes(&cohort), vec![("later".into(), "NOT_READY".into())]);
+    let b = &cohort.blocked[0];
+    assert!(b.id == "later" && b.code == "NOT_READY" && b.reason.contains("Pending"));
 }
 
 #[tokio::test]
@@ -876,4 +877,30 @@ async fn lockless_mark_complete_emits_completed_without_lease_event() {
             .iter()
             .any(|e| e.event_type == "completed_without_lease")
     );
+}
+
+#[tokio::test]
+async fn ids_and_filter_intersect() {
+    let (p, id) = submit_mixed().await;
+    let mut f = serde_json::Map::new();
+    f.insert("executor".into(), serde_json::json!("claude"));
+    let cohort = p
+        .acquire_cohort(
+            AcquireRequest::new(id, caller("a"), 10)
+                .with_ids(strs(&["code1", "jun"]))
+                .with_metadata_filter(f),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cohort_ids(&cohort), vec!["code1"]);
+}
+
+#[tokio::test]
+async fn unfiltered_acquire_lists_no_manual_entries_in_blocked() {
+    let (p, id) = submit_mixed().await;
+    let cohort = p
+        .acquire_cohort(AcquireRequest::new(id, caller("a"), 10))
+        .await
+        .unwrap();
+    assert!(cohort.blocked.iter().all(|b| b.code != "MANUAL"));
 }
