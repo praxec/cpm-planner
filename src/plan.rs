@@ -335,6 +335,14 @@ pub struct PlanStatus {
     pub ready: Vec<String>,
 }
 
+/// The stored definition of a plan: the [`PlanGraph`] exactly as submitted,
+/// returned by [`crate::ports::Planner::get_plan`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanDefinition {
+    pub plan_id: PlanId,
+    pub graph: PlanGraph,
+}
+
 /// One deliverable's CPM schedule, in hours from plan start.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScheduleRow {

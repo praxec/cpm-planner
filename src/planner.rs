@@ -35,8 +35,8 @@ use std::time::Duration;
 
 use crate::audit::{AuditEvent, AuditSink, NullAuditSink};
 use crate::plan::{
-    CallerId, Cohort, CohortRow, Deliverable, DeliverableStatus, LockInfo, PlanGraph, PlanId,
-    PlanStatus, PlannerError, ScheduleRow,
+    CallerId, Cohort, CohortRow, Deliverable, DeliverableStatus, LockInfo, PlanDefinition,
+    PlanGraph, PlanId, PlanStatus, PlannerError, ScheduleRow,
 };
 use crate::plan_store::SqlitePlanStore;
 use crate::ports::Planner;
@@ -800,6 +800,13 @@ impl Planner for BasicCpmPlanner {
 
             lock.expires_at = expires_at;
             Ok(())
+        })
+    }
+
+    async fn get_plan(&self, plan_id: &PlanId) -> Result<PlanDefinition, PlannerError> {
+        self.store.read_plan(plan_id, |state| PlanDefinition {
+            plan_id: plan_id.clone(),
+            graph: state.graph.clone(),
         })
     }
 

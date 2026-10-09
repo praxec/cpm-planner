@@ -378,6 +378,29 @@ async fn plan_force_release_roundtrip() {
     );
 }
 
+// ── Roundtrip: plan.get ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn plan_get_returns_submitted_graph() {
+    let server = server();
+    let plan_id = submit_plan(&server).await;
+    let got = server
+        .dispatch_call(call_args("plan.get", json!({ "plan_id": plan_id })))
+        .await
+        .unwrap();
+    assert_eq!(got["graph"]["deliverables"], sample_graph()["deliverables"]);
+}
+
+#[tokio::test]
+async fn plan_get_unknown_plan_is_an_error() {
+    let server = server();
+    let err = server
+        .dispatch_call(call_args("plan.get", json!({ "plan_id": "plan_missing" })))
+        .await
+        .unwrap_err();
+    assert!(err.message.contains("PLAN_NOT_FOUND"));
+}
+
 // ── Error mapping: INVALID_GRAPH on cycles ──────────────────────────────────
 
 #[tokio::test]
