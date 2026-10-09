@@ -108,11 +108,22 @@ pub(crate) fn deliverable_to_task(d: &Deliverable, estimator: &EffortEstimator) 
         }
     };
 
+    // Calendar duration, when given, is the scheduled length; effort stays
+    // on the deliverable as the cost basis.
+    let scheduled_hours = d.duration_hours.unwrap_or(effort_hours);
+    let lag_by_dependency = d
+        .prerequisites
+        .iter()
+        .filter(|p| p.lag_hours() > 0.0)
+        .map(|p| (p.id().to_string(), p.lag_hours()))
+        .collect();
+
     Task {
         id: d.id.clone(),
         name: d.id.clone(),
         kind,
-        effort_hours,
+        effort_hours: scheduled_hours,
+        lag_by_dependency,
         dependencies: crate::graph::prerequisite_ids(d)
             .map(str::to_string)
             .collect(),

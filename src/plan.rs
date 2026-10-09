@@ -205,6 +205,12 @@ pub struct Deliverable {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_effort_hours: Option<f32>,
 
+    /// Calendar time the deliverable occupies on the schedule, in hours.
+    /// When set it replaces the effort estimate as the scheduled length;
+    /// effort stays the cost basis. Must be finite and >= 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_hours: Option<f32>,
+
     /// Free-form metadata. Conventionally carries model hints, human
     /// descriptions, links to specs, etc. The Planner does not interpret
     /// this field.
@@ -808,6 +814,7 @@ mod tests {
                 prerequisites: vec!["d0".into()],
                 estimated_effort_hours: Some(1.5),
                 metadata: serde_json::json!({"description": "smoke test"}),
+                duration_hours: None,
                 milestone: false,
             }],
             max_chained_dispatch: Some(8),
@@ -867,6 +874,7 @@ mod tests {
                         prerequisites: vec![],
                         estimated_effort_hours: Some(1.0),
                         metadata: serde_json::Value::Null,
+                        duration_hours: None,
                         milestone: false,
                     },
                     lock: LockInfo {
@@ -884,6 +892,7 @@ mod tests {
                         prerequisites: vec![],
                         estimated_effort_hours: Some(2.0),
                         metadata: serde_json::Value::Null,
+                        duration_hours: None,
                         milestone: false,
                     },
                     lock: LockInfo {

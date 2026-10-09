@@ -21,8 +21,14 @@ fn deliverable(id: &str, files: &[&str], prereqs: &[&str], effort: Option<f32>) 
         prerequisites: prereqs.iter().map(|s| (*s).into()).collect(),
         estimated_effort_hours: effort,
         metadata: serde_json::Value::Null,
+        duration_hours: None,
         milestone: false,
     }
+}
+
+fn with_duration(mut d: Deliverable, hours: f32) -> Deliverable {
+    d.duration_hours = Some(hours);
+    d
 }
 
 fn caller(id: &str) -> CallerId {
@@ -1527,4 +1533,55 @@ async fn milestone_complete_reflects_status() {
     }
     let status = planner.status(&plan_id).await.unwrap();
     assert!(status.milestones[0].complete);
+}
+
+#[tokio::test]
+async fn duration_hours_overrides_effort_for_schedule() {
+    let planner = BasicCpmPlanner::new();
+    let graph = PlanGraph {
+        deliverables: vec![with_duration(
+            deliverable("d", &["src/d.rs"], &[], Some(8.0)),
+            2.0,
+        )],
+        max_chained_dispatch: None,
+    };
+    let plan_id = planner.submit_plan(graph).await.unwrap();
+    let status = planner.status(&plan_id).await.unwrap();
+    let finish = status
+        .schedule
+        .iter()
+        .find(|r| r.id == "__finish__")
+        .unwrap();
+    assert!((finish.es - 2.0).abs() < 1e-3);
+}
+
+#[tokio::test]
+async fn duration_change_changes_plan_identity() {
+    let planner = BasicCpmPlanner::new();
+    let base = deliverable("d", &["src/d.rs"], &[], Some(8.0));
+    let g1 = PlanGraph {
+        deliverables: vec![with_duration(base.clone(), 2.0)],
+        max_chained_dispatch: None,
+    };
+    let g2 = PlanGraph {
+        deliverables: vec![with_duration(base, 3.0)],
+        max_chained_dispatch: None,
+    };
+    let id1 = planner.submit_plan(g1).await.unwrap();
+    let id2 = planner.submit_plan(g2).await.unwrap();
+    assert_ne!(id1, id2);
+}
+
+#[tokio::test]
+async fn submit_rejects_negative_duration() {
+    let planner = BasicCpmPlanner::new();
+    let graph = PlanGraph {
+        deliverables: vec![with_duration(
+            deliverable("d", &["src/d.rs"], &[], Some(1.0)),
+            -1.0,
+        )],
+        max_chained_dispatch: None,
+    };
+    let err = planner.submit_plan(graph).await.unwrap_err();
+    assert!(matches!(err, PlannerError::InvalidGraph { .. }));
 }

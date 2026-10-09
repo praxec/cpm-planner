@@ -244,6 +244,7 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                                             }, "required": ["id"], "additionalProperties": false }
                                         ] } },
                                         "estimated_effort_hours": { "type": "number" },
+                                        "duration_hours":         { "type": "number", "minimum": 0, "description": "Calendar time on the schedule; replaces effort as the scheduled length. Effort stays the cost basis." },
                                         "metadata":              {}
                                     },
                                     "required": ["id", "owned_files", "prerequisites"]
@@ -767,7 +768,7 @@ fn instructions() -> &'static str {
 
 Tools (eight total, all `plan.<verb>`):
   plan.submit          — submit a PlanGraph, get a plan_id (idempotent on identical graphs)
-                        a prerequisite is an id string or {id, consumes?, kind?: artifact|interface, lag_hours?}
+                        a prerequisite is an id string or {id, consumes?, kind?: artifact|interface, lag_hours?}; a deliverable's duration_hours (calendar time, default = estimated_effort_hours) and lag_hours (minimum wait after a prerequisite finishes) drive the schedule
   plan.acquire_cohort  — atomically acquire ready, file-disjoint deliverables
   plan.heartbeat       — refresh a held lock's TTL
   plan.mark_status     — set a deliverable's status (Complete/Failed releases the lock); lockless Complete requires complete prerequisites (PREREQUISITES_INCOMPLETE) and is audited

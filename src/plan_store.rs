@@ -640,6 +640,7 @@ mod tests {
                 prerequisites: vec![],
                 estimated_effort_hours: Some(1.0),
                 metadata: serde_json::Value::Null,
+                duration_hours: None,
                 milestone: false,
             }],
             max_chained_dispatch: None,

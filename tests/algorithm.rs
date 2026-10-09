@@ -237,3 +237,49 @@ fn zero_effort_final_milestone_ends_the_critical_path() {
     let result = CpmAlgorithm::calculate(&mut tasks);
     assert_eq!(result.critical_path, vec!["A", "M"]);
 }
+
+fn make_task_with_lag(id: &str, effort: f32, deps: Vec<(&str, f32)>) -> Task {
+    let mut t = make_task(id, effort, deps.iter().map(|(d, _)| *d).collect());
+    t.lag_by_dependency = deps.into_iter().map(|(d, l)| (d.to_string(), l)).collect();
+    t
+}
+
+fn lagged_pair() -> Vec<Task> {
+    vec![
+        make_task("a", 2.0, vec![]),
+        make_task_with_lag("b", 1.0, vec![("a", 3.0)]),
+    ]
+}
+
+#[test]
+fn lag_delays_successor_start_by_lag() {
+    let mut tasks = lagged_pair();
+    let result = CpmAlgorithm::calculate(&mut tasks);
+    let b = result.tasks.iter().find(|t| t.id == "b").expect("b");
+    assert!((b.earliest_start - 5.0).abs() < 0.001);
+}
+
+#[test]
+fn lag_extends_project_length() {
+    let mut tasks = lagged_pair();
+    let result = CpmAlgorithm::calculate(&mut tasks);
+    assert!((result.critical_path_duration - 6.0).abs() < 0.001);
+}
+
+#[test]
+fn lag_edge_is_tight_on_critical_path() {
+    let mut tasks = lagged_pair();
+    let result = CpmAlgorithm::calculate(&mut tasks);
+    assert_eq!(result.critical_path, vec!["a", "b"]);
+}
+
+#[test]
+fn backward_pass_subtracts_lag() {
+    // The independent 10h task fixes the project end at 10, so b has slack
+    // (LS 9) and a.lf = 9 - 3 = 6; ignoring lag would give 9.
+    let mut tasks = lagged_pair();
+    tasks.push(make_task("c", 10.0, vec![]));
+    let result = CpmAlgorithm::calculate(&mut tasks);
+    let a = result.tasks.iter().find(|t| t.id == "a").expect("a");
+    assert!((a.latest_finish - 6.0).abs() < 0.001);
+}

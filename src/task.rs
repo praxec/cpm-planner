@@ -88,10 +88,15 @@ pub struct Task {
     pub name: String,
     /// Type of task.
     pub kind: TaskKind,
-    /// Estimated effort in hours.
+    /// Scheduled length in hours. For tasks built from a deliverable this is
+    /// its calendar `duration_hours` when set, else its effort estimate.
     pub effort_hours: f32,
     /// Task IDs this depends on (must complete before this can start).
     pub dependencies: Vec<String>,
+    /// Minimum wait in hours between a dependency's finish and this task's
+    /// start, keyed by dependency id. Absent means 0.
+    #[serde(default)]
+    pub lag_by_dependency: std::collections::HashMap<String, f32>,
     /// Current status.
     pub status: TaskStatus,
     /// Earliest start time (calculated by forward pass).
@@ -120,6 +125,7 @@ impl Default for Task {
             },
             effort_hours: 0.0,
             dependencies: Vec::new(),
+            lag_by_dependency: std::collections::HashMap::new(),
             status: TaskStatus::Pending,
             earliest_start: 0.0,
             earliest_finish: 0.0,

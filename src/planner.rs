@@ -266,6 +266,7 @@ fn hash_graph(graph: &PlanGraph) -> String {
                 "owned_files": files,
                 "prerequisites": prereqs,
                 "estimated_effort_hours": d.estimated_effort_hours,
+                "duration_hours": d.duration_hours,
                 "metadata": d.metadata,
                 "milestone": d.milestone,
             })
@@ -319,6 +320,20 @@ fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
             return Err(PlannerError::InvalidGraph {
                 reason: format!(
                     "deliverable '{}' has invalid estimated_effort_hours {h}; must be a finite number >= 0",
+                    d.id
+                ),
+            });
+        }
+    }
+
+    // Calendar durations, when present, must be finite and non-negative.
+    for d in &graph.deliverables {
+        if let Some(h) = d.duration_hours
+            && (h < 0.0 || !h.is_finite())
+        {
+            return Err(PlannerError::InvalidGraph {
+                reason: format!(
+                    "deliverable '{}' has invalid duration_hours {h}; must be a finite number >= 0",
                     d.id
                 ),
             });
@@ -1480,6 +1495,7 @@ mod tests {
             prerequisites: Vec::new(),
             estimated_effort_hours: effort,
             metadata,
+            duration_hours: None,
             milestone: false,
         }
     }
