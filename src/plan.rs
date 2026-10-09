@@ -544,6 +544,137 @@ impl AcceptRequest {
     }
 }
 
+/// Request bundle for [`crate::ports::Planner::sync_plan`]: register or
+/// update the variant `variant` of the plan line `(project, name)`.
+#[derive(Debug, Clone)]
+pub struct SyncRequest {
+    pub project: String,
+    pub name: String,
+    pub variant: String,
+    pub graph: PlanGraph,
+    /// Where the graph was read from (relative to the project root), if it
+    /// came from a plan file. `None` for an inline graph.
+    pub source_path: Option<String>,
+    /// Hash of the source file's bytes. `None` for an inline graph, which is
+    /// then identified by its canonical graph hash.
+    pub content_hash: Option<String>,
+    /// Passed to the revision when the content changed: release live locks
+    /// of removed deliverables instead of refusing. Defaults to `false`.
+    pub force: bool,
+}
+
+impl SyncRequest {
+    pub fn new(
+        project: impl Into<String>,
+        name: impl Into<String>,
+        variant: impl Into<String>,
+        graph: PlanGraph,
+    ) -> Self {
+        Self {
+            project: project.into(),
+            name: name.into(),
+            variant: variant.into(),
+            graph,
+            source_path: None,
+            content_hash: None,
+            force: false,
+        }
+    }
+
+    /// Record the plan file the graph was read from.
+    pub fn with_source_path(mut self, path: impl Into<String>) -> Self {
+        self.source_path = Some(path.into());
+        self
+    }
+
+    /// Record the hash of the plan file's bytes.
+    pub fn with_content_hash(mut self, hash: impl Into<String>) -> Self {
+        self.content_hash = Some(hash.into());
+        self
+    }
+
+    /// Set whether a changed graph may force-release live locks.
+    pub fn force(mut self, yes: bool) -> Self {
+        self.force = yes;
+        self
+    }
+}
+
+/// Request bundle for [`crate::ports::Planner::revise_plan`].
+#[derive(Debug, Clone)]
+pub struct ReviseRequest {
+    pub plan_id: PlanId,
+    pub graph: PlanGraph,
+    /// Release live locks of removed (or claim-conflicting) deliverables
+    /// instead of refusing with `LOCK_HELD`. Defaults to `false`.
+    pub force: bool,
+}
+
+impl ReviseRequest {
+    pub fn new(plan_id: PlanId, graph: PlanGraph) -> Self {
+        Self {
+            plan_id,
+            graph,
+            force: false,
+        }
+    }
+
+    /// Set whether live locks may be force-released.
+    pub fn force(mut self, yes: bool) -> Self {
+        self.force = yes;
+        self
+    }
+}
+
+/// One variant of a plan line, as reported by
+/// [`crate::ports::Planner::list_plans`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VariantSummary {
+    pub variant: String,
+    pub plan_id: PlanId,
+    /// True for the line's one executable variant.
+    pub selected: bool,
+    pub archived: bool,
+    pub head_revision: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    /// Deliverables `Complete`.
+    pub complete: usize,
+    /// Deliverables in the head graph.
+    pub total: usize,
+    /// True when every deliverable is `Complete` (vacuously for none).
+    pub plan_complete: bool,
+    /// Head graph's CPM makespan in hours.
+    pub makespan: f32,
+}
+
+/// A named plan line and its variants, sorted by variant name.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanLineSummary {
+    pub project: String,
+    pub name: String,
+    pub selected_variant: Option<String>,
+    pub archived: bool,
+    pub variants: Vec<VariantSummary>,
+}
+
+/// Result of [`crate::ports::Planner::sync_plan`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SyncOutcome {
+    pub plan_id: PlanId,
+    pub name: String,
+    pub variant: String,
+    /// The variant's head revision after the sync.
+    pub revision: u32,
+    /// True when this sync registered the variant.
+    pub created: bool,
+    /// True when this sync created the variant or a new revision.
+    pub changed: bool,
+    /// What the revision changed; `None` unless a new revision was made.
+    #[serde(default)]
+    pub diff: Option<crate::revise::RevisionDiff>,
+}
+
 /// Snapshot of a held lock. The Planner records one [`LockInfo`] per
 /// acquired deliverable and surfaces them in [`Cohort::locks`] and
 /// [`PlanStatus::locks_held`].

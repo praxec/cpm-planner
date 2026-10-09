@@ -6,8 +6,10 @@ use async_trait::async_trait;
 
 use crate::plan::{
     AcceptRequest, AcquireRequest, Cohort, ForceReleaseRequest, HeartbeatRequest,
-    MarkStatusRequest, PlanDefinition, PlanGraph, PlanId, PlanStatus, PlannerError,
+    MarkStatusRequest, PlanDefinition, PlanGraph, PlanId, PlanLineSummary, PlanStatus,
+    PlannerError, ReviseRequest, SyncOutcome, SyncRequest,
 };
+use crate::revise::RevisionDiff;
 
 /// Lock-aware planner.
 ///
@@ -69,4 +71,35 @@ pub trait Planner: Send + Sync {
     /// lease held by another caller is refused (`LOCK_HELD`) unless
     /// `override_lock` is set. Always audited.
     async fn accept(&self, req: AcceptRequest) -> Result<(), PlannerError>;
+
+    /// Register or update one variant of a named plan line. An unknown
+    /// `(project, name, variant)` creates a plan (revision 1; the first
+    /// variant of a line becomes its selected variant). A known variant
+    /// whose graph is unchanged reports `changed: false`; a changed graph is
+    /// revised in place exactly as [`Planner::revise_plan`]. Named plans
+    /// dedup within their variant only, never against the global
+    /// [`Planner::submit_plan`] dedup.
+    async fn sync_plan(&self, req: SyncRequest) -> Result<SyncOutcome, PlannerError>;
+
+    /// Every plan line of `project`, sorted by name, each with its variants
+    /// sorted by variant name. Archived lines and variants are omitted
+    /// unless `include_archived`.
+    async fn list_plans(
+        &self,
+        project: &str,
+        include_archived: bool,
+    ) -> Result<Vec<PlanLineSummary>, PlannerError>;
+
+    /// The graph of `revision` (the head when `None`) with its revision
+    /// number. A plan never revised is at revision 1.
+    async fn revision_graph(
+        &self,
+        plan_id: &PlanId,
+        revision: Option<u32>,
+    ) -> Result<(u32, PlanGraph), PlannerError>;
+
+    /// Replace a plan's graph in place, carrying progress over (see
+    /// [`crate::revise`]). Returns the new revision number and the diff.
+    /// Works on named and unnamed plans alike.
+    async fn revise_plan(&self, req: ReviseRequest) -> Result<(u32, RevisionDiff), PlannerError>;
 }

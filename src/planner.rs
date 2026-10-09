@@ -37,11 +37,13 @@ use crate::audit::{AuditEvent, AuditSink, NullAuditSink};
 use crate::plan::{
     AcceptRequest, AcquireRequest, BlockedDeliverable, CallerId, Cohort, CohortRow, Deliverable,
     DeliverableStatus, FINISH_ID, FileMode, ForceReleaseRequest, HeartbeatRequest, LockInfo,
-    MarkStatusRequest, MilestoneRow, OwnedFile, PlanDefinition, PlanGraph, PlanId, PlanStatus,
-    PlannerError, START_ID, ScheduleRow,
+    MarkStatusRequest, MilestoneRow, OwnedFile, PlanDefinition, PlanGraph, PlanId, PlanLineSummary,
+    PlanStatus, PlannerError, ReviseRequest, START_ID, ScheduleRow, SyncOutcome, SyncRequest,
 };
 use crate::plan_store::SqlitePlanStore;
+use crate::portfolio::{Revised, Synced};
 use crate::ports::Planner;
+use crate::revise::RevisionDiff;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use execution_policy::classify::{FailureClass, RetryDecision};
@@ -269,8 +271,9 @@ pub(crate) fn canonical_deliverable(d: &Deliverable) -> serde_json::Value {
 
 /// Deterministic content hash of a [`PlanGraph`]. Same logical graph -> same
 /// hash regardless of the order `deliverables` were submitted in. This is
-/// what lets `submit_plan` be idempotent.
-fn hash_graph(graph: &PlanGraph) -> String {
+/// what lets `submit_plan` be idempotent, and what tells `sync_plan` whether
+/// a variant's graph changed.
+pub(crate) fn hash_graph(graph: &PlanGraph) -> String {
     // Build a normalised JSON form: deliverables sorted by id; each
     // deliverable's prerequisites + owned_files sorted; metadata kept
     // as-is (callers are responsible for its determinism).
@@ -486,9 +489,76 @@ pub(crate) fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
     Ok(())
 }
 
+/// Build a new plan from a validated graph: CPM result, a fresh id, and
+/// initial statuses (no prerequisites -> Ready, else Pending).
+fn initial_plan(graph: PlanGraph) -> Result<(PlanId, PlanState), PlannerError> {
+    let cached_result = crate::schedule::compute_cpm(&graph)?;
+    let mut statuses: HashMap<String, DeliverableStatus> =
+        HashMap::with_capacity(graph.deliverables.len());
+    for d in &graph.deliverables {
+        let status = if d.prerequisites.is_empty() {
+            DeliverableStatus::Ready
+        } else {
+            DeliverableStatus::Pending
+        };
+        statuses.insert(d.id.clone(), status);
+    }
+    let plan_id = PlanId(format!("plan_{}", uuid::Uuid::new_v4().simple()));
+    Ok((plan_id, PlanState::new(graph, statuses, cached_result)))
+}
+
 // ---------------------------------------------------------------------------
 // Audit helpers
 // ---------------------------------------------------------------------------
+
+fn make_portfolio_created_event(
+    outcome: &SyncOutcome,
+    project: &str,
+    selected: bool,
+) -> AuditEvent {
+    AuditEvent::new("plan.portfolio.created").with_payload(json!({
+        "plan_id": outcome.plan_id.as_str(),
+        "project": project,
+        "name": outcome.name,
+        "variant": outcome.variant,
+        "revision": outcome.revision,
+        "selected": selected,
+    }))
+}
+
+fn make_portfolio_revised_event(
+    plan_id: &PlanId,
+    revision: u32,
+    diff: &RevisionDiff,
+) -> AuditEvent {
+    AuditEvent::new("plan.portfolio.revised").with_payload(json!({
+        "plan_id": plan_id.as_str(),
+        "revision": revision,
+        "diff": diff,
+    }))
+}
+
+/// Audit trail of a committed revision: reaped (expired) locks, locks the
+/// forced revision released, then the revision itself.
+fn revision_events(plan_id: &PlanId, revised: &Revised, now: DateTime<Utc>) -> Vec<AuditEvent> {
+    let mut events: Vec<AuditEvent> = revised
+        .reaped
+        .iter()
+        .map(|lock| make_expired_event(lock, now))
+        .collect();
+    events.extend(
+        revised
+            .released
+            .iter()
+            .map(|lock| make_released_event(lock, "revision")),
+    );
+    events.push(make_portfolio_revised_event(
+        plan_id,
+        revised.revision,
+        &revised.diff,
+    ));
+    events
+}
 
 fn make_acquired_event(lock: &LockInfo, owned_files: &[OwnedFile]) -> AuditEvent {
     AuditEvent::new("plan.lock.acquired")
@@ -756,24 +826,79 @@ impl Planner for BasicCpmPlanner {
         // sqlite transaction, so identical concurrent submissions — even
         // from different processes — resolve to a single PlanId. The build
         // closure only runs on a dedup miss.
-        self.store.submit_or_get(&graph_hash, move || {
-            let cached_result = crate::schedule::compute_cpm(&graph)?;
+        self.store
+            .submit_or_get(&graph_hash, move || initial_plan(graph))
+    }
 
-            // Initialise per-deliverable status: zero-prereq -> Ready, else Pending.
-            let mut statuses: HashMap<String, DeliverableStatus> =
-                HashMap::with_capacity(graph.deliverables.len());
-            for d in &graph.deliverables {
-                let status = if d.prerequisites.is_empty() {
-                    DeliverableStatus::Ready
-                } else {
-                    DeliverableStatus::Pending
-                };
-                statuses.insert(d.id.clone(), status);
+    async fn sync_plan(&self, req: SyncRequest) -> Result<SyncOutcome, PlannerError> {
+        validate_graph(&req.graph)?;
+        let graph_hash = hash_graph(&req.graph);
+        let now = self.now();
+        let (project, name, variant) = (req.project.clone(), req.name.clone(), req.variant.clone());
+        // Named plans bypass the global submit dedup: create, compare and
+        // revise all happen in one immediate transaction.
+        let synced = self
+            .store
+            .write_tx(|tx| crate::portfolio::sync(tx, req, &graph_hash, now, initial_plan))?;
+        let outcome = |plan_id, revision, created, changed, diff| SyncOutcome {
+            plan_id,
+            name: name.clone(),
+            variant: variant.clone(),
+            revision,
+            created,
+            changed,
+            diff,
+        };
+        let (outcome, events) = match synced {
+            Synced::Created { plan_id, selected } => {
+                let out = outcome(plan_id, 1, true, true, None);
+                let event = make_portfolio_created_event(&out, &project, selected);
+                (out, vec![event])
             }
+            Synced::Unchanged { plan_id, revision } => {
+                (outcome(plan_id, revision, false, false, None), Vec::new())
+            }
+            Synced::Revised { plan_id, revised } => {
+                let events = revision_events(&plan_id, &revised, now);
+                let out = outcome(plan_id, revised.revision, false, true, Some(revised.diff));
+                (out, events)
+            }
+        };
+        self.flush_audit(events).await;
+        Ok(outcome)
+    }
 
-            let plan_id = PlanId(format!("plan_{}", uuid::Uuid::new_v4().simple()));
-            Ok((plan_id, PlanState::new(graph, statuses, cached_result)))
-        })
+    async fn list_plans(
+        &self,
+        project: &str,
+        include_archived: bool,
+    ) -> Result<Vec<PlanLineSummary>, PlannerError> {
+        self.store
+            .read_tx(|tx| crate::portfolio::list(tx, project, include_archived))
+    }
+
+    async fn revision_graph(
+        &self,
+        plan_id: &PlanId,
+        revision: Option<u32>,
+    ) -> Result<(u32, PlanGraph), PlannerError> {
+        self.store
+            .read_tx(|tx| crate::portfolio::revision_graph(tx, plan_id, revision))
+    }
+
+    async fn revise_plan(&self, req: ReviseRequest) -> Result<(u32, RevisionDiff), PlannerError> {
+        let ReviseRequest {
+            plan_id,
+            graph,
+            force,
+        } = req;
+        let now = self.now();
+        let revised = self
+            .store
+            .write_tx(|tx| crate::portfolio::revise(tx, &plan_id, graph, None, None, force, now))?;
+        self.flush_audit(revision_events(&plan_id, &revised, now))
+            .await;
+        Ok((revised.revision, revised.diff))
     }
 
     async fn acquire_cohort(&self, req: AcquireRequest) -> Result<Cohort, PlannerError> {

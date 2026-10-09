@@ -2,7 +2,9 @@
 //!
 //! The store is the single source of truth for planner state: submitted
 //! plans (graph + cached CPM result), per-deliverable statuses, held
-//! cohort locks, and the submit-dedup map. Every planner operation loads
+//! cohort locks, the submit-dedup map, and (schema v3) the portfolio tables
+//! — named plan lines, variants and revisions, queried by
+//! `crate::portfolio`. Every planner operation loads
 //! the relevant [`PlanState`] from SQLite, runs the in-memory scheduling
 //! logic, and writes the result back — all inside ONE
 //! `BEGIN IMMEDIATE` transaction.
@@ -55,7 +57,7 @@ pub const DB_PATH_ENV: &str = "CPM_PLANNER_DB";
 const DEFAULT_DB_RELATIVE: &str = ".local/share/praxec/cpm-planner.db";
 
 /// Map any backend failure into the planner's wire-stable error variant.
-fn backend(err: impl Into<anyhow::Error>) -> PlannerError {
+pub(crate) fn backend(err: impl Into<anyhow::Error>) -> PlannerError {
     PlannerError::BackendError(err.into())
 }
 
@@ -276,21 +278,7 @@ impl SqlitePlanStore {
         }
 
         let (plan_id, state) = build()?;
-        let graph_json = serde_json::to_string(&state.graph).map_err(backend)?;
-        let result_json = serde_json::to_string(&state.cached_result).map_err(backend)?;
-        tx.execute(
-            "INSERT INTO plans (plan_id, graph, cached_result, created_at_us, cpm_version)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                plan_id.0,
-                graph_json,
-                result_json,
-                Utc::now().timestamp_micros(),
-                crate::algorithm::CPM_VERSION
-            ],
-        )
-        .map_err(backend)?;
-        save_plan_state(&tx, &plan_id, &state)?;
+        insert_plan(&tx, &plan_id, &state, Utc::now())?;
         tx.execute(
             "INSERT INTO submit_dedup (graph_hash, plan_id) VALUES (?1, ?2)",
             params![graph_hash, plan_id.0],
@@ -340,6 +328,32 @@ impl SqlitePlanStore {
         Ok(f(&state))
     }
 
+    /// Run `f` inside ONE `BEGIN IMMEDIATE` transaction and commit on `Ok`.
+    /// An `Err` from `f` rolls everything back. For multi-table writes
+    /// (the portfolio operations) that do not fit [`Self::mutate_plan`].
+    pub(crate) fn write_tx<R>(
+        &self,
+        f: impl FnOnce(&Transaction<'_>) -> Result<R, PlannerError>,
+    ) -> Result<R, PlannerError> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(backend)?;
+        let out = f(&tx)?;
+        tx.commit().map_err(backend)?;
+        Ok(out)
+    }
+
+    /// Run `f` over a consistent read snapshot (deferred transaction).
+    pub(crate) fn read_tx<R>(
+        &self,
+        f: impl FnOnce(&Transaction<'_>) -> Result<R, PlannerError>,
+    ) -> Result<R, PlannerError> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction().map_err(backend)?;
+        f(&tx)
+    }
+
     fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, PlannerError> {
         self.conn
             .lock()
@@ -353,6 +367,7 @@ impl SqlitePlanStore {
 const MIGRATIONS: &[fn(&Connection) -> anyhow::Result<()>] = &[
     migrate_v1_base_schema, // tables + counter columns (pre-versioning layout)
     migrate_v2_cpm_version, // plans.cpm_version
+    migrate_v3_portfolio,   // plan_lines, variants, revisions
 ];
 
 /// Runs the whole ladder plus the stale sweep in one immediate transaction,
@@ -431,6 +446,40 @@ fn migrate_v2_cpm_version(conn: &Connection) -> anyhow::Result<()> {
             .context("adding plans.cpm_version column")?;
     }
     Ok(())
+}
+
+/// Portfolio tables: named plan lines, their variants (each one plan row),
+/// and every variant's revision history. Legacy plans have no rows here.
+fn migrate_v3_portfolio(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS plan_lines (
+             project          TEXT,
+             name             TEXT,
+             selected_variant TEXT,
+             archived         INTEGER NOT NULL DEFAULT 0,
+             PRIMARY KEY (project, name)
+         );
+         CREATE TABLE IF NOT EXISTS variants (
+             project       TEXT,
+             name          TEXT,
+             variant       TEXT,
+             plan_id       TEXT NOT NULL UNIQUE REFERENCES plans(plan_id) ON DELETE CASCADE,
+             source_path   TEXT,
+             content_hash  TEXT,
+             head_revision INTEGER NOT NULL,
+             archived      INTEGER NOT NULL DEFAULT 0,
+             PRIMARY KEY (project, name, variant)
+         );
+         CREATE TABLE IF NOT EXISTS revisions (
+             plan_id       TEXT REFERENCES plans(plan_id) ON DELETE CASCADE,
+             revision      INTEGER,
+             graph         TEXT NOT NULL,
+             content_hash  TEXT,
+             created_at_us INTEGER NOT NULL,
+             PRIMARY KEY (plan_id, revision)
+         );",
+    )
+    .context("creating portfolio tables")
 }
 
 /// Recompute `cached_result` for every plan stored by an older CPM kernel.
@@ -513,7 +562,7 @@ fn migrate_counter_columns(conn: &Connection) -> anyhow::Result<()> {
 /// not exist. The `file -> deliverable` inverse index is rebuilt from the
 /// persisted locks + graph (it is derived state; persisting it separately
 /// could only ever drift).
-fn load_plan_state(
+pub(crate) fn load_plan_state(
     tx: &Transaction<'_>,
     plan_id: &PlanId,
 ) -> Result<Option<PlanState>, PlannerError> {
@@ -623,9 +672,61 @@ fn load_plan_state(
     }))
 }
 
+/// Insert the `plans` row for a new plan plus its statuses and locks.
+pub(crate) fn insert_plan(
+    tx: &Transaction<'_>,
+    plan_id: &PlanId,
+    state: &PlanState,
+    now: DateTime<Utc>,
+) -> Result<(), PlannerError> {
+    let graph_json = serde_json::to_string(&state.graph).map_err(backend)?;
+    let result_json = serde_json::to_string(&state.cached_result).map_err(backend)?;
+    tx.execute(
+        "INSERT INTO plans (plan_id, graph, cached_result, created_at_us, cpm_version)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            plan_id.0,
+            graph_json,
+            result_json,
+            now.timestamp_micros(),
+            crate::algorithm::CPM_VERSION
+        ],
+    )
+    .map_err(backend)?;
+    save_plan_state(tx, plan_id, state)
+}
+
+/// Replace a plan's whole runtime state after a revision: the `plans` row's
+/// graph and cached CPM result, and every status, counter and lock (rows of
+/// removed deliverables are deleted).
+pub(crate) fn replace_plan_state(
+    tx: &Transaction<'_>,
+    plan_id: &PlanId,
+    state: &PlanState,
+) -> Result<(), PlannerError> {
+    let graph_json = serde_json::to_string(&state.graph).map_err(backend)?;
+    let result_json = serde_json::to_string(&state.cached_result).map_err(backend)?;
+    tx.execute(
+        "UPDATE plans SET graph = ?1, cached_result = ?2, cpm_version = ?3 WHERE plan_id = ?4",
+        params![
+            graph_json,
+            result_json,
+            crate::algorithm::CPM_VERSION,
+            plan_id.0
+        ],
+    )
+    .map_err(backend)?;
+    tx.execute(
+        "DELETE FROM deliverable_statuses WHERE plan_id = ?1",
+        params![plan_id.0],
+    )
+    .map_err(backend)?;
+    save_plan_state(tx, plan_id, state)
+}
+
 /// Persist the mutable parts of a [`PlanState`] (statuses + locks). The
-/// graph and cached CPM result are immutable after submit and are written
-/// once by [`SqlitePlanStore::submit_or_get`].
+/// graph and cached CPM result are written by [`insert_plan`] and only
+/// replaced by a revision ([`replace_plan_state`]).
 fn save_plan_state(
     tx: &Transaction<'_>,
     plan_id: &PlanId,
