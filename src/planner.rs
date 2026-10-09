@@ -37,8 +37,8 @@ use crate::audit::{AuditEvent, AuditSink, NullAuditSink};
 use crate::plan::{
     AcceptRequest, AcquireRequest, BlockedDeliverable, CallerId, Cohort, CohortRow, Deliverable,
     DeliverableStatus, FINISH_ID, FileMode, ForceReleaseRequest, HeartbeatRequest, LockInfo,
-    MarkStatusRequest, OwnedFile, PlanDefinition, PlanGraph, PlanId, PlanStatus, PlannerError,
-    START_ID, ScheduleRow,
+    MAX_DELIVERABLES, MarkStatusRequest, OwnedFile, PlanDefinition, PlanGraph, PlanId, PlanStatus,
+    PlannerError, START_ID, ScheduleRow,
 };
 use crate::plan_store::SqlitePlanStore;
 use crate::ports::Planner;
@@ -304,7 +304,17 @@ fn hash_graph(graph: &PlanGraph) -> String {
 
 /// Reject graphs that fail any structural invariant. Returns
 /// [`PlannerError::InvalidGraph`] with a precise `reason` on first failure.
-fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
+/// Run by submit and by every analysis entry point (`resource_schedule`,
+/// `monte_carlo`, `simulate`).
+pub(crate) fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
+    if graph.deliverables.len() > MAX_DELIVERABLES {
+        return Err(PlannerError::InvalidGraph {
+            reason: format!(
+                "plan has {} deliverables; maximum is {MAX_DELIVERABLES}",
+                graph.deliverables.len()
+            ),
+        });
+    }
     for d in &graph.deliverables {
         if d.id == START_ID || d.id == FINISH_ID {
             return Err(PlannerError::InvalidGraph {
@@ -323,70 +333,17 @@ fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
         }
     }
 
-    // Effort estimates, when present, must be finite and non-negative.
-    for d in &graph.deliverables {
-        if let Some(h) = d.estimated_effort_hours
-            && (h < 0.0 || !h.is_finite())
-        {
-            return Err(PlannerError::InvalidGraph {
-                reason: format!(
-                    "deliverable '{}' has invalid estimated_effort_hours {h}; must be a finite number >= 0",
-                    d.id
-                ),
-            });
-        }
-    }
-
-    // Calendar durations, when present, must be finite and non-negative.
-    for d in &graph.deliverables {
-        if let Some(h) = d.duration_hours
-            && (h < 0.0 || !h.is_finite())
-        {
-            return Err(PlannerError::InvalidGraph {
-                reason: format!(
-                    "deliverable '{}' has invalid duration_hours {h}; must be a finite number >= 0",
-                    d.id
-                ),
-            });
-        }
-    }
-
-    // Three-point estimates, when present, must be finite, non-negative
-    // and ordered optimistic <= likely <= pessimistic.
-    for d in &graph.deliverables {
-        if let Some(e) = d.estimate {
-            let ordered = e.optimistic.is_finite()
-                && e.likely.is_finite()
-                && e.pessimistic.is_finite()
-                && e.optimistic >= 0.0
-                && e.optimistic <= e.likely
-                && e.likely <= e.pessimistic;
-            if !ordered {
-                return Err(PlannerError::InvalidGraph {
-                    reason: format!(
-                        "deliverable '{}' estimate must satisfy 0 <= optimistic <= likely <= pessimistic",
-                        d.id
-                    ),
-                });
-            }
-        }
+    // Effort, duration, estimate and lag hours: finite, within
+    // 0..=MAX_HOURS, and estimates ordered. Same messages as `plan.lint`.
+    if let Some(problem) = crate::graph::value_problems(graph).into_iter().next() {
+        return Err(PlannerError::InvalidGraph {
+            reason: problem.message,
+        });
     }
 
     // Prerequisite references resolve.
     let id_set: HashSet<&str> = graph.deliverables.iter().map(|d| d.id.as_str()).collect();
     for d in &graph.deliverables {
-        for p in &d.prerequisites {
-            let lag = p.lag_hours();
-            if !lag.is_finite() || lag < 0.0 {
-                return Err(PlannerError::InvalidGraph {
-                    reason: format!(
-                        "prerequisite '{}' of deliverable '{}' has invalid lag_hours {lag}; must be a finite number >= 0",
-                        p.id(),
-                        d.id
-                    ),
-                });
-            }
-        }
         for p in crate::graph::prerequisite_ids(d) {
             if !id_set.contains(p) {
                 return Err(PlannerError::InvalidGraph {

@@ -301,3 +301,126 @@ fn graph_dependent_checks_are_skipped_when_cyclic() {
     ]));
     assert!(finding(&lint(&g), "FEEDS_NO_MILESTONE").is_none());
 }
+
+#[test]
+fn bad_estimate_is_invalid_value() {
+    let g = graph(json!([d(
+        "a",
+        json!([]),
+        json!([]),
+        json!({ "estimate": { "optimistic": 3.0, "likely": 2.0, "pessimistic": 4.0 } })
+    )]));
+    assert_eq!(
+        finding(&lint(&g), "INVALID_VALUE").map(|f| f.message.as_str()),
+        Some("deliverable 'a' estimate must satisfy 0 <= optimistic <= likely <= pessimistic")
+    );
+}
+
+#[test]
+fn hours_above_one_million_are_invalid_value() {
+    let g = graph(json!([d(
+        "a",
+        json!([]),
+        json!([]),
+        json!({ "duration_hours": 1_000_001.0 })
+    )]));
+    assert_eq!(
+        finding(&lint(&g), "INVALID_VALUE").map(|f| f.message.as_str()),
+        Some(
+            "deliverable 'a' has invalid duration_hours 1000001; must be a finite number between 0 and 1000000"
+        )
+    );
+}
+
+#[test]
+fn estimate_above_one_million_is_invalid_value() {
+    let g = graph(json!([d(
+        "a",
+        json!([]),
+        json!([]),
+        json!({ "estimate": { "optimistic": 1.0, "likely": 2.0, "pessimistic": 2_000_000.0 } })
+    )]));
+    assert!(finding(&lint(&g), "INVALID_VALUE").is_some());
+}
+
+#[test]
+fn milestone_without_artifact_is_not_reported() {
+    let g = graph(json!([
+        d("a", json!([]), json!([]), json!({})),
+        { "id": "m", "owned_files": [], "prerequisites": [edge("a")], "milestone": true },
+    ]));
+    assert!(finding(&lint(&g), "NO_ARTIFACT").is_none());
+}
+
+#[test]
+fn warning_only_graph_is_not_clean() {
+    let g = graph(json!([
+        d("a", json!([]), json!([]), json!({})),
+        d("b", json!(["a"]), json!([]), json!({})),
+        ms("m", json!([edge("b")])),
+    ]));
+    let r = lint(&g);
+    assert_eq!((r.clean, codes(&r)), (false, vec!["NO_RATIONALE"]));
+}
+
+#[test]
+fn oversized_graph_reports_one_size_error() {
+    let deliverables: Vec<Value> = (0..5001)
+        .map(|i| json!({ "id": format!("d{i}"), "owned_files": [], "prerequisites": [] }))
+        .collect();
+    let r = lint(&graph(json!(deliverables)));
+    assert_eq!(codes(&r), vec!["TOO_MANY_DELIVERABLES"]);
+}
+
+#[test]
+fn redundant_edge_through_a_long_chain_is_reported() {
+    let mut v: Vec<Value> = vec![d("n0", json!([]), json!([]), json!({}))];
+    for i in 1..50 {
+        v.push(d(
+            &format!("n{i}"),
+            json!([edge(&format!("n{}", i - 1))]),
+            json!([]),
+            json!({}),
+        ));
+    }
+    v.push(d(
+        "top",
+        json!([edge("n0"), edge("n49")]),
+        json!([]),
+        json!({}),
+    ));
+    let r = lint(&graph(json!(v)));
+    let redundant: Vec<&Vec<String>> = r
+        .findings
+        .iter()
+        .filter(|f| f.code == "REDUNDANT_EDGE")
+        .map(|f| &f.ids)
+        .collect();
+    assert_eq!(redundant, vec![&vec!["top".to_string(), "n0".to_string()]]);
+}
+
+#[test]
+#[ignore = "timing probe: cargo test --release --test lint -- --ignored --nocapture"]
+fn timing_lint_5000_node_chain() {
+    let mut v: Vec<Value> = vec![d("n0", json!([]), json!([]), json!({}))];
+    for i in 1..4999 {
+        v.push(d(
+            &format!("n{i}"),
+            json!([edge(&format!("n{}", i - 1))]),
+            json!([]),
+            json!({}),
+        ));
+    }
+    v.push(ms("m", json!([edge("n4998")])));
+    assert_eq!(v.len(), 5000);
+    let g = graph(json!(v));
+    let start = std::time::Instant::now();
+    let r = lint(&g);
+    let elapsed = start.elapsed();
+    println!("TIMING lint 5000-node chain: {elapsed:?}");
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "{elapsed:?}; {}",
+        r.findings.len()
+    );
+}

@@ -257,8 +257,8 @@ impl From<PathBuf> for OwnedFile {
 /// Optional three-point effort estimate for a [`Deliverable`].
 ///
 /// The three points must satisfy `0 <= optimistic <= likely <= pessimistic`
-/// and all be finite; [`crate::planner`] rejects violations as
-/// [`PlannerError::InvalidGraph`].
+/// and all be finite and at most [`MAX_HOURS`]; [`crate::planner`] rejects
+/// violations as [`PlannerError::InvalidGraph`].
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Estimate {
@@ -309,9 +309,12 @@ pub struct Deliverable {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_hours: Option<f32>,
 
-    /// Optional three-point effort estimate. When neither `duration_hours`
-    /// nor `estimated_effort_hours` is set, `likely` is the scheduled length
-    /// and the basis for cost, DRAG and Monte Carlo sampling.
+    /// Optional three-point effort estimate. Scheduled-length precedence is
+    /// `duration_hours` > `estimated_effort_hours` > `estimate.likely` >
+    /// `0` for a milestone > the estimator's default. So only when neither
+    /// `duration_hours` nor `estimated_effort_hours` is set is `likely` the
+    /// scheduled length and the basis for cost and DRAG, and only then does
+    /// Monte Carlo sample the estimate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimate: Option<Estimate>,
 
@@ -759,6 +762,15 @@ pub struct MilestoneRow {
     /// True once the milestone deliverable is `Complete`.
     pub complete: bool,
 }
+
+/// Largest plan accepted by submit and the analysis tools. Bounds the
+/// quadratic parts of validation, lint and leveling.
+pub const MAX_DELIVERABLES: usize = 5000;
+
+/// Upper bound, in hours, for every effort, duration, lag and estimate
+/// value (about 114 years). Keeps schedule arithmetic far from `f32`
+/// overflow.
+pub const MAX_HOURS: f32 = 1_000_000.0;
 
 /// Reserved id of the synthetic zero-effort source node in every plan's CPM.
 pub const START_ID: &str = "__start__";

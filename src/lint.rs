@@ -10,7 +10,9 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::graph::{prerequisite_ids, reachability};
-use crate::plan::{Deliverable, FINISH_ID, FileMode, PlanGraph, PrerequisiteKind, START_ID};
+use crate::plan::{
+    Deliverable, FINISH_ID, FileMode, MAX_DELIVERABLES, PlanGraph, PrerequisiteKind, START_ID,
+};
 
 /// How serious a finding is. Orders errors first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -50,10 +52,6 @@ fn finding(code: &str, severity: Severity, message: String, ids: Vec<String>) ->
         ids,
         path: None,
     }
-}
-
-fn bad(v: f32) -> bool {
-    !v.is_finite() || v < 0.0
 }
 
 fn has_legacy_rationale(d: &Deliverable, prereq: &str) -> bool {
@@ -114,10 +112,163 @@ fn find_cycles(graph: &PlanGraph, known: &HashSet<&str>) -> Vec<Vec<String>> {
     cycles
 }
 
+/// Fixed-width set of node indices, one bit per node.
+struct BitSet {
+    words: Vec<u64>,
+}
+
+impl BitSet {
+    fn new(n: usize) -> Self {
+        Self {
+            words: vec![0; n.div_ceil(64)],
+        }
+    }
+
+    fn insert(&mut self, i: usize) {
+        self.words[i / 64] |= 1 << (i % 64);
+    }
+
+    fn union_with(&mut self, other: &Self) {
+        for (a, b) in self.words.iter_mut().zip(&other.words) {
+            *a |= *b;
+        }
+    }
+
+    fn intersects(&self, other: &Self) -> bool {
+        self.words.iter().zip(&other.words).any(|(a, b)| a & b != 0)
+    }
+}
+
+/// `REDUNDANT_EDGE` and `FEEDS_NO_MILESTONE` for an acyclic graph with
+/// unique, known ids. Descendant sets are bitsets filled in reverse
+/// topological order, so the cost is O(V + E * V / 64).
+fn structure_findings(graph: &PlanGraph) -> Vec<LintFinding> {
+    let n = graph.deliverables.len();
+    let index: HashMap<&str, usize> = graph
+        .deliverables
+        .iter()
+        .enumerate()
+        .map(|(i, d)| (d.id.as_str(), i))
+        .collect();
+    // Distinct prerequisite indices per node, in declaration order.
+    let preds: Vec<Vec<usize>> = graph
+        .deliverables
+        .iter()
+        .map(|d| {
+            let mut ps: Vec<usize> = Vec::new();
+            for p in prerequisite_ids(d) {
+                if let Some(&pi) = index.get(p)
+                    && !ps.contains(&pi)
+                {
+                    ps.push(pi);
+                }
+            }
+            ps
+        })
+        .collect();
+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, ps) in preds.iter().enumerate() {
+        for &p in ps {
+            succs[p].push(i);
+        }
+    }
+    let mut indeg: Vec<usize> = preds.iter().map(Vec::len).collect();
+    let mut order: Vec<usize> = (0..n).filter(|&i| indeg[i] == 0).collect();
+    let mut head = 0;
+    while head < order.len() {
+        let u = order[head];
+        head += 1;
+        for &v in &succs[u] {
+            indeg[v] -= 1;
+            if indeg[v] == 0 {
+                order.push(v);
+            }
+        }
+    }
+    if order.len() != n {
+        // Callers only pass acyclic graphs; never report on a bad order.
+        return Vec::new();
+    }
+
+    let milestone: Vec<bool> = graph
+        .deliverables
+        .iter()
+        .map(Deliverable::is_milestone)
+        .collect();
+    let mut desc: Vec<BitSet> = (0..n).map(|_| BitSet::new(n)).collect();
+    let mut feeds = vec![false; n];
+    for &i in order.iter().rev() {
+        let mut set = BitSet::new(n);
+        for &s in &succs[i] {
+            set.insert(s);
+            set.union_with(&desc[s]);
+            feeds[i] |= milestone[s] || feeds[s];
+        }
+        desc[i] = set;
+    }
+
+    let mut out = Vec::new();
+    for (i, d) in graph.deliverables.iter().enumerate() {
+        if preds[i].len() > 1 {
+            let mut prereq_set = BitSet::new(n);
+            for &p in &preds[i] {
+                prereq_set.insert(p);
+            }
+            for &p in &preds[i] {
+                // A DAG node is never its own descendant, so any hit is
+                // another prerequisite reachable from `p`.
+                if desc[p].intersects(&prereq_set) {
+                    let pid = &graph.deliverables[p].id;
+                    out.push(finding(
+                        "REDUNDANT_EDGE",
+                        Severity::Warning,
+                        format!(
+                            "'{}' <- '{pid}' is redundant: '{pid}' is already an ancestor of another prerequisite",
+                            d.id
+                        ),
+                        vec![d.id.clone(), pid.clone()],
+                    ));
+                }
+            }
+        }
+    }
+    if milestone.iter().any(|&m| m) {
+        for (i, d) in graph.deliverables.iter().enumerate() {
+            if !milestone[i] && !feeds[i] {
+                out.push(finding(
+                    "FEEDS_NO_MILESTONE",
+                    Severity::Warning,
+                    format!("'{}' is neither a milestone nor an ancestor of one", d.id),
+                    vec![d.id.clone()],
+                ));
+            }
+        }
+    }
+    out
+}
+
 /// Lint `graph`. Never errors or panics.
 pub fn lint(graph: &PlanGraph) -> LintReport {
     use Severity::{Error, Info, Warning};
     let mut out: Vec<LintFinding> = Vec::new();
+
+    // Size: an oversized graph gets one finding and no further (quadratic)
+    // analysis. Same limit and message as submit.
+    if graph.deliverables.len() > MAX_DELIVERABLES {
+        out.push(finding(
+            "TOO_MANY_DELIVERABLES",
+            Error,
+            format!(
+                "plan has {} deliverables; maximum is {MAX_DELIVERABLES}",
+                graph.deliverables.len()
+            ),
+            Vec::new(),
+        ));
+        return LintReport {
+            clean: false,
+            findings: out,
+        };
+    }
 
     // Identity.
     let mut seen: HashSet<&str> = HashSet::new();
@@ -140,41 +291,17 @@ pub fn lint(graph: &PlanGraph) -> LintReport {
             ));
         }
     }
+    let duplicated = !dup_reported.is_empty();
     let known: HashSet<&str> = seen;
 
-    // Values.
-    for d in &graph.deliverables {
-        for (field, v) in [
-            ("estimated_effort_hours", d.estimated_effort_hours),
-            ("duration_hours", d.duration_hours),
-        ] {
-            if let Some(h) = v.filter(|h| bad(*h)) {
-                out.push(finding(
-                    "INVALID_VALUE",
-                    Error,
-                    format!(
-                        "deliverable '{}' has invalid {field} {h}; must be a finite number >= 0",
-                        d.id
-                    ),
-                    vec![d.id.clone()],
-                ));
-            }
-        }
-        for p in &d.prerequisites {
-            let lag = p.lag_hours();
-            if bad(lag) {
-                out.push(finding(
-                    "INVALID_VALUE",
-                    Error,
-                    format!(
-                        "prerequisite '{}' of deliverable '{}' has invalid lag_hours {lag}; must be a finite number >= 0",
-                        p.id(),
-                        d.id
-                    ),
-                    vec![d.id.clone(), p.id().to_string()],
-                ));
-            }
-        }
+    // Values: same rules and messages as submit.
+    for problem in crate::graph::value_problems(graph) {
+        out.push(finding(
+            "INVALID_VALUE",
+            Error,
+            problem.message,
+            problem.ids,
+        ));
     }
 
     // References and cycles.
@@ -206,8 +333,9 @@ pub fn lint(graph: &PlanGraph) -> LintReport {
         ));
     }
 
-    // Shared files: same rule as submit.
-    let reach = reachability(graph);
+    // Shared files: same rule as submit. Reachability is only computed when
+    // a shared path actually needs an ordering check.
+    let mut reach: Option<HashMap<String, HashSet<String>>> = None;
     let mut claimants: HashMap<&std::path::Path, Vec<(&str, FileMode)>> = HashMap::new();
     let mut path_order: Vec<&std::path::Path> = Vec::new();
     for d in &graph.deliverables {
@@ -228,6 +356,7 @@ pub fn lint(graph: &PlanGraph) -> LintReport {
                 if x == y || (xm == FileMode::Append && ym == FileMode::Append) {
                     continue;
                 }
+                let reach = reach.get_or_insert_with(|| reachability(graph));
                 let ordered = reach.get(x).is_some_and(|r| r.contains(y))
                     || reach.get(y).is_some_and(|r| r.contains(x));
                 if !ordered {
@@ -291,50 +420,9 @@ pub fn lint(graph: &PlanGraph) -> LintReport {
         }
     }
 
-    // Structure checks need a well-formed DAG.
-    if !cyclic && !unknown {
-        for d in &graph.deliverables {
-            let mut done: HashSet<&str> = HashSet::new();
-            for p in prerequisite_ids(d) {
-                if !done.insert(p) {
-                    continue;
-                }
-                let implied = prerequisite_ids(d)
-                    .any(|q| q != p && reach.get(p).is_some_and(|r| r.contains(q)));
-                if implied {
-                    out.push(finding(
-                        "REDUNDANT_EDGE",
-                        Warning,
-                        format!(
-                            "'{}' <- '{p}' is redundant: '{p}' is already an ancestor of another prerequisite",
-                            d.id
-                        ),
-                        vec![d.id.clone(), p.to_string()],
-                    ));
-                }
-            }
-        }
-        let milestones: Vec<&str> = graph
-            .deliverables
-            .iter()
-            .filter(|d| d.is_milestone())
-            .map(|d| d.id.as_str())
-            .collect();
-        if !milestones.is_empty() {
-            for d in graph.deliverables.iter().filter(|d| !d.is_milestone()) {
-                let feeds = reach
-                    .get(d.id.as_str())
-                    .is_some_and(|r| milestones.iter().any(|m| r.contains(*m)));
-                if !feeds {
-                    out.push(finding(
-                        "FEEDS_NO_MILESTONE",
-                        Warning,
-                        format!("'{}' is neither a milestone nor an ancestor of one", d.id),
-                        vec![d.id.clone()],
-                    ));
-                }
-            }
-        }
+    // Structure checks need a well-formed DAG with unique ids.
+    if !cyclic && !unknown && !duplicated {
+        out.extend(structure_findings(graph));
     }
 
     if !graph.deliverables.iter().any(Deliverable::is_milestone) {
@@ -345,7 +433,7 @@ pub fn lint(graph: &PlanGraph) -> LintReport {
             Vec::new(),
         ));
     }
-    for d in &graph.deliverables {
+    for d in graph.deliverables.iter().filter(|d| !d.is_milestone()) {
         if d.metadata.get("artifact").is_none() {
             out.push(finding(
                 "NO_ARTIFACT",
