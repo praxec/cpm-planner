@@ -709,12 +709,15 @@ async fn requested_ids_beyond_max_count_are_blocked_max_count() {
         .await
         .unwrap();
     assert_eq!(
-        cohort
-            .blocked
-            .iter()
-            .map(|b| b.code.as_str())
-            .collect::<Vec<_>>(),
-        vec!["MAX_COUNT"]
+        (
+            cohort_ids(&cohort),
+            cohort
+                .blocked
+                .iter()
+                .map(|b| b.code.as_str())
+                .collect::<Vec<_>>()
+        ),
+        (vec!["code1".to_string()], vec!["MAX_COUNT"])
     );
 }
 
@@ -834,7 +837,7 @@ async fn accept_emits_accepted_audit_event_with_evidence() {
     let evt = audit
         .snapshot()
         .into_iter()
-        .find(|e| e.event_type == "accepted")
+        .find(|e| e.event_type == "plan.deliverable.accepted")
         .expect("accepted event present");
     assert_eq!(evt.payload["evidence"], "reviewed the PR");
 }
@@ -875,7 +878,7 @@ async fn lockless_mark_complete_emits_completed_without_lease_event() {
         audit
             .snapshot()
             .iter()
-            .any(|e| e.event_type == "completed_without_lease")
+            .any(|e| e.event_type == "plan.deliverable.completed_without_lease")
     );
 }
 
@@ -929,7 +932,7 @@ async fn accepting_complete_deliverable_emits_no_second_event() {
     let n = audit
         .snapshot()
         .iter()
-        .filter(|e| e.event_type == "accepted")
+        .filter(|e| e.event_type == "plan.deliverable.accepted")
         .count();
     assert_eq!(n, 1);
 }
@@ -968,7 +971,7 @@ async fn accepted_event_records_previous_status() {
     let evt = audit
         .snapshot()
         .into_iter()
-        .find(|e| e.event_type == "accepted")
+        .find(|e| e.event_type == "plan.deliverable.accepted")
         .unwrap();
     assert_eq!(evt.payload["previous_status"]["status"], "ready");
 }
@@ -989,7 +992,7 @@ async fn accepted_event_records_overridden_lock_holder() {
     let evt = audit
         .snapshot()
         .into_iter()
-        .find(|e| e.event_type == "accepted")
+        .find(|e| e.event_type == "plan.deliverable.accepted")
         .unwrap();
     assert_eq!(evt.payload["overrode_lock_of"], "w1");
 }
@@ -1013,7 +1016,127 @@ async fn lockless_mark_complete_on_complete_deliverable_emits_no_second_event() 
     let n = audit
         .snapshot()
         .iter()
-        .filter(|e| e.event_type == "completed_without_lease")
+        .filter(|e| e.event_type == "plan.deliverable.completed_without_lease")
         .count();
     assert_eq!(n, 1);
+}
+
+#[tokio::test]
+async fn overridden_holder_cannot_fail_an_accepted_deliverable() {
+    let (planner, plan_id) = submit_accept_graph().await;
+    planner
+        .acquire_cohort(AcquireRequest::new(plan_id.clone(), caller("w1"), 1))
+        .await
+        .unwrap();
+    planner
+        .accept(accept(&plan_id, "a").override_lock(true))
+        .await
+        .unwrap();
+    let err = planner
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
+            "a",
+            caller("w1"),
+            DeliverableStatus::Failed {
+                reason: "late".to_string(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().starts_with("LOCK_NOT_HELD"), "got: {err}");
+}
+
+#[tokio::test]
+async fn lockless_failed_mark_is_audited() {
+    let audit = Arc::new(MemoryAuditSink::new());
+    let (planner, plan_id) =
+        submit_accept_graph_with(BasicCpmPlanner::with_audit(audit.clone())).await;
+    planner
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
+            "a",
+            caller("w"),
+            DeliverableStatus::Failed {
+                reason: "nope".to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+    let evt = audit
+        .snapshot()
+        .into_iter()
+        .find(|e| e.event_type == "plan.deliverable.marked_without_lease")
+        .expect("marked_without_lease event present");
+    assert_eq!(
+        (
+            evt.payload["deliverable_id"].clone(),
+            evt.payload["caller_id"].clone(),
+            evt.payload["status"]["status"].clone(),
+            evt.payload["previous_status"]["status"].clone(),
+        ),
+        (
+            serde_json::json!("a"),
+            serde_json::json!("w"),
+            serde_json::json!("failed"),
+            serde_json::json!("ready"),
+        )
+    );
+}
+
+#[tokio::test]
+async fn completed_without_lease_event_records_previous_status() {
+    let audit = Arc::new(MemoryAuditSink::new());
+    let (planner, plan_id) =
+        submit_accept_graph_with(BasicCpmPlanner::with_audit(audit.clone())).await;
+    planner
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
+            "a",
+            caller("w"),
+            DeliverableStatus::Complete,
+        ))
+        .await
+        .unwrap();
+    let evt = audit
+        .snapshot()
+        .into_iter()
+        .find(|e| e.event_type == "plan.deliverable.completed_without_lease")
+        .unwrap();
+    assert_eq!(evt.payload["previous_status"]["status"], "ready");
+}
+
+#[tokio::test]
+async fn with_max_ttl_is_capped_at_thirty_days() {
+    let planner =
+        BasicCpmPlanner::new().with_max_ttl(std::time::Duration::from_secs(365 * 24 * 60 * 60));
+    let plan_id = planner
+        .submit_plan(PlanGraph {
+            deliverables: vec![deliverable("a", &["src/a.rs"], &[], Some(1.0))],
+            max_chained_dispatch: None,
+        })
+        .await
+        .unwrap();
+    let cohort = planner
+        .acquire_cohort(
+            AcquireRequest::new(plan_id, caller("w"), 1)
+                .with_ttl(std::time::Duration::from_secs(365 * 24 * 60 * 60)),
+        )
+        .await
+        .unwrap();
+    let lock = &cohort.rows[0].lock;
+    assert_eq!(
+        (lock.expires_at - lock.acquired_at).num_seconds(),
+        30 * 24 * 60 * 60
+    );
+}
+
+#[test]
+fn legacy_cohort_payload_without_blocked_deserializes() {
+    let cohort: cpm_planner::plan::Cohort = serde_json::from_value(serde_json::json!({
+        "plan_id": "p1",
+        "deliverables": [],
+        "locks": []
+    }))
+    .unwrap();
+    assert!(cohort.blocked.is_empty());
 }

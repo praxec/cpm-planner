@@ -400,8 +400,9 @@ pub struct Cohort {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockedDeliverable {
     pub id: String,
-    /// Stable code: "LAPSE_LIMIT" (later: "NOT_READY", "LOCKED",
-    /// "FILE_CONFLICT", "MANUAL").
+    /// Stable code; the authoritative list is "MANUAL", "NOT_READY",
+    /// "LOCKED", "LAPSE_LIMIT", "FILE_CONFLICT" and "MAX_COUNT" (see the
+    /// server `instructions()` for when each applies).
     pub code: String,
     pub reason: String,
 }
@@ -526,7 +527,8 @@ pub struct PlanStatus {
     /// `(float, es, id)` ascending. Same ordering as
     /// [`crate::ports::Planner::acquire_cohort`] (shared `priority_key`);
     /// membership is a superset: acquire may still skip deliverables at the
-    /// failure or lapse cap or whose files overlap a held lock.
+    /// failure or lapse cap, manual deliverables, or whose files overlap a
+    /// held lock.
     #[serde(default)]
     pub ready: Vec<String>,
 }

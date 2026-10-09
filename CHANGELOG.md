@@ -11,7 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `plan.acquire_cohort` accepts `ids` and `filter.metadata`; deliverables with `metadata.kind = "manual"` are never leased; requested ids that cannot be leased are reported in `blocked` with a code (#14).
 - `plan.accept` for manager/owner acceptance without a lease (#24).
-- `plan.force_release` `reset_counters: true` clears lapse/failure counters and revives circuit-broken deliverables.
+- `blocked` (codes MANUAL, NOT_READY, LOCKED, LAPSE_LIMIT, FILE_CONFLICT, MAX_COUNT), `blocked_count` and `needs_operator` on `plan.acquire_cohort` responses.
+- `PREREQUISITES_INCOMPLETE` returned by `plan.accept` and by lockless `plan.mark_status` completion.
+- `plan.force_release` `reset_counters: true` clears lapse/failure counters and revives circuit-broken deliverables (#17).
 - `plan.status` returns `critical_ids` (every zero-float deliverable),
   `schedule` (per-deliverable es/ef/ls/lf/float/critical, in hours) and
   `ready` (ready, unlocked deliverables in cohort priority order) (#15).
@@ -36,6 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Completing a deliverable without a lease now requires its prerequisites to be complete and is audited.
+- `plan.acquire_cohort` no longer returns the `LAPSE_LIMIT` error; lapse-limited deliverables appear in `blocked[]` with code `LAPSE_LIMIT` and the response sets `needs_operator: true` (drivers matching on the error must read `blocked`).
+- Library: `Planner` gains required method `accept`; `Cohort` gains public field `blocked`; `PlannerError` gains `PrerequisitesIncomplete` (breaks exhaustive matches); new `DEFAULT_MAX_TTL` / `BasicCpmPlanner::with_max_ttl`.
 - Library: `Planner` methods `acquire_cohort`, `mark_status`, `heartbeat`,
   `force_release` take request structs (`AcquireRequest`, `MarkStatusRequest`,
   `HeartbeatRequest`, `ForceReleaseRequest`).

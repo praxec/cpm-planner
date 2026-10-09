@@ -61,7 +61,8 @@ pub use plan::{
 };
 pub use plan_store::{DB_PATH_ENV, SqlitePlanStore};
 pub use planner::{
-    BasicCpmPlanner, ClockFn, DEFAULT_EFFORT_HOURS, DEFAULT_TTL, MAX_ATTEMPTS, MAX_LAPSES,
+    BasicCpmPlanner, ClockFn, DEFAULT_EFFORT_HOURS, DEFAULT_MAX_TTL, DEFAULT_TTL, MAX_ATTEMPTS,
+    MAX_LAPSES,
 };
 pub use server::{
     PLAN_TOOL_NAMES, PlanServer, TOOL_ACCEPT, TOOL_ACQUIRE_COHORT, TOOL_FORCE_RELEASE,

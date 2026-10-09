@@ -259,10 +259,15 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                  circuit-broken to failed instead of re-leased; leases lost \
                  environmentally (TTL lapse, no terminal mark) never trip \
                  that breaker but are bounded separately (LAPSE_LIMIT at 10). \
-                 Optional ids targets specific deliverables and filter.metadata \
-                 narrows by metadata equality; deliverables with \
-                 metadata.kind = \"manual\" are never leased. ids that do not \
-                 match filter.metadata are ignored (not reported in blocked).",
+                 Optional ttl_seconds sets the lease TTL (clamped to the \
+                 server maximum). Optional ids targets specific deliverables \
+                 and filter.metadata narrows by metadata equality; \
+                 deliverables with metadata.kind = \"manual\" are never \
+                 leased. ids that do not match filter.metadata are ignored \
+                 (not reported in blocked). The response carries blocked \
+                 [{id, code, reason}], blocked_count, and needs_operator \
+                 (true when any blocked code is LAPSE_LIMIT: clear with \
+                 plan.force_release {reset_counters: true}).",
             ),
             schema_object(json!({
                 "type": "object",
@@ -270,7 +275,7 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                     "plan_id":   { "type": "string" },
                     "caller_id": { "type": "string" },
                     "max_count": { "type": "integer", "minimum": 1 },
-                    "ids":       { "type": "array", "items": { "type": "string" } },
+                    "ids":       { "type": "array", "minItems": 1, "items": { "type": "string" } },
                     "ttl_seconds": { "type": "integer", "minimum": 1 },
                     "filter":    {
                         "type": "object",
@@ -284,7 +289,9 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
         Tool::new(
             Cow::Borrowed(TOOL_HEARTBEAT),
             Cow::Borrowed(
-                "Refresh the TTL on a held lock; LOCK_NOT_HELD or LOCK_EXPIRED on failure.",
+                "Refresh the TTL on a held lock; LOCK_NOT_HELD or LOCK_EXPIRED on failure. \
+                 Optional ttl_seconds sets the new TTL (clamped to the server \
+                 maximum); without it the lease is never shortened.",
             ),
             schema_object(json!({
                 "type": "object",
@@ -301,7 +308,11 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
             Cow::Borrowed(TOOL_MARK_STATUS),
             Cow::Borrowed(
                 "Set a deliverable's status. Complete/Failed releases the lock; \
-                 caller_id mismatch yields LOCK_NOT_HELD.",
+                 caller_id mismatch yields LOCK_NOT_HELD. Without a lock, \
+                 Complete requires all prerequisites complete \
+                 (PREREQUISITES_INCOMPLETE) and is audited; other lockless \
+                 marks are audited too, and an already-complete deliverable \
+                 cannot be changed (LOCK_NOT_HELD).",
             ),
             schema_object(json!({
                 "type": "object",
@@ -538,9 +549,13 @@ impl PlanServer {
         // `exhausted == true` rather than inspecting `rows`. True when this
         // acquisition returned no rows (nothing ready / all complete).
         let exhausted = cohort.rows.is_empty();
+        let blocked_count = cohort.blocked.len();
+        let needs_operator = cohort.blocked.iter().any(|b| b.code == "LAPSE_LIMIT");
         let mut value = to_value(&cohort)?;
         if let Some(obj) = value.as_object_mut() {
             obj.insert("exhausted".to_string(), Value::Bool(exhausted));
+            obj.insert("blocked_count".to_string(), json!(blocked_count));
+            obj.insert("needs_operator".to_string(), Value::Bool(needs_operator));
         }
         Ok(value)
     }
@@ -745,7 +760,7 @@ Tools (eight total, all `plan.<verb>`):
   plan.submit          — submit a PlanGraph, get a plan_id (idempotent on identical graphs)
   plan.acquire_cohort  — atomically acquire ready, file-disjoint deliverables
   plan.heartbeat       — refresh a held lock's TTL
-  plan.mark_status     — set a deliverable's status (Complete/Failed releases the lock)
+  plan.mark_status     — set a deliverable's status (Complete/Failed releases the lock); lockless Complete requires complete prerequisites (PREREQUISITES_INCOMPLETE) and is audited
   plan.status          — read-only snapshot ([id, status, attempt_count, failure_count, lapse_count] rows, critical_path (one real chain), critical_ids, per-deliverable schedule (es/ef/ls/lf/float, hours), the ready set ordered by float, held locks)
   plan.get             — return the submitted PlanGraph (deliverables, estimates, files, metadata) for a plan_id
   plan.force_release   — operator escape hatch; emits audit event with `reason`; optional reset_counters:true also clears lapse/failure counters and revives a circuit-broken deliverable
@@ -775,6 +790,10 @@ but at 10 lapses acquire_cohort stops re-leasing that deliverable: it is
 skipped (the rest of the plan stays leasable) and reported in the acquire
 response's `blocked` list as {id, code:"LAPSE_LIMIT", reason}. Fix the
 environment, then clear it with plan.force_release {reset_counters: true}.
+The response also carries scalar `blocked_count` and `needs_operator`.
+exhausted:true with needs_operator:true means the plan is stalled on
+lapse-limited deliverables (clear with plan.force_release {reset_counters:
+true}), not drained.
 
 Targeted acquire: plan.acquire_cohort accepts optional `ids` (only those
 deliverables are considered; unknown id -> DELIVERABLE_NOT_FOUND) and

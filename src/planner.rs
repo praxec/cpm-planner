@@ -59,6 +59,9 @@ pub const DEFAULT_TTL: Duration = Duration::from_secs(5 * 60);
 /// [`BasicCpmPlanner::with_max_ttl`] as a library.
 pub const DEFAULT_MAX_TTL: Duration = Duration::from_secs(8 * 60 * 60);
 
+/// Hard ceiling for the configurable maximum lease TTL (30 days).
+pub const MAX_TTL_CEILING: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
 /// Circuit-breaker: maximum number of times a deliverable may be
 /// EXPLICITLY marked failed (via [`Planner::mark_status`] with
 /// `status = Failed`) before the next [`Planner::acquire_cohort`]
@@ -145,8 +148,9 @@ impl BasicCpmPlanner {
 
     /// Override the maximum lease TTL a caller may request via
     /// `ttl_seconds`. Requested values above this are clamped down to it.
+    /// The value is itself capped at [`MAX_TTL_CEILING`] (30 days).
     pub fn with_max_ttl(mut self, max_ttl: Duration) -> Self {
-        self.max_ttl = max_ttl;
+        self.max_ttl = max_ttl.min(MAX_TTL_CEILING);
         self
     }
 
@@ -522,7 +526,7 @@ fn make_accepted_event(
     overrode_lock_of: Option<&str>,
     previous_status: &DeliverableStatus,
 ) -> AuditEvent {
-    AuditEvent::new("accepted")
+    AuditEvent::new("plan.deliverable.accepted")
         .with_actor(req.accepted_by.as_str())
         .with_payload(json!({
             "plan_id": req.plan_id.as_str(),
@@ -538,13 +542,33 @@ fn make_completed_without_lease_event(
     plan_id: &PlanId,
     deliverable_id: &str,
     caller_id: &CallerId,
+    previous_status: &DeliverableStatus,
 ) -> AuditEvent {
-    AuditEvent::new("completed_without_lease")
+    AuditEvent::new("plan.deliverable.completed_without_lease")
         .with_actor(caller_id.as_str())
         .with_payload(json!({
             "plan_id": plan_id.as_str(),
             "deliverable_id": deliverable_id,
             "caller_id": caller_id.as_str(),
+            "previous_status": previous_status,
+        }))
+}
+
+fn make_marked_without_lease_event(
+    plan_id: &PlanId,
+    deliverable_id: &str,
+    caller_id: &CallerId,
+    status: &DeliverableStatus,
+    previous_status: &DeliverableStatus,
+) -> AuditEvent {
+    AuditEvent::new("plan.deliverable.marked_without_lease")
+        .with_actor(caller_id.as_str())
+        .with_payload(json!({
+            "plan_id": plan_id.as_str(),
+            "deliverable_id": deliverable_id,
+            "caller_id": caller_id.as_str(),
+            "status": status,
+            "previous_status": previous_status,
         }))
 }
 
@@ -566,12 +590,14 @@ fn make_counters_reset_event(
     lapse_count: u32,
     failure_count: u32,
 ) -> AuditEvent {
-    AuditEvent::new("counters_reset").with_payload(json!({
-        "plan_id": plan_id.as_str(),
-        "deliverable_id": deliverable_id,
-        "reason": reason,
-        "previous": { "lapse_count": lapse_count, "failure_count": failure_count },
-    }))
+    AuditEvent::new("plan.deliverable.counters_reset")
+        .with_actor("operator")
+        .with_payload(json!({
+            "plan_id": plan_id.as_str(),
+            "deliverable_id": deliverable_id,
+            "reason": reason,
+            "previous": { "lapse_count": lapse_count, "failure_count": failure_count },
+        }))
 }
 
 // ---------------------------------------------------------------------------
@@ -687,27 +713,6 @@ impl Planner for BasicCpmPlanner {
             //     re-leasing it: skip it, leave the rest of the plan
             //     leasable, and report it in `blocked` so an operator
             //     intervenes (force_release with reset_counters).
-            let lapse_blocked: Vec<BlockedDeliverable> = state
-                .graph
-                .deliverables
-                .iter()
-                .filter(|d| {
-                    in_scope(d)
-                        && !is_manual(d)
-                        && matches!(state.statuses.get(&d.id), Some(DeliverableStatus::Ready))
-                        && !state.locks.contains_key(&d.id)
-                        && state.lapse_count(&d.id) >= MAX_LAPSES
-                })
-                .map(|d| BlockedDeliverable {
-                    id: d.id.clone(),
-                    code: "LAPSE_LIMIT".to_string(),
-                    reason: format!(
-                        "lease lapsed {} times (limit {MAX_LAPSES}); clear with \
-                         plan.force_release {{reset_counters: true}}",
-                        state.lapse_count(&d.id)
-                    ),
-                })
-                .collect();
 
             // 2b. Circuit-break: a Ready deliverable that has already been
             //     EXPLICITLY marked failed MAX_ATTEMPTS times is a poison
@@ -744,6 +749,30 @@ impl Planner for BasicCpmPlanner {
                     .statuses
                     .insert(id, DeliverableStatus::Failed { reason });
             }
+
+            // 2c. Lapse-limited set, computed AFTER the circuit-break so a
+            //     deliverable at both caps is reported only as Failed.
+            let lapse_blocked: Vec<BlockedDeliverable> = state
+                .graph
+                .deliverables
+                .iter()
+                .filter(|d| {
+                    in_scope(d)
+                        && !is_manual(d)
+                        && matches!(state.statuses.get(&d.id), Some(DeliverableStatus::Ready))
+                        && !state.locks.contains_key(&d.id)
+                        && state.lapse_count(&d.id) >= MAX_LAPSES
+                })
+                .map(|d| BlockedDeliverable {
+                    id: d.id.clone(),
+                    code: "LAPSE_LIMIT".to_string(),
+                    reason: format!(
+                        "lease lapsed {} times (limit {MAX_LAPSES}); clear with \
+                         plan.force_release {{reset_counters: true}}",
+                        state.lapse_count(&d.id)
+                    ),
+                })
+                .collect();
 
             // 3. Build the (float, ES) lookup table.
             let sched_by_id: HashMap<&str, (f32, f32)> = state
@@ -929,6 +958,24 @@ impl Planner for BasicCpmPlanner {
             }
 
             let is_complete = matches!(status, DeliverableStatus::Complete);
+            let previous_status = state
+                .statuses
+                .get(deliverable_id)
+                .cloned()
+                .unwrap_or(DeliverableStatus::Pending);
+
+            // No lock and already Complete: only an idempotent Complete is
+            // allowed; a late holder of an overridden lease cannot undo an
+            // accept.
+            if !state.locks.contains_key(deliverable_id)
+                && matches!(previous_status, DeliverableStatus::Complete)
+                && !is_complete
+            {
+                return Err(PlannerError::LockNotHeld {
+                    caller_id: caller_id.0.clone(),
+                    deliverable_id: deliverable_id.to_string(),
+                });
+            }
 
             // Completing without a lease: every prerequisite must be done,
             // and the bypass is audited.
@@ -952,6 +999,15 @@ impl Planner for BasicCpmPlanner {
                     &plan_id,
                     deliverable_id,
                     caller_id,
+                    &previous_status,
+                ));
+            } else if !is_complete && !state.locks.contains_key(deliverable_id) {
+                audit_buf.push(make_marked_without_lease_event(
+                    &plan_id,
+                    deliverable_id,
+                    caller_id,
+                    &status,
+                    &previous_status,
                 ));
             }
 
@@ -1029,6 +1085,7 @@ impl Planner for BasicCpmPlanner {
         let deliverable_id = deliverable_id.as_str();
         let caller_id = &caller_id;
         let now = self.now();
+        let explicit_ttl = ttl.is_some();
         let expires_at = now
             + chrono::Duration::from_std(self.effective_ttl(ttl))
                 .expect("INVARIANT: planner TTL fits in chrono::Duration");
@@ -1059,7 +1116,14 @@ impl Planner for BasicCpmPlanner {
                 });
             }
 
-            lock.expires_at = expires_at;
+            // A heartbeat without an explicit ttl never shortens a lease
+            // (e.g. one acquired with a long ttl_seconds); an explicit ttl
+            // sets now + ttl.
+            lock.expires_at = if explicit_ttl {
+                expires_at
+            } else {
+                lock.expires_at.max(expires_at)
+            };
             Ok(())
         })
     }
@@ -1119,7 +1183,7 @@ impl Planner for BasicCpmPlanner {
                 .collect();
             // Same ordering as acquire_cohort (shared priority_key). Membership is a
             // superset: acquire may still skip deliverables at the failure or lapse
-            // cap or whose files overlap a held lock.
+            // cap, manual deliverables, or ones whose files overlap a held lock.
             let sched_by_id: HashMap<&str, (f32, f32)> = state
                 .cached_result
                 .tasks

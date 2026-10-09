@@ -685,7 +685,8 @@ async fn reset_counters_emits_audit_event() {
     assert!(
         events
             .iter()
-            .any(|e| e.event_type == "counters_reset" && e.payload["deliverable_id"] == "stuck")
+            .any(|e| e.event_type == "plan.deliverable.counters_reset"
+                && e.payload["deliverable_id"] == "stuck")
     );
 }
 
@@ -1005,4 +1006,102 @@ async fn accept_ignores_expired_foreign_lease() {
         .accept(AcceptRequest::new(plan_id, "a", "owner", "ok"))
         .await;
     assert!(result.is_ok(), "got: {result:?}");
+}
+
+async fn lock_expiry(
+    planner: &BasicCpmPlanner,
+    plan_id: &cpm_planner::plan::PlanId,
+) -> DateTime<Utc> {
+    planner
+        .status(plan_id)
+        .await
+        .unwrap()
+        .locks_held
+        .into_iter()
+        .find(|l| l.deliverable_id == "a")
+        .expect("lock held")
+        .expires_at
+}
+
+async fn long_lease_planner() -> (BasicCpmPlanner, TestClock, cpm_planner::plan::PlanId) {
+    let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let clock = TestClock::new(t0);
+    let clock_arc = clock.clone();
+    let planner = BasicCpmPlanner::with_parts(
+        Arc::new(MemoryAuditSink::new()),
+        Duration::from_secs(5 * 60),
+        Arc::new(move || clock_arc.read()),
+    );
+    let plan_id = planner
+        .submit_plan(PlanGraph {
+            deliverables: vec![deliverable("a", &["src/a.rs"], &[], Some(1.0))],
+            max_chained_dispatch: None,
+        })
+        .await
+        .unwrap();
+    planner
+        .acquire_cohort(
+            AcquireRequest::new(plan_id.clone(), caller("c1"), 1)
+                .with_ttl(Duration::from_secs(2 * 60 * 60)),
+        )
+        .await
+        .unwrap();
+    (planner, clock, plan_id)
+}
+
+#[tokio::test]
+async fn heartbeat_without_ttl_never_shortens_long_lease() {
+    let (planner, clock, plan_id) = long_lease_planner().await;
+    clock.set(Utc.with_ymd_and_hms(2026, 1, 1, 0, 10, 0).unwrap());
+    planner
+        .heartbeat(HeartbeatRequest::new(plan_id.clone(), "a", caller("c1")))
+        .await
+        .unwrap();
+    assert_eq!(
+        lock_expiry(&planner, &plan_id).await,
+        Utc.with_ymd_and_hms(2026, 1, 1, 2, 0, 0).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn heartbeat_with_explicit_shorter_ttl_shortens_lease() {
+    let (planner, clock, plan_id) = long_lease_planner().await;
+    clock.set(Utc.with_ymd_and_hms(2026, 1, 1, 0, 10, 0).unwrap());
+    planner
+        .heartbeat(
+            HeartbeatRequest::new(plan_id.clone(), "a", caller("c1"))
+                .with_ttl(Duration::from_secs(60)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        lock_expiry(&planner, &plan_id).await,
+        Utc.with_ymd_and_hms(2026, 1, 1, 0, 11, 0).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn lapse_limited_deliverable_is_not_auto_failed() {
+    let (planner, _audit, _clock, plan_id) = planner_with_lapse_limited_stuck().await;
+    planner
+        .acquire_cohort(AcquireRequest::new(plan_id.clone(), caller("fresh"), 5))
+        .await
+        .unwrap();
+    let status = planner.status(&plan_id).await.unwrap();
+    assert_eq!(status_of(&status, "stuck"), DeliverableStatus::Ready);
+}
+
+#[tokio::test]
+async fn reset_counters_event_is_attributed_to_operator() {
+    let (planner, audit, _clock, plan_id) = planner_with_lapse_limited_stuck().await;
+    planner
+        .force_release(ForceReleaseRequest::new(plan_id, "stuck", "env fixed").reset_counters(true))
+        .await
+        .unwrap();
+    let evt = audit
+        .snapshot()
+        .into_iter()
+        .find(|e| e.event_type == "plan.deliverable.counters_reset")
+        .expect("counters_reset event");
+    assert_eq!(evt.actor.as_deref(), Some("operator"));
 }

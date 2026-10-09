@@ -19,11 +19,12 @@
 //! floor by default; this is the v0.6 baseline — operator-configurable
 //! audit wiring (file path, syslog, etc.) is a follow-up.
 
+use std::env::VarError;
 use std::sync::Arc;
 use std::time::Duration;
 
 use cpm_planner::audit::{AuditSink, NullAuditSink};
-use cpm_planner::planner::DEFAULT_MAX_TTL;
+use cpm_planner::planner::{DEFAULT_MAX_TTL, MAX_TTL_CEILING};
 use cpm_planner::{BasicCpmPlanner, PlanServer, SqlitePlanStore};
 use tracing_subscriber::EnvFilter;
 
@@ -60,8 +61,17 @@ async fn main() -> anyhow::Result<()> {
 /// Unset -> [`DEFAULT_MAX_TTL`] (8h). A non-integer or zero value aborts
 /// startup with a clear message rather than silently disabling the ceiling.
 fn resolve_max_ttl() -> anyhow::Result<Duration> {
-    match std::env::var("CPM_MAX_TTL_SECS") {
-        Err(_) => Ok(DEFAULT_MAX_TTL),
+    parse_max_ttl(std::env::var("CPM_MAX_TTL_SECS"))
+}
+
+/// Pure parse of the `CPM_MAX_TTL_SECS` lookup result. Values above 30 days
+/// ([`MAX_TTL_CEILING`]) abort startup.
+fn parse_max_ttl(raw: Result<String, VarError>) -> anyhow::Result<Duration> {
+    match raw {
+        Err(VarError::NotPresent) => Ok(DEFAULT_MAX_TTL),
+        Err(VarError::NotUnicode(_)) => {
+            anyhow::bail!("CPM_MAX_TTL_SECS is not valid unicode")
+        }
         Ok(raw) => {
             let secs: u64 = raw.trim().parse().map_err(|_| {
                 anyhow::anyhow!(
@@ -70,6 +80,9 @@ fn resolve_max_ttl() -> anyhow::Result<Duration> {
             })?;
             if secs == 0 {
                 anyhow::bail!("CPM_MAX_TTL_SECS must be >= 1; got 0");
+            }
+            if secs > MAX_TTL_CEILING.as_secs() {
+                anyhow::bail!("CPM_MAX_TTL_SECS must be <= 2592000 (30 days)");
             }
             Ok(Duration::from_secs(secs))
         }
@@ -86,4 +99,46 @@ fn init_tracing() {
         .with_writer(std::io::stderr)
         .with_ansi(false)
         .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unset_max_ttl_is_the_default() {
+        assert_eq!(
+            parse_max_ttl(Err(VarError::NotPresent)).unwrap(),
+            DEFAULT_MAX_TTL
+        );
+    }
+
+    #[test]
+    fn zero_max_ttl_is_rejected() {
+        assert!(parse_max_ttl(Ok("0".into())).is_err());
+    }
+
+    #[test]
+    fn non_numeric_max_ttl_is_rejected() {
+        assert!(parse_max_ttl(Ok("abc".into())).is_err());
+    }
+
+    #[test]
+    fn max_ttl_above_thirty_days_is_rejected() {
+        assert!(parse_max_ttl(Ok("2592001".into())).is_err());
+    }
+
+    #[test]
+    fn max_ttl_of_one_hour_parses() {
+        assert_eq!(
+            parse_max_ttl(Ok("3600".into())).unwrap(),
+            Duration::from_secs(3600)
+        );
+    }
+
+    #[test]
+    fn non_unicode_max_ttl_is_rejected() {
+        let bad = VarError::NotUnicode(std::ffi::OsString::from("x"));
+        assert!(parse_max_ttl(Err(bad)).is_err());
+    }
 }

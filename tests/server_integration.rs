@@ -682,3 +682,62 @@ async fn plan_heartbeat_accepts_ttl_seconds() {
         .expect("plan.heartbeat accepts ttl_seconds");
     assert_eq!(resp["ok"].as_bool(), Some(true));
 }
+
+// ── acquire response: blocked_count / needs_operator ────────────────────────
+
+#[tokio::test]
+async fn plan_acquire_cohort_reports_needs_operator_when_lapse_limited() {
+    use chrono::{Duration as ChronoDuration, TimeZone, Utc};
+    use std::sync::Mutex;
+
+    let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let now = Arc::new(Mutex::new(t0));
+    let clock_now = now.clone();
+    let planner = BasicCpmPlanner::with_parts(
+        Arc::new(cpm_planner::audit::NullAuditSink),
+        std::time::Duration::from_secs(60),
+        Arc::new(move || *clock_now.lock().unwrap()),
+    );
+    let server = PlanServer::new(Arc::new(planner));
+    let plan_id = submit_plan(&server).await;
+
+    let acquire = || {
+        call_args(
+            TOOL_ACQUIRE_COHORT,
+            json!({ "plan_id": plan_id, "caller_id": "w", "max_count": 1 }),
+        )
+    };
+    for round in 1..=cpm_planner::MAX_LAPSES {
+        server.dispatch_call(acquire()).await.expect("acquire ok");
+        *now.lock().unwrap() = t0 + ChronoDuration::minutes(5 * i64::from(round));
+    }
+    let resp = server.dispatch_call(acquire()).await.expect("acquire ok");
+    assert_eq!(
+        (
+            resp["exhausted"].clone(),
+            resp["blocked_count"].clone(),
+            resp["needs_operator"].clone()
+        ),
+        (json!(true), json!(1), json!(true))
+    );
+}
+
+#[tokio::test]
+async fn plan_acquire_cohort_without_blocked_does_not_need_operator() {
+    let server = server();
+    let plan_id = submit_plan(&server).await;
+    let resp = server
+        .dispatch_call(call_args(
+            TOOL_ACQUIRE_COHORT,
+            json!({ "plan_id": plan_id, "caller_id": "w", "max_count": 1 }),
+        ))
+        .await
+        .expect("acquire ok");
+    assert_eq!(
+        (
+            resp["blocked_count"].clone(),
+            resp["needs_operator"].clone()
+        ),
+        (json!(0), json!(false))
+    );
+}
