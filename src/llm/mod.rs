@@ -257,6 +257,11 @@ impl LlmConfig {
         &self.jev_endpoint
     }
 
+    /// Host of the Jev endpoint, from the parsed URL (see [`endpoint_host`]).
+    pub fn jev_endpoint_host(&self) -> Option<String> {
+        endpoint_host(&self.jev_endpoint)
+    }
+
     /// The bound applied to every network call.
     pub fn timeout(&self) -> Duration {
         self.timeout
@@ -412,27 +417,35 @@ impl fmt::Display for JudgmentErrorKind {
 /// A classed judgment failure. `message` never contains the key, is at most
 /// [`MAX_ERROR_MESSAGE_CHARS`] chars, and carries only a short reason (an
 /// HTTP status, a decode reason) — never the upstream body.
+///
+/// The fields are private and the only constructor,
+/// [`JudgmentError::scrubbed`], scrubs the message of the key, so no caller
+/// can build an error carrying it.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{kind}: {message}")]
 pub struct JudgmentError {
-    /// The failure class.
-    pub kind: JudgmentErrorKind,
-    /// A safe, human-readable detail.
-    pub message: String,
+    kind: JudgmentErrorKind,
+    message: String,
 }
 
 impl JudgmentError {
-    /// Build an error. Callers must pass an already-scrubbed message; it is
-    /// cut to [`MAX_ERROR_MESSAGE_CHARS`].
-    pub fn new(kind: JudgmentErrorKind, message: impl Into<String>) -> Self {
+    /// Build an error whose message is [`ApiKey::excerpt`]ed: scrubbed of
+    /// `key`, then cut to [`MAX_ERROR_MESSAGE_CHARS`].
+    pub fn scrubbed(kind: JudgmentErrorKind, message: impl AsRef<str>, key: &ApiKey) -> Self {
         Self {
             kind,
-            message: message
-                .into()
-                .chars()
-                .take(MAX_ERROR_MESSAGE_CHARS)
-                .collect(),
+            message: key.excerpt(message.as_ref(), MAX_ERROR_MESSAGE_CHARS),
         }
+    }
+
+    /// The failure class.
+    pub fn kind(&self) -> JudgmentErrorKind {
+        self.kind
+    }
+
+    /// A safe, human-readable detail.
+    pub fn message(&self) -> &str {
+        &self.message
     }
 }
 
@@ -446,4 +459,18 @@ pub trait JudgmentModel: Send + Sync {
         state: serde_json::Value,
         questions: BTreeMap<String, Question>,
     ) -> Result<Decisions, JudgmentError>;
+
+    /// Host of the endpoint this model calls, for the review report. `None`
+    /// when unknown (fakes) or unparseable.
+    fn endpoint_host(&self) -> Option<String> {
+        None
+    }
+}
+
+/// Host of `endpoint` as [`url::Url`] parses it (lower-cased, no port,
+/// userinfo, path or query). `None` when it does not parse or has no host.
+pub fn endpoint_host(endpoint: &str) -> Option<String> {
+    url::Url::parse(endpoint)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
 }

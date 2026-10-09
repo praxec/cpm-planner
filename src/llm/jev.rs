@@ -2,7 +2,8 @@
 //!
 //! Error messages are tool-facing: scrubbed of the key, capped, and limited
 //! to the class plus an HTTP status or short reason. Upstream bodies are
-//! logged at `debug` only (scrubbed, then truncated).
+//! logged at `debug` only (scrubbed, then truncated, and Debug-escaped so a
+//! body cannot forge log lines).
 //!
 //! Follow-up (not implemented): the reply body size is not capped. rig's
 //! driver reads replies through `HttpClientExt::send_streaming`, so a cap
@@ -64,14 +65,15 @@ impl JevJudge {
         &self.endpoint
     }
 
+    /// Host of the configured endpoint, from the parsed URL.
+    pub fn endpoint_host(&self) -> Option<String> {
+        super::endpoint_host(&self.endpoint)
+    }
+
     /// A tool-facing error: scrubbed, then capped at
     /// [`MAX_ERROR_MESSAGE_CHARS`](super::MAX_ERROR_MESSAGE_CHARS).
     fn error(&self, kind: JudgmentErrorKind, message: impl AsRef<str>) -> JudgmentError {
-        JudgmentError::new(
-            kind,
-            self.key
-                .excerpt(message.as_ref(), super::MAX_ERROR_MESSAGE_CHARS),
-        )
+        JudgmentError::scrubbed(kind, message, &self.key)
     }
 
     /// The upstream body goes to the debug log only (scrubbed, then cut);
@@ -84,7 +86,7 @@ impl JevJudge {
         let status = reply.status.map(|s| s.as_u16());
         tracing::debug!(
             ?status,
-            body = %self.key.excerpt(reply.body.trim(), BODY_LOG_CHARS),
+            body = ?self.key.excerpt(reply.body.trim(), BODY_LOG_CHARS),
             "jev upstream error reply"
         );
         match status {
@@ -102,7 +104,7 @@ impl JevJudge {
         error: &ProviderError,
     ) -> JudgmentError {
         tracing::debug!(
-            detail = %self.key.excerpt(&error.to_string(), BODY_LOG_CHARS),
+            detail = ?self.key.excerpt(&error.to_string(), BODY_LOG_CHARS),
             "jev provider failure"
         );
         self.error(kind, summary)
@@ -177,5 +179,9 @@ impl JudgmentModel for JevJudge {
             model: result.model,
             usage: result.usage,
         })
+    }
+
+    fn endpoint_host(&self) -> Option<String> {
+        JevJudge::endpoint_host(self)
     }
 }

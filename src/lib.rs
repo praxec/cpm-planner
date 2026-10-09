@@ -61,6 +61,7 @@ mod portfolio;
 pub mod ports;
 pub mod project;
 pub mod resource_schedule;
+pub mod review;
 pub mod revise;
 pub mod risk;
 pub mod schedule;

@@ -331,7 +331,7 @@ async fn jev_401_is_unauthorized() {
     let err = decide_with(ResponseTemplate::new(401).set_body_string("{\"error\":\"bad key\"}"))
         .await
         .unwrap_err();
-    assert_eq!(err.kind, JudgmentErrorKind::Unauthorized);
+    assert_eq!(err.kind(), JudgmentErrorKind::Unauthorized);
 }
 
 #[tokio::test]
@@ -339,7 +339,7 @@ async fn jev_403_is_unauthorized() {
     let err = decide_with(ResponseTemplate::new(403).set_body_string("forbidden"))
         .await
         .unwrap_err();
-    assert_eq!(err.kind, JudgmentErrorKind::Unauthorized);
+    assert_eq!(err.kind(), JudgmentErrorKind::Unauthorized);
 }
 
 #[tokio::test]
@@ -347,7 +347,7 @@ async fn jev_429_is_rate_limited() {
     let err = decide_with(ResponseTemplate::new(429).set_body_string("slow down"))
         .await
         .unwrap_err();
-    assert_eq!(err.kind, JudgmentErrorKind::RateLimited);
+    assert_eq!(err.kind(), JudgmentErrorKind::RateLimited);
 }
 
 #[tokio::test]
@@ -355,7 +355,7 @@ async fn jev_500_is_upstream() {
     let err = decide_with(ResponseTemplate::new(500).set_body_string("boom"))
         .await
         .unwrap_err();
-    assert_eq!(err.kind, JudgmentErrorKind::Upstream);
+    assert_eq!(err.kind(), JudgmentErrorKind::Upstream);
 }
 
 #[tokio::test]
@@ -375,7 +375,7 @@ async fn jev_slow_response_is_timeout() {
         .decide(state(), noul_question())
         .await
         .unwrap_err();
-    assert_eq!(err.kind, JudgmentErrorKind::Timeout);
+    assert_eq!(err.kind(), JudgmentErrorKind::Timeout);
 }
 
 #[tokio::test]
@@ -383,7 +383,7 @@ async fn jev_malformed_body_is_decode() {
     let err = decide_with(ResponseTemplate::new(200).set_body_string("not json at all"))
         .await
         .unwrap_err();
-    assert_eq!(err.kind, JudgmentErrorKind::Decode);
+    assert_eq!(err.kind(), JudgmentErrorKind::Decode);
 }
 
 #[tokio::test]
@@ -395,7 +395,7 @@ async fn jev_answer_for_unasked_question_is_decode() {
     let err = decide_with(ResponseTemplate::new(200).set_body_json(body))
         .await
         .unwrap_err();
-    assert_eq!(err.kind, JudgmentErrorKind::Decode);
+    assert_eq!(err.kind(), JudgmentErrorKind::Decode);
 }
 
 #[tokio::test]
@@ -409,7 +409,7 @@ async fn jev_refused_connection_is_transport() {
         .decide(state(), noul_question())
         .await
         .unwrap_err();
-    assert_eq!(err.kind, JudgmentErrorKind::Transport);
+    assert_eq!(err.kind(), JudgmentErrorKind::Transport);
 }
 
 #[tokio::test]
@@ -424,7 +424,7 @@ async fn jev_invalid_question_is_rejected_before_sending() {
         .decide(state(), BTreeMap::new())
         .await
         .unwrap_err();
-    assert_eq!(err.kind, JudgmentErrorKind::InvalidRequest);
+    assert_eq!(err.kind(), JudgmentErrorKind::InvalidRequest);
 }
 
 #[tokio::test]
@@ -440,7 +440,7 @@ async fn jev_errors_never_contain_key_even_when_upstream_echoes_it() {
         let err = decide_with(ResponseTemplate::new(status).set_body_string(body))
             .await
             .unwrap_err();
-        rendered.push_str(&format!("{err} {err:?} {}\n", err.message));
+        rendered.push_str(&format!("{err} {err:?} {}\n", err.message()));
     }
     assert!(!rendered.contains(SENTINEL), "{rendered}");
 }
@@ -453,8 +453,65 @@ fn jev_judge_debug_redacts_key() {
 
 #[test]
 fn judgment_error_display_names_its_class() {
-    let err = cpm_planner::llm::JudgmentError::new(JudgmentErrorKind::RateLimited, "status 429");
+    let err = cpm_planner::llm::JudgmentError::scrubbed(
+        JudgmentErrorKind::RateLimited,
+        "status 429",
+        config_with_key().api_key(),
+    );
     assert_eq!(err.to_string(), "rate_limited: status 429");
+}
+
+#[test]
+fn judgment_error_scrubbed_redacts_the_key() {
+    let cfg = config_with_key();
+    let err = cpm_planner::llm::JudgmentError::scrubbed(
+        JudgmentErrorKind::Upstream,
+        format!("echo {SENTINEL} back"),
+        cfg.api_key(),
+    );
+    assert!(!err.message().contains(SENTINEL));
+}
+
+#[test]
+fn judgment_error_scrubbed_caps_the_message() {
+    let err = cpm_planner::llm::JudgmentError::scrubbed(
+        JudgmentErrorKind::Upstream,
+        "x".repeat(MAX_ERROR_MESSAGE_CHARS * 2),
+        config_with_key().api_key(),
+    );
+    assert_eq!(err.message().chars().count(), MAX_ERROR_MESSAGE_CHARS);
+}
+
+#[test]
+fn jev_judge_reports_the_parsed_endpoint_host() {
+    let cfg = config_with_key().with_jev_endpoint("https://OpenRouter.AI:443/api/v1/systemone");
+    assert_eq!(
+        JevJudge::new(&cfg).endpoint_host().as_deref(),
+        Some("openrouter.ai")
+    );
+}
+
+#[test]
+fn jev_judge_reports_no_host_for_an_unparseable_endpoint() {
+    let cfg = config_with_key().with_jev_endpoint("not a url");
+    assert_eq!(JevJudge::new(&cfg).endpoint_host(), None);
+}
+
+#[test]
+fn config_endpoint_host_is_taken_from_the_parsed_url() {
+    let cfg = LlmConfig::from_lookup(lookup(&[
+        ("OPENROUTER_API_KEY", SENTINEL),
+        (
+            "CPM_JEV_ENDPOINT",
+            "https://user-free.example.com/x?h=evil.com",
+        ),
+    ]))
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        cfg.jev_endpoint_host().as_deref(),
+        Some("user-free.example.com")
+    );
 }
 
 // ---------------------------------------------------------------- openrouter
@@ -559,7 +616,7 @@ async fn upstream_error_message_names_status() {
     let err = decide_with(ResponseTemplate::new(503).set_body_string("down"))
         .await
         .unwrap_err();
-    assert!(err.message.contains("503"));
+    assert!(err.message().contains("503"));
 }
 
 #[tokio::test]
@@ -567,7 +624,7 @@ async fn error_message_is_capped() {
     let err = decide_with(ResponseTemplate::new(200).set_body_string("y".repeat(5000)))
         .await
         .unwrap_err();
-    assert!(err.message.chars().count() <= MAX_ERROR_MESSAGE_CHARS);
+    assert!(err.message().chars().count() <= MAX_ERROR_MESSAGE_CHARS);
 }
 
 #[test]
