@@ -901,6 +901,11 @@ pub enum PlannerError {
     #[error("INVALID_GRAPH: {reason}")]
     InvalidGraph { reason: String },
 
+    /// `plan.schedule` was given no usable capacity (missing or zero) for
+    /// one or more resources that scheduled work needs. `missing` is sorted.
+    #[error("INVALID_CAPACITIES: no capacity for resources [{}]", missing.join(", "))]
+    InvalidCapacities { missing: Vec<String> },
+
     /// Catch-all for backend failures (DB unavailable, serialization
     /// errors against the persistence layer, etc.). Wraps the underlying
     /// `anyhow::Error` so the caller can introspect via `source()`.
