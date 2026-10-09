@@ -27,6 +27,9 @@ pub struct Scorecard {
     pub near_critical_count: usize,
     pub total_float: f32,
     pub criticality_risk: f64,
+    /// Risk band of `criticality_risk`; `"not_applicable"` when the plan has
+    /// zero deliverables (there is nothing to score, and a 0.0 risk would
+    /// otherwise read as `over_decompressed`).
     pub risk_band: String,
     pub max_drag: Option<(String, f32)>,
     pub diameter: f32,
@@ -81,6 +84,19 @@ pub fn scorecard(
     } else {
         criticality_risk(&bands)
     };
+    // A plan with no deliverables has no float to band: report the band as
+    // `not_applicable` rather than the `over_decompressed` a 0.0 risk would
+    // otherwise imply.
+    let risk_band = if graph.deliverables.is_empty() {
+        "not_applicable".to_string()
+    } else {
+        match band_flag(risk) {
+            RiskBandFlag::InTarget => "in_target",
+            RiskBandFlag::HighRisk => "high_risk",
+            RiskBandFlag::OverDecompressed => "over_decompressed",
+        }
+        .to_string()
+    };
 
     let max_drag = drag(&real)
         .into_iter()
@@ -127,12 +143,7 @@ pub fn scorecard(
         near_critical_count,
         total_float: real.iter().map(|t| t.float).sum(),
         criticality_risk: risk,
-        risk_band: match band_flag(risk) {
-            RiskBandFlag::InTarget => "in_target",
-            RiskBandFlag::HighRisk => "high_risk",
-            RiskBandFlag::OverDecompressed => "over_decompressed",
-        }
-        .to_string(),
+        risk_band,
         max_drag,
         diameter: diameter(&real),
         cyclomatic_complexity: cc,

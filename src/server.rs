@@ -309,15 +309,24 @@ fn graph_schema() -> Value {
 }
 
 /// Selector for the read-only analysis tools: exactly one of `graph` or
-/// `plan_id`.
-fn graph_or_plan_id() -> Value {
-    json!([{ "required": ["graph"] }, { "required": ["plan_id"] }])
+/// `plan_id` is required by the server-side check, but the JSON Schema stays a
+/// plain object so clients that only understand `type`/`properties` can still
+/// parse it.
+fn graph_selector_schema() -> Value {
+    let mut schema = graph_schema();
+    if let Some(obj) = schema.as_object_mut() {
+        obj.insert(
+            "description".to_string(),
+            json!("An inline plan graph to analyse. Provide exactly one of graph or plan_id."),
+        );
+    }
+    schema
 }
 
 fn plan_id_schema() -> Value {
     json!({
         "type": "string",
-        "description": "A stored plan (from plan.submit) to analyse instead of an inline graph; give exactly one of graph or plan_id."
+        "description": "A stored plan (from plan.submit) to analyse instead of an inline graph. Provide exactly one of graph or plan_id."
     })
 }
 
@@ -513,15 +522,14 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                 "Lint a graph or stored plan without creating one: cycles (with the \
                  loop), redundant edges, edges without rationale, interface edges \
                  not targeting a contract, deliverables feeding no milestone, and \
-                 unordered file overlaps. Accepts exactly one of graph or plan_id.",
+                 unordered file overlaps. Provide exactly one of graph or plan_id.",
             ),
             schema_object(json!({
                 "type": "object",
                 "properties": {
-                    "graph": graph_schema(),
+                    "graph": graph_selector_schema(),
                     "plan_id": plan_id_schema()
                 },
-                "oneOf": graph_or_plan_id(),
                 "additionalProperties": false
             })),
         ),
@@ -531,16 +539,16 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                 "Level a graph or stored plan against resource capacities \
                  (`metadata.owner` by default): makespan, per-deliverable \
                  start/finish, per-resource load, the driving chain (dependency vs \
-                 resource waits), and project/feeding buffers. Accepts exactly one \
+                 resource waits), and project/feeding buffers. Provide exactly one \
                  of graph or plan_id. capacities is required: every resource that \
                  carries work needs at least 1 unit (otherwise INVALID_CAPACITIES: \
-                 lists the missing resources). The graph is validated like \
-                 plan.submit (INVALID_GRAPH:).",
+                 lists the missing resources). plan.schedule rejects what \
+                 plan.submit rejects (INVALID_GRAPH:).",
             ),
             schema_object(json!({
                 "type": "object",
                 "properties": {
-                    "graph": graph_schema(),
+                    "graph": graph_selector_schema(),
                     "plan_id": plan_id_schema(),
                     "capacities": capacities_schema(),
                     "resource_key": {
@@ -555,7 +563,6 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                     }
                 },
                 "required": ["capacities"],
-                "oneOf": graph_or_plan_id(),
                 "additionalProperties": false
             })),
         ),
@@ -564,18 +571,19 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
             Cow::Borrowed(
                 "Read-only what-if for a graph or stored plan (nothing is persisted): \
                  lint, critical path, schedule, milestones, optional resource \
-                 schedule and Monte Carlo, and the scorecard. Accepts exactly one \
+                 schedule and Monte Carlo, and the scorecard. Provide exactly one \
                  of graph or plan_id. schedule takes the plan.schedule inputs \
                  (capacities required; INVALID_CAPACITIES: when a working resource \
                  has none). monte_carlo takes iterations (1..50000, default 2000) \
                  and seed (default 0xC0FFEE); iterations × (deliverables + \
-                 prerequisite edges) must not exceed 200000000. Lint errors or an \
-                 invalid graph are INVALID_GRAPH:.",
+                 prerequisite edges) must not exceed 200000000. plan.simulate \
+                 rejects what plan.submit rejects; lint errors or an invalid graph \
+                 are INVALID_GRAPH:.",
             ),
             schema_object(json!({
                 "type": "object",
                 "properties": {
-                    "graph": graph_schema(),
+                    "graph": graph_selector_schema(),
                     "plan_id": plan_id_schema(),
                     "schedule": {
                         "type": "object",
@@ -598,7 +606,6 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                         "additionalProperties": false
                     }
                 },
-                "oneOf": graph_or_plan_id(),
                 "additionalProperties": false
             })),
         ),
@@ -1058,7 +1065,7 @@ Tools (eleven total, all `plan.<verb>`):
   plan.lint            — static checks without submitting: cycles (with the loop), redundant edges, edges without rationale, interface edges not targeting a contract, deliverables feeding no milestone, unordered file overlaps
   plan.schedule        — level a graph against resource capacities (`metadata.owner` by default): makespan, per-deliverable start/finish, per-resource load, driving chain (dependency vs resource waits), project and feeding buffers; capacities is required and every resource carrying work needs >= 1 unit (INVALID_CAPACITIES: lists the missing ones); project_buffer_pct 0..100 (default 25)
   plan.simulate        — read-only what-if: lint, critical path, schedule, milestones, optional resource schedule (schedule: same inputs as plan.schedule) and Monte Carlo (monte_carlo: iterations 1..50000, default 2000; seed, default 0xC0FFEE, reproducible on the same platform and build; iterations × (deliverables + prerequisite edges) must not exceed 200000000), and the scorecard; persists nothing
-  plan.lint, plan.schedule and plan.simulate take exactly one of an inline graph or a stored plan_id, and validate the graph exactly as plan.submit does
+  plan.lint, plan.schedule and plan.simulate take exactly one of an inline graph or a stored plan_id; plan.schedule and plan.simulate reject what plan.submit rejects, and plan.lint reports it as findings
 
 Leases default to 5 minutes. Pass ttl_seconds (≤ server max, default 8h)
 on acquire/heartbeat for long-running work, and heartbeat at least every

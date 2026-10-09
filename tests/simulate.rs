@@ -119,7 +119,7 @@ fn simulate_error_reason_lists_offending_ids() {
     let err = simulate(&g, &SimulateRequest::default()).expect_err("cycle");
     assert_eq!(
         err.to_string(),
-        "INVALID_GRAPH: lint errors: CYCLE [a, b, a]"
+        "INVALID_GRAPH: lint errors: CYCLE [a, b, a]: prerequisite cycle: a -> b -> a"
     );
 }
 
@@ -175,6 +175,6 @@ fn simulate_rejects_oversized_graph() {
     let err = simulate(&graph(v), &SimulateRequest::default()).expect_err("too large");
     assert_eq!(
         err.to_string(),
-        "INVALID_GRAPH: lint errors: TOO_MANY_DELIVERABLES []"
+        "INVALID_GRAPH: lint errors: TOO_MANY_DELIVERABLES []: plan has 5001 deliverables; maximum is 5000"
     );
 }

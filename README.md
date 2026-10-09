@@ -60,8 +60,8 @@ any other MCP server:
 | `plan.simulate` | Read-only what-if for a graph or stored plan (persists nothing): lint, critical path, schedule, milestones, optional resource schedule (`schedule`, same inputs and `INVALID_CAPACITIES:` rule as `plan.schedule`) and Monte Carlo (`monte_carlo`: `iterations` 1 to 50000, default 2000; `seed`, default `0xC0FFEE`; `iterations × (deliverables + prerequisite edges)` must not exceed 200000000), and the scorecard (#23). |
 
 `plan.lint`, `plan.schedule` and `plan.simulate` take exactly one of an inline
-`graph` or a stored `plan_id`, and validate the graph exactly as `plan.submit`
-does. Monte Carlo output is reproducible for a given seed on the same platform
+`graph` or a stored `plan_id`; `plan.schedule` and `plan.simulate` reject what `plan.submit`
+rejects, and `plan.lint` reports it as findings. Monte Carlo output is reproducible for a given seed on the same platform
 and toolchain; bit-identical results across targets or compiler versions are
 not guaranteed, because float math functions can differ.
 

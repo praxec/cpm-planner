@@ -50,6 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `plan.lint` reports an invalid three-point estimate as `INVALID_VALUE`, with the same message as `plan.submit`, and no longer reports `NO_ARTIFACT` for milestones.
 - Monte Carlo samples an estimate only when neither `duration_hours` nor `estimated_effort_hours` is set, matching the scheduled-length precedence.
 - `plan.simulate` rejects unknown fields inside `schedule` and `monte_carlo`.
+- Critical-path bottleneck `blocked_hours` is now summed deterministically (previously order-dependent float noise).
 
 ### Changed
 
@@ -60,7 +61,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The CPM kernel, lint, leveling and Monte Carlo no longer do quadratic string-set work or recursion: a 5000-deliverable chain is handled in well under a second.
 - Library: `cpm_planner::schedule::compute_cpm` is public.
 - The scorecard's merge bias and cyclomatic complexity count distinct prerequisite ids; an empty plan scores criticality risk 0.
-
 - `plan.acquire_cohort` and `ready` order by longest remaining tail (smallest latest start), then float, then id (#19).
 - A lockless `plan.mark_status` to `ready` or `in_progress` now requires the deliverable's prerequisites to be complete (`PREREQUISITES_INCOMPLETE`), so dependency order can't be bypassed.
 - Plan identity hashes changed (prerequisites, owned_files, duration_hours and milestone are normalised into the hash): re-submitting any graph stored by an earlier version creates a new plan.

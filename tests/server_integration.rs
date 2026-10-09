@@ -1070,6 +1070,21 @@ fn tool_definitions_match_tool_names() {
     assert_eq!((names, expected.len()), (expected, 11));
 }
 
+#[test]
+fn no_tool_schema_has_top_level_combinators() {
+    let defs = cpm_planner::plan_tool_definitions();
+    let offending: Vec<String> = defs
+        .iter()
+        .filter(|t| {
+            ["oneOf", "anyOf", "allOf"]
+                .iter()
+                .any(|key| t.input_schema.contains_key(*key))
+        })
+        .map(|t| t.name.to_string())
+        .collect();
+    assert_eq!(offending, Vec::<String>::new());
+}
+
 #[tokio::test]
 async fn plan_lint_rejects_neither_graph_nor_plan_id() {
     let err = server()

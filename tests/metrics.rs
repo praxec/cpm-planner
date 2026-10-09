@@ -94,10 +94,14 @@ fn scorecard_with_schedule_reports_resource_makespan_and_peak_load() {
 fn empty_graph_has_zero_criticality_risk() {
     let g = graph(vec![]);
     let s = card(&g);
-    assert_eq!(
-        (s.criticality_risk, s.risk_band.as_str()),
-        (0.0, "over_decompressed")
-    );
+    assert_eq!(s.criticality_risk, 0.0);
+}
+
+#[test]
+fn empty_graph_risk_band_is_not_applicable() {
+    let g = graph(vec![]);
+    let s = card(&g);
+    assert_eq!(s.risk_band.as_str(), "not_applicable");
 }
 
 #[test]

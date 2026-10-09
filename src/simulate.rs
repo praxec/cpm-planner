@@ -40,7 +40,7 @@ pub struct SimulationResult {
 /// Simulate `graph` without persisting anything.
 ///
 /// A lint `Error` finding (including a cycle) is [`PlannerError::InvalidGraph`]
-/// listing each code and its ids; anything else submit would reject is
+/// listing each code, its ids and its message; anything else submit would reject is
 /// [`PlannerError::InvalidGraph`] with submit's message. CPM runs once and
 /// is shared by leveling and Monte Carlo.
 pub fn simulate(
@@ -52,7 +52,7 @@ pub fn simulate(
         .findings
         .iter()
         .filter(|f| f.severity == Severity::Error)
-        .map(|f| format!("{} [{}]", f.code, f.ids.join(", ")))
+        .map(|f| format!("{} [{}]: {}", f.code, f.ids.join(", "), f.message))
         .collect();
     if !errors.is_empty() {
         return Err(PlannerError::InvalidGraph {
