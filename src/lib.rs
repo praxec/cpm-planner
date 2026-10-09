@@ -56,6 +56,7 @@ pub mod resource_schedule;
 pub mod risk;
 mod schedule;
 pub mod server;
+pub mod simulate;
 pub mod task;
 
 pub use algorithm::CpmAlgorithm;

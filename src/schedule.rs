@@ -4,7 +4,9 @@
 
 use crate::algorithm::CpmAlgorithm;
 use crate::estimator::EffortEstimator;
-use crate::plan::{Deliverable, FINISH_ID, PlanGraph, PlannerError, START_ID};
+use crate::plan::{
+    Deliverable, FINISH_ID, MilestoneRow, PlanGraph, PlannerError, START_ID, ScheduleRow,
+};
 use crate::task::{CriticalPathResult, Task, TaskKind};
 use std::collections::HashSet;
 
@@ -171,4 +173,55 @@ pub(crate) fn deliverable_to_task(d: &Deliverable, estimator: &EffortEstimator) 
             .collect(),
         ..Task::default()
     }
+}
+
+/// Schedule rows for `graph`: `__start__`, each deliverable in graph order,
+/// then `__finish__`. The synthetic endpoints are flagged. Shared by
+/// `plan.status` and `plan.simulate` so both report identical rows.
+pub(crate) fn schedule_rows(graph: &PlanGraph, cpm: &CriticalPathResult) -> Vec<ScheduleRow> {
+    let task_of = |id: &str| cpm.tasks.iter().find(|t| t.id == id);
+    let row_of = |t: &Task, synthetic: bool| ScheduleRow {
+        id: t.id.clone(),
+        es: t.earliest_start,
+        ef: t.earliest_finish,
+        ls: t.latest_start,
+        lf: t.latest_finish,
+        float: t.float,
+        critical: t.is_critical,
+        synthetic,
+    };
+    let mut rows: Vec<ScheduleRow> = Vec::new();
+    rows.extend(task_of(START_ID).map(|t| row_of(t, true)));
+    rows.extend(
+        graph
+            .deliverables
+            .iter()
+            .filter_map(|d| task_of(&d.id))
+            .map(|t| row_of(t, false)),
+    );
+    rows.extend(task_of(FINISH_ID).map(|t| row_of(t, true)));
+    rows
+}
+
+/// Milestone rows for `graph`; `is_complete` supplies each milestone's
+/// completion flag (`plan.simulate` has no statuses and passes `false`).
+pub(crate) fn milestone_rows(
+    graph: &PlanGraph,
+    cpm: &CriticalPathResult,
+    is_complete: impl Fn(&str) -> bool,
+) -> Vec<MilestoneRow> {
+    graph
+        .deliverables
+        .iter()
+        .filter(|d| d.is_milestone())
+        .filter_map(|d| {
+            let task = cpm.tasks.iter().find(|t| t.id == d.id)?;
+            Some(MilestoneRow {
+                id: d.id.clone(),
+                critical_path: CpmAlgorithm::trace_path_to(&cpm.tasks, &d.id),
+                hours: task.earliest_finish,
+                complete: is_complete(&d.id),
+            })
+        })
+        .collect()
 }

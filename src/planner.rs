@@ -37,8 +37,8 @@ use crate::audit::{AuditEvent, AuditSink, NullAuditSink};
 use crate::plan::{
     AcceptRequest, AcquireRequest, BlockedDeliverable, CallerId, Cohort, CohortRow, Deliverable,
     DeliverableStatus, FINISH_ID, FileMode, ForceReleaseRequest, HeartbeatRequest, LockInfo,
-    MarkStatusRequest, MilestoneRow, OwnedFile, PlanDefinition, PlanGraph, PlanId, PlanStatus,
-    PlannerError, START_ID, ScheduleRow,
+    MarkStatusRequest, OwnedFile, PlanDefinition, PlanGraph, PlanId, PlanStatus, PlannerError,
+    START_ID, ScheduleRow,
 };
 use crate::plan_store::SqlitePlanStore;
 use crate::ports::Planner;
@@ -48,7 +48,6 @@ use execution_policy::classify::{FailureClass, RetryDecision};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::algorithm::CpmAlgorithm;
 use crate::locks::{FileClaim, PlanState, add_file_claims, modes_conflict, release_file_claims};
 
 /// Default TTL applied to newly acquired locks. Five minutes is the
@@ -140,6 +139,17 @@ impl BasicCpmPlanner {
     /// TTL. The real `Utc::now` is used as the clock.
     pub fn with_audit(audit: Arc<dyn AuditSink>) -> Self {
         Self::with_parts(audit, DEFAULT_TTL, Arc::new(Utc::now))
+    }
+
+    /// Simulate a stored plan's graph read-only: nothing is written and no
+    /// audit events are emitted. See [`crate::simulate::simulate`].
+    pub async fn simulate_plan(
+        &self,
+        plan_id: &PlanId,
+        req: &crate::simulate::SimulateRequest,
+    ) -> Result<crate::simulate::SimulationResult, PlannerError> {
+        let graph = self.get_plan(plan_id).await?.graph;
+        crate::simulate::simulate(&graph, req)
     }
 
     /// Override the lock TTL. Useful for short-lived integration tests.
@@ -1317,28 +1327,7 @@ impl Planner for BasicCpmPlanner {
                 })
                 .collect();
 
-            let task_of = |id: &str| state.cached_result.tasks.iter().find(|t| t.id == id);
-            let row_of = |t: &crate::task::Task, synthetic: bool| ScheduleRow {
-                id: t.id.clone(),
-                es: t.earliest_start,
-                ef: t.earliest_finish,
-                ls: t.latest_start,
-                lf: t.latest_finish,
-                float: t.float,
-                critical: t.is_critical,
-                synthetic,
-            };
-            let mut schedule: Vec<ScheduleRow> = Vec::new();
-            schedule.extend(task_of(START_ID).map(|t| row_of(t, true)));
-            schedule.extend(
-                state
-                    .graph
-                    .deliverables
-                    .iter()
-                    .filter_map(|d| task_of(&d.id))
-                    .map(|t| row_of(t, false)),
-            );
-            schedule.extend(task_of(FINISH_ID).map(|t| row_of(t, true)));
+            let schedule = crate::schedule::schedule_rows(&state.graph, &state.cached_result);
             let mut ready_rows: Vec<&ScheduleRow> = schedule
                 .iter()
                 .filter(|r| {
@@ -1358,27 +1347,10 @@ impl Planner for BasicCpmPlanner {
             ready_rows.sort_by_key(|r| priority_key(&r.id, &sched_by_id));
             let ready: Vec<String> = ready_rows.iter().map(|r| r.id.clone()).collect();
 
-            let milestones: Vec<MilestoneRow> = state
-                .graph
-                .deliverables
-                .iter()
-                .filter(|d| d.is_milestone())
-                .filter_map(|d| {
-                    let task = task_of(&d.id)?;
-                    Some(MilestoneRow {
-                        id: d.id.clone(),
-                        critical_path: CpmAlgorithm::trace_path_to(
-                            &state.cached_result.tasks,
-                            &d.id,
-                        ),
-                        hours: task.earliest_finish,
-                        complete: matches!(
-                            state.statuses.get(&d.id),
-                            Some(DeliverableStatus::Complete)
-                        ),
-                    })
-                })
-                .collect();
+            let milestones =
+                crate::schedule::milestone_rows(&state.graph, &state.cached_result, |id| {
+                    matches!(state.statuses.get(id), Some(DeliverableStatus::Complete))
+                });
 
             PlanStatus {
                 plan_id: plan_id.clone(),
