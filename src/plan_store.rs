@@ -789,6 +789,7 @@ pub(crate) fn load_plan_state(
         file_claims,
         cached_result,
         leased_hours: HashMap::new(),
+        reported_actuals: HashMap::new(),
         actuals_updated_at: None,
     }))
 }
@@ -846,7 +847,8 @@ pub(crate) fn replace_plan_state(
 }
 
 /// Persist the mutable parts of a [`PlanState`] (statuses, locks, and the
-/// lease hours ended in this transaction, added to `ev_actuals`). The
+/// lease hours ended and progress reported in this transaction, applied to
+/// `ev_actuals`). The
 /// graph and cached CPM result are written by [`insert_plan`] and only
 /// replaced by a revision ([`replace_plan_state`]).
 pub(crate) fn save_plan_state(
@@ -903,11 +905,14 @@ pub(crate) fn save_plan_state(
         }
     }
 
-    // Lease hours ended in this transaction (a delta, see
-    // `PlanState::leased_hours`).
+    // Lease hours ended and progress reported in this transaction (deltas,
+    // see `PlanState::leased_hours` / `reported_actuals`).
     if let Some(at) = state.actuals_updated_at {
         for (deliverable_id, hours) in &state.leased_hours {
             crate::ev_store::add_leased_hours(tx, plan_id, deliverable_id, *hours, at)?;
+        }
+        for (deliverable_id, report) in &state.reported_actuals {
+            crate::ev_store::record_reported(tx, plan_id, deliverable_id, report, at)?;
         }
     }
     Ok(())

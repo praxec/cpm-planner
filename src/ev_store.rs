@@ -39,7 +39,6 @@ pub(crate) struct EvSnapshot {
 
 /// Progress reported through `mark_status`, applied to `ev_actuals`.
 #[derive(Debug, Clone, Default, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))] // TEMP-WIRING
 pub(crate) struct ReportedActuals {
     /// Replaces the stored percent when set.
     pub(crate) earned_pct: Option<u8>,
@@ -137,7 +136,6 @@ pub(crate) fn add_leased_hours(
 
 /// Apply a `mark_status` progress report: set the percent and actual hours
 /// that are given and append the evidence entry.
-#[cfg_attr(not(test), allow(dead_code))] // TEMP-WIRING
 pub(crate) fn record_reported(
     conn: &Connection,
     plan_id: &PlanId,

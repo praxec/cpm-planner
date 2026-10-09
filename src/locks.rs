@@ -81,8 +81,14 @@ pub(crate) struct PlanState {
     /// [`PlanState::record_lease_end`]; a plan revision carries it over.
     pub(crate) leased_hours: HashMap<String, f32>,
 
-    /// Latest lease end recorded in `leased_hours`; stored as the actuals
-    /// rows' `updated_at_us`.
+    /// Progress reported by `mark_status` during this transaction, keyed by
+    /// deliverable id; applied to `ev_actuals` by
+    /// [`crate::plan_store::save_plan_state`]. Written through
+    /// [`PlanState::report_actuals`].
+    pub(crate) reported_actuals: HashMap<String, crate::ev_store::ReportedActuals>,
+
+    /// Latest time recorded in `leased_hours` or `reported_actuals`; stored
+    /// as the actuals rows' `updated_at_us`.
     pub(crate) actuals_updated_at: Option<DateTime<Utc>>,
 }
 
@@ -207,8 +213,29 @@ impl PlanState {
             file_claims: HashMap::new(),
             cached_result,
             leased_hours: HashMap::new(),
+            reported_actuals: HashMap::new(),
             actuals_updated_at: None,
         }
+    }
+
+    fn touch_actuals(&mut self, at: DateTime<Utc>) {
+        self.actuals_updated_at = Some(self.actuals_updated_at.map_or(at, |t| t.max(at)));
+    }
+
+    /// Queue a `mark_status` progress report for `deliverable_id` at `at`.
+    /// An empty report is dropped.
+    pub(crate) fn report_actuals(
+        &mut self,
+        deliverable_id: &str,
+        report: crate::ev_store::ReportedActuals,
+        at: DateTime<Utc>,
+    ) {
+        if report == crate::ev_store::ReportedActuals::default() {
+            return;
+        }
+        self.reported_actuals
+            .insert(deliverable_id.to_string(), report);
+        self.touch_actuals(at);
     }
 
     /// Credit `lock`'s holder with the hours from acquisition to `end`
@@ -218,7 +245,7 @@ impl PlanState {
             .leased_hours
             .entry(lock.deliverable_id.clone())
             .or_insert(0.0) += hours_between(lock.acquired_at, end);
-        self.actuals_updated_at = Some(self.actuals_updated_at.map_or(end, |at| at.max(end)));
+        self.touch_actuals(end);
     }
 
     /// End `deliverable_id`'s lease at `end`: drop the lock and its file

@@ -1703,3 +1703,113 @@ async fn lint_path_on_cyclic_file_reports_cycle_finding() {
         .unwrap_or_default();
     assert!(codes.contains(&"CYCLE"), "got {resp}");
 }
+
+// ── plan.mark_status progress fields (earned value) ─────────────────────────
+
+/// A server with `d1` of the sample plan leased to `w1`; returns the plan id.
+async fn server_with_d1_leased(server: &PlanServer) -> String {
+    let plan_id = submit_plan(server).await;
+    server
+        .dispatch_call(call_args(
+            TOOL_ACQUIRE_COHORT,
+            json!({ "plan_id": plan_id, "caller_id": "w1", "max_count": 1 }),
+        ))
+        .await
+        .expect("acquire ok");
+    plan_id
+}
+
+fn mark_d1(plan_id: &str, extra: Value) -> Value {
+    let mut args = json!({
+        "plan_id": plan_id,
+        "deliverable_id": "d1",
+        "caller_id": "w1",
+        "status": { "status": "in_progress" }
+    });
+    for (k, v) in extra.as_object().expect("extra is an object") {
+        args[k] = v.clone();
+    }
+    args
+}
+
+#[tokio::test]
+async fn mark_status_accepts_progress_fields() {
+    let server = server();
+    let plan_id = server_with_d1_leased(&server).await;
+    let resp = server
+        .dispatch_call(call_args(
+            TOOL_MARK_STATUS,
+            mark_d1(
+                &plan_id,
+                json!({ "earned_pct": 40, "actual_effort_hours": 1.5, "evidence": "tests pass" }),
+            ),
+        ))
+        .await
+        .expect("mark_status ok");
+    assert_eq!(resp["ok"], json!(true));
+}
+
+#[tokio::test]
+async fn mark_status_earned_pct_beyond_a_byte_is_invalid_actuals() {
+    let server = server();
+    let plan_id = server_with_d1_leased(&server).await;
+    let err = call_err(
+        &server,
+        TOOL_MARK_STATUS,
+        mark_d1(&plan_id, json!({ "earned_pct": 300 })),
+    )
+    .await;
+    assert_eq!(
+        err.message,
+        "INVALID_ACTUALS: earned_pct must be an integer 0..=100, got 300"
+    );
+}
+
+#[tokio::test]
+async fn mark_status_actual_hours_beyond_f32_is_invalid_actuals() {
+    let server = server();
+    let plan_id = server_with_d1_leased(&server).await;
+    let err = call_err(
+        &server,
+        TOOL_MARK_STATUS,
+        mark_d1(&plan_id, json!({ "actual_effort_hours": 1e300 })),
+    )
+    .await;
+    assert!(
+        err.message
+            .starts_with("INVALID_ACTUALS: actual_effort_hours"),
+        "{}",
+        err.message
+    );
+}
+
+#[test]
+fn mark_status_schema_bounds_earned_pct() {
+    let tools = cpm_planner::server::plan_tool_definitions();
+    let mark = tools
+        .iter()
+        .find(|t| t.name == "plan.mark_status")
+        .expect("plan.mark_status advertised");
+    assert_eq!(
+        mark.input_schema["properties"]["earned_pct"],
+        json!({
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Percent complete (used by the weighted earning rule). Only with status in_progress; accepted and ignored with complete."
+        })
+    );
+}
+
+#[test]
+fn mark_status_schema_caps_evidence_length() {
+    let tools = cpm_planner::server::plan_tool_definitions();
+    let mark = tools
+        .iter()
+        .find(|t| t.name == "plan.mark_status")
+        .expect("plan.mark_status advertised");
+    assert_eq!(
+        mark.input_schema["properties"]["evidence"]["maxLength"],
+        json!(2048)
+    );
+}

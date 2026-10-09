@@ -936,6 +936,49 @@ fn make_circuit_break_event(
     }))
 }
 
+/// Validate `mark_status` progress fields (`INVALID_ACTUALS`). Takes wide
+/// types so the server can check raw wire values with the same messages.
+pub(crate) fn validate_actuals(
+    status: &DeliverableStatus,
+    earned_pct: Option<u64>,
+    actual_effort_hours: Option<f64>,
+    evidence: Option<&str>,
+) -> Result<(), PlannerError> {
+    let bad = |reason: String| Err(PlannerError::InvalidActuals { reason });
+    if let Some(pct) = earned_pct {
+        if pct > 100 {
+            return bad(format!("earned_pct must be an integer 0..=100, got {pct}"));
+        }
+        if !matches!(
+            status,
+            DeliverableStatus::InProgress | DeliverableStatus::Complete
+        ) {
+            return bad(
+                "earned_pct is only accepted with status in_progress (or complete, where it is \
+                 ignored)"
+                    .to_string(),
+            );
+        }
+    }
+    if let Some(h) = actual_effort_hours
+        && !(h.is_finite() && (0.0..=f64::from(crate::plan::MAX_HOURS)).contains(&h))
+    {
+        return bad(format!(
+            "actual_effort_hours must be a finite number between 0 and 1000000, got {h}"
+        ));
+    }
+    if let Some(e) = evidence {
+        let chars = e.chars().count();
+        if chars > crate::plan::MAX_EVIDENCE_CHARS {
+            return bad(format!(
+                "evidence must be at most {} characters, got {chars}",
+                crate::plan::MAX_EVIDENCE_CHARS
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Missing (non-Complete) prerequisites of `deliverable_id`.
 fn incomplete_prerequisites(state: &PlanState, deliverable_id: &str) -> Vec<String> {
     state
@@ -1651,7 +1694,22 @@ impl Planner for BasicCpmPlanner {
             deliverable_id,
             caller_id,
             status,
+            earned_pct,
+            actual_effort_hours,
+            evidence,
         } = req;
+        validate_actuals(
+            &status,
+            earned_pct.map(u64::from),
+            actual_effort_hours.map(f64::from),
+            evidence.as_deref(),
+        )?;
+        let report = crate::ev_store::ReportedActuals {
+            // Accepted alongside Complete, but ignored there.
+            earned_pct: earned_pct.filter(|_| status == DeliverableStatus::InProgress),
+            actual_hours: actual_effort_hours,
+            evidence,
+        };
         let deliverable_id = deliverable_id.as_str();
         let caller_id = &caller_id;
         let now = self.now();
@@ -1699,6 +1757,10 @@ impl Planner for BasicCpmPlanner {
                     deliverable_id: deliverable_id.to_string(),
                 });
             }
+
+            // Progress fields ride along with every accepted mark (also an
+            // idempotent Complete); a refused mark rolls them back.
+            state.report_actuals(deliverable_id, report, now);
 
             // Completing without a lease: every prerequisite must be done,
             // and the bypass is audited.

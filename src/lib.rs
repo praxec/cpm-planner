@@ -54,6 +54,8 @@ mod graph;
 mod lease_hours_tests;
 pub mod lint;
 mod locks;
+#[cfg(test)]
+mod mark_actuals_tests;
 pub mod metrics;
 pub mod monte_carlo;
 pub mod network_health;

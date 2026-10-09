@@ -200,6 +200,14 @@ struct MarkStatusArgs {
     deliverable_id: String,
     caller_id: String,
     status: DeliverableStatus,
+    /// Wide wire types so out-of-range values get `INVALID_ACTUALS`, not a
+    /// parse error.
+    #[serde(default)]
+    earned_pct: Option<u64>,
+    #[serde(default)]
+    actual_effort_hours: Option<f64>,
+    #[serde(default)]
+    evidence: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -625,7 +633,12 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                  Complete, Ready or InProgress requires all prerequisites \
                  complete (PREREQUISITES_INCOMPLETE) and is audited; other \
                  lockless marks are audited too, and an already-complete deliverable \
-                 cannot be changed (LOCK_NOT_HELD).",
+                 cannot be changed (LOCK_NOT_HELD). Optional earned-value progress: \
+                 earned_pct (0..100, only with in_progress; ignored with complete), \
+                 actual_effort_hours (total so far, 0..1000000; replaces leased hours \
+                 as actual cost) and evidence (<= 2048 chars, appended to a list); \
+                 violations are INVALID_ACTUALS. Every lease that ends adds its hours \
+                 to the deliverable's leased hours.",
             ),
             schema_object(json!({
                 "type": "object",
@@ -636,6 +649,23 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                     "status": {
                         "type": "object",
                         "description": "Internally-tagged: {\"status\":\"pending|ready|in_progress|complete\"} or {\"status\":\"failed\",\"reason\":\"...\"}"
+                    },
+                    "earned_pct": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": "Percent complete (used by the weighted earning rule). Only with status in_progress; accepted and ignored with complete."
+                    },
+                    "actual_effort_hours": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1000000,
+                        "description": "Total effort spent so far, in hours; replaces the stored value and takes precedence over leased hours for actual cost."
+                    },
+                    "evidence": {
+                        "type": "string",
+                        "maxLength": 2048,
+                        "description": "One evidence note, appended to the deliverable's evidence list."
                     }
                 },
                 "required": ["plan_id", "deliverable_id", "caller_id", "status"]
@@ -1258,13 +1288,31 @@ impl PlanServer {
 
     async fn handle_mark_status(&self, args: Value) -> Result<Value, McpError> {
         let parsed: MarkStatusArgs = parse_args(args)?;
+        crate::planner::validate_actuals(
+            &parsed.status,
+            parsed.earned_pct,
+            parsed.actual_effort_hours,
+            parsed.evidence.as_deref(),
+        )
+        .map_err(planner_error_to_mcp)?;
+        let mut request = MarkStatusRequest::new(
+            PlanId(parsed.plan_id),
+            parsed.deliverable_id,
+            CallerId(parsed.caller_id),
+            parsed.status,
+        );
+        // Validated above: the percent fits a u8 and the hours an f32.
+        if let Some(pct) = parsed.earned_pct.and_then(|p| u8::try_from(p).ok()) {
+            request = request.with_earned_pct(pct);
+        }
+        if let Some(hours) = parsed.actual_effort_hours {
+            request = request.with_actual_effort_hours(hours as f32);
+        }
+        if let Some(evidence) = parsed.evidence {
+            request = request.with_evidence(evidence);
+        }
         self.planner
-            .mark_status(MarkStatusRequest::new(
-                PlanId(parsed.plan_id),
-                parsed.deliverable_id,
-                CallerId(parsed.caller_id),
-                parsed.status,
-            ))
+            .mark_status(request)
             .await
             .map_err(planner_error_to_mcp)?;
         to_value(&OkResponse::new())
@@ -1728,6 +1776,7 @@ Tools (nineteen total, all `plan.<verb>`):
   plan.acquire_cohort  — atomically acquire ready deliverables with no conflicting file claims (an owned_files entry may be {path, mode: "append"}: append claims on one path may be co-leased and are listed in the response's shared_paths; exclusive claims never overlap anything at once; plan.submit accepts a shared file only when the claimants are ordered by prerequisites, or all claims are append)
   plan.heartbeat       — refresh a held lock's TTL
   plan.mark_status     — set a deliverable's status (Complete/Failed releases the lock); lockless Complete/Ready/InProgress requires complete prerequisites (PREREQUISITES_INCOMPLETE) and is audited
+                        optional earned-value progress: earned_pct (integer 0..100, only with in_progress; accepted and ignored with complete), actual_effort_hours (total so far, finite 0..1000000; replaces leased hours as actual cost), evidence (<= 2048 chars, appended to the deliverable's list); violations are INVALID_ACTUALS. Every lease that ends (complete, failed, force_release, expiry, accept override, forced revise/select/archive) adds its hours (up to expiry for a lapsed lease) to the deliverable's leased hours
   plan.status          — read-only snapshot ([id, status, attempt_count, failure_count, lapse_count] rows, critical_path (one real chain, always __start__ to __finish__), critical_ids, per-deliverable schedule (es/ef/ls/lf/float, hours; synthetic __start__/__finish__ endpoint rows have synthetic=true and critical=true; critical_ids lists only real deliverables), the ready set in acquire/ready priority order (smallest latest start first, i.e. longest remaining tail, then least float, then id), plan_complete, milestones (one row per `milestone: true` deliverable, or metadata.milestone == true: id, critical_path from __start__ to it, hours = its earliest finish, complete), held locks; for a named variant also name, variant, selected and definition_drift). __start__ and __finish__ are reserved deliverable ids (INVALID_GRAPH)
                         definition_drift: null when unknown (no root for the variant's project, no tracked file, file missing/unreadable/over 8 MiB); false when the file matches the last synced/exported bytes or its graph equals the head graph (re-formatting is not drift); true when the file's graph differs from the head or does not parse — so after an inline revise it is true until plan.export or plan.sync {path}
   plan.get             — return the submitted PlanGraph (deliverables, estimates, files, metadata) for a plan_id
@@ -1763,7 +1812,7 @@ Errors carry stable prefixes: LOCK_HELD, LOCK_NOT_HELD, LOCK_EXPIRED,
 OVERLAP_DETECTED, MISSING_PREREQUISITE, PLAN_NOT_FOUND,
 DELIVERABLE_NOT_FOUND, LAPSE_LIMIT, PREREQUISITES_INCOMPLETE, INVALID_GRAPH,
 INVALID_CAPACITIES, VARIANT_NOT_SELECTED, ARCHIVE_REFUSED, INVALID_PATH,
-BACKEND_ERROR.
+INVALID_ACTUALS, BACKEND_ERROR.
 
 DeliverableStatus is internally tagged on `status`:
   {"status":"pending"} | {"status":"ready"} | {"status":"in_progress"} |

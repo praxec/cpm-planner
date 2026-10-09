@@ -54,7 +54,10 @@ pub trait Planner: Send + Sync {
 
     /// Update the lifecycle state of a deliverable. Setting `Complete` or
     /// `Failed` releases the lock; `caller_id` MUST be the lock holder or the
-    /// call is rejected with [`PlannerError::LockNotHeld`].
+    /// call is rejected with [`PlannerError::LockNotHeld`]. Optional
+    /// earned-value progress fields are validated as
+    /// [`PlannerError::InvalidActuals`] (see [`MarkStatusRequest`]) and
+    /// stored with the mark.
     async fn mark_status(&self, req: MarkStatusRequest) -> Result<(), PlannerError>;
 
     /// Refresh the TTL on a held lock. Rejected with
