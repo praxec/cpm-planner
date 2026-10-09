@@ -1080,9 +1080,10 @@ pub enum PlannerError {
         selected: String,
     },
 
-    /// A portfolio operation was refused because of archiving: archiving the
-    /// selected variant alone, or syncing into / selecting an archived
-    /// variant or line.
+    /// An operation was refused because of archiving: archiving the selected
+    /// variant alone, syncing into / selecting an archived variant or line,
+    /// unarchiving a variant of an archived line, or an execution operation
+    /// on any variant of an archived line.
     #[error("ARCHIVE_REFUSED: {reason}")]
     ArchiveRefused { reason: String },
 

@@ -605,24 +605,55 @@ fn selection_events(selected: &Selected, now: DateTime<Utc>) -> Vec<AuditEvent> 
     events
 }
 
-fn make_portfolio_archived_event(
+/// Audit trail of a committed archive (`archived`) or unarchive: reaped
+/// (expired) locks, locks a forced line archive released, then
+/// `plan.portfolio.archived` / `plan.portfolio.unarchived`. Nothing when no
+/// flag changed.
+fn archive_events(
     project: &str,
     name: &str,
     variant: Option<&str>,
-    archived: &Archived,
-) -> AuditEvent {
-    let variants: Vec<serde_json::Value> = archived
+    archived: bool,
+    outcome: &Archived,
+    now: DateTime<Utc>,
+) -> Vec<AuditEvent> {
+    if !outcome.changed() {
+        return Vec::new();
+    }
+    let mut events: Vec<AuditEvent> = outcome
+        .reaped
+        .iter()
+        .map(|lock| make_expired_event(lock, now))
+        .collect();
+    events.extend(
+        outcome
+            .released
+            .iter()
+            .map(|lock| make_released_event(lock, "line archived")),
+    );
+    let variants: Vec<serde_json::Value> = outcome
         .variants
         .iter()
         .map(|(v, plan_id)| json!({ "variant": v, "plan_id": plan_id.as_str() }))
         .collect();
-    AuditEvent::new("plan.portfolio.archived").with_payload(json!({
+    let event_type = if archived {
+        "plan.portfolio.archived"
+    } else {
+        "plan.portfolio.unarchived"
+    };
+    events.push(AuditEvent::new(event_type).with_payload(json!({
         "project": project,
         "name": name,
         "variant": variant,
-        "line": archived.line,
+        "line": outcome.line,
         "variants": variants,
-    }))
+        "released": outcome
+            .released
+            .iter()
+            .map(|l| l.deliverable_id.as_str())
+            .collect::<Vec<_>>(),
+    })));
+    events
 }
 
 /// Longest `project` key accepted by `sync_plan` (a path-derived key, not a
@@ -1000,16 +1031,17 @@ impl Planner for BasicCpmPlanner {
         project: &str,
         name: &str,
         variant: Option<&str>,
+        archived: bool,
+        force: bool,
     ) -> Result<(), PlannerError> {
-        let archived = self
-            .store
-            .write_tx(|tx| crate::portfolio::archive(tx, project, name, variant))?;
-        if archived.changed() {
-            self.flush_audit(vec![make_portfolio_archived_event(
-                project, name, variant, &archived,
-            )])
-            .await;
-        }
+        let now = self.now();
+        let outcome = self.store.write_tx(|tx| {
+            crate::portfolio::archive(tx, project, name, variant, archived, force, now)
+        })?;
+        self.flush_audit(archive_events(
+            project, name, variant, archived, &outcome, now,
+        ))
+        .await;
         Ok(())
     }
 

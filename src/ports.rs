@@ -34,8 +34,9 @@ use crate::revise::RevisionDiff;
 ///   MUST emit an audit event carrying the supplied `reason`.
 /// - Execution methods (`acquire_cohort`, `heartbeat`, `mark_status`,
 ///   `accept`, `force_release`) on a named variant that is not its line's
-///   selected variant return [`PlannerError::VariantNotSelected`]; unnamed
-///   plans and read/analysis methods are never gated.
+///   selected variant return [`PlannerError::VariantNotSelected`], and on
+///   any variant of an archived line [`PlannerError::ArchiveRefused`];
+///   unnamed plans and read/analysis methods are never gated.
 #[async_trait]
 pub trait Planner: Send + Sync {
     /// Submit a [`PlanGraph`]. Idempotent on `(graph, caller_id)`; an
@@ -122,15 +123,22 @@ pub trait Planner: Send + Sync {
         force: bool,
     ) -> Result<SelectOutcome, PlannerError>;
 
-    /// Archive a whole plan line (`variant: None`: the line and all its
-    /// variants) or one variant. Archived variants stay readable but are
-    /// hidden from [`Planner::list_plans`] unless `include_archived`, and
-    /// refuse sync and selection. Archiving the selected variant alone is
-    /// `ARCHIVE_REFUSED`. Unknown line/variant is `PLAN_NOT_FOUND`.
+    /// Archive (`archived: true`) or unarchive a whole plan line
+    /// (`variant: None`: the line and all its variants) or one variant.
+    /// Archived variants stay readable but are hidden from
+    /// [`Planner::list_plans`] unless `include_archived`, and refuse sync and
+    /// selection; every variant of an archived line refuses execution
+    /// (`ARCHIVE_REFUSED`). Archiving the selected variant alone is
+    /// `ARCHIVE_REFUSED`. Archiving a line whose selected variant holds live
+    /// locks (expired ones are reaped first) is `LOCK_HELD` unless `force`,
+    /// which releases them (audited). Unarchiving one variant of an archived
+    /// line is `ARCHIVE_REFUSED`. Unknown line/variant is `PLAN_NOT_FOUND`.
     async fn archive(
         &self,
         project: &str,
         name: &str,
         variant: Option<&str>,
+        archived: bool,
+        force: bool,
     ) -> Result<(), PlannerError>;
 }

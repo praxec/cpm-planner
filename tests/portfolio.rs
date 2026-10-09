@@ -1283,7 +1283,10 @@ async fn select_of_unnamed_plan_is_plan_not_found() {
 async fn archive_hides_variant_from_list() {
     let planner = BasicCpmPlanner::new();
     main_and_alt(&planner).await;
-    planner.archive(PROJECT, "web", Some("alt")).await.unwrap();
+    planner
+        .archive(PROJECT, "web", Some("alt"), true, false)
+        .await
+        .unwrap();
     let lines = planner.list_plans(PROJECT, false).await.unwrap();
     let variants: Vec<&str> = lines[0]
         .variants
@@ -1297,7 +1300,10 @@ async fn archive_hides_variant_from_list() {
 async fn archived_variant_is_listed_on_request() {
     let planner = BasicCpmPlanner::new();
     main_and_alt(&planner).await;
-    planner.archive(PROJECT, "web", Some("alt")).await.unwrap();
+    planner
+        .archive(PROJECT, "web", Some("alt"), true, false)
+        .await
+        .unwrap();
     let lines = planner.list_plans(PROJECT, true).await.unwrap();
     assert!(lines[0].variants.iter().any(|v| v.archived));
 }
@@ -1306,7 +1312,10 @@ async fn archived_variant_is_listed_on_request() {
 async fn archived_variant_stays_readable() {
     let planner = BasicCpmPlanner::new();
     let (_, alt) = main_and_alt(&planner).await;
-    planner.archive(PROJECT, "web", Some("alt")).await.unwrap();
+    planner
+        .archive(PROJECT, "web", Some("alt"), true, false)
+        .await
+        .unwrap();
     assert!(planner.get_plan(&alt).await.is_ok());
 }
 
@@ -1315,7 +1324,7 @@ async fn archiving_selected_variant_alone_is_refused() {
     let planner = BasicCpmPlanner::new();
     main_and_alt(&planner).await;
     let err = planner
-        .archive(PROJECT, "web", Some("main"))
+        .archive(PROJECT, "web", Some("main"), true, false)
         .await
         .unwrap_err();
     assert_eq!(
@@ -1329,7 +1338,10 @@ async fn archiving_selected_variant_alone_is_refused() {
 async fn archiving_a_line_hides_it_from_list() {
     let planner = BasicCpmPlanner::new();
     main_and_alt(&planner).await;
-    planner.archive(PROJECT, "web", None).await.unwrap();
+    planner
+        .archive(PROJECT, "web", None, true, false)
+        .await
+        .unwrap();
     assert!(planner.list_plans(PROJECT, false).await.unwrap().is_empty());
 }
 
@@ -1337,7 +1349,10 @@ async fn archiving_a_line_hides_it_from_list() {
 async fn archiving_a_line_archives_every_variant() {
     let planner = BasicCpmPlanner::new();
     main_and_alt(&planner).await;
-    planner.archive(PROJECT, "web", None).await.unwrap();
+    planner
+        .archive(PROJECT, "web", None, true, false)
+        .await
+        .unwrap();
     let lines = planner.list_plans(PROJECT, true).await.unwrap();
     assert!(lines[0].variants.iter().all(|v| v.archived));
 }
@@ -1347,7 +1362,7 @@ async fn archive_of_unknown_variant_is_plan_not_found() {
     let planner = BasicCpmPlanner::new();
     main_and_alt(&planner).await;
     let err = planner
-        .archive(PROJECT, "web", Some("nope"))
+        .archive(PROJECT, "web", Some("nope"), true, false)
         .await
         .unwrap_err();
     assert!(matches!(err, PlannerError::PlanNotFound { .. }));
@@ -1356,7 +1371,10 @@ async fn archive_of_unknown_variant_is_plan_not_found() {
 #[tokio::test]
 async fn archive_of_unknown_line_is_plan_not_found() {
     let planner = BasicCpmPlanner::new();
-    let err = planner.archive(PROJECT, "nope", None).await.unwrap_err();
+    let err = planner
+        .archive(PROJECT, "nope", None, true, false)
+        .await
+        .unwrap_err();
     assert!(matches!(err, PlannerError::PlanNotFound { .. }));
 }
 
@@ -1364,7 +1382,10 @@ async fn archive_of_unknown_line_is_plan_not_found() {
 async fn archive_emits_portfolio_archived_event() {
     let (planner, sink) = audited();
     main_and_alt(&planner).await;
-    planner.archive(PROJECT, "web", Some("alt")).await.unwrap();
+    planner
+        .archive(PROJECT, "web", Some("alt"), true, false)
+        .await
+        .unwrap();
     assert!(
         sink.event_types()
             .contains(&"plan.portfolio.archived".to_string())
@@ -1375,7 +1396,10 @@ async fn archive_emits_portfolio_archived_event() {
 async fn sync_into_archived_variant_is_refused() {
     let planner = BasicCpmPlanner::new();
     main_and_alt(&planner).await;
-    planner.archive(PROJECT, "web", Some("alt")).await.unwrap();
+    planner
+        .archive(PROJECT, "web", Some("alt"), true, false)
+        .await
+        .unwrap();
     let err = planner
         .sync_plan(sync_req("web", "alt", chain()))
         .await
@@ -1387,7 +1411,10 @@ async fn sync_into_archived_variant_is_refused() {
 async fn sync_new_variant_into_archived_line_is_refused() {
     let planner = BasicCpmPlanner::new();
     main_and_alt(&planner).await;
-    planner.archive(PROJECT, "web", None).await.unwrap();
+    planner
+        .archive(PROJECT, "web", None, true, false)
+        .await
+        .unwrap();
     let err = planner
         .sync_plan(sync_req("web", "third", chain()))
         .await
@@ -1399,7 +1426,176 @@ async fn sync_new_variant_into_archived_line_is_refused() {
 async fn select_of_archived_variant_is_refused() {
     let planner = BasicCpmPlanner::new();
     let (_, alt) = main_and_alt(&planner).await;
-    planner.archive(PROJECT, "web", Some("alt")).await.unwrap();
+    planner
+        .archive(PROJECT, "web", Some("alt"), true, false)
+        .await
+        .unwrap();
     let err = planner.select_variant(&alt, false).await.unwrap_err();
     assert!(matches!(err, PlannerError::ArchiveRefused { .. }));
+}
+
+#[tokio::test]
+async fn execution_on_archived_line_is_refused() {
+    let planner = BasicCpmPlanner::new();
+    let (main, _) = main_and_alt(&planner).await;
+    planner
+        .archive(PROJECT, "web", None, true, false)
+        .await
+        .unwrap();
+    let err = planner
+        .acquire_cohort(acquire_req(&main))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "ARCHIVE_REFUSED: 'web' is archived; unarchive it to resume execution"
+    );
+}
+
+#[tokio::test]
+async fn archiving_line_with_live_lock_is_refused() {
+    let planner = BasicCpmPlanner::new();
+    let (main, _) = main_and_alt(&planner).await;
+    acquire_a(&planner, &main).await;
+    let err = planner
+        .archive(PROJECT, "web", None, true, false)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PlannerError::LockHeld { .. }));
+}
+
+#[tokio::test]
+async fn refused_line_archive_leaves_line_listed() {
+    let planner = BasicCpmPlanner::new();
+    let (main, _) = main_and_alt(&planner).await;
+    acquire_a(&planner, &main).await;
+    let _ = planner.archive(PROJECT, "web", None, true, false).await;
+    assert_eq!(planner.list_plans(PROJECT, false).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn archiving_line_with_expired_lock_succeeds() {
+    let start = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let clock = TestClock::at(start);
+    let reader = clock.clone();
+    let planner = BasicCpmPlanner::with_parts(
+        Arc::new(MemoryAuditSink::new()),
+        Duration::from_secs(60),
+        Arc::new(move || *reader.now.lock().unwrap()),
+    );
+    let (main, _) = main_and_alt(&planner).await;
+    acquire_a(&planner, &main).await;
+    clock.set(start + chrono::Duration::seconds(120));
+    assert!(
+        planner
+            .archive(PROJECT, "web", None, true, false)
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn forced_archive_releases_locks() {
+    let planner = BasicCpmPlanner::new();
+    let (main, _) = main_and_alt(&planner).await;
+    acquire_a(&planner, &main).await;
+    planner
+        .archive(PROJECT, "web", None, true, true)
+        .await
+        .unwrap();
+    assert!(planner.status(&main).await.unwrap().locks_held.is_empty());
+}
+
+#[tokio::test]
+async fn forced_archive_emits_released_event() {
+    let (planner, sink) = audited();
+    let (main, _) = main_and_alt(&planner).await;
+    acquire_a(&planner, &main).await;
+    planner
+        .archive(PROJECT, "web", None, true, true)
+        .await
+        .unwrap();
+    assert!(
+        sink.event_types()
+            .contains(&"plan.lock.released".to_string())
+    );
+}
+
+#[tokio::test]
+async fn unarchive_restores_execution() {
+    let planner = BasicCpmPlanner::new();
+    let (main, _) = main_and_alt(&planner).await;
+    planner
+        .archive(PROJECT, "web", None, true, false)
+        .await
+        .unwrap();
+    planner
+        .archive(PROJECT, "web", None, false, false)
+        .await
+        .unwrap();
+    assert!(planner.acquire_cohort(acquire_req(&main)).await.is_ok());
+}
+
+#[tokio::test]
+async fn unarchive_line_lists_its_variants_again() {
+    let planner = BasicCpmPlanner::new();
+    main_and_alt(&planner).await;
+    planner
+        .archive(PROJECT, "web", None, true, false)
+        .await
+        .unwrap();
+    planner
+        .archive(PROJECT, "web", None, false, false)
+        .await
+        .unwrap();
+    let lines = planner.list_plans(PROJECT, false).await.unwrap();
+    assert_eq!(lines[0].variants.len(), 2);
+}
+
+#[tokio::test]
+async fn unarchive_variant_makes_it_selectable() {
+    let planner = BasicCpmPlanner::new();
+    let (_, alt) = main_and_alt(&planner).await;
+    planner
+        .archive(PROJECT, "web", Some("alt"), true, false)
+        .await
+        .unwrap();
+    planner
+        .archive(PROJECT, "web", Some("alt"), false, false)
+        .await
+        .unwrap();
+    assert!(planner.select_variant(&alt, false).await.is_ok());
+}
+
+#[tokio::test]
+async fn unarchive_variant_in_archived_line_is_refused() {
+    let planner = BasicCpmPlanner::new();
+    main_and_alt(&planner).await;
+    planner
+        .archive(PROJECT, "web", None, true, false)
+        .await
+        .unwrap();
+    let err = planner
+        .archive(PROJECT, "web", Some("alt"), false, false)
+        .await
+        .unwrap_err();
+    assert_eq!(err.to_string(), "ARCHIVE_REFUSED: unarchive the line first");
+}
+
+#[tokio::test]
+async fn unarchive_emits_portfolio_unarchived_event() {
+    let (planner, sink) = audited();
+    main_and_alt(&planner).await;
+    planner
+        .archive(PROJECT, "web", None, true, false)
+        .await
+        .unwrap();
+    planner
+        .archive(PROJECT, "web", None, false, false)
+        .await
+        .unwrap();
+    assert!(
+        sink.event_types()
+            .contains(&"plan.portfolio.unarchived".to_string())
+    );
 }
