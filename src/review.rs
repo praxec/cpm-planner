@@ -762,15 +762,17 @@ impl Context<'_> {
             }
         }
 
-        let mut owners: BTreeMap<&str, BTreeSet<usize>> = BTreeMap::new();
+        // Members in deliverable-id order, so the pair cap does not depend
+        // on declaration order.
+        let mut owners: BTreeMap<&str, BTreeSet<(&str, usize)>> = BTreeMap::new();
         for (i, d) in ds.iter().enumerate() {
             if let Some(owner) = d.metadata.get("owner").and_then(Value::as_str) {
-                owners.entry(owner).or_default().insert(i);
+                owners.entry(owner).or_default().insert((d.id.as_str(), i));
             }
         }
         let mut owner_pairs: BTreeSet<(usize, usize)> = BTreeSet::new();
         'owners: for members in owners.values().filter(|m| m.len() <= MAX_SIGNAL_GROUP) {
-            let members: Vec<usize> = members.iter().copied().collect();
+            let members: Vec<usize> = members.iter().map(|(_, i)| *i).collect();
             for (k, &a) in members.iter().enumerate() {
                 for &b in &members[k + 1..] {
                     if owner_pairs.len() >= MAX_CANDIDATE_PAIRS {
@@ -1198,17 +1200,18 @@ fn ordered_pair(ds: &[Deliverable], a: usize, b: usize) -> (usize, usize) {
 /// of more than [`MAX_SIGNAL_GROUP`] deliverables is skipped, and so is an
 /// ancestor whose subtree (its own entries plus every descendant
 /// directory's) has more than [`MAX_SIGNAL_GROUP`] entries. Directories are
-/// visited in sorted order (members in index order, nearest ancestor first)
-/// and generation stops at [`MAX_CANDIDATE_PAIRS`] pairs.
+/// visited in sorted order (members in deliverable-id order, nearest
+/// ancestor first) and generation stops at [`MAX_CANDIDATE_PAIRS`] pairs, so
+/// which pairs survive the cap does not depend on declaration order.
 pub(crate) fn directory_pairs(ds: &[Deliverable]) -> BTreeMap<(usize, usize), u32> {
-    let mut dirs: BTreeMap<&Path, BTreeSet<usize>> = BTreeMap::new();
+    let mut dirs: BTreeMap<&Path, BTreeSet<(&str, usize)>> = BTreeMap::new();
     for (i, d) in ds.iter().enumerate() {
         for f in &d.owned_files {
             if let Some(dir) = f.path().parent()
                 && dir.parent().is_some()
                 && dir.components().nth(MAX_DIR_DEPTH).is_none()
             {
-                dirs.entry(dir).or_default().insert(i);
+                dirs.entry(dir).or_default().insert((d.id.as_str(), i));
             }
         }
     }
@@ -1230,7 +1233,7 @@ pub(crate) fn directory_pairs(ds: &[Deliverable]) -> BTreeMap<(usize, usize), u3
     };
     for (dir, members) in &dirs {
         if members.len() <= MAX_SIGNAL_GROUP {
-            let list: Vec<usize> = members.iter().copied().collect();
+            let list: Vec<usize> = members.iter().map(|(_, i)| *i).collect();
             for (k, &a) in list.iter().enumerate() {
                 for &b in &list[k + 1..] {
                     if !add(a, b, SHARED_DIR_WEIGHT) {
@@ -1246,8 +1249,8 @@ pub(crate) fn directory_pairs(ds: &[Deliverable]) -> BTreeMap<(usize, usize), u3
             let Some(others) = dirs.get(ancestor) else {
                 continue;
             };
-            for &a in members {
-                for &b in others.iter().filter(|b| **b != a) {
+            for &(_, a) in members {
+                for &(_, b) in others.iter().filter(|(_, b)| *b != a) {
                     if !add(a, b, NESTED_DIR_WEIGHT) {
                         return pairs;
                     }
@@ -1359,5 +1362,25 @@ mod tests {
             .map(|i| owning(format!("x{i:05}"), format!("src/m{:03}/f{i}.rs", i / 20)))
             .collect();
         assert_eq!(directory_pairs(&ds).len(), MAX_CANDIDATE_PAIRS);
+    }
+
+    /// Pairs named by id, so two declaration orders can be compared.
+    fn id_pairs(ds: &[Deliverable]) -> BTreeMap<(String, String), u32> {
+        directory_pairs(ds)
+            .into_iter()
+            .map(|((a, b), w)| ((ds[a].id.clone(), ds[b].id.clone()), w))
+            .collect()
+    }
+
+    #[test]
+    fn pair_selection_is_independent_of_declaration_order() {
+        // The cap is hit mid-directory, so the member order decides which
+        // pairs of that directory survive.
+        let ds: Vec<Deliverable> = (0..20_000)
+            .map(|i| owning(format!("x{i:05}"), format!("src/m{:03}/f{i}.rs", i / 20)))
+            .collect();
+        let mut reversed = ds.clone();
+        reversed.reverse();
+        assert_eq!(id_pairs(&ds), id_pairs(&reversed));
     }
 }
