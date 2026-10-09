@@ -239,8 +239,19 @@ fn hash_graph(graph: &PlanGraph) -> String {
         .deliverables
         .iter()
         .map(|d| {
-            let mut prereqs = d.prerequisites.clone();
-            prereqs.sort();
+            let mut prereqs: Vec<serde_json::Value> = d
+                .prerequisites
+                .iter()
+                .map(|p| {
+                    json!({
+                        "id": p.id(),
+                        "consumes": p.consumes(),
+                        "kind": p.kind(),
+                        "lag_hours": p.lag_hours(),
+                    })
+                })
+                .collect();
+            prereqs.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
             let mut files: Vec<String> = d
                 .owned_files
                 .iter()
@@ -314,7 +325,19 @@ fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
     let id_set: HashSet<&str> = graph.deliverables.iter().map(|d| d.id.as_str()).collect();
     for d in &graph.deliverables {
         for p in &d.prerequisites {
-            if !id_set.contains(p.as_str()) {
+            let lag = p.lag_hours();
+            if !lag.is_finite() || lag < 0.0 {
+                return Err(PlannerError::InvalidGraph {
+                    reason: format!(
+                        "prerequisite '{}' of deliverable '{}' has invalid lag_hours {lag}; must be a finite number >= 0",
+                        p.id(),
+                        d.id
+                    ),
+                });
+            }
+        }
+        for p in crate::graph::prerequisite_ids(d) {
+            if !id_set.contains(p) {
                 return Err(PlannerError::InvalidGraph {
                     reason: format!(
                         "prerequisite '{p}' for deliverable '{}' does not exist",
@@ -350,9 +373,9 @@ fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
         succs.entry(d.id.as_str()).or_default();
     }
     for d in &graph.deliverables {
-        for p in &d.prerequisites {
+        for p in crate::graph::prerequisite_ids(d) {
             *indeg.entry(d.id.as_str()).or_insert(0) += 1;
-            succs.entry(p.as_str()).or_default().push(d.id.as_str());
+            succs.entry(p).or_default().push(d.id.as_str());
         }
     }
     let mut queue: Vec<&str> = indeg
@@ -461,10 +484,9 @@ fn incomplete_prerequisites(state: &PlanState, deliverable_id: &str) -> Vec<Stri
         .iter()
         .find(|d| d.id == deliverable_id)
         .map(|d| {
-            d.prerequisites
-                .iter()
+            crate::graph::prerequisite_ids(d)
                 .filter(|p| !matches!(state.statuses.get(*p), Some(DeliverableStatus::Complete)))
-                .cloned()
+                .map(str::to_string)
                 .collect()
         })
         .unwrap_or_default()
@@ -513,7 +535,7 @@ fn complete_deliverable(
         .graph
         .deliverables
         .iter()
-        .filter(|d| d.prerequisites.iter().any(|p| p == deliverable_id))
+        .filter(|d| crate::graph::prerequisite_ids(d).any(|p| p == deliverable_id))
         .map(|d| d.id.clone())
         .collect();
     for dep_id in dependents {
@@ -521,9 +543,7 @@ fn complete_deliverable(
             Some(d) => d,
             None => unreachable!("dependent id {dep_id} present in graph but not findable"),
         };
-        let all_done = dep
-            .prerequisites
-            .iter()
+        let all_done = crate::graph::prerequisite_ids(dep)
             .all(|p| matches!(state.statuses.get(p), Some(DeliverableStatus::Complete)));
         let currently_pending = matches!(
             state.statuses.get(&dep_id),
@@ -1390,7 +1410,7 @@ impl Planner for BasicCpmPlanner {
                         .iter()
                         .find(|d| d.id == deliverable_id)
                         .is_some_and(|d| {
-                            d.prerequisites.iter().all(|p| {
+                            crate::graph::prerequisite_ids(d).all(|p| {
                                 matches!(state.statuses.get(p), Some(DeliverableStatus::Complete))
                             })
                         });

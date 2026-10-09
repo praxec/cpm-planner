@@ -234,7 +234,15 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                                     "properties": {
                                         "id":                    { "type": "string" },
                                         "owned_files":           { "type": "array", "items": { "type": "string" } },
-                                        "prerequisites":         { "type": "array", "items": { "type": "string" } },
+                                        "prerequisites":         { "type": "array", "description": "Each item is a deliverable id string, or an object {id, consumes?, kind?: artifact|interface, lag_hours?}.", "items": { "oneOf": [
+                                            { "type": "string" },
+                                            { "type": "object", "properties": {
+                                                "id": { "type": "string" },
+                                                "consumes": { "type": "string" },
+                                                "kind": { "type": "string", "enum": ["artifact", "interface"] },
+                                                "lag_hours": { "type": "number", "minimum": 0 }
+                                            }, "required": ["id"], "additionalProperties": false }
+                                        ] } },
                                         "estimated_effort_hours": { "type": "number" },
                                         "metadata":              {}
                                     },
@@ -759,6 +767,7 @@ fn instructions() -> &'static str {
 
 Tools (eight total, all `plan.<verb>`):
   plan.submit          — submit a PlanGraph, get a plan_id (idempotent on identical graphs)
+                        a prerequisite is an id string or {id, consumes?, kind?: artifact|interface, lag_hours?}
   plan.acquire_cohort  — atomically acquire ready, file-disjoint deliverables
   plan.heartbeat       — refresh a held lock's TTL
   plan.mark_status     — set a deliverable's status (Complete/Failed releases the lock); lockless Complete requires complete prerequisites (PREREQUISITES_INCOMPLETE) and is audited

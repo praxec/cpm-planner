@@ -42,6 +42,7 @@ pub mod algorithm;
 pub mod audit;
 pub mod drag;
 pub mod estimator;
+mod graph;
 mod locks;
 pub mod network_health;
 pub mod plan;

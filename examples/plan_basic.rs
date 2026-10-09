@@ -60,7 +60,7 @@ fn deliverable(
     Deliverable {
         id: id.to_string(),
         owned_files: owned_files.iter().map(PathBuf::from).collect(),
-        prerequisites: prerequisites.iter().map(|s| s.to_string()).collect(),
+        prerequisites: prerequisites.iter().map(|s| (*s).into()).collect(),
         estimated_effort_hours: Some(estimated_effort_hours),
         metadata: serde_json::Value::Null,
     }

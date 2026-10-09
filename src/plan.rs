@@ -104,6 +104,76 @@ pub struct PlanGraph {
     pub max_chained_dispatch: Option<u32>,
 }
 
+/// What a prerequisite edge hands over: a finished artifact or an interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrerequisiteKind {
+    Artifact,
+    Interface,
+}
+
+/// A prerequisite edge. Wire: a bare id string, or an object.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Prerequisite {
+    Id(String),
+    Edge {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        consumes: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<PrerequisiteKind>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lag_hours: Option<f32>,
+    },
+}
+
+impl Prerequisite {
+    /// Id of the deliverable this edge points at.
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Id(id) | Self::Edge { id, .. } => id,
+        }
+    }
+
+    /// What the dependent consumes from the prerequisite, if stated.
+    pub fn consumes(&self) -> Option<&str> {
+        match self {
+            Self::Id(_) => None,
+            Self::Edge { consumes, .. } => consumes.as_deref(),
+        }
+    }
+
+    /// Edge kind, if stated.
+    pub fn kind(&self) -> Option<PrerequisiteKind> {
+        match self {
+            Self::Id(_) => None,
+            Self::Edge { kind, .. } => *kind,
+        }
+    }
+
+    /// Hours between the prerequisite finishing and the dependent starting;
+    /// `0.0` when absent.
+    pub fn lag_hours(&self) -> f32 {
+        match self {
+            Self::Id(_) => 0.0,
+            Self::Edge { lag_hours, .. } => lag_hours.unwrap_or(0.0),
+        }
+    }
+}
+
+impl From<&str> for Prerequisite {
+    fn from(id: &str) -> Self {
+        Self::Id(id.to_string())
+    }
+}
+
+impl From<String> for Prerequisite {
+    fn from(id: String) -> Self {
+        Self::Id(id)
+    }
+}
+
 /// A single unit of work scheduled by the Planner.
 ///
 /// `owned_files` is the load-bearing field for concurrent dispatch: the
@@ -127,7 +197,7 @@ pub struct Deliverable {
     /// Ids of other deliverables in the same plan that must reach
     /// [`DeliverableStatus::Complete`] before this one becomes eligible
     /// for acquisition.
-    pub prerequisites: Vec<String>,
+    pub prerequisites: Vec<Prerequisite>,
 
     /// Estimated wall-clock effort, used by critical-path math in
     /// [`PlanStatus::critical_path`]. `None` means the planner derives an
@@ -701,7 +771,7 @@ mod tests {
             deliverables: vec![Deliverable {
                 id: "d1".to_string(),
                 owned_files: vec![PathBuf::from("src/foo.rs"), PathBuf::from("src/bar.rs")],
-                prerequisites: vec!["d0".to_string()],
+                prerequisites: vec!["d0".into()],
                 estimated_effort_hours: Some(1.5),
                 metadata: serde_json::json!({"description": "smoke test"}),
             }],
@@ -718,7 +788,7 @@ mod tests {
             d.owned_files,
             vec![PathBuf::from("src/foo.rs"), PathBuf::from("src/bar.rs")]
         );
-        assert_eq!(d.prerequisites, vec!["d0".to_string()]);
+        assert_eq!(d.prerequisites, vec![Prerequisite::from("d0")]);
         assert_eq!(d.estimated_effort_hours, Some(1.5));
         assert_eq!(d.metadata, serde_json::json!({"description": "smoke test"}));
         assert_eq!(back.max_chained_dispatch, Some(8));

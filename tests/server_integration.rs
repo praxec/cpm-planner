@@ -441,6 +441,35 @@ async fn plan_get_unknown_plan_is_an_error() {
     assert!(err.message.contains("PLAN_NOT_FOUND"));
 }
 
+#[tokio::test]
+async fn plan_get_round_trips_mixed_prerequisite_forms() {
+    let server = server();
+    let deliverables = json!([
+        { "id": "a", "owned_files": ["a.rs"], "prerequisites": [] },
+        { "id": "c", "owned_files": ["c.rs"], "prerequisites": [] },
+        { "id": "d", "owned_files": ["d.rs"],
+          "prerequisites": ["a", { "id": "c", "kind": "interface" }] }
+    ]);
+    let submitted = server
+        .dispatch_call(call_args(
+            TOOL_SUBMIT,
+            json!({ "graph": { "deliverables": deliverables } }),
+        ))
+        .await
+        .unwrap();
+    let got = server
+        .dispatch_call(call_args(
+            "plan.get",
+            json!({ "plan_id": submitted["plan_id"] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        got["graph"]["deliverables"][2]["prerequisites"],
+        deliverables[2]["prerequisites"]
+    );
+}
+
 // ── Error mapping: INVALID_GRAPH on cycles ──────────────────────────────────
 
 #[tokio::test]

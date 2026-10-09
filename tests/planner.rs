@@ -10,7 +10,7 @@ use cpm_planner::BasicCpmPlanner;
 use cpm_planner::audit::MemoryAuditSink;
 use cpm_planner::plan::{
     AcceptRequest, AcquireRequest, CallerId, Deliverable, DeliverableStatus, ForceReleaseRequest,
-    HeartbeatRequest, MarkStatusRequest, PlanGraph, PlanId, PlannerError,
+    HeartbeatRequest, MarkStatusRequest, PlanGraph, PlanId, PlannerError, Prerequisite,
 };
 use cpm_planner::ports::Planner;
 
@@ -18,7 +18,7 @@ fn deliverable(id: &str, files: &[&str], prereqs: &[&str], effort: Option<f32>) 
     Deliverable {
         id: id.to_string(),
         owned_files: files.iter().map(PathBuf::from).collect(),
-        prerequisites: prereqs.iter().map(|s| s.to_string()).collect(),
+        prerequisites: prereqs.iter().map(|s| (*s).into()).collect(),
         estimated_effort_hours: effort,
         metadata: serde_json::Value::Null,
     }
@@ -1349,4 +1349,82 @@ async fn empty_graph_has_start_to_finish_critical_path() {
     let plan_id = submit(&planner, vec![]).await;
     let status = planner.status(&plan_id).await.unwrap();
     assert_eq!(status.critical_path, vec!["__start__", "__finish__"]);
+}
+
+fn edge(id: &str, consumes: Option<&str>, lag: Option<f32>) -> Prerequisite {
+    Prerequisite::Edge {
+        id: id.to_string(),
+        consumes: consumes.map(str::to_string),
+        kind: None,
+        lag_hours: lag,
+    }
+}
+
+fn graph_b_after(prereq: Prerequisite) -> PlanGraph {
+    let mut b = deliverable("b", &["src/b.rs"], &[], Some(1.0));
+    b.prerequisites = vec![prereq];
+    PlanGraph {
+        deliverables: vec![deliverable("a", &["src/a.rs"], &[], Some(1.0)), b],
+        max_chained_dispatch: None,
+    }
+}
+
+#[tokio::test]
+async fn object_prerequisite_parses_and_schedules() {
+    let planner = BasicCpmPlanner::new();
+    let plan_id = planner
+        .submit_plan(graph_b_after(edge("a", Some("api schema"), None)))
+        .await
+        .unwrap();
+    planner
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
+            "a",
+            caller("owner"),
+            DeliverableStatus::Complete,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        status_of(&planner, &plan_id, "b").await,
+        DeliverableStatus::Ready
+    );
+}
+
+#[tokio::test]
+async fn string_and_object_prerequisite_hash_identically() {
+    let planner = BasicCpmPlanner::new();
+    let bare = planner
+        .submit_plan(graph_b_after(Prerequisite::from("a")))
+        .await
+        .unwrap();
+    let object = planner
+        .submit_plan(graph_b_after(edge("a", None, None)))
+        .await
+        .unwrap();
+    assert_eq!(bare, object);
+}
+
+#[tokio::test]
+async fn consumes_difference_changes_plan_identity() {
+    let planner = BasicCpmPlanner::new();
+    let bare = planner
+        .submit_plan(graph_b_after(Prerequisite::from("a")))
+        .await
+        .unwrap();
+    let consuming = planner
+        .submit_plan(graph_b_after(edge("a", Some("api schema"), None)))
+        .await
+        .unwrap();
+    assert_ne!(bare, consuming);
+}
+
+#[tokio::test]
+async fn negative_lag_is_rejected() {
+    let planner = BasicCpmPlanner::new();
+    let err = planner
+        .submit_plan(graph_b_after(edge("a", None, Some(-1.0))))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().starts_with("INVALID_GRAPH"), "got: {err}");
 }

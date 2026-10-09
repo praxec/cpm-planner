@@ -44,7 +44,7 @@ fn add_endpoints(graph: &PlanGraph, tasks: &mut Vec<Task>) {
     let referenced: HashSet<&str> = graph
         .deliverables
         .iter()
-        .flat_map(|d| d.prerequisites.iter().map(String::as_str))
+        .flat_map(crate::graph::prerequisite_ids)
         .collect();
     for t in tasks.iter_mut().filter(|t| t.dependencies.is_empty()) {
         t.dependencies.push(START_ID.to_string());
@@ -113,7 +113,9 @@ pub(crate) fn deliverable_to_task(d: &Deliverable, estimator: &EffortEstimator) 
         name: d.id.clone(),
         kind,
         effort_hours,
-        dependencies: d.prerequisites.clone(),
+        dependencies: crate::graph::prerequisite_ids(d)
+            .map(str::to_string)
+            .collect(),
         ..Task::default()
     }
 }

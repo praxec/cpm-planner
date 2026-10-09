@@ -21,7 +21,7 @@ fn deliverable(id: &str, files: &[&str], prereqs: &[&str], effort: Option<f32>) 
     Deliverable {
         id: id.to_string(),
         owned_files: files.iter().map(PathBuf::from).collect(),
-        prerequisites: prereqs.iter().map(|s| s.to_string()).collect(),
+        prerequisites: prereqs.iter().map(|s| (*s).into()).collect(),
         estimated_effort_hours: effort,
         metadata: serde_json::Value::Null,
     }
