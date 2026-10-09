@@ -7,7 +7,8 @@
 //! MCP tool surface for the open-source CPM planner.
 //!
 //! [`PlanServer`] wraps an `Arc<BasicCpmPlanner>` and exposes the eight
-//! [`Planner`] trait methods as MCP tools so any MCP-speaking agent
+//! [`Planner`] trait methods plus three read-only analysis tools as MCP
+//! tools so any MCP-speaking agent
 //! (Claude Code, Cursor, custom orchestrator, or the §33 LLM executor)
 //! can drive the planner over the standard MCP protocol.
 //!
@@ -46,12 +47,15 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::monte_carlo::MonteCarloRequest;
 use crate::plan::{
     AcceptRequest, AcquireRequest, CallerId, Cohort, DeliverableStatus, ForceReleaseRequest,
     HeartbeatRequest, MarkStatusRequest, PlanDefinition, PlanGraph, PlanId, PlanStatus,
     PlannerError,
 };
 use crate::ports::Planner;
+use crate::resource_schedule::{ScheduleRequest, resource_schedule};
+use crate::simulate::SimulateRequest;
 use rmcp::ErrorData as McpError;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, Implementation, InitializeRequestParams,
@@ -77,8 +81,11 @@ pub const TOOL_STATUS: &str = "plan.status";
 pub const TOOL_GET: &str = "plan.get";
 pub const TOOL_FORCE_RELEASE: &str = "plan.force_release";
 pub const TOOL_ACCEPT: &str = "plan.accept";
+pub const TOOL_LINT: &str = "plan.lint";
+pub const TOOL_SCHEDULE: &str = "plan.schedule";
+pub const TOOL_SIMULATE: &str = "plan.simulate";
 
-/// All eight MCP tool names exposed by [`PlanServer`], in declaration order.
+/// All eleven MCP tool names exposed by [`PlanServer`], in declaration order.
 pub const PLAN_TOOL_NAMES: &[&str] = &[
     TOOL_SUBMIT,
     TOOL_ACQUIRE_COHORT,
@@ -88,6 +95,9 @@ pub const PLAN_TOOL_NAMES: &[&str] = &[
     TOOL_GET,
     TOOL_FORCE_RELEASE,
     TOOL_ACCEPT,
+    TOOL_LINT,
+    TOOL_SCHEDULE,
+    TOOL_SIMULATE,
 ];
 
 // ---------------------------------------------------------------------------
@@ -177,6 +187,57 @@ struct ForceReleaseArgs {
     reset_counters: bool,
 }
 
+/// Shared by `plan.lint`: exactly one of an inline `graph` or a stored
+/// `plan_id` must be supplied.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GraphOrPlanIdArgs {
+    #[serde(default)]
+    graph: Option<PlanGraph>,
+    #[serde(default)]
+    plan_id: Option<String>,
+}
+
+/// `plan.schedule`: the graph/plan selector plus the leveling inputs
+/// (`capacities` required; `resource_key` and `project_buffer_pct` defaulted
+/// exactly as [`ScheduleRequest`] is).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScheduleToolArgs {
+    #[serde(default)]
+    graph: Option<PlanGraph>,
+    #[serde(default)]
+    plan_id: Option<String>,
+    capacities: std::collections::BTreeMap<String, u32>,
+    #[serde(default = "default_resource_key")]
+    resource_key: String,
+    #[serde(default = "default_buffer_pct")]
+    project_buffer_pct: f32,
+}
+
+/// `plan.simulate`: the graph/plan selector plus optional leveling and
+/// Monte Carlo requests.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SimulateToolArgs {
+    #[serde(default)]
+    graph: Option<PlanGraph>,
+    #[serde(default)]
+    plan_id: Option<String>,
+    #[serde(default)]
+    schedule: Option<ScheduleRequest>,
+    #[serde(default)]
+    monte_carlo: Option<MonteCarloRequest>,
+}
+
+fn default_resource_key() -> String {
+    "owner".to_string()
+}
+
+fn default_buffer_pct() -> f32 {
+    25.0
+}
+
 // ---------------------------------------------------------------------------
 // Per-tool response shapes
 // ---------------------------------------------------------------------------
@@ -204,7 +265,54 @@ impl OkResponse {
 // Tool-list construction
 // ---------------------------------------------------------------------------
 
-/// Build the eight `Tool` definitions advertised in `list_tools`.
+/// The inline `PlanGraph` JSON Schema shared by `plan.submit` and the
+/// read-only analysis tools (`plan.lint`, `plan.schedule`, `plan.simulate`).
+fn graph_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "deliverables": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id":                    { "type": "string" },
+                        "owned_files":           { "type": "array", "description": "Each item is a path string (exclusive) or an object {path, mode?: exclusive|append}. Append claims on the same path may be leased together.", "items": { "oneOf": [
+                            { "type": "string" },
+                            { "type": "object", "properties": {
+                                "path": { "type": "string" },
+                                "mode": { "type": "string", "enum": ["exclusive", "append"] }
+                            }, "required": ["path"], "additionalProperties": false }
+                        ] } },
+                        "prerequisites":         { "type": "array", "description": "Each item is a deliverable id string, or an object {id, consumes?, kind?: artifact|interface, lag_hours?}.", "items": { "oneOf": [
+                            { "type": "string" },
+                            { "type": "object", "properties": {
+                                "id": { "type": "string" },
+                                "consumes": { "type": "string" },
+                                "kind": { "type": "string", "enum": ["artifact", "interface"] },
+                                "lag_hours": { "type": "number", "minimum": 0 }
+                            }, "required": ["id"], "additionalProperties": false }
+                        ] } },
+                        "estimated_effort_hours": { "type": "number" },
+                        "duration_hours":         { "type": "number", "minimum": 0, "description": "Calendar time on the schedule; replaces effort as the scheduled length. Effort stays the cost basis." },
+                        "estimate":               { "type": "object", "description": "Optional three-point effort estimate; `likely` is the scheduled length when no duration or effort is given and the basis for cost and Monte Carlo sampling.", "properties": {
+                            "optimistic":  { "type": "number", "minimum": 0 },
+                            "likely":      { "type": "number", "minimum": 0 },
+                            "pessimistic": { "type": "number", "minimum": 0 }
+                        }, "required": ["optimistic", "likely", "pessimistic"], "additionalProperties": false },
+                        "milestone":              { "type": "boolean", "description": "Acceptance point; reported in plan.status milestones with its own critical path." },
+                        "metadata":              {}
+                    },
+                    "required": ["id", "owned_files", "prerequisites"]
+                }
+            },
+            "max_chained_dispatch": { "type": ["integer", "null"] }
+        },
+        "required": ["deliverables"]
+    })
+}
+
+/// Build the eleven `Tool` definitions advertised in `list_tools`.
 ///
 /// Each tool carries an inline JSON Schema describing its arguments. The
 /// schemas are hand-written rather than derived because the workspace's
@@ -224,48 +332,7 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
             schema_object(json!({
                 "type": "object",
                 "properties": {
-                    "graph": {
-                        "type": "object",
-                        "properties": {
-                            "deliverables": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "id":                    { "type": "string" },
-                                        "owned_files":           { "type": "array", "description": "Each item is a path string (exclusive) or an object {path, mode?: exclusive|append}. Append claims on the same path may be leased together.", "items": { "oneOf": [
-                                            { "type": "string" },
-                                            { "type": "object", "properties": {
-                                                "path": { "type": "string" },
-                                                "mode": { "type": "string", "enum": ["exclusive", "append"] }
-                                            }, "required": ["path"], "additionalProperties": false }
-                                        ] } },
-                                        "prerequisites":         { "type": "array", "description": "Each item is a deliverable id string, or an object {id, consumes?, kind?: artifact|interface, lag_hours?}.", "items": { "oneOf": [
-                                            { "type": "string" },
-                                            { "type": "object", "properties": {
-                                                "id": { "type": "string" },
-                                                "consumes": { "type": "string" },
-                                                "kind": { "type": "string", "enum": ["artifact", "interface"] },
-                                                "lag_hours": { "type": "number", "minimum": 0 }
-                                            }, "required": ["id"], "additionalProperties": false }
-                                        ] } },
-                                        "estimated_effort_hours": { "type": "number" },
-                                        "duration_hours":         { "type": "number", "minimum": 0, "description": "Calendar time on the schedule; replaces effort as the scheduled length. Effort stays the cost basis." },
-                                        "estimate":               { "type": "object", "description": "Optional three-point effort estimate; `likely` is the scheduled length when no duration or effort is given and the basis for cost and Monte Carlo sampling.", "properties": {
-                                            "optimistic":  { "type": "number", "minimum": 0 },
-                                            "likely":      { "type": "number", "minimum": 0 },
-                                            "pessimistic": { "type": "number", "minimum": 0 }
-                                        }, "required": ["optimistic", "likely", "pessimistic"], "additionalProperties": false },
-                                        "milestone":              { "type": "boolean", "description": "Acceptance point; reported in plan.status milestones with its own critical path." },
-                                        "metadata":              {}
-                                    },
-                                    "required": ["id", "owned_files", "prerequisites"]
-                                }
-                            },
-                            "max_chained_dispatch": { "type": ["integer", "null"] }
-                        },
-                        "required": ["deliverables"]
-                    }
+                    "graph": graph_schema()
                 },
                 "required": ["graph"],
                 "additionalProperties": false
@@ -423,6 +490,95 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                 "required": ["plan_id", "deliverable_id", "accepted_by", "evidence"]
             })),
         ),
+        Tool::new(
+            Cow::Borrowed(TOOL_LINT),
+            Cow::Borrowed(
+                "Lint a graph or stored plan without creating one: cycles (with the \
+                 loop), redundant edges, edges without rationale, interface edges \
+                 not targeting a contract, deliverables feeding no milestone, and \
+                 unordered file overlaps. Accepts exactly one of graph or plan_id.",
+            ),
+            schema_object(json!({
+                "type": "object",
+                "properties": {
+                    "graph": graph_schema(),
+                    "plan_id": { "type": "string" }
+                },
+                "additionalProperties": false
+            })),
+        ),
+        Tool::new(
+            Cow::Borrowed(TOOL_SCHEDULE),
+            Cow::Borrowed(
+                "Level a graph or stored plan against resource capacities \
+                 (`metadata.owner` by default): makespan, per-deliverable \
+                 start/finish, per-resource load, the driving chain (dependency vs \
+                 resource waits), and project/feeding buffers. Accepts exactly one \
+                 of graph or plan_id.",
+            ),
+            schema_object(json!({
+                "type": "object",
+                "properties": {
+                    "graph": graph_schema(),
+                    "plan_id": { "type": "string" },
+                    "capacities": {
+                        "type": "object",
+                        "description": "Units available per resource; every resource that carries work needs a count of at least 1.",
+                        "additionalProperties": { "type": "integer", "minimum": 1 }
+                    },
+                    "resource_key": {
+                        "type": "string",
+                        "description": "Metadata key naming a deliverable's resource (default \"owner\")."
+                    },
+                    "project_buffer_pct": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": "Project buffer as a percentage of the driving chain (default 25)."
+                    }
+                },
+                "required": ["capacities"],
+                "additionalProperties": false
+            })),
+        ),
+        Tool::new(
+            Cow::Borrowed(TOOL_SIMULATE),
+            Cow::Borrowed(
+                "Read-only what-if for a graph or stored plan (nothing is persisted): \
+                 lint, critical path, schedule, milestones, optional resource \
+                 schedule and Monte Carlo, and the scorecard. Accepts exactly one \
+                 of graph or plan_id.",
+            ),
+            schema_object(json!({
+                "type": "object",
+                "properties": {
+                    "graph": graph_schema(),
+                    "plan_id": { "type": "string" },
+                    "schedule": {
+                        "type": "object",
+                        "properties": {
+                            "capacities": {
+                                "type": "object",
+                                "additionalProperties": { "type": "integer", "minimum": 1 }
+                            },
+                            "resource_key": { "type": "string" },
+                            "project_buffer_pct": { "type": "number", "minimum": 0, "maximum": 100 }
+                        },
+                        "required": ["capacities"],
+                        "additionalProperties": false
+                    },
+                    "monte_carlo": {
+                        "type": "object",
+                        "properties": {
+                            "iterations": { "type": "integer", "minimum": 1, "maximum": 50000 },
+                            "seed": { "type": "integer" }
+                        },
+                        "additionalProperties": false
+                    }
+                },
+                "additionalProperties": false
+            })),
+        ),
     ]
 }
 
@@ -448,7 +604,7 @@ fn schema_object(value: Value) -> Arc<rmcp::model::JsonObject> {
 // PlanServer
 // ---------------------------------------------------------------------------
 
-/// MCP server façade exposing a [`BasicCpmPlanner`] over eight tools.
+/// MCP server façade exposing a [`BasicCpmPlanner`] over eleven tools.
 #[derive(Clone)]
 pub struct PlanServer {
     planner: Arc<BasicCpmPlanner>,
@@ -478,6 +634,31 @@ impl PlanServer {
     /// (e.g. submit a plan, then drive `acquire_cohort` via MCP).
     pub fn planner(&self) -> &Arc<BasicCpmPlanner> {
         &self.planner
+    }
+
+    /// Resolve the read-only analysis tools' graph selector: exactly one of
+    /// an inline `graph` or a stored `plan_id`; both or neither is an
+    /// invalid-params error.
+    async fn resolve_graph(
+        &self,
+        graph: Option<PlanGraph>,
+        plan_id: Option<String>,
+    ) -> Result<PlanGraph, McpError> {
+        match (graph, plan_id) {
+            (Some(graph), None) => Ok(graph),
+            (None, Some(plan_id)) => {
+                let definition = self
+                    .planner
+                    .get_plan(&PlanId(plan_id))
+                    .await
+                    .map_err(planner_error_to_mcp)?;
+                Ok(definition.graph)
+            }
+            _ => Err(McpError::invalid_params(
+                "provide exactly one of graph or plan_id",
+                None,
+            )),
+        }
     }
 
     /// Serve the MCP surface over stdio. Blocks until the peer disconnects.
@@ -513,6 +694,9 @@ impl PlanServer {
             TOOL_GET => self.handle_get(args).await,
             TOOL_FORCE_RELEASE => self.handle_force_release(args).await,
             TOOL_ACCEPT => self.handle_accept(args).await,
+            TOOL_LINT => self.handle_lint(args).await,
+            TOOL_SCHEDULE => self.handle_schedule(args).await,
+            TOOL_SIMULATE => self.handle_simulate(args).await,
             other => Err(McpError::invalid_params(
                 format!(
                     "Unknown tool '{other}'. Available: {}.",
@@ -665,6 +849,49 @@ impl PlanServer {
             .map_err(planner_error_to_mcp)?;
         to_value(&OkResponse::new())
     }
+
+    async fn handle_lint(&self, args: Value) -> Result<Value, McpError> {
+        let parsed: GraphOrPlanIdArgs = parse_args(args)?;
+        let graph = self.resolve_graph(parsed.graph, parsed.plan_id).await?;
+        to_value(&crate::lint::lint(&graph))
+    }
+
+    async fn handle_schedule(&self, args: Value) -> Result<Value, McpError> {
+        let parsed: ScheduleToolArgs = parse_args(args)?;
+        let graph = self.resolve_graph(parsed.graph, parsed.plan_id).await?;
+        let request = ScheduleRequest {
+            capacities: parsed.capacities,
+            resource_key: parsed.resource_key,
+            project_buffer_pct: parsed.project_buffer_pct,
+        };
+        let schedule = resource_schedule(&graph, &request).map_err(planner_error_to_mcp)?;
+        to_value(&schedule)
+    }
+
+    async fn handle_simulate(&self, args: Value) -> Result<Value, McpError> {
+        let parsed: SimulateToolArgs = parse_args(args)?;
+        let request = SimulateRequest {
+            schedule: parsed.schedule,
+            monte_carlo: parsed.monte_carlo,
+        };
+        let result = match (parsed.graph, parsed.plan_id) {
+            (Some(graph), None) => {
+                crate::simulate::simulate(&graph, &request).map_err(planner_error_to_mcp)?
+            }
+            (None, Some(plan_id)) => self
+                .planner
+                .simulate_plan(&PlanId(plan_id), &request)
+                .await
+                .map_err(planner_error_to_mcp)?,
+            _ => {
+                return Err(McpError::invalid_params(
+                    "provide exactly one of graph or plan_id",
+                    None,
+                ));
+            }
+        };
+        to_value(&result)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -677,7 +904,7 @@ impl ServerHandler for PlanServer {
             Implementation::new(self.server_name.clone(), self.server_version.clone());
         server_info.title = Some("cpm-planner".to_string());
         server_info.description = Some(
-            "MCP server exposing the open-source Praxec CPM planner via eight tools.".to_string(),
+            "MCP server exposing the open-source Praxec CPM planner via eleven tools.".to_string(),
         );
 
         let mut info = InitializeResult::default();
@@ -778,7 +1005,7 @@ fn planner_error_to_mcp(err: PlannerError) -> McpError {
 fn instructions() -> &'static str {
     r#"This is the cpm-planner MCP server — the open-source CPM planner.
 
-Tools (eight total, all `plan.<verb>`):
+Tools (eleven total, all `plan.<verb>`):
   plan.submit          — submit a PlanGraph, get a plan_id (idempotent on identical graphs)
                         a prerequisite is an id string or {id, consumes?, kind?: artifact|interface, lag_hours?}; a deliverable's duration_hours (calendar time; when absent the default is the effort estimate, explicit or estimator-derived) and lag_hours (minimum wait after a prerequisite finishes) drive the schedule
                         a milestone (milestone: true) is zero-length unless you give it an estimate or duration; it is still an ordinary deliverable someone must complete (accept or mark Complete), and it is not leased if metadata.kind=manual
@@ -789,6 +1016,9 @@ Tools (eight total, all `plan.<verb>`):
   plan.get             — return the submitted PlanGraph (deliverables, estimates, files, metadata) for a plan_id
   plan.force_release   — operator escape hatch; emits audit event with `reason`; optional reset_counters:true also clears lapse/failure counters and revives a circuit-broken deliverable
   plan.accept          — a manager/owner marks a deliverable Complete without a lease (audited; evidence required; override_lock to take over a live lease)
+  plan.lint            — static checks without submitting: cycles (with the loop), redundant edges, edges without rationale, interface edges not targeting a contract, deliverables feeding no milestone, unordered file overlaps
+  plan.schedule        — level a graph against resource capacities (`metadata.owner` by default): makespan, per-deliverable start/finish, per-resource load, driving chain (dependency vs resource waits), project and feeding buffers
+  plan.simulate        — read-only what-if: lint, critical path, schedule, milestones, optional resource schedule and Monte Carlo, and the scorecard; persists nothing
 
 Leases default to 5 minutes. Pass ttl_seconds (≤ server max, default 8h)
 on acquire/heartbeat for long-running work, and heartbeat at least every

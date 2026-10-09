@@ -823,3 +823,128 @@ async fn plan_acquire_cohort_without_blocked_does_not_need_operator() {
         (json!(0), json!(false))
     );
 }
+
+// ── Roundtrip: plan.lint / plan.schedule / plan.simulate ────────────────────
+
+fn lintable_graph() -> Value {
+    json!({
+        "deliverables": [
+            {
+                "id": "a",
+                "owned_files": ["src/a.rs"],
+                "prerequisites": [],
+                "estimated_effort_hours": 1.0
+            },
+            {
+                "id": "b",
+                "owned_files": ["src/b.rs"],
+                "prerequisites": [{ "id": "a", "consumes": "artifact" }],
+                "estimated_effort_hours": 2.0
+            }
+        ]
+    })
+}
+
+#[tokio::test]
+async fn plan_lint_inline_graph_roundtrip() {
+    let server = server();
+    let resp = server
+        .dispatch_call(call_args("plan.lint", json!({ "graph": lintable_graph() })))
+        .await
+        .expect("plan.lint returns Ok");
+    assert_eq!(resp["clean"], json!(true));
+}
+
+#[tokio::test]
+async fn plan_lint_stored_plan_roundtrip() {
+    let server = server();
+    let sub = server
+        .dispatch_call(call_args(TOOL_SUBMIT, json!({ "graph": lintable_graph() })))
+        .await
+        .unwrap();
+    let plan_id = sub["plan_id"].as_str().unwrap().to_string();
+    let resp = server
+        .dispatch_call(call_args("plan.lint", json!({ "plan_id": plan_id })))
+        .await
+        .expect("plan.lint by plan_id returns Ok");
+    assert_eq!(resp["clean"], json!(true));
+}
+
+#[tokio::test]
+async fn plan_lint_rejects_both_graph_and_plan_id() {
+    let server = server();
+    let err = server
+        .dispatch_call(call_args(
+            "plan.lint",
+            json!({ "graph": lintable_graph(), "plan_id": "plan_x" }),
+        ))
+        .await
+        .expect_err("both graph and plan_id must be rejected");
+    assert_eq!(err.message, "provide exactly one of graph or plan_id");
+}
+
+#[tokio::test]
+async fn plan_schedule_roundtrip() {
+    let server = server();
+    let resp = server
+        .dispatch_call(call_args(
+            "plan.schedule",
+            json!({
+                "graph": sample_graph(),
+                "capacities": { "unassigned": 1 }
+            }),
+        ))
+        .await
+        .expect("plan.schedule returns Ok");
+    assert_eq!(resp["makespan"], json!(3.0));
+}
+
+#[tokio::test]
+async fn plan_schedule_rejects_missing_capacities() {
+    let server = server();
+    let err = server
+        .dispatch_call(call_args(
+            "plan.schedule",
+            json!({
+                "graph": sample_graph(),
+                "capacities": {}
+            }),
+        ))
+        .await
+        .expect_err("missing capacities must be rejected");
+    assert!(
+        err.message.contains("INVALID_CAPACITIES"),
+        "expected INVALID_CAPACITIES; got: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn plan_simulate_roundtrip() {
+    let server = server();
+    let resp = server
+        .dispatch_call(call_args(
+            "plan.simulate",
+            json!({ "graph": sample_graph() }),
+        ))
+        .await
+        .expect("plan.simulate returns Ok");
+    assert_eq!(resp["scorecard"]["deliverables"], json!(2));
+}
+
+#[tokio::test]
+async fn plan_simulate_rejects_unknown_fields() {
+    let server = server();
+    let err = server
+        .dispatch_call(call_args(
+            "plan.simulate",
+            json!({ "graph": sample_graph(), "bogus": 1 }),
+        ))
+        .await
+        .expect_err("unknown fields must be rejected");
+    assert!(
+        err.message.contains("bogus") || err.message.contains("unknown field"),
+        "expected unknown-field rejection; got: {}",
+        err.message
+    );
+}

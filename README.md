@@ -55,6 +55,9 @@ any other MCP server:
 | `plan.get` | Return the stored plan graph for a plan_id (read back what was submitted). |
 | `plan.force_release` | Operator escape hatch: release a lock regardless of holder/TTL; `reset_counters: true` also clears lapse/failure counters. |
 | `plan.accept` | Manager/owner acceptance: complete a deliverable without holding its lease (audited, with evidence). |
+| `plan.lint` | Static checks without submitting: cycles (with the loop), redundant edges, edges without rationale, interface edges not targeting a contract, deliverables feeding no milestone, and unordered file overlaps (#20). |
+| `plan.schedule` | Level a graph against resource capacities (`metadata.owner` by default): makespan, per-deliverable start/finish, per-resource load, the driving chain (dependency vs resource waits), and project/feeding buffers (#19). |
+| `plan.simulate` | Read-only what-if for a graph or stored plan (persists nothing): lint, critical path, schedule, milestones, optional resource schedule and Monte Carlo, and the scorecard (#23). |
 
 ## Use as a library
 
