@@ -602,3 +602,85 @@ async fn force_release_from_another_connection_frees_the_lock() {
     assert_eq!(cohort.rows.len(), 1);
     assert_eq!(cohort.rows[0].deliverable.id, "d1");
 }
+
+// ---------------------------------------------------------------------
+// Schema versioning + stale CPM result repair
+// ---------------------------------------------------------------------
+
+fn effort_deliverable(id: &str, prereqs: &[&str], hours: f32) -> Deliverable {
+    let mut d = deliverable(id, &[], prereqs);
+    d.estimated_effort_hours = Some(hours);
+    d
+}
+
+/// Two independent chains: `P0a(2)->P0b(3)` and `P1a(2)->P1b(3)`.
+async fn submit_parallel_chains(path: &Path) -> cpm_planner::plan::PlanId {
+    let planner = open_planner(path);
+    planner
+        .submit_plan(PlanGraph {
+            deliverables: vec![
+                effort_deliverable("P0a", &[], 2.0),
+                effort_deliverable("P0b", &["P0a"], 3.0),
+                effort_deliverable("P1a", &[], 2.0),
+                effort_deliverable("P1b", &["P1a"], 3.0),
+            ],
+            max_chained_dispatch: None,
+        })
+        .await
+        .expect("submit")
+}
+
+#[tokio::test]
+async fn reopening_store_repairs_stale_cached_critical_path() {
+    let db = TempDb::new();
+    let plan_id = submit_parallel_chains(&db.path).await;
+    // Simulate a row written by an older kernel: buggy path + version 0.
+    {
+        let conn = rusqlite::Connection::open(&db.path).unwrap();
+        let mut result: serde_json::Value = serde_json::from_str(
+            &conn
+                .query_row(
+                    "SELECT cached_result FROM plans WHERE plan_id = ?1",
+                    [&plan_id.0],
+                    |r| r.get::<_, String>(0),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        result["critical_path"] = serde_json::json!(["P0a", "P1a", "P0b", "P1b"]);
+        conn.execute(
+            "UPDATE plans SET cached_result = ?1, cpm_version = 0 WHERE plan_id = ?2",
+            rusqlite::params![result.to_string(), plan_id.0],
+        )
+        .unwrap();
+    }
+    let planner = open_planner(&db.path);
+    let status = planner.status(&plan_id).await.unwrap();
+    assert_eq!(status.critical_path, vec!["P0a", "P0b"]);
+}
+
+#[test]
+fn opened_store_reports_schema_version_2() {
+    let db = TempDb::new();
+    drop(SqlitePlanStore::open(&db.path).unwrap());
+    let conn = rusqlite::Connection::open(&db.path).unwrap();
+    let v: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, 2);
+}
+
+#[tokio::test]
+async fn newly_submitted_plan_is_stamped_with_current_cpm_version() {
+    let db = TempDb::new();
+    let plan_id = submit_parallel_chains(&db.path).await;
+    let conn = rusqlite::Connection::open(&db.path).unwrap();
+    let v: i64 = conn
+        .query_row(
+            "SELECT cpm_version FROM plans WHERE plan_id = ?1",
+            [&plan_id.0],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(v, cpm_planner::algorithm::CPM_VERSION);
+}

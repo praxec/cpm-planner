@@ -46,10 +46,7 @@ use execution_policy::classify::{FailureClass, RetryDecision};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::algorithm::CpmAlgorithm;
-use crate::estimator::EffortEstimator;
 use crate::locks::PlanState;
-use crate::task::{Task, TaskKind};
 
 /// Default TTL applied to newly acquired locks. Five minutes is the
 /// open-source default called out in SPEC §33 PA3.
@@ -350,47 +347,6 @@ fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
     Ok(())
 }
 
-/// Convert each [`Deliverable`] into a [`Task`] for the CPM kernel.
-///
-/// Effort precedence: an explicit `estimated_effort_hours` on the
-/// deliverable always wins. When it is absent we ask `estimator` to derive
-/// a kind-aware estimate rather than falling back to the flat
-/// [`DEFAULT_EFFORT_HOURS`] placeholder. A `complexity` hint can be carried
-/// in `metadata` (boolean `complexity`/`is_complex`) to opt a deliverable
-/// into the configured complexity multiplier.
-fn deliverable_to_task(d: &Deliverable, estimator: &EffortEstimator) -> Task {
-    let description = d
-        .metadata
-        .get("description")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let kind = TaskKind::Custom { description };
-
-    let effort_hours = match d.estimated_effort_hours {
-        Some(explicit) => explicit,
-        None => {
-            // Coarse complexity hint from metadata; defaults to false.
-            let is_complex = d
-                .metadata
-                .get("complexity")
-                .or_else(|| d.metadata.get("is_complex"))
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            estimator.estimate(&kind, is_complex)
-        }
-    };
-
-    Task {
-        id: d.id.clone(),
-        name: d.id.clone(),
-        kind,
-        effort_hours,
-        dependencies: d.prerequisites.clone(),
-        ..Task::default()
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Audit helpers
 // ---------------------------------------------------------------------------
@@ -495,31 +451,7 @@ impl Planner for BasicCpmPlanner {
         // from different processes — resolve to a single PlanId. The build
         // closure only runs on a dedup miss.
         self.store.submit_or_get(&graph_hash, move || {
-            // Build the CPM kernel input and run the algorithm. A single
-            // default-config estimator fills in effort for deliverables that
-            // omit an explicit `estimated_effort_hours`.
-            let estimator = EffortEstimator::new();
-            let mut tasks: Vec<Task> = graph
-                .deliverables
-                .iter()
-                .map(|d| deliverable_to_task(d, &estimator))
-                .collect();
-            let cached_result = CpmAlgorithm::calculate(&mut tasks);
-
-            // `validate_graph` above already rejected cyclic graphs, so the CPM
-            // kernel must have scheduled every task. If `unscheduled` is non-empty
-            // here, the two cycle detectors disagree — a correctness bug, not bad
-            // input. Surface it as an InvalidGraph rather than caching and serving
-            // a confidently-wrong plan.
-            if !cached_result.unscheduled.is_empty() {
-                return Err(PlannerError::InvalidGraph {
-                    reason: format!(
-                        "internal CPM inconsistency: deliverables passed cycle validation but \
-                         could not be scheduled: [{}]",
-                        cached_result.unscheduled.join(", ")
-                    ),
-                });
-            }
+            let cached_result = crate::schedule::compute_cpm(&graph)?;
 
             // Initialise per-deliverable status: zero-prereq -> Ready, else Pending.
             let mut statuses: HashMap<String, DeliverableStatus> =
@@ -917,12 +849,14 @@ impl Planner for BasicCpmPlanner {
                         && !state.locks.contains_key(&r.id)
                 })
                 .collect();
-            ready_rows.sort_by(|a, b| {
-                a.float
-                    .total_cmp(&b.float)
-                    .then(a.es.total_cmp(&b.es))
-                    .then_with(|| a.id.cmp(&b.id))
-            });
+            // Same ordering as `acquire_cohort`, so the two can never disagree.
+            let sched_by_id: HashMap<&str, (f32, f32)> = state
+                .cached_result
+                .tasks
+                .iter()
+                .map(|t| (t.id.as_str(), (t.float, t.earliest_start)))
+                .collect();
+            ready_rows.sort_by_key(|r| priority_key(&r.id, &sched_by_id));
             let ready: Vec<String> = ready_rows.iter().map(|r| r.id.clone()).collect();
 
             PlanStatus {
@@ -993,6 +927,9 @@ impl Planner for BasicCpmPlanner {
 #[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
+    use crate::estimator::EffortEstimator;
+    use crate::schedule::deliverable_to_task;
+    use crate::task::TaskKind;
 
     fn deliverable(id: &str, effort: Option<f32>, metadata: serde_json::Value) -> Deliverable {
         Deliverable {
