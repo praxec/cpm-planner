@@ -58,7 +58,7 @@ Get-Content install.ps1
 .\install.ps1 -Version v0.0.3
 ```
 
-The installers print the absolute path they installed to (for example `~/.local/bin/cpm-planner`) and, if that directory is not on your `PATH`, the exact line to add. Pass `--add-to-path` (`-AddToPath` on Windows) to have the installer do it for you (user-level only, never sudo). They only accept `https://` download URLs. After upgrading, restart your MCP client so it launches the new binary (on Windows the old exe is renamed to `cpm-planner.exe.old` and removed on the next run).
+The installers print the absolute path they installed to (for example `~/.local/bin/cpm-planner`) and, if that directory is not on your `PATH`, the exact line to add. Pass `--add-to-path` (`-AddToPath` on Windows) to have the installer do it for you (user-level only, never sudo). On Linux/macOS it appends to `~/.zshrc` (zsh), `~/.bash_profile` if it exists else `~/.bashrc` (bash), or `~/.profile` (other shells), only if the line is not already there; for fish it prints `fish_add_path <dir>` for you to run instead of writing a file. They only accept `https://` download URLs. After upgrading, restart your MCP client so it launches the new binary (on Windows the old exe is renamed to `cpm-planner.exe.old` and removed on the next run).
 
 Or download an archive directly and check it against `checksums.sha256` (a machine-readable `release-manifest.json` is published too):
 

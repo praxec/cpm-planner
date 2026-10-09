@@ -276,6 +276,39 @@ test('cpm-planner/install.sh --add-to-path appends to the shell rc once', (t) =>
   assert.equal(rc.split(`export PATH="${dest}:$PATH"`).length - 1, 1);
 });
 
+test('cpm-planner/install.sh --add-to-path without HOME fails with a clear message', (t) => {
+  const dest = tempDir(t);
+  const r = run('sh', [scriptPath('cpm-planner', 'install.sh'), '--add-to-path', '--install-dir', dest, '--version', TAG], {
+    env: { PRAXEC_OS: 'linux', PRAXEC_ARCH: 'x86_64', HOME: '' },
+  });
+  assert.match(r.stderr, /HOME is not set/);
+  assert.doesNotMatch(r.stderr, /unbound variable/);
+  assert.notEqual(r.status, 0);
+});
+
+function installWithShell(t, shell, setup) {
+  const fixture = makeReleaseFixture('cpm-planner', [{ target: 'x86_64-unknown-linux-gnu', payload: 'X\n' }]);
+  t.after(() => fs.rmSync(fixture.root, { recursive: true, force: true }));
+  const dest = tempDir(t);
+  const home = tempDir(t);
+  if (setup) setup(home);
+  const r = run('sh', [scriptPath('cpm-planner', 'install.sh'), ...installArgs(fixture, dest), '--add-to-path'], {
+    env: { PRAXEC_OS: 'linux', PRAXEC_ARCH: 'x86_64', HOME: home, SHELL: shell },
+  });
+  return { r, home, dest };
+}
+
+test('cpm-planner/install.sh --add-to-path prefers an existing ~/.bash_profile for bash', (t) => {
+  const { home, dest } = installWithShell(t, '/bin/bash', (h) => fs.writeFileSync(path.join(h, '.bash_profile'), '# mine\n'));
+  assert.ok(fs.readFileSync(path.join(home, '.bash_profile'), 'utf8').includes(`export PATH="${dest}:$PATH"`));
+});
+
+test('cpm-planner/install.sh --add-to-path prints fish_add_path for fish and writes no rc file', (t) => {
+  const { r, home, dest } = installWithShell(t, '/usr/bin/fish');
+  assert.ok(r.stderr.includes(`fish_add_path ${dest}`), r.stderr);
+  assert.deepEqual(fs.readdirSync(home), []);
+});
+
 const PWSH = spawnSync('pwsh', ['-NoProfile', '-Command', '1']).status === 0;
 test('cpm-planner/install.ps1 resolves the native windows/x86_64 target', { skip: !PWSH }, () => {
   const r = run('pwsh', ['-NoProfile', '-File', scriptPath('cpm-planner', 'install.ps1'), '-PrintTarget'], {
@@ -423,4 +456,28 @@ test('cpm-planner/install.ps1 resolves the native windows/arm64 target', { skip:
     env: { PRAXEC_OS: 'windows', PRAXEC_ARCH: 'aarch64' },
   });
   assert.equal(r.stdout.trim(), 'aarch64-pc-windows-msvc');
+});
+
+// install.ps1 header parsing: run the real function (extracted from the script) under StrictMode
+// with the shapes returned by Windows PowerShell 5.1 and PowerShell 7.
+function pwshHeaderCase(expr) {
+  const script = path.join(ROOT, 'install.ps1');
+  const code = `
+Set-StrictMode -Version Latest
+$ast = [System.Management.Automation.Language.Parser]::ParseFile('${script}', [ref]$null, [ref]$null)
+$fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-LocationFromHeaders' }, $true)
+. ([scriptblock]::Create($fn.Extent.Text))
+[string](Get-LocationFromHeaders (${expr}))`;
+  return run('pwsh', ['-NoProfile', '-Command', code]).stdout.trim();
+}
+const LOC = 'https://github.com/o/r/releases/tag/v1.2.3';
+test('install.ps1 Get-LocationFromHeaders reads a dictionary-style (PS 5.1 WebHeaderCollection) object', { skip: !PWSH }, () => {
+  assert.equal(pwshHeaderCase(`& { $h = New-Object System.Net.WebHeaderCollection; $h.Add('Location','${LOC}'); ,$h }`), LOC);
+});
+test('install.ps1 Get-LocationFromHeaders reads a property-style (PS 7) object with a Uri', { skip: !PWSH }, () => {
+  assert.equal(pwshHeaderCase(`[pscustomobject]@{ Location = [uri]'${LOC}' }`), LOC);
+});
+test('install.ps1 Get-LocationFromHeaders reads a string[] value and tolerates a missing header', { skip: !PWSH }, () => {
+  assert.equal(pwshHeaderCase(`@{ Location = @('${LOC}') }`), LOC);
+  assert.equal(pwshHeaderCase(`@{ Other = 'x' }`), '');
 });

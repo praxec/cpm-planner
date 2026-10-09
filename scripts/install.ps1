@@ -51,7 +51,7 @@ $ProgressPreference = 'SilentlyContinue'
 function Write-Say([string]$Message) { Write-Host "install: $Message" }
 function Write-Die([string]$Message) { Write-Error "install: error: $Message"; exit 1 }
 
-if (($BaseUrl -notlike 'https://*') -and ($env:PRAXEC_ALLOW_INSECURE -ne '1')) {
+if ((-not $BaseUrl.ToLowerInvariant().StartsWith('https://')) -and ($env:PRAXEC_ALLOW_INSECURE -ne '1')) {
   Write-Die "refusing non-https base URL '$BaseUrl' (set PRAXEC_ALLOW_INSECURE=1 to override for local testing)"
 }
 
@@ -94,16 +94,30 @@ function Set-Urls {
 Set-Urls
 
 # Resolve "latest" to a concrete tag so the archive and checksums come from the same release.
+# Extract a redirect Location from a response headers object. Windows PowerShell 5.1 gives a
+# WebHeaderCollection (string indexer, no .Location property); PowerShell 7 gives
+# HttpResponseHeaders (.Location is a Uri). Values may be a string, a Uri or a string[].
+function Get-LocationFromHeaders($Headers) {
+  if ($null -eq $Headers) { return $null }
+  $v = $null
+  try { $v = $Headers['Location'] } catch { $v = $null }
+  if ($null -eq $v) {
+    $prop = $Headers.PSObject.Properties['Location']
+    if ($prop) { $v = $prop.Value }
+  }
+  if ($null -eq $v) { return $null }
+  if (($v -is [System.Collections.IEnumerable]) -and ($v -isnot [string])) { $v = @($v)[0] }
+  if ($null -eq $v) { return $null }
+  return [string]$v
+}
+
 function Resolve-LatestTag {
   $location = $null
   try {
     Invoke-WebRequest -Uri "$BaseUrl/latest" -Method Head -MaximumRedirection 0 -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop | Out-Null
   } catch {
     $resp = $_.Exception.Response
-    if ($resp) {
-      $location = $resp.Headers.Location
-      if (-not $location) { $location = $resp.Headers['Location'] }
-    }
+    if ($resp) { $location = Get-LocationFromHeaders $resp.Headers }
   }
   if (-not $location) { Write-Die "could not resolve the latest release from $BaseUrl/latest" }
   $tag = ([string]$location).TrimEnd('/').Split('/')[-1]
@@ -180,11 +194,25 @@ try {
   Get-ChildItem -Path $InstallDir -Filter "${Bin}.exe.old" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
   $tmpDest = Join-Path $InstallDir ".${Bin}.tmp.$PID.exe"
   Copy-Item -Force -Path $src.FullName -Destination $tmpDest
-  if (Test-Path $dest) {
-    # Windows lets a running exe be renamed but not overwritten: move it aside first.
-    Move-Item -Force -Path $dest -Destination $old
+  $movedAside = $false
+  try {
+    if (Test-Path $dest) {
+      # Windows lets a running exe be renamed but not overwritten: move it aside first.
+      try {
+        Move-Item -Force -Path $dest -Destination $old -ErrorAction Stop
+      } catch {
+        Write-Die "a previous ${Bin}.exe.old is still in use; restart your MCP client and re-run the installer"
+      }
+      $movedAside = $true
+    }
+    Move-Item -Force -Path $tmpDest -Destination $dest -ErrorAction Stop
+  } catch {
+    # Roll back so a failed swap never leaves the install without a binary.
+    if ($movedAside -and -not (Test-Path $dest)) {
+      Move-Item -Force -Path $old -Destination $dest -ErrorAction SilentlyContinue
+    }
+    throw
   }
-  Move-Item -Force -Path $tmpDest -Destination $dest
   $tmpDest = $null
   Write-Say "installed $Bin $Version -> $dest"
   Write-Say "restart your MCP client to load the new version"

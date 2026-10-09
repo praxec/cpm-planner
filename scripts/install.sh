@@ -73,6 +73,7 @@ if [ -z "$INSTALL_DIR" ]; then
   [ -n "${HOME:-}" ] || die "HOME is not set; pass --install-dir DIR"
   INSTALL_DIR="$HOME/.local/bin"
 fi
+[ "$ADD_TO_PATH" -eq 0 ] || [ -n "${HOME:-}" ] || die "HOME is not set; cannot use --add-to-path"
 case "$BASE_URL" in
   https://*) ;;
   *) [ "$ALLOW_INSECURE" = "1" ] || die "refusing non-https base URL '$BASE_URL' (set PRAXEC_ALLOW_INSECURE=1 to override for local testing)";;
@@ -250,12 +251,20 @@ case ":${PATH:-}:" in
   *)
     _line="export PATH=\"$INSTALL_DIR:\$PATH\""
     if [ "$ADD_TO_PATH" -eq 1 ]; then
+      [ -n "${HOME:-}" ] || die "HOME is not set; cannot --add-to-path (add $INSTALL_DIR to PATH manually)"
       case "${SHELL:-}" in
+        */fish)
+          say "fish detected: run this once to persist the PATH change:"
+          say "  fish_add_path $INSTALL_DIR"
+          _rc=""
+          ;;
         */zsh) _rc="${ZDOTDIR:-$HOME}/.zshrc";;
-        */bash) if [ "$OS" = "darwin" ]; then _rc="$HOME/.bash_profile"; else _rc="$HOME/.bashrc"; fi;;
+        */bash) if [ -f "$HOME/.bash_profile" ]; then _rc="$HOME/.bash_profile"; else _rc="$HOME/.bashrc"; fi;;
         *) _rc="$HOME/.profile";;
       esac
-      if [ -f "$_rc" ] && grep -qxF "$_line" "$_rc"; then
+      if [ -z "$_rc" ]; then
+        :
+      elif [ -f "$_rc" ] && grep -qxF "$_line" "$_rc"; then
         say "$INSTALL_DIR already configured in $_rc"
       else
         printf '\n# added by cpm-planner install.sh\n%s\n' "$_line" >> "$_rc"
