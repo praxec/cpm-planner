@@ -122,6 +122,9 @@ pub struct EvRow {
 /// The ratios of an earlier snapshot, used for trend alerts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvSummary {
+    /// The baseline the snapshot was measured against; alerts only compare
+    /// snapshots of the current baseline.
+    pub baseline_number: u32,
     pub spi: Option<f32>,
     pub cpi: Option<f32>,
 }
@@ -380,8 +383,9 @@ pub fn build_baseline(
 /// Reported `actual_hours` that is non-finite or negative is treated as
 /// absent (AC falls back to leased hours). TCPI can be negative when AC > BAC.
 ///
-/// Alerts need the two most recent entries of `previous_snapshots`
-/// (chronological) to both have the metric below 0.9.
+/// Alerts need the two latest entries of `previous_snapshots` (in `as_of`
+/// order) taken against this baseline to both have the metric below 0.9
+/// (see [`trend_alerts`]).
 pub fn compute_ev(
     baseline: &Baseline,
     graph: &PlanGraph,
@@ -488,7 +492,7 @@ pub fn compute_ev(
     let cpm = compute_cpm(graph)?;
     let critical_float = (finish_of(&cpm) - baseline.finish_hours).max(0.0);
 
-    let alerts = trend_alerts(previous_snapshots);
+    let alerts = trend_alerts(previous_snapshots, baseline.number);
     for (field, v) in [
         ("pv", pv),
         ("ev", ev),
@@ -652,12 +656,18 @@ pub struct SnapshotOutcome {
     pub snapshot_count: usize,
 }
 
-/// Trend alerts over chronological snapshot ratios: `SPI_BELOW_0_9` /
+/// Trend alerts over snapshot ratios in `as_of` order: `SPI_BELOW_0_9` /
 /// `CPI_BELOW_0_9` when the metric is defined and below 0.9 on both of the
-/// two most recent entries. Fewer than two entries raise nothing.
-pub fn trend_alerts(snapshots: &[EvSummary]) -> Vec<String> {
+/// two latest snapshots taken against `baseline_number` (snapshots of
+/// earlier baselines are ignored). Fewer than two such snapshots raise
+/// nothing.
+pub fn trend_alerts(snapshots: &[EvSummary], baseline_number: u32) -> Vec<String> {
     let mut alerts = Vec::new();
-    if let [.., a, b] = snapshots {
+    let current: Vec<&EvSummary> = snapshots
+        .iter()
+        .filter(|s| s.baseline_number == baseline_number)
+        .collect();
+    if let [.., a, b] = current.as_slice() {
         let low = |v: Option<f32>| v.is_some_and(|x| x < 0.9);
         if low(a.spi) && low(b.spi) {
             alerts.push("SPI_BELOW_0_9".to_string());
@@ -689,6 +699,8 @@ pub struct SnapshotSummary {
     pub etc: Option<f32>,
     pub vac: Option<f32>,
     pub tcpi: Option<f32>,
+    /// Why each `null` ratio is undefined (as in [`EvReport::undefined`]).
+    pub undefined: Vec<Undefined>,
     pub alerts: Vec<String>,
 }
 
@@ -711,6 +723,7 @@ impl SnapshotSummary {
             etc: report.etc,
             vac: report.vac,
             tcpi: report.tcpi,
+            undefined: report.undefined.clone(),
             alerts: report.alerts.clone(),
         }
     }
@@ -718,6 +731,7 @@ impl SnapshotSummary {
     /// The ratios trend alerts look at.
     pub fn ratios(&self) -> EvSummary {
         EvSummary {
+            baseline_number: self.baseline_number,
             spi: self.spi,
             cpi: self.cpi,
         }
@@ -1459,6 +1473,7 @@ mod tests {
 
     fn snap(spi: f32, cpi: f32) -> EvSummary {
         EvSummary {
+            baseline_number: 1,
             spi: Some(spi),
             cpi: Some(cpi),
         }
@@ -1506,6 +1521,7 @@ mod tests {
     #[test]
     fn alert_ignores_snapshots_with_undefined_metric() {
         let none = EvSummary {
+            baseline_number: 1,
             spi: None,
             cpi: None,
         };
@@ -1813,7 +1829,7 @@ mod tests {
 
     #[test]
     fn trend_alerts_fire_spi_when_two_latest_are_low() {
-        let a = trend_alerts(&[snap(0.8, 1.0), snap(0.85, 1.0)]);
+        let a = trend_alerts(&[snap(0.8, 1.0), snap(0.85, 1.0)], 1);
         assert_eq!(a, vec!["SPI_BELOW_0_9".to_string()]);
     }
 
@@ -1903,5 +1919,24 @@ mod tests {
                 .nth(2)
                 .is_some_and(|l| l.ends_with("| n/a | n/a |"))
         );
+    }
+
+    #[test]
+    fn alerts_ignore_snapshots_from_previous_baseline() {
+        assert!(trend_alerts(&[snap(0.5, 0.5), snap(0.5, 0.5)], 2).is_empty());
+    }
+
+    #[test]
+    fn alerts_use_the_two_latest_snapshots_of_the_current_baseline() {
+        let mut current = snap(0.5, 1.0);
+        current.baseline_number = 2;
+        let a = trend_alerts(&[current.clone(), snap(1.0, 1.0), current], 2);
+        assert_eq!(a, vec!["SPI_BELOW_0_9".to_string()]);
+    }
+
+    #[test]
+    fn snapshot_summary_explains_undefined_ratios() {
+        let r = one(EarningRule::ZeroHundred, DeliverableStatus::Pending, None);
+        assert_eq!(summary_of(&r).undefined, r.undefined);
     }
 }

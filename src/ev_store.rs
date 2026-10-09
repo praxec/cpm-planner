@@ -7,7 +7,8 @@
 //! Tables (created by the v4 migration in [`crate::plan_store`]):
 //! - `baselines(plan_id, number, start_us, calendar, rows, bac, reason, created_at_us)`
 //! - `ev_actuals(plan_id, deliverable_id, earned_pct, actual_hours, leased_hours, evidence, updated_at_us)`
-//! - `ev_snapshots(plan_id, taken_at_us, as_of_us, summary)`
+//! - `ev_snapshots(plan_id, taken_at_us, as_of_us, summary)`; reads are bounded
+//!   to the newest [`SNAPSHOT_HISTORY_LIMIT`] by `as_of`
 
 use std::collections::HashMap;
 
@@ -17,6 +18,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::earned_value::{Actuals, Baseline, BaselineRow, Calendar};
 use crate::plan::{PlanId, PlannerError};
 use crate::plan_store::backend;
+
+/// Most snapshots one history read returns (the newest by `as_of`); the
+/// `plan.snapshot` export and the alert window are drawn from them.
+pub(crate) const SNAPSHOT_HISTORY_LIMIT: usize = crate::earned_value::SNAPSHOT_EXPORT_LIMIT;
 
 /// A stored baseline with its bookkeeping columns.
 #[derive(Debug, Clone, PartialEq)]
@@ -373,7 +378,9 @@ pub(crate) fn insert_snapshot(
     Ok(())
 }
 
-/// Every snapshot of `plan_id`, oldest `taken_at` first.
+/// The newest [`SNAPSHOT_HISTORY_LIMIT`] snapshots of `plan_id` by
+/// `as_of` (ties by `taken_at`), returned oldest first in that order. Only
+/// those rows are read, so the cost does not grow with the history.
 pub(crate) fn snapshots(
     conn: &Connection,
     plan_id: &PlanId,
@@ -381,11 +388,12 @@ pub(crate) fn snapshots(
     let mut stmt = conn
         .prepare(
             "SELECT taken_at_us, as_of_us, summary FROM ev_snapshots
-             WHERE plan_id = ?1 ORDER BY taken_at_us",
+             WHERE plan_id = ?1 ORDER BY as_of_us DESC, taken_at_us DESC LIMIT ?2",
         )
         .map_err(backend)?;
+    let limit = i64::try_from(SNAPSHOT_HISTORY_LIMIT).unwrap_or(i64::MAX);
     let rows = stmt
-        .query_map(params![plan_id.0], |r| {
+        .query_map(params![plan_id.0, limit], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, i64>(1)?,
@@ -406,7 +414,35 @@ pub(crate) fn snapshots(
             })?,
         });
     }
+    out.reverse();
     Ok(out)
+}
+
+/// The latest `taken_at` of any snapshot of `plan_id`.
+pub(crate) fn latest_taken_at(
+    conn: &Connection,
+    plan_id: &PlanId,
+) -> Result<Option<DateTime<Utc>>, PlannerError> {
+    let us: Option<i64> = conn
+        .query_row(
+            "SELECT MAX(taken_at_us) FROM ev_snapshots WHERE plan_id = ?1",
+            params![plan_id.0],
+            |r| r.get(0),
+        )
+        .map_err(backend)?;
+    us.map(|us| dt(us, "ev_snapshots.taken_at_us")).transpose()
+}
+
+/// How many snapshots `plan_id` has stored.
+pub(crate) fn snapshot_count(conn: &Connection, plan_id: &PlanId) -> Result<usize, PlannerError> {
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM ev_snapshots WHERE plan_id = ?1",
+            params![plan_id.0],
+            |r| r.get(0),
+        )
+        .map_err(backend)?;
+    usize::try_from(n).map_err(backend)
 }
 
 #[cfg(test)]
@@ -763,17 +799,62 @@ mod tests {
     }
 
     #[test]
-    fn snapshots_come_back_oldest_first() {
+    fn snapshots_come_back_in_as_of_order() {
         let (store, plan_id) = store_with_plan();
         store
             .write_tx(|tx| {
-                insert_snapshot(tx, &plan_id, at(3), at(3), &serde_json::json!({"n": 2}))?;
-                insert_snapshot(tx, &plan_id, at(1), at(1), &serde_json::json!({"n": 1}))
+                insert_snapshot(tx, &plan_id, at(1), at(3), &serde_json::json!({"n": 2}))?;
+                insert_snapshot(tx, &plan_id, at(3), at(1), &serde_json::json!({"n": 1}))
             })
             .unwrap();
         let got = store.read_tx(|tx| snapshots(tx, &plan_id)).unwrap();
         let order: Vec<_> = got.iter().map(|s| s.summary["n"].clone()).collect();
         assert_eq!(order, vec![serde_json::json!(1), serde_json::json!(2)]);
+    }
+
+    #[test]
+    fn snapshots_at_one_as_of_come_back_in_taken_at_order() {
+        let (store, plan_id) = store_with_plan();
+        store
+            .write_tx(|tx| {
+                insert_snapshot(tx, &plan_id, at(3), at(1), &serde_json::json!({"n": 2}))?;
+                insert_snapshot(tx, &plan_id, at(2), at(1), &serde_json::json!({"n": 1}))
+            })
+            .unwrap();
+        let got = store.read_tx(|tx| snapshots(tx, &plan_id)).unwrap();
+        let order: Vec<_> = got.iter().map(|s| s.summary["n"].clone()).collect();
+        assert_eq!(order, vec![serde_json::json!(1), serde_json::json!(2)]);
+    }
+
+    fn store_with_101_snapshots() -> (SqlitePlanStore, PlanId) {
+        let (store, plan_id) = store_with_plan();
+        store
+            .write_tx(|tx| {
+                for i in 0..101 {
+                    let t = at(0) + chrono::Duration::minutes(i);
+                    insert_snapshot(tx, &plan_id, t, t, &serde_json::json!({"n": i}))?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        (store, plan_id)
+    }
+
+    #[test]
+    fn history_load_is_bounded_to_100_snapshots() {
+        let (store, plan_id) = store_with_101_snapshots();
+        let got = store.read_tx(|tx| snapshots(tx, &plan_id)).unwrap();
+        assert_eq!(
+            (got.len(), got[0].summary["n"].clone()),
+            (100, serde_json::json!(1))
+        );
+    }
+
+    #[test]
+    fn snapshot_count_counts_every_snapshot() {
+        let (store, plan_id) = store_with_101_snapshots();
+        let got = store.read_tx(|tx| snapshot_count(tx, &plan_id)).unwrap();
+        assert_eq!(got, 101);
     }
 
     #[test]

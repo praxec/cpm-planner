@@ -1335,6 +1335,28 @@ impl Planner for BasicCpmPlanner {
         Ok(file.rel_path)
     }
 
+    async fn baseline(
+        &self,
+        req: crate::earned_value::BaselineRequest,
+    ) -> Result<crate::earned_value::BaselineOutcome, PlannerError> {
+        self.take_baseline(req).await
+    }
+
+    async fn ev(
+        &self,
+        plan_id: &PlanId,
+        as_of: Option<DateTime<Utc>>,
+    ) -> Result<crate::earned_value::EvReport, PlannerError> {
+        self.ev_report(plan_id, as_of)
+    }
+
+    async fn snapshot(
+        &self,
+        req: crate::earned_value::SnapshotRequest,
+    ) -> Result<crate::earned_value::SnapshotOutcome, PlannerError> {
+        self.take_snapshot(req)
+    }
+
     async fn list_plans(
         &self,
         project: &str,

@@ -2058,45 +2058,72 @@ async fn plan_snapshots_with_low_spi_raise_alert() {
     assert_eq!(last["summary"]["alerts"], json!(["SPI_BELOW_0_9"]));
 }
 
-/// Every `null` in an EV report must be a ratio its `undefined` list
-/// explains; returns the offending JSON paths.
-fn unexplained_nulls(report: &Value) -> Vec<String> {
-    fn walk(v: &Value, path: String, out: &mut Vec<String>) {
+/// Walk an EV payload: every `null` must be a field that the `undefined`
+/// list of its own object names, and every number must be finite. Returns
+/// the offending JSON paths.
+fn unexplained_values(value: &Value) -> Vec<String> {
+    fn walk(v: &Value, path: &str, explained: bool, out: &mut Vec<String>) {
         match v {
-            Value::Null => out.push(path),
+            Value::Null if !explained => out.push(format!("{path}: null")),
+            Value::Number(n) if !n.as_f64().is_some_and(f64::is_finite) => {
+                out.push(format!("{path}: {n}"));
+            }
             Value::Array(items) => {
                 for (i, item) in items.iter().enumerate() {
-                    walk(item, format!("{path}[{i}]"), out);
+                    walk(item, &format!("{path}[{i}]"), false, out);
                 }
             }
             Value::Object(map) => {
+                let named: Vec<&str> = map
+                    .get("undefined")
+                    .and_then(Value::as_array)
+                    .map(|u| u.iter().filter_map(|e| e["field"].as_str()).collect())
+                    .unwrap_or_default();
                 for (k, item) in map {
-                    walk(item, format!("{path}.{k}"), out);
+                    walk(
+                        item,
+                        &format!("{path}.{k}"),
+                        named.contains(&k.as_str()),
+                        out,
+                    );
                 }
             }
             _ => {}
         }
     }
-    let explained: Vec<String> = report["undefined"]
-        .as_array()
-        .map(|u| {
-            u.iter()
-                .filter_map(|e| e["field"].as_str().map(|f| format!(".{f}")))
-                .collect()
+    let mut out = Vec::new();
+    walk(value, "", false, &mut out);
+    out
+}
+
+/// Every value cell of a snapshot Markdown table is `n/a` or a finite
+/// number. Returns the offending cells.
+fn unparseable_markdown_cells(md: &str) -> Vec<String> {
+    md.lines()
+        .skip(2)
+        .flat_map(|line| {
+            let cells: Vec<String> = line
+                .trim_matches('|')
+                .split('|')
+                .map(|c| c.trim().to_string())
+                .collect();
+            let width = if cells.len() == 7 {
+                Vec::new()
+            } else {
+                vec![format!("row with {} cells: {line}", cells.len())]
+            };
+            cells
+                .into_iter()
+                .skip(1)
+                .filter(|c| c != "n/a" && !c.parse::<f64>().is_ok_and(f64::is_finite))
+                .chain(width)
+                .collect::<Vec<_>>()
         })
-        .unwrap_or_default();
-    let mut nulls = Vec::new();
-    walk(report, String::new(), &mut nulls);
-    nulls.retain(|p| !explained.contains(p));
-    let text = report.to_string();
-    if text.contains("NaN") || text.contains("inf") {
-        nulls.push(format!("non-finite literal in {text}"));
-    }
-    nulls
+        .collect()
 }
 
 #[tokio::test]
-async fn plan_ev_never_serialises_unexplained_null_or_nan() {
+async fn plan_ev_and_snapshot_never_serialise_unexplained_null_or_non_finite() {
     let mut seed: u64 = 0x5eed_cafe;
     let mut next = |n: u64| {
         seed = seed
@@ -2150,27 +2177,45 @@ async fn plan_ev_never_serialises_unexplained_null_or_nan() {
         )
         .await;
         for d in cohort["deliverables"].as_array().into_iter().flatten() {
-            let mut mark = json!({
-                "plan_id": plan_id,
-                "deliverable_id": d["id"],
-                "caller_id": "w",
-                "status": { "status": "in_progress" },
-                "earned_pct": next(101),
-            });
+            let mut mark = if next(3) == 0 {
+                json!({ "status": { "status": "complete" } })
+            } else {
+                json!({ "status": { "status": "in_progress" }, "earned_pct": next(101) })
+            };
+            mark["plan_id"] = json!(plan_id);
+            mark["deliverable_id"] = d["id"].clone();
+            mark["caller_id"] = json!("w");
             if next(2) == 0 {
                 let hours = [0.0, 1.5, 40.0][next(3) as usize];
                 mark["actual_effort_hours"] = json!(hours);
             }
             call_ok(&server, TOOL_MARK_STATUS, mark).await;
         }
-        let as_of = ev_t0() + chrono::Duration::hours(next(120) as i64 - 10);
+        let as_of = |h: u64| (ev_t0() + chrono::Duration::hours(h as i64 - 10)).to_rfc3339();
         let report = call_ok(
             &server,
             "plan.ev",
-            json!({ "plan_id": plan_id, "as_of": as_of.to_rfc3339() }),
+            json!({ "plan_id": plan_id, "as_of": as_of(next(120)) }),
         )
         .await;
-        let bad = unexplained_nulls(&report);
+        let json_snapshot = call_ok(
+            &server,
+            "plan.snapshot",
+            json!({ "plan_id": plan_id, "as_of": as_of(next(120)) }),
+        )
+        .await;
+        let md_snapshot = call_ok(
+            &server,
+            "plan.snapshot",
+            json!({ "plan_id": plan_id, "as_of": as_of(next(120)), "format": "markdown" }),
+        )
+        .await;
+        let mut bad = unexplained_values(&report);
+        bad.extend(unexplained_values(&json_snapshot));
+        bad.extend(unexplained_values(&md_snapshot["summary"]));
+        bad.extend(unparseable_markdown_cells(
+            md_snapshot["export"].as_str().unwrap_or_default(),
+        ));
         if !bad.is_empty() {
             failures.push((case, bad));
         }

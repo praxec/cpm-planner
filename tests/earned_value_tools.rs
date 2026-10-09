@@ -262,7 +262,7 @@ async fn baseline_then_ev_roundtrip_reports_planned_value() {
     let f = Fixture::new();
     let plan_id = f.baselined().await;
     f.advance(5);
-    let r = f.planner.earned_value(&plan_id, None).unwrap();
+    let r = f.planner.ev(&plan_id, None).await.unwrap();
     assert_eq!(r.pv, 5.0);
 }
 
@@ -270,14 +270,14 @@ async fn baseline_then_ev_roundtrip_reports_planned_value() {
 async fn ev_before_baseline_is_not_baselined() {
     let f = Fixture::new();
     let plan_id = f.plan().await;
-    let e = err_text(f.planner.earned_value(&plan_id, None));
+    let e = err_text(f.planner.ev(&plan_id, None).await);
     assert!(e.starts_with("NOT_BASELINED:"), "{e}");
 }
 
 #[tokio::test]
 async fn ev_of_unknown_plan_is_plan_not_found() {
     let f = Fixture::new();
-    let r = f.planner.earned_value(&PlanId("nope".into()), None);
+    let r = f.planner.ev(&PlanId("nope".into()), None).await;
     assert!(matches!(r, Err(PlannerError::PlanNotFound { .. })));
 }
 
@@ -287,7 +287,8 @@ async fn ev_honours_an_explicit_as_of() {
     let plan_id = f.baselined().await;
     let r = f
         .planner
-        .earned_value(&plan_id, Some(t0() + Duration::hours(15)))
+        .ev(&plan_id, Some(t0() + Duration::hours(15)))
+        .await
         .unwrap();
     assert_eq!(r.pv, 15.0);
 }
@@ -297,7 +298,7 @@ async fn ev_reports_earned_value_from_mark_status() {
     let f = Fixture::new();
     let plan_id = f.baselined().await;
     f.report_a(&plan_id, 4.0).await;
-    let r = f.planner.earned_value(&plan_id, None).unwrap();
+    let r = f.planner.ev(&plan_id, None).await.unwrap();
     assert_eq!(r.ev, 5.0);
 }
 
@@ -310,7 +311,7 @@ async fn rebaseline_keeps_actuals() {
         .baseline(BaselineRequest::new(plan_id.clone()).with_reason("replan"))
         .await
         .unwrap();
-    let r = f.planner.earned_value(&plan_id, None).unwrap();
+    let r = f.planner.ev(&plan_id, None).await.unwrap();
     assert_eq!((r.baseline_number, r.ac), (2, 4.0));
 }
 
@@ -323,7 +324,7 @@ async fn rebaseline_resets_the_planned_value_curve() {
         .baseline(BaselineRequest::new(plan_id.clone()).with_reason("replan"))
         .await
         .unwrap();
-    let r = f.planner.earned_value(&plan_id, None).unwrap();
+    let r = f.planner.ev(&plan_id, None).await.unwrap();
     assert_eq!(r.pv, 0.0);
 }
 
@@ -336,7 +337,7 @@ async fn ev_reads_a_deselected_variant() {
         .await
         .unwrap();
     f.planner.select_variant(&alt, false).await.unwrap();
-    let r = f.planner.earned_value(&main, None).unwrap();
+    let r = f.planner.ev(&main, None).await.unwrap();
     assert_eq!(r.bac, 20.0);
 }
 
@@ -346,7 +347,7 @@ async fn ev_reads_a_deselected_variant() {
 async fn snapshot_before_baseline_is_not_baselined() {
     let f = Fixture::new();
     let plan_id = f.plan().await;
-    let e = err_text(f.planner.snapshot(SnapshotRequest::new(plan_id)));
+    let e = err_text(f.planner.snapshot(SnapshotRequest::new(plan_id)).await);
     assert!(e.starts_with("NOT_BASELINED:"), "{e}");
 }
 
@@ -357,6 +358,7 @@ async fn snapshot_markdown_contains_header_row() {
     let out = f
         .planner
         .snapshot(SnapshotRequest::new(plan_id).with_format(SnapshotFormat::Markdown))
+        .await
         .unwrap();
     assert!(
         out.export
@@ -371,8 +373,13 @@ async fn snapshot_json_export_lists_every_snapshot() {
     let plan_id = f.baselined().await;
     f.planner
         .snapshot(SnapshotRequest::new(plan_id.clone()))
+        .await
         .unwrap();
-    let out = f.planner.snapshot(SnapshotRequest::new(plan_id)).unwrap();
+    let out = f
+        .planner
+        .snapshot(SnapshotRequest::new(plan_id))
+        .await
+        .unwrap();
     assert_eq!(out.export.as_array().map(Vec::len), Some(2));
 }
 
@@ -381,7 +388,11 @@ async fn snapshot_summary_is_taken_at_the_clock() {
     let f = Fixture::new();
     let plan_id = f.baselined().await;
     f.advance(2);
-    let out = f.planner.snapshot(SnapshotRequest::new(plan_id)).unwrap();
+    let out = f
+        .planner
+        .snapshot(SnapshotRequest::new(plan_id))
+        .await
+        .unwrap();
     assert_eq!(out.summary.taken_at, t0() + Duration::hours(2));
 }
 
@@ -391,8 +402,13 @@ async fn snapshots_at_one_clock_instant_are_both_kept() {
     let plan_id = f.baselined().await;
     f.planner
         .snapshot(SnapshotRequest::new(plan_id.clone()))
+        .await
         .unwrap();
-    let out = f.planner.snapshot(SnapshotRequest::new(plan_id)).unwrap();
+    let out = f
+        .planner
+        .snapshot(SnapshotRequest::new(plan_id))
+        .await
+        .unwrap();
     assert_eq!(out.snapshot_count, 2);
 }
 
@@ -408,6 +424,7 @@ async fn two_low_snapshots(f: &Fixture) -> (PlanId, Vec<String>) {
             .snapshot(
                 SnapshotRequest::new(plan_id.clone()).with_as_of(t0() + Duration::hours(hours)),
             )
+            .await
             .unwrap();
         alerts = out.summary.alerts;
     }
@@ -425,7 +442,7 @@ async fn two_low_snapshots_raise_spi_alert() {
 async fn ev_after_two_low_snapshots_raises_spi_alert() {
     let f = Fixture::new();
     let (plan_id, _) = two_low_snapshots(&f).await;
-    let r = f.planner.earned_value(&plan_id, None).unwrap();
+    let r = f.planner.ev(&plan_id, None).await.unwrap();
     assert!(r.alerts.contains(&"SPI_BELOW_0_9".to_string()));
 }
 
@@ -436,6 +453,7 @@ async fn first_low_snapshot_raises_no_alert() {
     let out = f
         .planner
         .snapshot(SnapshotRequest::new(plan_id).with_as_of(t0() + Duration::hours(10)))
+        .await
         .unwrap();
     assert!(out.summary.alerts.is_empty());
 }
@@ -444,7 +462,7 @@ async fn first_low_snapshot_raises_no_alert() {
 async fn snapshot_on_draft_variant_is_variant_not_selected() {
     let f = Fixture::new();
     let (_, alt) = main_and_draft(&f).await;
-    let r = f.planner.snapshot(SnapshotRequest::new(alt));
+    let r = f.planner.snapshot(SnapshotRequest::new(alt)).await;
     assert!(matches!(r, Err(PlannerError::VariantNotSelected { .. })));
 }
 
@@ -457,6 +475,7 @@ async fn snapshot_export_keeps_the_newest_100() {
         last = Some(
             f.planner
                 .snapshot(SnapshotRequest::new(plan_id.clone()))
+                .await
                 .unwrap(),
         );
     }
@@ -465,4 +484,121 @@ async fn snapshot_export_keeps_the_newest_100() {
         (last.export.as_array().map(Vec::len), last.snapshot_count),
         (Some(100), 101)
     );
+}
+
+// ── Fix round 1: ordering, per-baseline alerts, gating ───────────────────
+
+#[tokio::test]
+async fn rebaseline_keeps_earned_value() {
+    let f = Fixture::new();
+    let plan_id = f.baselined().await;
+    f.report_a(&plan_id, 4.0).await;
+    f.planner
+        .baseline(BaselineRequest::new(plan_id.clone()).with_reason("replan"))
+        .await
+        .unwrap();
+    let r = f.planner.ev(&plan_id, None).await.unwrap();
+    assert_eq!(r.ev, 5.0);
+}
+
+#[tokio::test]
+async fn newly_selected_variant_takes_baseline_one_without_reason() {
+    let f = Fixture::new();
+    let (main, alt) = main_and_draft(&f).await;
+    f.planner
+        .baseline(BaselineRequest::new(main))
+        .await
+        .unwrap();
+    f.planner.select_variant(&alt, false).await.unwrap();
+    let out = f.planner.baseline(BaselineRequest::new(alt)).await.unwrap();
+    assert_eq!(out.baseline_number, 1);
+}
+
+#[tokio::test]
+async fn snapshot_on_archived_variant_is_archive_refused() {
+    let f = Fixture::new();
+    let (main, _) = main_and_draft(&f).await;
+    f.planner
+        .archive("p", "web", None, true, false)
+        .await
+        .unwrap();
+    let r = f.planner.snapshot(SnapshotRequest::new(main)).await;
+    assert!(matches!(r, Err(PlannerError::ArchiveRefused { .. })));
+}
+
+#[tokio::test]
+async fn ev_alerts_ignore_the_current_reading() {
+    let f = Fixture::new();
+    let plan_id = f.baselined().await;
+    f.planner
+        .snapshot(SnapshotRequest::new(plan_id.clone()).with_as_of(t0() + Duration::hours(10)))
+        .await
+        .unwrap();
+    let r = f
+        .planner
+        .ev(&plan_id, Some(t0() + Duration::hours(12)))
+        .await
+        .unwrap();
+    assert!(r.alerts.is_empty(), "{:?}", r.alerts);
+}
+
+#[tokio::test]
+async fn snapshot_alerts_ignore_snapshots_from_previous_baseline() {
+    let f = Fixture::new();
+    let plan_id = f.baselined().await;
+    f.planner
+        .snapshot(SnapshotRequest::new(plan_id.clone()).with_as_of(t0() + Duration::hours(10)))
+        .await
+        .unwrap();
+    f.planner
+        .baseline(BaselineRequest::new(plan_id.clone()).with_reason("replan"))
+        .await
+        .unwrap();
+    let out = f
+        .planner
+        .snapshot(SnapshotRequest::new(plan_id).with_as_of(t0() + Duration::hours(12)))
+        .await
+        .unwrap();
+    assert!(out.summary.alerts.is_empty(), "{:?}", out.summary.alerts);
+}
+
+#[tokio::test]
+async fn backfilled_snapshot_sorts_by_as_of() {
+    let f = Fixture::new();
+    let plan_id = f.baselined().await;
+    let mut last = None;
+    for hours in [10, 5] {
+        last = Some(
+            f.planner
+                .snapshot(
+                    SnapshotRequest::new(plan_id.clone()).with_as_of(t0() + Duration::hours(hours)),
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    let export = last.unwrap().export;
+    let order: Vec<serde_json::Value> = export
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["as_of"].clone())
+        .collect();
+    let want: Vec<serde_json::Value> = [5, 10]
+        .iter()
+        .map(|h| serde_json::to_value(t0() + Duration::hours(*h)).unwrap())
+        .collect();
+    assert_eq!(order, want);
+}
+
+#[tokio::test]
+async fn snapshot_summary_explains_undefined_cpi() {
+    let f = Fixture::new();
+    let plan_id = f.baselined().await;
+    let out = f
+        .planner
+        .snapshot(SnapshotRequest::new(plan_id))
+        .await
+        .unwrap();
+    assert!(out.summary.undefined.iter().any(|u| u.field == "cpi"));
 }

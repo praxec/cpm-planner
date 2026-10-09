@@ -3,8 +3,12 @@
 //! textbook Critical Path Method implementation shipped by this crate.
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 
 use crate::compare::Comparison;
+use crate::earned_value::{
+    BaselineOutcome, BaselineRequest, EvReport, SnapshotOutcome, SnapshotRequest,
+};
 use crate::plan::{
     AcceptRequest, AcquireRequest, Cohort, ComparePlansRequest, ForceReleaseRequest, ForkRequest,
     HeartbeatRequest, MarkStatusRequest, PlanDefinition, PlanGraph, PlanId, PlanLineSummary,
@@ -38,7 +42,9 @@ use crate::revise::RevisionDiff;
 ///   `accept`, `force_release`) on a named variant that is not its line's
 ///   selected variant return [`PlannerError::VariantNotSelected`], and on
 ///   any variant of an archived line [`PlannerError::ArchiveRefused`];
-///   unnamed plans and read/analysis methods are never gated.
+///   unnamed plans and read/analysis methods are never gated. The
+///   earned-value writes [`Planner::baseline`] and [`Planner::snapshot`] are
+///   gated the same way; [`Planner::ev`] is a read and is not.
 #[async_trait]
 pub trait Planner: Send + Sync {
     /// Submit a [`PlanGraph`]. Idempotent on `(graph, caller_id)`; an
@@ -199,4 +205,30 @@ pub trait Planner: Send + Sync {
         path: Option<&str>,
         force: bool,
     ) -> Result<String, PlannerError>;
+
+    /// Freeze the plan's current CPM schedule and budgets as its next
+    /// numbered earned-value baseline. Baselines belong to one plan (one
+    /// variant): the first is number 1 and needs no reason; a re-baseline
+    /// needs a non-blank `reason` (`INVALID_GRAPH` otherwise) and keeps
+    /// actuals and snapshots. `start` defaults to now. Gated like the
+    /// execution methods. Audited as `plan.ev.baselined`.
+    async fn baseline(&self, req: BaselineRequest) -> Result<BaselineOutcome, PlannerError>;
+
+    /// The earned-value report of `plan_id` against its latest baseline as
+    /// of `as_of` (default now). Alerts compare the two latest stored
+    /// snapshots (by `as_of`) of that baseline; the current reading is not
+    /// one of them. `NOT_BASELINED` before the first baseline. Read-only.
+    async fn ev(
+        &self,
+        plan_id: &PlanId,
+        as_of: Option<DateTime<Utc>>,
+    ) -> Result<EvReport, PlannerError>;
+
+    /// Compute the earned-value report (as [`Planner::ev`]) and append it as
+    /// a snapshot. Its alerts compare the two latest snapshots by `as_of`,
+    /// this one included, of the current baseline. Returns the summary, the
+    /// stored count and an export of the newest snapshots by `as_of`.
+    /// `NOT_BASELINED` before the first baseline. Gated like the execution
+    /// methods.
+    async fn snapshot(&self, req: SnapshotRequest) -> Result<SnapshotOutcome, PlannerError>;
 }

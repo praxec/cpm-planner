@@ -1,12 +1,21 @@
-//! Earned-value operations of [`BasicCpmPlanner`]: `plan.baseline`,
-//! `plan.ev` and `plan.snapshot` (P5).
+//! Earned-value operations of [`BasicCpmPlanner`] behind
+//! [`crate::ports::Planner::baseline`], [`crate::ports::Planner::ev`] and
+//! [`crate::ports::Planner::snapshot`] (`plan.baseline`, `plan.ev`,
+//! `plan.snapshot`; P5).
 //!
 //! Gating: taking a baseline and appending a snapshot are execution-side
 //! writes, so both refuse a draft variant (`VARIANT_NOT_SELECTED`) and an
 //! archived one (`ARCHIVE_REFUSED`), like `acquire_cohort`. Reading the
-//! report ([`BasicCpmPlanner::earned_value`]) is read-only and works on any
-//! plan, including drafts and archived variants, as long as it has a
-//! baseline (`NOT_BASELINED` otherwise).
+//! report is read-only and works on any plan, including drafts and archived
+//! variants, as long as it has a baseline (`NOT_BASELINED` otherwise).
+//!
+//! Baselines, actuals and snapshots belong to one plan id, so each variant
+//! has its own: a newly selected variant takes baseline 1 (no reason
+//! needed) and starts its own snapshot history.
+//!
+//! History is read bounded ([`ev_store::snapshots`]: the newest 100 by
+//! `as_of`, ties by `taken_at`) and kept in that order, so a backfilled
+//! snapshot lands in date order in the export and the alert window.
 
 use std::collections::HashMap;
 
@@ -38,7 +47,8 @@ fn not_baselined(plan_id: &PlanId) -> PlannerError {
     }
 }
 
-/// Every stored snapshot summary of `plan_id`, oldest first.
+/// The newest stored snapshot summaries of `plan_id`, in `as_of` order
+/// (ties by `taken_at`).
 fn history(tx: &Transaction<'_>, plan_id: &PlanId) -> Result<Vec<SnapshotSummary>, PlannerError> {
     ev_store::snapshots(tx, plan_id)?
         .into_iter()
@@ -86,7 +96,10 @@ impl BasicCpmPlanner {
     /// the PV curve and budgets change. `start` defaults to the clock's now.
     /// Gated like execution (selected, unarchived variant only). Audited as
     /// `plan.ev.baselined`.
-    pub async fn baseline(&self, req: BaselineRequest) -> Result<BaselineOutcome, PlannerError> {
+    pub(super) async fn take_baseline(
+        &self,
+        req: BaselineRequest,
+    ) -> Result<BaselineOutcome, PlannerError> {
         let reason = normalise_reason(req.reason.as_deref())?;
         let now = self.now();
         let start = req.start.unwrap_or(now);
@@ -145,12 +158,13 @@ impl BasicCpmPlanner {
 
     /// The earned-value report of `plan_id` against its latest baseline
     /// (`plan.ev`), as of `as_of` (default: the clock's now). Read-only and
-    /// ungated. Trend alerts look at the two most recent stored snapshots.
-    /// `NOT_BASELINED` before the first baseline.
+    /// ungated. Trend alerts look at the two latest stored snapshots (by
+    /// `as_of`) of the latest baseline; the current reading is not one of
+    /// them. `NOT_BASELINED` before the first baseline.
     ///
     /// Blocking: the report recomputes the CPM, so async callers should run
     /// it off the runtime's worker threads (the MCP server does).
-    pub fn earned_value(
+    pub(super) fn ev_report(
         &self,
         plan_id: &PlanId,
         as_of: Option<DateTime<Utc>>,
@@ -179,17 +193,21 @@ impl BasicCpmPlanner {
         )
     }
 
-    /// Compute the report (as for [`Self::earned_value`]) and append it as
-    /// a snapshot (`plan.snapshot`). Its alerts look at this snapshot and
-    /// the one before it. `taken_at` is the clock's now, nudged one
-    /// microsecond past the latest stored snapshot when the clock has not
-    /// moved past it, so snapshots stay ordered and distinct. Gated like
-    /// execution. Returns the summary and the newest
-    /// [`SNAPSHOT_EXPORT_LIMIT`] snapshots rendered in `format`.
-    /// `NOT_BASELINED` before the first baseline.
+    /// Compute the report (as for [`Self::ev_report`]) and append it as a
+    /// snapshot (`plan.snapshot`). Its alerts look at the two latest
+    /// snapshots by `as_of`, this one included, of the current baseline.
+    /// `taken_at` is the clock's now, nudged one microsecond past the
+    /// latest stored `taken_at` when the clock has not moved past it, so
+    /// snapshots stay distinct. Gated like execution. Returns the summary,
+    /// the stored count and the newest [`SNAPSHOT_EXPORT_LIMIT`] snapshots
+    /// by `as_of`, rendered in `format`. `NOT_BASELINED` before the first
+    /// baseline.
     ///
-    /// Blocking, like [`Self::earned_value`].
-    pub fn snapshot(&self, req: SnapshotRequest) -> Result<SnapshotOutcome, PlannerError> {
+    /// Blocking, like [`Self::ev_report`].
+    pub(super) fn take_snapshot(
+        &self,
+        req: SnapshotRequest,
+    ) -> Result<SnapshotOutcome, PlannerError> {
         let now = self.now();
         let as_of = req.as_of.unwrap_or(now);
         let plan_id = &req.plan_id;
@@ -201,7 +219,7 @@ impl BasicCpmPlanner {
                 .baseline;
             let actuals = ev_store::load_actuals(tx, plan_id)?;
             let mut history = history(tx, plan_id)?;
-            let mut ratios: Vec<EvSummary> = history.iter().map(SnapshotSummary::ratios).collect();
+            let previous: Vec<EvSummary> = history.iter().map(SnapshotSummary::ratios).collect();
             let report = compute_ev(
                 &baseline,
                 &state.graph,
@@ -209,20 +227,22 @@ impl BasicCpmPlanner {
                 &rules_of(&state.graph),
                 &actuals,
                 as_of,
-                &ratios,
+                &previous,
             )?;
-            let taken_at = match history.last() {
-                Some(last) if now <= last.taken_at => {
-                    last.taken_at + chrono::Duration::microseconds(1)
-                }
+            let taken_at = match ev_store::latest_taken_at(tx, plan_id)? {
+                Some(last) if now <= last => last + chrono::Duration::microseconds(1),
                 _ => now,
             };
             let mut summary = SnapshotSummary::from_report(&report, taken_at);
-            ratios.push(summary.ratios());
-            summary.alerts = trend_alerts(&ratios);
+            history.push(summary.clone());
+            history.sort_by_key(|h| (h.as_of, h.taken_at));
+            let ratios: Vec<EvSummary> = history.iter().map(SnapshotSummary::ratios).collect();
+            summary.alerts = trend_alerts(&ratios, baseline.number);
+            if let Some(this) = history.iter_mut().find(|h| h.taken_at == taken_at) {
+                this.alerts = summary.alerts.clone();
+            }
             let stored = serde_json::to_value(&summary).map_err(backend)?;
             ev_store::insert_snapshot(tx, plan_id, taken_at, as_of, &stored)?;
-            history.push(summary.clone());
             let newest = &history[history.len().saturating_sub(SNAPSHOT_EXPORT_LIMIT)..];
             let export = match req.format {
                 SnapshotFormat::Json => serde_json::to_value(newest).map_err(backend)?,
@@ -232,7 +252,7 @@ impl BasicCpmPlanner {
                 summary,
                 format: req.format,
                 export,
-                snapshot_count: history.len(),
+                snapshot_count: ev_store::snapshot_count(tx, plan_id)?,
             })
         })
     }

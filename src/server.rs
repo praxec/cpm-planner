@@ -35,9 +35,9 @@
 //! | `plan.select`            | [`Planner::select_variant`]   |
 //! | `plan.archive`           | [`Planner::archive`]          |
 //! | `plan.compare`           | [`Planner::compare_plans`]    |
-//! | `plan.baseline`          | [`BasicCpmPlanner::baseline`] |
-//! | `plan.ev`                | [`BasicCpmPlanner::earned_value`] |
-//! | `plan.snapshot`          | [`BasicCpmPlanner::snapshot`] |
+//! | `plan.baseline`          | [`Planner::baseline`]         |
+//! | `plan.ev`                | [`Planner::ev`]               |
+//! | `plan.snapshot`          | [`Planner::snapshot`]         |
 //!
 //! # Error mapping
 //!
@@ -1106,9 +1106,10 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                 "Earned-value report against the plan's latest baseline as of `as_of` \
                  (default now): BAC, PV, EV, AC, SV, CV, SPI, CPI, EAC, ETC, VAC, TCPI, \
                  per-deliverable rows, critical float consumed, SPI_BELOW_0_9 / \
-                 CPI_BELOW_0_9 alerts from the two latest snapshots, and deliverables \
-                 added since the baseline. A ratio whose denominator is 0 is null and \
-                 explained in `undefined`. Read-only; works on any variant. \
+                 CPI_BELOW_0_9 alerts from the two latest stored snapshots (by as_of) of \
+                 the current baseline, and deliverables added since the baseline. A \
+                 ratio whose denominator is 0 is null and explained in `undefined`. \
+                 Read-only; works on any variant. \
                  NOT_BASELINED before plan.baseline.",
             ),
             schema_object(json!({
@@ -1125,10 +1126,11 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
             Cow::Borrowed(TOOL_SNAPSHOT),
             Cow::Borrowed(
                 "Compute the earned-value report (as plan.ev) and append it as a \
-                 snapshot. Returns the snapshot summary (alerts consider this snapshot \
-                 and the previous one) and an export of the newest 100 snapshots: a \
-                 list of summaries (format json, default) or a Markdown table with \
-                 columns date, PV, EV, AC, SPI, CPI, EAC (format markdown). \
+                 snapshot. Returns the snapshot summary (alerts consider the two latest \
+                 snapshots by as_of of the current baseline, this one included) and an \
+                 export of the newest 100 snapshots by as_of, oldest first: a list of \
+                 summaries (format json, default) or a Markdown table with columns \
+                 date, PV, EV, AC, SPI, CPI, EAC (format markdown). \
                  Execution-side like plan.baseline. NOT_BASELINED before plan.baseline.",
             ),
             schema_object(json!({
@@ -1762,7 +1764,11 @@ impl PlanServer {
         let parsed: EvArgs = parse_args(args)?;
         let planner = Arc::clone(&self.planner);
         let plan_id = PlanId(parsed.plan_id);
-        let report = run_blocking(move || planner.earned_value(&plan_id, parsed.as_of)).await?;
+        let report =
+            run_blocking_planner(
+                async move { Planner::ev(&*planner, &plan_id, parsed.as_of).await },
+            )
+            .await?;
         to_value(&report)
     }
 
@@ -1771,7 +1777,9 @@ impl PlanServer {
         let mut request = SnapshotRequest::new(PlanId(parsed.plan_id)).with_format(parsed.format);
         request.as_of = parsed.as_of;
         let planner = Arc::clone(&self.planner);
-        let outcome = run_blocking(move || planner.snapshot(request)).await?;
+        let outcome =
+            run_blocking_planner(async move { Planner::snapshot(&*planner, request).await })
+                .await?;
         to_value(&outcome)
     }
 }
@@ -1801,6 +1809,17 @@ fn check_compare_weights(weights: &CompareWeights) -> Result<(), McpError> {
         }
     }
     Ok(())
+}
+
+/// Run a [`Planner`] call whose future does synchronous store and CPM work
+/// (`plan.ev`, `plan.snapshot`) on a blocking thread, driven to completion
+/// there, so it never stalls the runtime's worker threads.
+async fn run_blocking_planner<T, Fut>(call: Fut) -> Result<T, McpError>
+where
+    T: Send + 'static,
+    Fut: std::future::Future<Output = Result<T, PlannerError>> + Send + 'static,
+{
+    run_blocking(move || tokio::runtime::Handle::current().block_on(call)).await
 }
 
 /// Run CPU-bound analysis off the async runtime's worker threads.
@@ -1954,9 +1973,9 @@ Tools (twenty-two total, all `plan.<verb>`):
   plan.select          — make a variant its line's selected (only executable) variant, carrying progress over (Complete statuses of identically defined deliverables, with their earned-value actuals); force releases locks on the previous variant
   plan.archive         — archive (archived defaults true) or unarchive a whole line or one variant; archived variants stay readable but refuse sync/select/execute
   plan.compare         — compare stored plans (plan_ids: 2..16 distinct ids, or plan line name in project, default the discovered root, for every live variant, at most 16) on the scorecard: Pareto front, weighted rank, recommended; weights must be finite and >= 0; the Monte Carlo budget (200000000) is shared across variants
-  plan.baseline        — freeze the plan's CPM schedule (es/ef) and budgets (effort basis x metadata.cost_rate, default 1) as its next numbered earned-value baseline; optional start (RFC 3339, default now) and calendar {hours_per_day (0 < h <= 24, default 8), workdays (default mon..fri), utc_offset_minutes (default 0)} (omitted: wall-clock hours); re-baselining needs a non-blank reason (<= 2048 chars, INVALID_GRAPH otherwise) and keeps actuals and snapshots; selected, unarchived variant only; audited as plan.ev.baselined
-  plan.ev              — earned-value report against the latest baseline as of as_of (RFC 3339, default now): bac, pv, ev, ac, sv, cv, spi, cpi, eac, etc, vac, tcpi, per-deliverable rows, critical_float_consumed_hours, alerts (SPI_BELOW_0_9 / CPI_BELOW_0_9 when below 0.9 on the two latest snapshots), excluded_unbaselined; a ratio with a zero denominator is null and explained in `undefined` (never NaN); read-only on any variant; NOT_BASELINED before plan.baseline
-  plan.snapshot        — compute the plan.ev report and append it as a snapshot; returns summary (alerts consider this snapshot and the previous one), snapshot_count and export of the newest 100 snapshots: a list of summaries (format "json", default) or a Markdown table with columns date, PV, EV, AC, SPI, CPI, EAC (format "markdown"); selected, unarchived variant only; NOT_BASELINED before plan.baseline
+  plan.baseline        — freeze the plan's CPM schedule (es/ef) and budgets (effort basis x metadata.cost_rate, default 1) as its next numbered earned-value baseline; optional start (RFC 3339, default now) and calendar {hours_per_day (0 < h <= 24, default 8), workdays (default mon..fri), utc_offset_minutes (default 0)} (omitted: wall-clock hours); re-baselining needs a non-blank reason (<= 2048 chars, INVALID_GRAPH otherwise) and keeps actuals and snapshots; baselines, actuals and snapshots belong to one variant, so a newly selected variant takes its own baseline 1 with no reason needed; selected, unarchived variant only; audited as plan.ev.baselined
+  plan.ev              — earned-value report against the latest baseline as of as_of (RFC 3339, default now): bac, pv, ev, ac, sv, cv, spi, cpi, eac, etc, vac, tcpi, per-deliverable rows, critical_float_consumed_hours, alerts (SPI_BELOW_0_9 / CPI_BELOW_0_9 when below 0.9 on the two latest stored snapshots by as_of of the current baseline; the current reading is not one of them), excluded_unbaselined; a ratio with a zero denominator is null and explained in `undefined` (never NaN); read-only on any variant; NOT_BASELINED before plan.baseline
+  plan.snapshot        — compute the plan.ev report and append it as a snapshot; returns summary (undefined explains each null ratio; alerts consider the two latest snapshots by as_of of the current baseline, this one included), snapshot_count and export of the newest 100 snapshots by as_of (ties by taken_at), oldest first, so a backfilled as_of lands in date order: a list of summaries (format "json", default) or a Markdown table with columns date, PV, EV, AC, SPI, CPI, EAC (format "markdown"); selected, unarchived variant only; NOT_BASELINED before plan.baseline
   plan.submit with a `name` (optional `project`/`variant`, variant defaults to "main") registers a named variant instead of an unnamed plan
   plan.lint, plan.simulate take exactly one of an inline graph, a stored plan_id, or a plan-file path; plan.schedule takes graph or plan_id; plan.schedule and plan.simulate reject what plan.submit rejects, and plan.lint reports it as findings
 
