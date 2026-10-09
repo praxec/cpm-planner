@@ -26,8 +26,9 @@
 use chrono::{DateTime, Utc};
 use rusqlite::{OptionalExtension, Transaction, params};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use crate::graph::prerequisite_ids;
 use crate::locks::{PlanState, rederive_status, release_file_claims};
 use crate::plan::{
     Deliverable, DeliverableStatus, LockInfo, PlanGraph, PlanId, PlanLineSummary, PlannerError,
@@ -355,6 +356,21 @@ pub(crate) fn revise(
     })
 }
 
+/// Refuse to revise an effectively archived variant (its line or itself)
+/// with `ARCHIVE_REFUSED`, as sync does. Unnamed plans always pass.
+pub(crate) fn ensure_revisable(tx: &Transaction<'_>, plan_id: &PlanId) -> Result<(), PlannerError> {
+    let Some((project, name, variant, v_archived)) = variant_of(tx, plan_id)? else {
+        return Ok(());
+    };
+    if line(tx, &project, &name)?.is_some_and(|l| l.archived) {
+        return Err(line_archived(&name));
+    }
+    if v_archived {
+        return Err(variant_archived(&variant, &name));
+    }
+    Ok(())
+}
+
 /// Plan lines of `project` sorted by name, variants sorted by variant.
 pub(crate) fn list(
     tx: &Transaction<'_>,
@@ -597,8 +613,11 @@ pub(crate) struct Selected {
 /// for every deliverable in both with an identical canonical definition the
 /// counters are copied (the larger of each pair, so no lapse or failure
 /// pressure is lost) and a `Complete` status is copied onto a deliverable
-/// that is not `Complete` and not leased; finally every unleased
-/// `Ready`/`Pending` deliverable of the new variant is re-derived.
+/// that is not `Complete` and not leased. A carried `Complete` whose new
+/// variant has any non-`Complete` prerequisite (checked transitively after
+/// carrying) is not carried after all, matching revise's reopen rule.
+/// Finally every unleased `Ready`/`Pending` deliverable of the new variant
+/// is re-derived.
 pub(crate) fn select(
     tx: &Transaction<'_>,
     plan_id: &PlanId,
@@ -743,6 +762,32 @@ fn carry_progress(old: &PlanState, new: &mut PlanState) -> Vec<String> {
             carried.push(id.to_string());
         }
     }
+    // A carried `Complete` must not sit above an open prerequisite in the
+    // new variant (revise's reopen rule): un-carry it, then re-check, since
+    // un-carrying may open a prerequisite of another carried deliverable.
+    let mut kept: HashSet<String> = carried.iter().cloned().collect();
+    loop {
+        let open_above: Vec<String> = new
+            .graph
+            .deliverables
+            .iter()
+            .filter(|d| kept.contains(&d.id))
+            .filter(|d| {
+                prerequisite_ids(d)
+                    .any(|p| new.statuses.get(p) != Some(&DeliverableStatus::Complete))
+            })
+            .map(|d| d.id.clone())
+            .collect();
+        if open_above.is_empty() {
+            break;
+        }
+        for id in open_above {
+            // Placeholder; the re-derivation below sets Ready/Pending.
+            new.statuses.insert(id.clone(), DeliverableStatus::Pending);
+            kept.remove(&id);
+        }
+    }
+    carried.retain(|id| kept.contains(id));
     let rederived: Vec<(String, DeliverableStatus)> = new
         .graph
         .deliverables

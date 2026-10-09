@@ -627,11 +627,18 @@ fn archive_events(
 /// slug).
 const MAX_PROJECT_LEN: usize = 512;
 
-/// Reject a malformed `(project, name, variant)` with `INVALID_PATH`.
+/// Reject a malformed `(project, name, variant)` with `INVALID_PATH`. The
+/// project key is echoed by tools and audit events, so control characters
+/// (newlines included) are refused.
 fn validate_variant_key(req: &SyncRequest) -> Result<(), PlannerError> {
     if req.project.is_empty() || req.project.chars().count() > MAX_PROJECT_LEN {
         return Err(PlannerError::InvalidPath {
             reason: format!("project must be 1..={MAX_PROJECT_LEN} characters"),
+        });
+    }
+    if req.project.chars().any(char::is_control) {
+        return Err(PlannerError::InvalidPath {
+            reason: "project must not contain control characters".to_string(),
         });
     }
     crate::project::validate_slug("name", &req.name)?;
@@ -972,9 +979,10 @@ impl Planner for BasicCpmPlanner {
             force,
         } = req;
         let now = self.now();
-        let revised = self
-            .store
-            .write_tx(|tx| crate::portfolio::revise(tx, &plan_id, graph, None, None, force, now))?;
+        let revised = self.store.write_tx(|tx| {
+            crate::portfolio::ensure_revisable(tx, &plan_id)?;
+            crate::portfolio::revise(tx, &plan_id, graph, None, None, force, now)
+        })?;
         self.flush_audit(revision_events(&plan_id, &revised, now))
             .await;
         Ok((revised.revision, revised.diff))

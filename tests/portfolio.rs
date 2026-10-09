@@ -1656,3 +1656,84 @@ async fn execution_on_archived_variant_is_archive_refused() {
     let err = planner.acquire_cohort(acquire_req(&alt)).await.unwrap_err();
     assert!(matches!(err, PlannerError::ArchiveRefused { .. }));
 }
+
+// ---------------------------------------------------------------------
+// Task 4 rulings: transitive carry-over, archived revise, project hygiene
+// ---------------------------------------------------------------------
+
+/// Lease the single next deliverable of `plan_id` and mark it `Complete`.
+async fn complete_next(planner: &BasicCpmPlanner, plan_id: &PlanId, id: &str) {
+    let cohort = planner
+        .acquire_cohort(acquire_req(plan_id))
+        .await
+        .expect("harness: acquire");
+    assert_eq!(cohort.rows[0].deliverable.id, id, "harness: leased id");
+    planner
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
+            id,
+            CallerId("w1".into()),
+            DeliverableStatus::Complete,
+        ))
+        .await
+        .expect("harness: complete");
+}
+
+#[tokio::test]
+async fn select_does_not_carry_complete_above_uncarried_prerequisite() {
+    let planner = BasicCpmPlanner::new();
+    let main = sync(&planner, "web", "main", chain()).await;
+    // `a` changes (not carried); `b` is identical but sits above it.
+    let changed = graph(vec![
+        deliverable("a", &["src/a.rs"], &[], 5.0),
+        deliverable("b", &["src/b.rs"], &["a"], 2.0),
+    ]);
+    let alt = sync(&planner, "web", "alt", changed).await;
+    complete_next(&planner, &main, "a").await;
+    complete_next(&planner, &main, "b").await;
+    planner.select_variant(&alt, false).await.unwrap();
+    assert_eq!(
+        status_of(&planner, &alt, "b").await,
+        DeliverableStatus::Pending
+    );
+}
+
+#[tokio::test]
+async fn revise_on_archived_variant_is_refused() {
+    let planner = BasicCpmPlanner::new();
+    let (_, alt) = main_and_alt(&planner).await;
+    planner
+        .archive(PROJECT, "web", Some("alt"), true, false)
+        .await
+        .unwrap();
+    let err = planner
+        .revise_plan(ReviseRequest::new(alt, chain()))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PlannerError::ArchiveRefused { .. }));
+}
+
+#[tokio::test]
+async fn revise_on_archived_line_is_refused() {
+    let planner = BasicCpmPlanner::new();
+    let (main, _) = main_and_alt(&planner).await;
+    planner
+        .archive(PROJECT, "web", None, true, false)
+        .await
+        .unwrap();
+    let err = planner
+        .revise_plan(ReviseRequest::new(main, chain_plus_c()))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PlannerError::ArchiveRefused { .. }));
+}
+
+#[tokio::test]
+async fn sync_rejects_control_characters_in_project() {
+    let planner = BasicCpmPlanner::new();
+    let err = planner
+        .sync_plan(SyncRequest::new("proj\nevil", "web", "main", chain()))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PlannerError::InvalidPath { .. }));
+}

@@ -105,14 +105,17 @@ pub trait Planner: Send + Sync {
 
     /// Replace a plan's graph in place, carrying progress over (see
     /// [`crate::revise`]). Returns the new revision number and the diff.
-    /// Works on named and unnamed plans alike.
+    /// Works on named and unnamed plans alike; an archived variant or a
+    /// variant of an archived line is `ARCHIVE_REFUSED`.
     async fn revise_plan(&self, req: ReviseRequest) -> Result<(u32, RevisionDiff), PlannerError>;
 
     /// Make the named variant owning `plan_id` its line's selected (the only
     /// executable) variant. Progress carries over from the previously
     /// selected variant: every deliverable present in both with an identical
     /// canonical definition gets its `Complete` status and counters copied,
-    /// then the new variant's open deliverables are re-derived. Expired
+    /// unless one of its prerequisites in the new variant is not `Complete`
+    /// after carrying (checked transitively), and then the new variant's
+    /// open deliverables are re-derived. Expired
     /// locks on the previous variant are reaped first; live ones refuse the
     /// selection with `LOCK_HELD` unless `force`, which releases them
     /// (audited). Selecting the selected variant is a no-op. An unnamed plan
