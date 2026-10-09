@@ -240,3 +240,55 @@ fn output_is_deterministic() {
     let second = serde_json::to_string(&run(&g, &r)).expect("json");
     assert_eq!(first, second);
 }
+
+#[test]
+fn nan_project_buffer_pct_is_rejected() {
+    let g = graph(vec![d("a", 1.0, "x", &[])]);
+    let mut r = req(&[("x", 1)]);
+    r.project_buffer_pct = f32::NAN;
+    let err = resource_schedule(&g, &r).expect_err("must fail");
+    assert!(
+        err.to_string()
+            .starts_with("INVALID_GRAPH: project_buffer_pct")
+    );
+}
+
+#[test]
+fn project_buffer_pct_above_100_is_rejected() {
+    let g = graph(vec![d("a", 1.0, "x", &[])]);
+    let mut r = req(&[("x", 1)]);
+    r.project_buffer_pct = 100.5;
+    let err = resource_schedule(&g, &r).expect_err("must fail");
+    assert!(
+        err.to_string()
+            .starts_with("INVALID_GRAPH: project_buffer_pct")
+    );
+}
+
+#[test]
+fn duplicate_id_is_invalid_graph() {
+    let g = graph(vec![d("a", 1.0, "x", &[]), d("a", 1.0, "x", &[])]);
+    let err = resource_schedule(&g, &req(&[("x", 1)])).expect_err("must fail");
+    assert_eq!(
+        err.to_string(),
+        "INVALID_GRAPH: duplicate deliverable id 'a'"
+    );
+}
+
+#[test]
+fn request_rejects_unknown_fields() {
+    let parsed: Result<ScheduleRequest, _> =
+        serde_json::from_value(serde_json::json!({ "capacities": {}, "bogus": 1 }));
+    assert!(parsed.is_err());
+}
+
+#[test]
+fn long_chain_schedules_without_recursion() {
+    let mut v = vec![d("n0", 1.0, "x", &[])];
+    for i in 1..5000 {
+        let prev = format!("n{}", i - 1);
+        v.push(d(&format!("n{i}"), 1.0, "x", &[prev.as_str()]));
+    }
+    let s = run(&graph(v), &req(&[("x", 1)]));
+    assert_eq!(s.makespan, 5000.0);
+}

@@ -167,6 +167,19 @@ fn first_variant_has_an_empty_diff() {
 }
 
 #[test]
+fn compare_diff_leaves_runtime_fields_empty() {
+    let base = graph(&[("a", &[], 5.0), ("b", &["a"], 5.0)]);
+    let other = graph(&[("a", &[], 9.0)]);
+    let c = compare(
+        &[input("base", base), input("other", other)],
+        &CompareRequest::default(),
+    )
+    .expect("compare");
+    let d = &by_id(&c, "other").diff_vs_first;
+    assert!(d.reopened.is_empty() && d.released_locks.is_empty());
+}
+
+#[test]
 fn compare_requires_two_variants() {
     let err = compare(&[input("only", parallel())], &CompareRequest::default()).expect_err("err");
     assert!(
@@ -208,5 +221,44 @@ fn compare_is_deterministic() {
     assert_eq!(
         compare(&three(), &r).expect("first"),
         compare(&three(), &r).expect("second")
+    );
+}
+
+// ── Limits (final-review I1) ────────────────────────────────────────────────
+
+/// `n` independent one-hour deliverables (no prerequisite edges).
+fn wide(n: usize) -> PlanGraph {
+    let v: Vec<_> = (0..n)
+        .map(|i| json!({"id": format!("d{i}"), "owned_files": [], "prerequisites": [], "estimated_effort_hours": 1.0}))
+        .collect();
+    serde_json::from_value(json!({ "deliverables": v })).expect("valid graph")
+}
+
+#[test]
+fn compare_rejects_more_than_16_variants() {
+    let inputs: Vec<_> = (0..17).map(|i| input(&format!("p{i}"), single())).collect();
+    let err = compare(&inputs, &CompareRequest::default()).unwrap_err();
+    assert!(
+        matches!(&err, PlannerError::InvalidGraph { reason } if reason.contains("at most 16")),
+        "got {err}"
+    );
+}
+
+#[test]
+fn compare_shared_monte_carlo_budget_is_enforced() {
+    // Each variant alone fits (50000 × 2001 ≈ 100M ≤ 200M); together they
+    // do not (≈ 200.1M).
+    let inputs = vec![input("a", wide(2001)), input("b", wide(2001))];
+    let request = CompareRequest {
+        monte_carlo: Some(MonteCarloRequest {
+            iterations: 50_000,
+            seed: 1,
+        }),
+        ..CompareRequest::default()
+    };
+    let err = compare(&inputs, &request).unwrap_err();
+    assert!(
+        matches!(&err, PlannerError::InvalidGraph { reason } if reason.contains("budget")),
+        "got {err}"
     );
 }

@@ -823,3 +823,883 @@ async fn plan_acquire_cohort_without_blocked_does_not_need_operator() {
         (json!(0), json!(false))
     );
 }
+
+// ── Roundtrip: plan.lint / plan.schedule / plan.simulate ────────────────────
+
+fn lintable_graph() -> Value {
+    json!({
+        "deliverables": [
+            {
+                "id": "a",
+                "owned_files": ["src/a.rs"],
+                "prerequisites": [],
+                "estimated_effort_hours": 1.0
+            },
+            {
+                "id": "b",
+                "owned_files": ["src/b.rs"],
+                "prerequisites": [{ "id": "a", "consumes": "artifact" }],
+                "estimated_effort_hours": 2.0
+            }
+        ]
+    })
+}
+
+#[tokio::test]
+async fn plan_lint_inline_graph_roundtrip() {
+    let server = server();
+    let resp = server
+        .dispatch_call(call_args("plan.lint", json!({ "graph": lintable_graph() })))
+        .await
+        .expect("plan.lint returns Ok");
+    assert_eq!(resp["clean"], json!(true));
+}
+
+#[tokio::test]
+async fn plan_lint_stored_plan_roundtrip() {
+    let server = server();
+    let sub = server
+        .dispatch_call(call_args(TOOL_SUBMIT, json!({ "graph": lintable_graph() })))
+        .await
+        .unwrap();
+    let plan_id = sub["plan_id"].as_str().unwrap().to_string();
+    let resp = server
+        .dispatch_call(call_args("plan.lint", json!({ "plan_id": plan_id })))
+        .await
+        .expect("plan.lint by plan_id returns Ok");
+    assert_eq!(resp["clean"], json!(true));
+}
+
+#[tokio::test]
+async fn plan_lint_rejects_both_graph_and_plan_id() {
+    let server = server();
+    let err = server
+        .dispatch_call(call_args(
+            "plan.lint",
+            json!({ "graph": lintable_graph(), "plan_id": "plan_x" }),
+        ))
+        .await
+        .expect_err("both graph and plan_id must be rejected");
+    assert_eq!(
+        err.message,
+        "provide exactly one of graph, plan_id, or path"
+    );
+}
+
+#[tokio::test]
+async fn plan_schedule_roundtrip() {
+    let server = server();
+    let resp = server
+        .dispatch_call(call_args(
+            "plan.schedule",
+            json!({
+                "graph": sample_graph(),
+                "capacities": { "unassigned": 1 }
+            }),
+        ))
+        .await
+        .expect("plan.schedule returns Ok");
+    assert_eq!(resp["makespan"], json!(3.0));
+}
+
+#[tokio::test]
+async fn plan_schedule_rejects_missing_capacities() {
+    let server = server();
+    let err = server
+        .dispatch_call(call_args(
+            "plan.schedule",
+            json!({
+                "graph": sample_graph(),
+                "capacities": {}
+            }),
+        ))
+        .await
+        .expect_err("missing capacities must be rejected");
+    assert!(
+        err.message.contains("INVALID_CAPACITIES"),
+        "expected INVALID_CAPACITIES; got: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn plan_simulate_roundtrip() {
+    let server = server();
+    let resp = server
+        .dispatch_call(call_args(
+            "plan.simulate",
+            json!({ "graph": sample_graph() }),
+        ))
+        .await
+        .expect("plan.simulate returns Ok");
+    assert_eq!(resp["scorecard"]["deliverables"], json!(2));
+}
+
+#[tokio::test]
+async fn plan_simulate_rejects_unknown_fields() {
+    let server = server();
+    let err = server
+        .dispatch_call(call_args(
+            "plan.simulate",
+            json!({ "graph": sample_graph(), "bogus": 1 }),
+        ))
+        .await
+        .expect_err("unknown fields must be rejected");
+    assert!(
+        err.message.contains("bogus") || err.message.contains("unknown field"),
+        "expected unknown-field rejection; got: {}",
+        err.message
+    );
+}
+
+// ── Fix wave: validation, limits and read-only guarantees ──────────────────
+
+async fn call_within(server: &PlanServer, name: &str, args: Value) -> Result<Value, String> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        server.dispatch_call(call_args(name, args)),
+    )
+    .await
+    .expect("tool call returns promptly")
+    .map_err(|e| e.message.to_string())
+}
+
+fn schedule_args(deliverables: Value) -> Value {
+    json!({
+        "graph": { "deliverables": deliverables },
+        "capacities": { "unassigned": 1 }
+    })
+}
+
+#[tokio::test]
+async fn plan_schedule_rejects_reserved_id() {
+    let args = schedule_args(json!([
+        { "id": "__start__", "owned_files": [], "prerequisites": [], "estimated_effort_hours": 1.0 }
+    ]));
+    let err = call_within(&server(), "plan.schedule", args)
+        .await
+        .unwrap_err();
+    assert!(err.contains("INVALID_GRAPH"), "{err}");
+}
+
+#[tokio::test]
+async fn plan_schedule_rejects_duplicate_id() {
+    let args = schedule_args(json!([
+        { "id": "a", "owned_files": [], "prerequisites": [], "estimated_effort_hours": 1.0 },
+        { "id": "a", "owned_files": [], "prerequisites": ["b"], "estimated_effort_hours": 1.0 },
+        { "id": "b", "owned_files": [], "prerequisites": ["a"], "estimated_effort_hours": 1.0 }
+    ]));
+    let err = call_within(&server(), "plan.schedule", args)
+        .await
+        .unwrap_err();
+    assert!(err.contains("INVALID_GRAPH"), "{err}");
+}
+
+#[tokio::test]
+async fn plan_schedule_rejects_cycle() {
+    let args = schedule_args(json!([
+        { "id": "a", "owned_files": [], "prerequisites": ["b"], "estimated_effort_hours": 1.0 },
+        { "id": "b", "owned_files": [], "prerequisites": ["a"], "estimated_effort_hours": 1.0 }
+    ]));
+    let err = call_within(&server(), "plan.schedule", args)
+        .await
+        .unwrap_err();
+    assert!(err.contains("INVALID_GRAPH: cycle detected"), "{err}");
+}
+
+#[tokio::test]
+async fn plan_simulate_rejects_nested_unknown_field() {
+    let args = json!({ "graph": sample_graph(), "monte_carlo": { "iteratons": 10 } });
+    let err = call_within(&server(), "plan.simulate", args)
+        .await
+        .unwrap_err();
+    assert!(err.contains("unknown field `iteratons`"), "{err}");
+}
+
+#[tokio::test]
+async fn plan_schedule_rejects_nested_unknown_field_in_simulate_schedule() {
+    let args = json!({
+        "graph": sample_graph(),
+        "schedule": { "capacities": { "unassigned": 1 }, "resource_keys": "owner" }
+    });
+    let err = call_within(&server(), "plan.simulate", args)
+        .await
+        .unwrap_err();
+    assert!(err.contains("unknown field `resource_keys`"), "{err}");
+}
+
+#[tokio::test]
+async fn plan_simulate_rejects_zero_iterations_as_invalid_params() {
+    let args = json!({ "graph": sample_graph(), "monte_carlo": { "iterations": 0 } });
+    let err = server()
+        .dispatch_call(call_args("plan.simulate", args))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+}
+
+#[tokio::test]
+async fn plan_schedule_rejects_buffer_pct_above_100_as_invalid_params() {
+    let mut args = schedule_args(sample_graph()["deliverables"].clone());
+    args["project_buffer_pct"] = json!(101.0);
+    let err = server()
+        .dispatch_call(call_args("plan.schedule", args))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+}
+
+#[tokio::test]
+async fn plan_simulate_rejects_buffer_pct_above_100_as_invalid_params() {
+    let args = json!({
+        "graph": sample_graph(),
+        "schedule": { "capacities": { "unassigned": 1 }, "project_buffer_pct": 150.0 }
+    });
+    let err = server()
+        .dispatch_call(call_args("plan.simulate", args))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+}
+
+#[test]
+fn tool_definitions_match_tool_names() {
+    let defs = cpm_planner::plan_tool_definitions();
+    let names: Vec<String> = defs.iter().map(|t| t.name.to_string()).collect();
+    let expected: Vec<String> = cpm_planner::PLAN_TOOL_NAMES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    assert_eq!((names, expected.len()), (expected, 19));
+}
+
+#[test]
+fn no_tool_schema_has_top_level_combinators() {
+    let defs = cpm_planner::plan_tool_definitions();
+    let offending: Vec<String> = defs
+        .iter()
+        .filter(|t| {
+            ["oneOf", "anyOf", "allOf"]
+                .iter()
+                .any(|key| t.input_schema.contains_key(*key))
+        })
+        .map(|t| t.name.to_string())
+        .collect();
+    assert_eq!(offending, Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn plan_lint_rejects_neither_graph_nor_plan_id() {
+    let err = server()
+        .dispatch_call(call_args("plan.lint", json!({})))
+        .await
+        .expect_err("neither graph nor plan_id must be rejected");
+    assert_eq!(
+        err.message,
+        "provide exactly one of graph, plan_id, or path"
+    );
+}
+
+#[tokio::test]
+async fn plan_schedule_by_plan_id_roundtrip() {
+    let server = server();
+    let plan_id = submit_plan(&server).await;
+    let resp = server
+        .dispatch_call(call_args(
+            "plan.schedule",
+            json!({ "plan_id": plan_id, "capacities": { "unassigned": 1 } }),
+        ))
+        .await
+        .expect("plan.schedule by plan_id returns Ok");
+    assert_eq!(resp["makespan"], json!(3.0));
+}
+
+#[tokio::test]
+async fn plan_simulate_by_plan_id_roundtrip() {
+    let server = server();
+    let plan_id = submit_plan(&server).await;
+    let resp = server
+        .dispatch_call(call_args("plan.simulate", json!({ "plan_id": plan_id })))
+        .await
+        .expect("plan.simulate by plan_id returns Ok");
+    assert_eq!(resp["critical_path_hours"], json!(3.0));
+}
+
+#[tokio::test]
+async fn analysis_tools_are_read_only() {
+    use cpm_planner::audit::MemoryAuditSink;
+    let dir = std::env::temp_dir().join(format!(
+        "cpm-read-only-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("plans.db");
+    let audit = Arc::new(MemoryAuditSink::new());
+    let store = cpm_planner::SqlitePlanStore::open(&path).unwrap();
+    let server = PlanServer::new(Arc::new(BasicCpmPlanner::with_store(store, audit.clone())));
+    let plan_id = submit_plan(&server).await;
+    let plans = || -> i64 {
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM plans", [], |r| r.get(0))
+            .unwrap()
+    };
+    let before = (plans(), audit.snapshot().len());
+    for (tool, extra) in [
+        ("plan.lint", json!({})),
+        (
+            "plan.schedule",
+            json!({ "capacities": { "unassigned": 1 } }),
+        ),
+        (
+            "plan.simulate",
+            json!({ "schedule": { "capacities": { "unassigned": 1 } },
+                    "monte_carlo": { "iterations": 20 } }),
+        ),
+    ] {
+        let mut args = extra;
+        args["plan_id"] = json!(plan_id);
+        server.dispatch_call(call_args(tool, args)).await.unwrap();
+    }
+    let after = (plans(), audit.snapshot().len());
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(after, before);
+}
+
+// ── Portfolio tools (Task 7) ────────────────────────────────────────────────
+
+fn temp_project() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "cpm-task7-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn rooted_server(dir: &std::path::Path) -> PlanServer {
+    let root = cpm_planner::project::ProjectRoot::from_path(dir).expect("project root");
+    let planner = BasicCpmPlanner::new().with_project_root(root);
+    PlanServer::new(Arc::new(planner))
+}
+
+async fn sync_named(server: &PlanServer, name: &str, variant: &str) -> String {
+    let resp = server
+        .dispatch_call(call_args(
+            "plan.sync",
+            json!({ "graph": sample_graph(), "name": name, "variant": variant }),
+        ))
+        .await
+        .expect("plan.sync returns Ok");
+    resp["plan_id"].as_str().expect("plan_id").to_string()
+}
+
+async fn fork_alt(server: &PlanServer, plan_id: &str) -> String {
+    let resp = server
+        .dispatch_call(call_args(
+            "plan.fork",
+            json!({ "plan_id": plan_id, "variant": "alt" }),
+        ))
+        .await
+        .expect("plan.fork returns Ok");
+    resp["plan_id"].as_str().expect("plan_id").to_string()
+}
+
+async fn write_plan_file(dir: &std::path::Path, name: &str, variant: &str, graph: Value) {
+    let root = cpm_planner::project::ProjectRoot::from_path(dir).expect("project root");
+    let file = root.plan_file(name, variant).expect("plan file ref");
+    let parsed: cpm_planner::plan::PlanGraph = serde_json::from_value(graph).unwrap();
+    root.write_graph(&file, &parsed).unwrap();
+}
+
+#[tokio::test]
+async fn plan_sync_roundtrip() {
+    let dir = temp_project();
+    let server = rooted_server(&dir);
+    let resp = server
+        .dispatch_call(call_args(
+            "plan.sync",
+            json!({ "graph": sample_graph(), "name": "web", "variant": "main" }),
+        ))
+        .await
+        .expect("plan.sync returns Ok");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(resp["created"], json!(true));
+}
+
+#[tokio::test]
+async fn plan_list_roundtrip() {
+    let dir = temp_project();
+    let server = rooted_server(&dir);
+    sync_named(&server, "web", "main").await;
+    let resp = server
+        .dispatch_call(call_args("plan.list", json!({})))
+        .await
+        .expect("plan.list returns Ok");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(resp.as_array().map(Vec::len), Some(1));
+}
+
+#[tokio::test]
+async fn plan_export_roundtrip() {
+    let dir = temp_project();
+    let server = rooted_server(&dir);
+    let plan_id = sync_named(&server, "web", "main").await;
+    let resp = server
+        .dispatch_call(call_args("plan.export", json!({ "plan_id": plan_id })))
+        .await
+        .expect("plan.export returns Ok");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(resp["path"], json!(".cpm-planner/plans/web/main.json"));
+}
+
+#[tokio::test]
+async fn plan_revise_roundtrip() {
+    let dir = temp_project();
+    let server = rooted_server(&dir);
+    let plan_id = sync_named(&server, "web", "main").await;
+    let mut changed = sample_graph();
+    changed["deliverables"][0]["estimated_effort_hours"] = json!(5.0);
+    let resp = server
+        .dispatch_call(call_args(
+            "plan.revise",
+            json!({ "plan_id": plan_id, "graph": changed }),
+        ))
+        .await
+        .expect("plan.revise returns Ok");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(resp["revision"], json!(2));
+}
+
+#[tokio::test]
+async fn plan_fork_roundtrip() {
+    let dir = temp_project();
+    let server = rooted_server(&dir);
+    let plan_id = sync_named(&server, "web", "main").await;
+    let resp = server
+        .dispatch_call(call_args(
+            "plan.fork",
+            json!({ "plan_id": plan_id, "variant": "alt" }),
+        ))
+        .await
+        .expect("plan.fork returns Ok");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(resp["variant"], json!("alt"));
+}
+
+#[tokio::test]
+async fn plan_select_roundtrip() {
+    let dir = temp_project();
+    let server = rooted_server(&dir);
+    let main = sync_named(&server, "web", "main").await;
+    let alt = fork_alt(&server, &main).await;
+    let resp = server
+        .dispatch_call(call_args("plan.select", json!({ "plan_id": alt })))
+        .await
+        .expect("plan.select returns Ok");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(resp["changed"], json!(true));
+}
+
+#[tokio::test]
+async fn plan_archive_roundtrip() {
+    let dir = temp_project();
+    let server = rooted_server(&dir);
+    let main = sync_named(&server, "web", "main").await;
+    fork_alt(&server, &main).await;
+    let resp = server
+        .dispatch_call(call_args(
+            "plan.archive",
+            json!({ "name": "web", "variant": "alt" }),
+        ))
+        .await
+        .expect("plan.archive returns Ok");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(resp["ok"], json!(true));
+}
+
+#[tokio::test]
+async fn plan_compare_roundtrip() {
+    let dir = temp_project();
+    let server = rooted_server(&dir);
+    let main = sync_named(&server, "web", "main").await;
+    fork_alt(&server, &main).await;
+    let resp = server
+        .dispatch_call(call_args("plan.compare", json!({ "plan": "web" })))
+        .await
+        .expect("plan.compare returns Ok");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(resp["variants"].as_array().map(Vec::len), Some(2));
+}
+
+#[tokio::test]
+async fn plan_sync_rejects_path_escape() {
+    let dir = temp_project();
+    let server = rooted_server(&dir);
+    let err = server
+        .dispatch_call(call_args("plan.sync", json!({ "path": "../evil.json" })))
+        .await
+        .expect_err("path escape must be rejected");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        err.message.starts_with("INVALID_PATH"),
+        "got {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn plan_status_reports_definition_drift() {
+    let dir = temp_project();
+    let server = rooted_server(&dir);
+    write_plan_file(&dir, "web", "main", sample_graph()).await;
+    let sync = server
+        .dispatch_call(call_args(
+            "plan.sync",
+            json!({ "path": ".cpm-planner/plans/web/main.json" }),
+        ))
+        .await
+        .expect("plan.sync from path returns Ok");
+    let plan_id = sync["plan_id"].as_str().unwrap().to_string();
+    let mut changed = sample_graph();
+    changed["deliverables"][0]["estimated_effort_hours"] = json!(9.0);
+    write_plan_file(&dir, "web", "main", changed).await;
+    let resp = server
+        .dispatch_call(call_args("plan.status", json!({ "plan_id": plan_id })))
+        .await
+        .expect("plan.status returns Ok");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(resp["definition_drift"], json!(true));
+}
+
+#[tokio::test]
+async fn execution_on_draft_variant_returns_variant_not_selected() {
+    let dir = temp_project();
+    let server = rooted_server(&dir);
+    let main = sync_named(&server, "web", "main").await;
+    let alt = fork_alt(&server, &main).await;
+    let err = server
+        .dispatch_call(call_args(
+            TOOL_ACQUIRE_COHORT,
+            json!({ "plan_id": alt, "caller_id": "worker", "max_count": 1 }),
+        ))
+        .await
+        .expect_err("execution on a draft is gated");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        err.message.starts_with("VARIANT_NOT_SELECTED"),
+        "got {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn plan_compare_rejects_negative_weights() {
+    let dir = temp_project();
+    let server = rooted_server(&dir);
+    let main = sync_named(&server, "web", "main").await;
+    fork_alt(&server, &main).await;
+    let err = server
+        .dispatch_call(call_args(
+            "plan.compare",
+            json!({ "plan": "web", "weights": { "makespan": -1.0 } }),
+        ))
+        .await
+        .expect_err("negative weights must be rejected");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+}
+
+#[tokio::test]
+async fn plan_submit_named_roundtrip() {
+    let dir = temp_project();
+    let server = rooted_server(&dir);
+    let resp = server
+        .dispatch_call(call_args(
+            TOOL_SUBMIT,
+            json!({ "graph": sample_graph(), "name": "web" }),
+        ))
+        .await
+        .expect("named plan.submit returns Ok");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(resp["name"], json!("web"));
+}
+
+#[tokio::test]
+async fn plan_lint_path_roundtrip() {
+    let dir = temp_project();
+    let server = rooted_server(&dir);
+    write_plan_file(&dir, "web", "main", lintable_graph()).await;
+    let resp = server
+        .dispatch_call(call_args(
+            "plan.lint",
+            json!({ "path": ".cpm-planner/plans/web/main.json" }),
+        ))
+        .await
+        .expect("plan.lint by path returns Ok");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(resp["clean"], json!(true));
+}
+
+#[tokio::test]
+async fn plan_simulate_path_roundtrip() {
+    let dir = temp_project();
+    let server = rooted_server(&dir);
+    write_plan_file(&dir, "web", "main", sample_graph()).await;
+    let resp = server
+        .dispatch_call(call_args(
+            "plan.simulate",
+            json!({ "path": ".cpm-planner/plans/web/main.json" }),
+        ))
+        .await
+        .expect("plan.simulate by path returns Ok");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(resp["critical_path_hours"], json!(3.0));
+}
+
+// ── Final-review fixes ──────────────────────────────────────────────────────
+
+fn write_raw_plan_file(dir: &std::path::Path, name: &str, variant: &str, graph: &Value) {
+    let plans = dir.join(".cpm-planner/plans").join(name);
+    std::fs::create_dir_all(&plans).unwrap();
+    std::fs::write(
+        plans.join(format!("{variant}.json")),
+        serde_json::to_vec(graph).unwrap(),
+    )
+    .unwrap();
+}
+
+async fn call_err(server: &PlanServer, name: &str, args: Value) -> rmcp::ErrorData {
+    server
+        .dispatch_call(call_args(name, args))
+        .await
+        .expect_err("call must fail")
+}
+
+#[tokio::test]
+async fn sync_path_rejects_contradicting_name() {
+    let dir = temp_project();
+    let server = rooted_server(&dir);
+    write_raw_plan_file(&dir, "web", "main", &sample_graph());
+    let err = call_err(
+        &server,
+        "plan.sync",
+        json!({ "path": ".cpm-planner/plans/web/main.json", "name": "other" }),
+    )
+    .await;
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        err.message,
+        "INVALID_PATH: name/variant/project must match the plan file path"
+    );
+}
+
+#[tokio::test]
+async fn sync_path_rejects_foreign_project() {
+    let dir = temp_project();
+    let server = rooted_server(&dir);
+    write_raw_plan_file(&dir, "web", "main", &sample_graph());
+    let err = call_err(
+        &server,
+        "plan.sync",
+        json!({ "path": ".cpm-planner/plans/web/main.json", "project": "/somewhere/else" }),
+    )
+    .await;
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        err.message,
+        "INVALID_PATH: name/variant/project must match the plan file path"
+    );
+}
+
+#[tokio::test]
+async fn sync_path_accepts_matching_name_and_variant() {
+    let dir = temp_project();
+    let server = rooted_server(&dir);
+    write_raw_plan_file(&dir, "web", "main", &sample_graph());
+    let resp = server
+        .dispatch_call(call_args(
+            "plan.sync",
+            json!({ "path": ".cpm-planner/plans/web/main.json", "name": "web", "variant": "main" }),
+        ))
+        .await
+        .expect("matching name/variant is accepted");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(resp["created"], json!(true));
+}
+
+#[tokio::test]
+async fn compare_rejects_duplicate_plan_ids() {
+    let dir = temp_project();
+    let server = rooted_server(&dir);
+    let main = sync_named(&server, "web", "main").await;
+    let err = call_err(&server, "plan.compare", json!({ "plan_ids": [main, main] })).await;
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        (err.code, err.message.as_ref()),
+        (
+            rmcp::model::ErrorCode::INVALID_PARAMS,
+            "plan_ids must be distinct"
+        )
+    );
+}
+
+#[tokio::test]
+async fn compare_by_name_with_explicit_project() {
+    let server = server();
+    for variant in ["main", "alt"] {
+        server
+            .dispatch_call(call_args(
+                "plan.sync",
+                json!({ "graph": sample_graph(), "project": "elsewhere", "name": "web", "variant": variant }),
+            ))
+            .await
+            .expect("plan.sync returns Ok");
+    }
+    let resp = server
+        .dispatch_call(call_args(
+            "plan.compare",
+            json!({ "plan": "web", "project": "elsewhere" }),
+        ))
+        .await
+        .expect("compare in an explicit project needs no root");
+    assert_eq!(resp["variants"].as_array().map(Vec::len), Some(2));
+}
+
+#[test]
+fn compare_schema_caps_plan_ids_at_16() {
+    let tools = cpm_planner::server::plan_tool_definitions();
+    let compare = tools
+        .iter()
+        .find(|t| t.name == "plan.compare")
+        .expect("plan.compare advertised");
+    assert_eq!(
+        compare.input_schema["properties"]["plan_ids"]["maxItems"],
+        json!(16)
+    );
+}
+
+#[tokio::test]
+async fn export_force_overwrites_unsynced_local_edits() {
+    let dir = temp_project();
+    let server = rooted_server(&dir);
+    write_raw_plan_file(&dir, "web", "main", &sample_graph());
+    let sync = server
+        .dispatch_call(call_args(
+            "plan.sync",
+            json!({ "path": ".cpm-planner/plans/web/main.json" }),
+        ))
+        .await
+        .expect("plan.sync from path");
+    let mut edited = sample_graph();
+    edited["deliverables"][0]["estimated_effort_hours"] = json!(7.0);
+    write_raw_plan_file(&dir, "web", "main", &edited);
+    let resp = server
+        .dispatch_call(call_args(
+            "plan.export",
+            json!({ "plan_id": sync["plan_id"], "force": true }),
+        ))
+        .await;
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(resp.is_ok(), "got {resp:?}");
+}
+
+#[tokio::test]
+async fn sync_path_without_root_is_invalid_path() {
+    let err = call_err(
+        &server(),
+        "plan.sync",
+        json!({ "path": ".cpm-planner/plans/web/main.json" }),
+    )
+    .await;
+    assert!(
+        err.message.starts_with("INVALID_PATH"),
+        "got {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn lint_path_without_root_is_invalid_path() {
+    let err = call_err(
+        &server(),
+        "plan.lint",
+        json!({ "path": ".cpm-planner/plans/web/main.json" }),
+    )
+    .await;
+    assert!(
+        err.message.starts_with("INVALID_PATH"),
+        "got {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn export_without_root_is_invalid_path() {
+    let server = server();
+    let plan_id = submit_plan(&server).await;
+    let err = call_err(&server, "plan.export", json!({ "plan_id": plan_id })).await;
+    assert!(
+        err.message.starts_with("INVALID_PATH"),
+        "got {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn sync_with_both_path_and_graph_is_invalid_params() {
+    let err = call_err(
+        &server(),
+        "plan.sync",
+        json!({ "path": ".cpm-planner/plans/web/main.json", "graph": sample_graph(), "name": "web" }),
+    )
+    .await;
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+}
+
+#[tokio::test]
+async fn sync_with_neither_path_nor_graph_is_invalid_params() {
+    let err = call_err(&server(), "plan.sync", json!({})).await;
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+}
+
+#[tokio::test]
+async fn compare_with_both_plan_ids_and_plan_is_invalid_params() {
+    let err = call_err(
+        &server(),
+        "plan.compare",
+        json!({ "plan_ids": ["a", "b"], "plan": "web" }),
+    )
+    .await;
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+}
+
+#[tokio::test]
+async fn compare_with_neither_plan_ids_nor_plan_is_invalid_params() {
+    let err = call_err(&server(), "plan.compare", json!({})).await;
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+}
+
+#[tokio::test]
+async fn lint_path_on_cyclic_file_reports_cycle_finding() {
+    let dir = temp_project();
+    let server = rooted_server(&dir);
+    let mut cyclic = sample_graph();
+    cyclic["deliverables"][0]["prerequisites"] = json!(["d2"]);
+    write_raw_plan_file(&dir, "cyc", "main", &cyclic);
+    let resp = server
+        .dispatch_call(call_args(
+            "plan.lint",
+            json!({ "path": ".cpm-planner/plans/cyc/main.json" }),
+        ))
+        .await
+        .expect("lint reports a cycle as findings, not an error");
+    let _ = std::fs::remove_dir_all(&dir);
+    let codes: Vec<&str> = resp["findings"]
+        .as_array()
+        .map(|f| f.iter().filter_map(|x| x["code"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(codes.contains(&"CYCLE"), "got {resp}");
+}

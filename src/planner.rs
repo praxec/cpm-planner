@@ -35,20 +35,23 @@ use std::time::Duration;
 
 use crate::audit::{AuditEvent, AuditSink, NullAuditSink};
 use crate::plan::{
-    AcceptRequest, AcquireRequest, BlockedDeliverable, CallerId, Cohort, CohortRow, Deliverable,
-    DeliverableStatus, FINISH_ID, FileMode, ForceReleaseRequest, HeartbeatRequest, LockInfo,
-    MarkStatusRequest, MilestoneRow, OwnedFile, PlanDefinition, PlanGraph, PlanId, PlanStatus,
-    PlannerError, START_ID, ScheduleRow,
+    AcceptRequest, AcquireRequest, BlockedDeliverable, CallerId, Cohort, CohortRow,
+    ComparePlansRequest, Deliverable, DeliverableStatus, FINISH_ID, FileMode, ForceReleaseRequest,
+    ForkRequest, HeartbeatRequest, LockInfo, MAX_DELIVERABLES, MarkStatusRequest, OwnedFile,
+    PlanDefinition, PlanGraph, PlanId, PlanLineSummary, PlanStatus, PlannerError, ReviseRequest,
+    START_ID, ScheduleRow, SelectOutcome, SyncOutcome, SyncRequest,
 };
 use crate::plan_store::SqlitePlanStore;
+use crate::portfolio::{Archived, Revised, Selected, Synced, VariantInfo};
 use crate::ports::Planner;
+use crate::project::ProjectRoot;
+use crate::revise::RevisionDiff;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use execution_policy::classify::{FailureClass, RetryDecision};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::algorithm::CpmAlgorithm;
 use crate::locks::{FileClaim, PlanState, add_file_claims, modes_conflict, release_file_claims};
 
 /// Default TTL applied to newly acquired locks. Five minutes is the
@@ -126,6 +129,9 @@ pub struct BasicCpmPlanner {
     ttl: Duration,
     max_ttl: Duration,
     clock: ClockFn,
+    /// The project whose plan files this planner may read and write (drift
+    /// detection, fork). `None`: file features degrade to inline/unknown.
+    project_root: Option<ProjectRoot>,
 }
 
 impl BasicCpmPlanner {
@@ -140,6 +146,17 @@ impl BasicCpmPlanner {
     /// TTL. The real `Utc::now` is used as the clock.
     pub fn with_audit(audit: Arc<dyn AuditSink>) -> Self {
         Self::with_parts(audit, DEFAULT_TTL, Arc::new(Utc::now))
+    }
+
+    /// Simulate a stored plan's graph read-only: nothing is written and no
+    /// audit events are emitted. See [`crate::simulate::simulate`].
+    pub async fn simulate_plan(
+        &self,
+        plan_id: &PlanId,
+        req: &crate::simulate::SimulateRequest,
+    ) -> Result<crate::simulate::SimulationResult, PlannerError> {
+        let graph = self.get_plan(plan_id).await?.graph;
+        crate::simulate::simulate(&graph, req)
     }
 
     /// Override the lock TTL. Useful for short-lived integration tests.
@@ -191,7 +208,128 @@ impl BasicCpmPlanner {
             ttl,
             max_ttl: DEFAULT_MAX_TTL,
             clock,
+            project_root: None,
         }
+    }
+
+    /// Give the planner a project root. [`Planner::status`] then reports
+    /// `definition_drift` for that project's file-backed variants, and
+    /// [`Planner::fork_plan`] writes the new variant's plan file there when
+    /// the request names no root of its own.
+    pub fn with_project_root(mut self, root: ProjectRoot) -> Self {
+        self.project_root = Some(root);
+        self
+    }
+
+    /// The project root given with [`Self::with_project_root`], if any. The
+    /// MCP server reads its root from here (one source of truth).
+    pub fn project_root(&self) -> Option<&ProjectRoot> {
+        self.project_root.as_ref()
+    }
+
+    /// The `(plan id, label, head graph)` inputs of a comparison, read in one
+    /// store snapshot: `plan_ids` in the given order (an unnamed plan is
+    /// labelled by its id) or every non-archived variant of the line `plan`
+    /// (sorted by variant). Both or neither, duplicate ids, or a count
+    /// outside `2..=`[`crate::compare::MAX_COMPARE_VARIANTS`] is
+    /// `INVALID_GRAPH`; an unknown plan or line is `PLAN_NOT_FOUND`. Pair it
+    /// with the pure, CPU-bound [`crate::compare::compare`].
+    pub fn compare_inputs(
+        &self,
+        req: &ComparePlansRequest,
+    ) -> Result<Vec<(PlanId, String, PlanGraph)>, PlannerError> {
+        if let Some(ids) = &req.plan_ids {
+            let distinct: HashSet<&str> = ids.iter().map(|id| id.0.as_str()).collect();
+            if distinct.len() != ids.len() {
+                return Err(PlannerError::InvalidGraph {
+                    reason: "plan_ids must be distinct".to_string(),
+                });
+            }
+            crate::compare::check_variant_count(ids.len())?;
+        }
+        self.store.read_tx(|tx| {
+            let targets: Vec<(PlanId, Option<String>)> = match (&req.plan_ids, &req.plan) {
+                (Some(ids), None) => ids.iter().map(|id| (id.clone(), None)).collect(),
+                (None, Some((project, name))) => {
+                    crate::portfolio::live_variants(tx, project, name)?
+                        .into_iter()
+                        .map(|(variant, id)| (id, Some(variant)))
+                        .collect()
+                }
+                _ => {
+                    return Err(PlannerError::InvalidGraph {
+                        reason: "compare takes exactly one of plan_ids or plan".to_string(),
+                    });
+                }
+            };
+            crate::compare::check_variant_count(targets.len())?;
+            targets
+                .into_iter()
+                .map(|(id, label)| {
+                    let (_, graph) = crate::portfolio::revision_graph(tx, &id, None)?;
+                    let label = match label {
+                        Some(variant) => variant,
+                        None => crate::portfolio::variant_info(tx, &id)?
+                            .map_or_else(|| id.0.clone(), |info| info.variant),
+                    };
+                    Ok((id, label, graph))
+                })
+                .collect::<Result<Vec<_>, PlannerError>>()
+        })
+    }
+
+    /// Refuse an export over `file` that would clobber work (see
+    /// [`Planner::export_plan`]): another variant's tracked plan file, or
+    /// this variant's own file while it holds local edits that were never
+    /// synced.
+    fn check_export_target(
+        &self,
+        plan_id: &PlanId,
+        root: &ProjectRoot,
+        file: &crate::project::PlanFileRef,
+    ) -> Result<(), PlannerError> {
+        let project = root.project_key();
+        let trackers = self.store.read_tx(|tx| {
+            crate::portfolio::variants_tracking(tx, &project, &file.rel_path)?
+                .into_iter()
+                .map(|id| {
+                    let info = crate::portfolio::variant_info(tx, &id)?;
+                    let (_, head) = crate::portfolio::revision_graph(tx, &id, None)?;
+                    let recorded = crate::portfolio::revision_content_hashes(tx, &id)?;
+                    Ok((id, info, hash_graph(&head), recorded))
+                })
+                .collect::<Result<Vec<_>, PlannerError>>()
+        })?;
+        for (id, info, head_hash, mut recorded) in trackers {
+            let Some(info) = info else { continue };
+            if id != *plan_id {
+                return Err(PlannerError::InvalidPath {
+                    reason: format!(
+                        "{} is the tracked plan file of variant '{}' of '{}'; pass force to \
+                         overwrite it",
+                        file.rel_path, info.variant, info.name
+                    ),
+                });
+            }
+            if definition_drift(Some(root), &info, &head_hash) != Some(true) {
+                continue;
+            }
+            // Drifted: refuse only if the file holds content no revision of
+            // this variant recorded (local edits). A file that merely lags
+            // the head (e.g. after an inline revise) is safe to re-export.
+            recorded.extend(info.content_hash.clone());
+            recorded.insert(head_hash);
+            if has_local_edits(root, file, &recorded) {
+                return Err(PlannerError::InvalidPath {
+                    reason: format!(
+                        "{} has local edits that were never synced (definition drift); sync it \
+                         or pass force to overwrite it",
+                        file.rel_path
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn now(&self) -> DateTime<Utc> {
@@ -222,6 +360,55 @@ impl BasicCpmPlanner {
 impl Default for BasicCpmPlanner {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Drift of a variant's plan file against its head graph (`head_hash`, the
+/// [`hash_graph`] of the head read in the same snapshot as `info`).
+///
+/// `None` (unknown) unless there is a root for the variant's project, the
+/// variant has a source path, and that file is readable within
+/// [`crate::project::MAX_PLAN_FILE_BYTES`]. Otherwise: `Some(false)` when the
+/// file's bytes hash to the stored content hash; else the file is parsed and
+/// `Some(file graph != head graph)` (canonically, so re-formatting is not
+/// drift); an unparseable file is `Some(true)`.
+fn definition_drift(
+    root: Option<&ProjectRoot>,
+    info: &VariantInfo,
+    head_hash: &str,
+) -> Option<bool> {
+    let root = root?;
+    if root.project_key() != info.project {
+        return None;
+    }
+    let rel = info.source_path.as_deref()?;
+    let file = root.resolve_plan_file(rel).ok()?;
+    let bytes = root.read_bytes(&file).ok()?;
+    if info.content_hash.as_deref() == Some(crate::project::content_hash(&bytes).as_str()) {
+        return Some(false);
+    }
+    match serde_json::from_slice::<PlanGraph>(&bytes) {
+        Ok(graph) => Some(hash_graph(&graph) != head_hash),
+        Err(_) => Some(true),
+    }
+}
+
+/// True when `file` exists and its content matches none of `recorded` (by
+/// byte hash or canonical graph hash). An unreadable file counts as none.
+fn has_local_edits(
+    root: &ProjectRoot,
+    file: &crate::project::PlanFileRef,
+    recorded: &HashSet<String>,
+) -> bool {
+    let Ok(bytes) = root.read_bytes(file) else {
+        return false;
+    };
+    if recorded.contains(&crate::project::content_hash(&bytes)) {
+        return false;
+    }
+    match serde_json::from_slice::<PlanGraph>(&bytes) {
+        Ok(graph) => !recorded.contains(&hash_graph(&graph)),
+        Err(_) => true,
     }
 }
 
@@ -269,8 +456,9 @@ pub(crate) fn canonical_deliverable(d: &Deliverable) -> serde_json::Value {
 
 /// Deterministic content hash of a [`PlanGraph`]. Same logical graph -> same
 /// hash regardless of the order `deliverables` were submitted in. This is
-/// what lets `submit_plan` be idempotent.
-fn hash_graph(graph: &PlanGraph) -> String {
+/// what lets `submit_plan` be idempotent, and what tells `sync_plan` whether
+/// a variant's graph changed.
+pub(crate) fn hash_graph(graph: &PlanGraph) -> String {
     // Build a normalised JSON form: deliverables sorted by id; each
     // deliverable's prerequisites + owned_files sorted; metadata kept
     // as-is (callers are responsible for its determinism).
@@ -300,7 +488,17 @@ fn hash_graph(graph: &PlanGraph) -> String {
 
 /// Reject graphs that fail any structural invariant. Returns
 /// [`PlannerError::InvalidGraph`] with a precise `reason` on first failure.
+/// Run by submit and by every analysis entry point (`resource_schedule`,
+/// `monte_carlo`, `simulate`).
 pub(crate) fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
+    if graph.deliverables.len() > MAX_DELIVERABLES {
+        return Err(PlannerError::InvalidGraph {
+            reason: format!(
+                "plan has {} deliverables; maximum is {MAX_DELIVERABLES}",
+                graph.deliverables.len()
+            ),
+        });
+    }
     for d in &graph.deliverables {
         if d.id == START_ID || d.id == FINISH_ID {
             return Err(PlannerError::InvalidGraph {
@@ -319,70 +517,17 @@ pub(crate) fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
         }
     }
 
-    // Effort estimates, when present, must be finite and non-negative.
-    for d in &graph.deliverables {
-        if let Some(h) = d.estimated_effort_hours
-            && (h < 0.0 || !h.is_finite())
-        {
-            return Err(PlannerError::InvalidGraph {
-                reason: format!(
-                    "deliverable '{}' has invalid estimated_effort_hours {h}; must be a finite number >= 0",
-                    d.id
-                ),
-            });
-        }
-    }
-
-    // Calendar durations, when present, must be finite and non-negative.
-    for d in &graph.deliverables {
-        if let Some(h) = d.duration_hours
-            && (h < 0.0 || !h.is_finite())
-        {
-            return Err(PlannerError::InvalidGraph {
-                reason: format!(
-                    "deliverable '{}' has invalid duration_hours {h}; must be a finite number >= 0",
-                    d.id
-                ),
-            });
-        }
-    }
-
-    // Three-point estimates, when present, must be finite, non-negative
-    // and ordered optimistic <= likely <= pessimistic.
-    for d in &graph.deliverables {
-        if let Some(e) = d.estimate {
-            let ordered = e.optimistic.is_finite()
-                && e.likely.is_finite()
-                && e.pessimistic.is_finite()
-                && e.optimistic >= 0.0
-                && e.optimistic <= e.likely
-                && e.likely <= e.pessimistic;
-            if !ordered {
-                return Err(PlannerError::InvalidGraph {
-                    reason: format!(
-                        "deliverable '{}' estimate must satisfy 0 <= optimistic <= likely <= pessimistic",
-                        d.id
-                    ),
-                });
-            }
-        }
+    // Effort, duration, estimate and lag hours: finite, within
+    // 0..=MAX_HOURS, and estimates ordered. Same messages as `plan.lint`.
+    if let Some(problem) = crate::graph::value_problems(graph).into_iter().next() {
+        return Err(PlannerError::InvalidGraph {
+            reason: problem.message,
+        });
     }
 
     // Prerequisite references resolve.
     let id_set: HashSet<&str> = graph.deliverables.iter().map(|d| d.id.as_str()).collect();
     for d in &graph.deliverables {
-        for p in &d.prerequisites {
-            let lag = p.lag_hours();
-            if !lag.is_finite() || lag < 0.0 {
-                return Err(PlannerError::InvalidGraph {
-                    reason: format!(
-                        "prerequisite '{}' of deliverable '{}' has invalid lag_hours {lag}; must be a finite number >= 0",
-                        p.id(),
-                        d.id
-                    ),
-                });
-            }
-        }
         for p in crate::graph::prerequisite_ids(d) {
             if !id_set.contains(p) {
                 return Err(PlannerError::InvalidGraph {
@@ -486,9 +631,245 @@ pub(crate) fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
     Ok(())
 }
 
+/// Build a new plan from a validated graph: CPM result, a fresh id, and
+/// initial statuses (no prerequisites -> Ready, else Pending).
+fn initial_plan(graph: PlanGraph) -> Result<(PlanId, PlanState), PlannerError> {
+    let cached_result = crate::schedule::compute_cpm(&graph)?;
+    let mut statuses: HashMap<String, DeliverableStatus> =
+        HashMap::with_capacity(graph.deliverables.len());
+    for d in &graph.deliverables {
+        let status = if d.prerequisites.is_empty() {
+            DeliverableStatus::Ready
+        } else {
+            DeliverableStatus::Pending
+        };
+        statuses.insert(d.id.clone(), status);
+    }
+    let plan_id = PlanId(format!("plan_{}", uuid::Uuid::new_v4().simple()));
+    Ok((plan_id, PlanState::new(graph, statuses, cached_result)))
+}
+
 // ---------------------------------------------------------------------------
 // Audit helpers
 // ---------------------------------------------------------------------------
+
+fn make_portfolio_created_event(
+    outcome: &SyncOutcome,
+    project: &str,
+    selected: bool,
+) -> AuditEvent {
+    AuditEvent::new("plan.portfolio.created").with_payload(json!({
+        "plan_id": outcome.plan_id.as_str(),
+        "project": project,
+        "name": outcome.name,
+        "variant": outcome.variant,
+        "revision": outcome.revision,
+        "selected": selected,
+    }))
+}
+
+fn make_portfolio_revised_event(
+    plan_id: &PlanId,
+    revision: u32,
+    diff: &RevisionDiff,
+) -> AuditEvent {
+    AuditEvent::new("plan.portfolio.revised").with_payload(json!({
+        "plan_id": plan_id.as_str(),
+        "revision": revision,
+        "diff": diff,
+    }))
+}
+
+/// Audit trail of a committed revision: reaped (expired) locks, locks the
+/// forced revision released, then the revision itself.
+fn revision_events(plan_id: &PlanId, revised: &Revised, now: DateTime<Utc>) -> Vec<AuditEvent> {
+    if revised.no_op {
+        return Vec::new();
+    }
+    let mut events: Vec<AuditEvent> = revised
+        .reaped
+        .iter()
+        .map(|lock| make_expired_event(lock, now))
+        .collect();
+    events.extend(
+        revised
+            .released
+            .iter()
+            .map(|lock| make_released_event(lock, "revision")),
+    );
+    events.push(make_portfolio_revised_event(
+        plan_id,
+        revised.revision,
+        &revised.diff,
+    ));
+    if let Some(count) = revised.completed {
+        events.push(make_plan_completed_event(plan_id, count));
+    }
+    events
+}
+
+fn make_portfolio_selected_event(outcome: &SelectOutcome) -> AuditEvent {
+    AuditEvent::new("plan.portfolio.selected").with_payload(json!({
+        "plan_id": outcome.plan_id.as_str(),
+        "project": outcome.project,
+        "name": outcome.name,
+        "from": outcome.previous,
+        "to": outcome.variant,
+        "carried": outcome.carried,
+        "released": outcome.released_locks,
+    }))
+}
+
+/// Audit trail of a committed selection: reaped (expired) locks, locks the
+/// forced selection released, the selection itself, then `plan.completed`
+/// when the carry-over completed the newly selected plan. A no-op selection
+/// is not audited.
+fn selection_events(selected: &Selected, now: DateTime<Utc>) -> Vec<AuditEvent> {
+    if !selected.outcome.changed {
+        return Vec::new();
+    }
+    let mut events: Vec<AuditEvent> = selected
+        .reaped
+        .iter()
+        .map(|lock| make_expired_event(lock, now))
+        .collect();
+    events.extend(
+        selected
+            .released
+            .iter()
+            .map(|lock| make_released_event(lock, "variant deselected")),
+    );
+    events.push(make_portfolio_selected_event(&selected.outcome));
+    if let Some(count) = selected.completed {
+        events.push(make_plan_completed_event(&selected.outcome.plan_id, count));
+    }
+    events
+}
+
+/// Audit trail of a committed archive (`archived`) or unarchive: reaped
+/// (expired) locks, locks a forced line archive released, then
+/// `plan.portfolio.archived` / `plan.portfolio.unarchived`. Nothing when no
+/// flag changed.
+fn archive_events(
+    project: &str,
+    name: &str,
+    variant: Option<&str>,
+    archived: bool,
+    outcome: &Archived,
+    now: DateTime<Utc>,
+) -> Vec<AuditEvent> {
+    if !outcome.changed() {
+        return Vec::new();
+    }
+    let mut events: Vec<AuditEvent> = outcome
+        .reaped
+        .iter()
+        .map(|lock| make_expired_event(lock, now))
+        .collect();
+    events.extend(
+        outcome
+            .released
+            .iter()
+            .map(|lock| make_released_event(lock, "line archived")),
+    );
+    let variants: Vec<serde_json::Value> = outcome
+        .variants
+        .iter()
+        .map(|(v, plan_id)| json!({ "variant": v, "plan_id": plan_id.as_str() }))
+        .collect();
+    let event_type = if archived {
+        "plan.portfolio.archived"
+    } else {
+        "plan.portfolio.unarchived"
+    };
+    events.push(AuditEvent::new(event_type).with_payload(json!({
+        "project": project,
+        "name": name,
+        "variant": variant,
+        "line": outcome.line,
+        "variants": variants,
+        "released": outcome
+            .released
+            .iter()
+            .map(|l| l.deliverable_id.as_str())
+            .collect::<Vec<_>>(),
+    })));
+    events
+}
+
+/// The [`SyncOutcome`] of a committed sync and its audit trail.
+fn sync_outcome(
+    synced: Synced,
+    project: &str,
+    name: String,
+    variant: String,
+    now: DateTime<Utc>,
+) -> (SyncOutcome, Vec<AuditEvent>) {
+    let outcome = |plan_id, revision, created, changed, diff| SyncOutcome {
+        plan_id,
+        name: name.clone(),
+        variant: variant.clone(),
+        revision,
+        created,
+        changed,
+        diff,
+    };
+    match synced {
+        Synced::Created { plan_id, selected } => {
+            let out = outcome(plan_id, 1, true, true, None);
+            let event = make_portfolio_created_event(&out, project, selected);
+            (out, vec![event])
+        }
+        Synced::Unchanged { plan_id, revision } => {
+            (outcome(plan_id, revision, false, false, None), Vec::new())
+        }
+        Synced::Revised { plan_id, revised } => {
+            let events = revision_events(&plan_id, &revised, now);
+            let out = outcome(plan_id, revised.revision, false, true, Some(revised.diff));
+            (out, events)
+        }
+    }
+}
+
+/// Longest `project` key accepted by `sync_plan` (a path-derived key, not a
+/// slug).
+const MAX_PROJECT_LEN: usize = 512;
+
+/// Characters refused in a project key: controls (newlines included) and
+/// invisible Unicode format/separator characters that can disguise how the
+/// key reads when echoed (zero-width, bidi embeddings/overrides/isolates,
+/// word joiners, BOM, line/paragraph separators, interlinear annotations).
+fn is_disallowed_project_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{206F}'
+                | '\u{FEFF}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{FFF9}'..='\u{FFFB}'
+        )
+}
+
+/// Reject a malformed `(project, name, variant)` with `INVALID_PATH`. The
+/// project key is echoed by tools and audit events, so control and
+/// invisible format characters are refused.
+fn validate_variant_key(req: &SyncRequest) -> Result<(), PlannerError> {
+    if req.project.is_empty() || req.project.chars().count() > MAX_PROJECT_LEN {
+        return Err(PlannerError::InvalidPath {
+            reason: format!("project must be 1..={MAX_PROJECT_LEN} characters"),
+        });
+    }
+    if req.project.chars().any(is_disallowed_project_char) {
+        return Err(PlannerError::InvalidPath {
+            reason: "project must not contain control or invisible format characters".to_string(),
+        });
+    }
+    crate::project::validate_slug("name", &req.name)?;
+    crate::project::validate_slug("variant", &req.variant)
+}
 
 fn make_acquired_event(lock: &LockInfo, owned_files: &[OwnedFile]) -> AuditEvent {
     AuditEvent::new("plan.lock.acquired")
@@ -622,7 +1003,7 @@ fn complete_deliverable(
 }
 
 /// True when every deliverable in the plan is `Complete`.
-fn all_complete(state: &PlanState) -> bool {
+pub(crate) fn all_complete(state: &PlanState) -> bool {
     state
         .graph
         .deliverables
@@ -756,24 +1137,220 @@ impl Planner for BasicCpmPlanner {
         // sqlite transaction, so identical concurrent submissions — even
         // from different processes — resolve to a single PlanId. The build
         // closure only runs on a dedup miss.
-        self.store.submit_or_get(&graph_hash, move || {
-            let cached_result = crate::schedule::compute_cpm(&graph)?;
+        self.store
+            .submit_or_get(&graph_hash, move || initial_plan(graph))
+    }
 
-            // Initialise per-deliverable status: zero-prereq -> Ready, else Pending.
-            let mut statuses: HashMap<String, DeliverableStatus> =
-                HashMap::with_capacity(graph.deliverables.len());
-            for d in &graph.deliverables {
-                let status = if d.prerequisites.is_empty() {
-                    DeliverableStatus::Ready
-                } else {
-                    DeliverableStatus::Pending
-                };
-                statuses.insert(d.id.clone(), status);
+    async fn sync_plan(&self, req: SyncRequest) -> Result<SyncOutcome, PlannerError> {
+        validate_variant_key(&req)?;
+        validate_graph(&req.graph)?;
+        let graph_hash = hash_graph(&req.graph);
+        let now = self.now();
+        let (project, name, variant) = (req.project.clone(), req.name.clone(), req.variant.clone());
+        // Named plans bypass the global submit dedup: create, compare and
+        // revise all happen in one immediate transaction.
+        let synced = self
+            .store
+            .write_tx(|tx| crate::portfolio::sync(tx, req, &graph_hash, now, initial_plan))?;
+        let (outcome, events) = sync_outcome(synced, &project, name, variant, now);
+        self.flush_audit(events).await;
+        Ok(outcome)
+    }
+
+    async fn fork_plan(&self, req: ForkRequest) -> Result<SyncOutcome, PlannerError> {
+        let ForkRequest {
+            plan_id,
+            variant,
+            edits,
+            project_root,
+        } = req;
+        crate::project::validate_slug("variant", &variant)?;
+        let (head, info, exists, line_archived) = self.store.read_tx(|tx| {
+            let (_, head) = crate::portfolio::revision_graph(tx, &plan_id, None)?;
+            let info = crate::portfolio::variant_info(tx, &plan_id)?.ok_or_else(|| {
+                PlannerError::InvalidPath {
+                    reason: "fork requires a named plan".to_string(),
+                }
+            })?;
+            let exists = crate::portfolio::has_variant(tx, &info.project, &info.name, &variant)?;
+            let line_archived = crate::portfolio::line_is_archived(tx, &info.project, &info.name)?;
+            Ok((head, info, exists, line_archived))
+        })?;
+        // Both are checked again inside the creating transaction; failing
+        // here first avoids writing a plan file for a fork that cannot be
+        // registered. Forking FROM an archived variant of a live line is
+        // allowed: the source stays readable and the new draft is live.
+        if line_archived {
+            return Err(crate::portfolio::line_archived(&info.name));
+        }
+        if exists {
+            return Err(crate::portfolio::variant_exists(&variant, &info.name));
+        }
+        let graph = crate::edits::apply_edits(&head, &edits)?;
+        let root = match project_root {
+            Some(root) if root.project_key() != info.project => {
+                return Err(PlannerError::InvalidPath {
+                    reason: format!(
+                        "the project root belongs to a different project than plan {}",
+                        plan_id.0
+                    ),
+                });
             }
+            Some(root) => Some(root),
+            None => self
+                .project_root
+                .clone()
+                .filter(|root| root.project_key() == info.project),
+        };
+        let mut sync_req = SyncRequest::new(
+            info.project.clone(),
+            info.name.clone(),
+            variant.clone(),
+            graph,
+        );
+        let mut written = None;
+        if let Some(root) = &root {
+            let file = root.plan_file(&info.name, &variant)?;
+            let hash = root.write_new_graph(&file, &sync_req.graph)?;
+            sync_req = sync_req
+                .with_source_path(file.rel_path.clone())
+                .with_content_hash(hash.clone());
+            written = Some((root, file, hash));
+        }
+        let graph_hash = hash_graph(&sync_req.graph);
+        let now = self.now();
+        let synced = self
+            .store
+            .write_tx(|tx| crate::portfolio::sync_new(tx, sync_req, &graph_hash, now, initial_plan))
+            .inspect_err(|_| {
+                // The fork was never registered: do not leave its file behind.
+                if let Some((root, file, hash)) = &written {
+                    root.remove_plan_file_if_unchanged(file, hash);
+                }
+            })?;
+        let (outcome, events) = sync_outcome(synced, &info.project, info.name, variant, now);
+        self.flush_audit(events).await;
+        Ok(outcome)
+    }
 
-            let plan_id = PlanId(format!("plan_{}", uuid::Uuid::new_v4().simple()));
-            Ok((plan_id, PlanState::new(graph, statuses, cached_result)))
-        })
+    async fn compare_plans(
+        &self,
+        req: ComparePlansRequest,
+    ) -> Result<crate::compare::Comparison, PlannerError> {
+        let inputs = self.compare_inputs(&req)?;
+        crate::compare::compare(&inputs, &req.request)
+    }
+
+    async fn export_plan(
+        &self,
+        plan_id: &PlanId,
+        root: &ProjectRoot,
+        path: Option<&str>,
+        force: bool,
+    ) -> Result<String, PlannerError> {
+        let (graph, info) = self.store.read_tx(|tx| {
+            let (_, graph) = crate::portfolio::revision_graph(tx, plan_id, None)?;
+            Ok((graph, crate::portfolio::variant_info(tx, plan_id)?))
+        })?;
+        let file = match (path, &info) {
+            (Some(path), _) => root.resolve_plan_file(path)?,
+            (None, Some(info)) if info.project == root.project_key() => {
+                root.plan_file(&info.name, &info.variant)?
+            }
+            (None, Some(_)) => {
+                return Err(PlannerError::InvalidPath {
+                    reason: format!(
+                        "plan {} belongs to a different project; give a path",
+                        plan_id.0
+                    ),
+                });
+            }
+            (None, None) => {
+                return Err(PlannerError::InvalidPath {
+                    reason: format!("plan {} is unnamed; export requires a path", plan_id.0),
+                });
+            }
+        };
+        if !force {
+            self.check_export_target(plan_id, root, &file)?;
+        }
+        let hash = root.write_graph(&file, &graph)?;
+        // Exported to its own tracked file: the file now matches the head,
+        // so record its hash (drift stays false).
+        if let Some(info) = &info
+            && info.project == root.project_key()
+            && info.source_path.as_deref() == Some(file.rel_path.as_str())
+        {
+            self.store
+                .write_tx(|tx| crate::portfolio::set_content_hash(tx, plan_id, &hash))?;
+        }
+        Ok(file.rel_path)
+    }
+
+    async fn list_plans(
+        &self,
+        project: &str,
+        include_archived: bool,
+    ) -> Result<Vec<PlanLineSummary>, PlannerError> {
+        self.store
+            .read_tx(|tx| crate::portfolio::list(tx, project, include_archived))
+    }
+
+    async fn revision_graph(
+        &self,
+        plan_id: &PlanId,
+        revision: Option<u32>,
+    ) -> Result<(u32, PlanGraph), PlannerError> {
+        self.store
+            .read_tx(|tx| crate::portfolio::revision_graph(tx, plan_id, revision))
+    }
+
+    async fn revise_plan(&self, req: ReviseRequest) -> Result<(u32, RevisionDiff), PlannerError> {
+        let ReviseRequest {
+            plan_id,
+            graph,
+            force,
+        } = req;
+        let now = self.now();
+        let revised = self.store.write_tx(|tx| {
+            crate::portfolio::ensure_revisable(tx, &plan_id)?;
+            crate::portfolio::revise(tx, &plan_id, graph, None, None, force, now)
+        })?;
+        self.flush_audit(revision_events(&plan_id, &revised, now))
+            .await;
+        Ok((revised.revision, revised.diff))
+    }
+
+    async fn select_variant(
+        &self,
+        plan_id: &PlanId,
+        force: bool,
+    ) -> Result<SelectOutcome, PlannerError> {
+        let now = self.now();
+        let selected = self
+            .store
+            .write_tx(|tx| crate::portfolio::select(tx, plan_id, force, now))?;
+        self.flush_audit(selection_events(&selected, now)).await;
+        Ok(selected.outcome)
+    }
+
+    async fn archive(
+        &self,
+        project: &str,
+        name: &str,
+        variant: Option<&str>,
+        archived: bool,
+        force: bool,
+    ) -> Result<(), PlannerError> {
+        let now = self.now();
+        let outcome = self.store.write_tx(|tx| {
+            crate::portfolio::archive(tx, project, name, variant, archived, force, now)
+        })?;
+        self.flush_audit(archive_events(
+            project, name, variant, archived, &outcome, now,
+        ))
+        .await;
+        Ok(())
     }
 
     async fn acquire_cohort(&self, req: AcquireRequest) -> Result<Cohort, PlannerError> {
@@ -794,7 +1371,7 @@ impl Planner for BasicCpmPlanner {
         // that's what gives us atomicity against concurrent acquirers,
         // including acquirers in other OS processes.
         let mut audit_buf: Vec<AuditEvent> = Vec::new();
-        let cohort = self.store.mutate_plan(&plan_id, |state| {
+        let cohort = self.store.mutate_executable_plan(&plan_id, |state| {
             // 1. Reap expired locks, emitting expiry events.
             let reaped = state.reap_expired(now);
             for lock in &reaped {
@@ -1080,7 +1657,7 @@ impl Planner for BasicCpmPlanner {
         let deliverable_id = deliverable_id.as_str();
         let caller_id = &caller_id;
         let mut audit_buf: Vec<AuditEvent> = Vec::new();
-        self.store.mutate_plan(&plan_id, |state| {
+        self.store.mutate_executable_plan(&plan_id, |state| {
             // Deliverable existence.
             if !state
                 .graph
@@ -1255,7 +1832,7 @@ impl Planner for BasicCpmPlanner {
             + chrono::Duration::from_std(self.effective_ttl(ttl))
                 .expect("INVARIANT: planner TTL fits in chrono::Duration");
 
-        self.store.mutate_plan(&plan_id, |state| {
+        self.store.mutate_executable_plan(&plan_id, |state| {
             let lock =
                 state
                     .locks
@@ -1301,110 +1878,87 @@ impl Planner for BasicCpmPlanner {
     }
 
     async fn status(&self, plan_id: &PlanId) -> Result<PlanStatus, PlannerError> {
-        self.store.read_plan(plan_id, |state| {
-            // Preserve insertion order from the original graph for stable UI.
-            let deliverables: Vec<(String, DeliverableStatus, u32, u32, u32)> = state
-                .graph
-                .deliverables
-                .iter()
-                .map(|d| {
-                    let status = state
-                        .statuses
-                        .get(&d.id)
-                        .cloned()
-                        .unwrap_or(DeliverableStatus::Pending);
-                    (
-                        d.id.clone(),
-                        status,
-                        state.attempt_count(&d.id),
-                        state.failure_count(&d.id),
-                        state.lapse_count(&d.id),
-                    )
-                })
-                .collect();
-
-            let task_of = |id: &str| state.cached_result.tasks.iter().find(|t| t.id == id);
-            let row_of = |t: &crate::task::Task, synthetic: bool| ScheduleRow {
-                id: t.id.clone(),
-                es: t.earliest_start,
-                ef: t.earliest_finish,
-                ls: t.latest_start,
-                lf: t.latest_finish,
-                float: t.float,
-                critical: t.is_critical,
-                synthetic,
-            };
-            let mut schedule: Vec<ScheduleRow> = Vec::new();
-            schedule.extend(task_of(START_ID).map(|t| row_of(t, true)));
-            schedule.extend(
-                state
+        let ((mut status, head_hash), info) =
+            self.store.read_plan_and_variant(plan_id, |state| {
+                // Preserve insertion order from the original graph for stable UI.
+                let deliverables: Vec<(String, DeliverableStatus, u32, u32, u32)> = state
                     .graph
                     .deliverables
                     .iter()
-                    .filter_map(|d| task_of(&d.id))
-                    .map(|t| row_of(t, false)),
-            );
-            schedule.extend(task_of(FINISH_ID).map(|t| row_of(t, true)));
-            let mut ready_rows: Vec<&ScheduleRow> = schedule
-                .iter()
-                .filter(|r| {
-                    matches!(state.statuses.get(&r.id), Some(DeliverableStatus::Ready))
-                        && !state.locks.contains_key(&r.id)
-                })
-                .collect();
-            // Same ordering as acquire_cohort (shared priority_key). Membership is a
-            // superset: acquire may still skip deliverables at the failure or lapse
-            // cap, manual deliverables, or ones whose files overlap a held lock.
-            let sched_by_id: HashMap<&str, (f32, f32)> = state
-                .cached_result
-                .tasks
-                .iter()
-                .map(|t| (t.id.as_str(), (t.latest_start, t.float)))
-                .collect();
-            ready_rows.sort_by_key(|r| priority_key(&r.id, &sched_by_id));
-            let ready: Vec<String> = ready_rows.iter().map(|r| r.id.clone()).collect();
-
-            let milestones: Vec<MilestoneRow> = state
-                .graph
-                .deliverables
-                .iter()
-                .filter(|d| d.is_milestone())
-                .filter_map(|d| {
-                    let task = task_of(&d.id)?;
-                    Some(MilestoneRow {
-                        id: d.id.clone(),
-                        critical_path: CpmAlgorithm::trace_path_to(
-                            &state.cached_result.tasks,
-                            &d.id,
-                        ),
-                        hours: task.earliest_finish,
-                        complete: matches!(
-                            state.statuses.get(&d.id),
-                            Some(DeliverableStatus::Complete)
-                        ),
+                    .map(|d| {
+                        let status = state
+                            .statuses
+                            .get(&d.id)
+                            .cloned()
+                            .unwrap_or(DeliverableStatus::Pending);
+                        (
+                            d.id.clone(),
+                            status,
+                            state.attempt_count(&d.id),
+                            state.failure_count(&d.id),
+                            state.lapse_count(&d.id),
+                        )
                     })
-                })
-                .collect();
+                    .collect();
 
-            PlanStatus {
-                plan_id: plan_id.clone(),
-                milestones,
-                critical_ids: state
-                    .cached_result
-                    .critical_ids
+                let schedule = crate::schedule::schedule_rows(&state.graph, &state.cached_result);
+                let mut ready_rows: Vec<&ScheduleRow> = schedule
                     .iter()
-                    .filter(|id| id.as_str() != START_ID && id.as_str() != FINISH_ID)
-                    .cloned()
-                    .collect(),
-                plan_complete: all_complete(state),
-                schedule,
-                ready,
-                deliverables,
-                critical_path: state.cached_result.critical_path.clone(),
-                critical_path_hours: state.cached_result.critical_path_duration,
-                locks_held: state.locks.values().cloned().collect(),
-            }
-        })
+                    .filter(|r| {
+                        matches!(state.statuses.get(&r.id), Some(DeliverableStatus::Ready))
+                            && !state.locks.contains_key(&r.id)
+                    })
+                    .collect();
+                // Same ordering as acquire_cohort (shared priority_key). Membership is a
+                // superset: acquire may still skip deliverables at the failure or lapse
+                // cap, manual deliverables, or ones whose files overlap a held lock.
+                let sched_by_id: HashMap<&str, (f32, f32)> = state
+                    .cached_result
+                    .tasks
+                    .iter()
+                    .map(|t| (t.id.as_str(), (t.latest_start, t.float)))
+                    .collect();
+                ready_rows.sort_by_key(|r| priority_key(&r.id, &sched_by_id));
+                let ready: Vec<String> = ready_rows.iter().map(|r| r.id.clone()).collect();
+
+                let milestones =
+                    crate::schedule::milestone_rows(&state.graph, &state.cached_result, |id| {
+                        matches!(state.statuses.get(id), Some(DeliverableStatus::Complete))
+                    });
+
+                let status = PlanStatus {
+                    plan_id: plan_id.clone(),
+                    milestones,
+                    critical_ids: state
+                        .cached_result
+                        .critical_ids
+                        .iter()
+                        .filter(|id| id.as_str() != START_ID && id.as_str() != FINISH_ID)
+                        .cloned()
+                        .collect(),
+                    plan_complete: all_complete(state),
+                    schedule,
+                    ready,
+                    deliverables,
+                    critical_path: state.cached_result.critical_path.clone(),
+                    critical_path_hours: state.cached_result.critical_path_duration,
+                    locks_held: state.locks.values().cloned().collect(),
+                    name: None,
+                    variant: None,
+                    selected: None,
+                    definition_drift: None,
+                };
+                (status, hash_graph(&state.graph))
+            })?;
+        if let Some(info) = info {
+            // File I/O outside the read snapshot; the head hash is from it.
+            status.definition_drift =
+                definition_drift(self.project_root.as_ref(), &info, &head_hash);
+            status.name = Some(info.name);
+            status.variant = Some(info.variant);
+            status.selected = Some(info.selected);
+        }
+        Ok(status)
     }
 
     async fn accept(&self, req: AcceptRequest) -> Result<(), PlannerError> {
@@ -1412,7 +1966,7 @@ impl Planner for BasicCpmPlanner {
         let plan_id = req.plan_id.clone();
         let deliverable_id = req.deliverable_id.as_str();
         let now = self.now();
-        self.store.mutate_plan(&plan_id, |state| {
+        self.store.mutate_executable_plan(&plan_id, |state| {
             if !state
                 .graph
                 .deliverables
@@ -1492,7 +2046,7 @@ impl Planner for BasicCpmPlanner {
         let deliverable_id = deliverable_id.as_str();
         let reason = reason.as_str();
         let mut audit_buf: Vec<AuditEvent> = Vec::new();
-        self.store.mutate_plan(&plan_id, |state| {
+        self.store.mutate_executable_plan(&plan_id, |state| {
             if !state
                 .graph
                 .deliverables

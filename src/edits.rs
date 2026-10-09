@@ -55,13 +55,20 @@ pub enum GraphEdit {
 ///
 /// An edit that names a deliverable id absent from the graph being edited
 /// returns [`PlannerError::InvalidGraph`] whose `reason` starts with
-/// `edit <index>: ` and names the offending id.
+/// `edit <index>: ` and names the offending id. A failure of the final
+/// whole-graph validation is `INVALID_GRAPH` whose `reason` starts with
+/// `after applying <n> edits: `.
 pub fn apply_edits(graph: &PlanGraph, edits: &[GraphEdit]) -> Result<PlanGraph, PlannerError> {
     let mut out = graph.clone();
     for (index, edit) in edits.iter().enumerate() {
         apply_one(&mut out, index, edit)?;
     }
-    validate_graph(&out)?;
+    validate_graph(&out).map_err(|err| match err {
+        PlannerError::InvalidGraph { reason } => PlannerError::InvalidGraph {
+            reason: format!("after applying {} edits: {reason}", edits.len()),
+        },
+        other => other,
+    })?;
     Ok(out)
 }
 

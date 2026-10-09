@@ -31,7 +31,10 @@
 //!   doesn't need to expose).
 //! - [`planner`] — [`BasicCpmPlanner`], the lock-aware implementation.
 //! - [`plan_store`] — durable SQLite persistence (plans, statuses, cohort
-//!   locks, submit dedup) and the cross-process atomicity mechanism.
+//!   locks, submit dedup, portfolio lines/variants/revisions) and the
+//!   cross-process atomicity mechanism.
+//! - [`schedule`] — [`schedule::compute_cpm`], the CPM run shared by submit,
+//!   status and the analysis tools.
 //! - [`server`] — the MCP tool façade.
 //! - [`audit`] — the lock-lifecycle audit surface.
 //!
@@ -54,12 +57,15 @@ pub mod network_health;
 pub mod plan;
 pub mod plan_store;
 pub mod planner;
+mod portfolio;
 pub mod ports;
+pub mod project;
 pub mod resource_schedule;
 pub mod revise;
 pub mod risk;
-mod schedule;
+pub mod schedule;
 pub mod server;
+pub mod simulate;
 pub mod task;
 
 pub use algorithm::CpmAlgorithm;

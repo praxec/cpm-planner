@@ -25,9 +25,6 @@
 //!   `Failed` deliverables are outside the reopen rule: they stay `Failed`
 //!   (re-derivation applies only to `Complete`/`Ready`/`Pending`).
 
-// Store wiring (a later task) is the first non-test caller of `plan_revision`.
-#![allow(dead_code)]
-
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};

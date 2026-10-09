@@ -2051,5 +2051,76 @@ async fn submit_rejects_unknown_estimate_field() {
     });
     let request = CallToolRequestParams::new(cpm_planner::TOOL_SUBMIT.to_string())
         .with_arguments(args.as_object().unwrap().clone());
-    assert!(server.dispatch_call(request).await.is_err());
+    let err = server.dispatch_call(request).await.unwrap_err();
+    assert!(err.message.contains("unknown field"), "{}", err.message);
+}
+
+#[tokio::test]
+async fn submit_rejects_effort_above_one_million_hours() {
+    let planner = BasicCpmPlanner::new();
+    let graph = PlanGraph {
+        deliverables: vec![deliverable("a", &["src/a.rs"], &[], Some(1_000_001.0))],
+        max_chained_dispatch: None,
+    };
+    let err = planner.submit_plan(graph).await.unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "INVALID_GRAPH: deliverable 'a' has invalid estimated_effort_hours 1000001; must be a finite number between 0 and 1000000"
+    );
+}
+
+#[tokio::test]
+async fn submit_rejects_lag_above_one_million_hours() {
+    let planner = BasicCpmPlanner::new();
+    let mut b = deliverable("b", &["src/b.rs"], &[], Some(1.0));
+    b.prerequisites = vec![edge("a", None, Some(2_000_000.0))];
+    let graph = PlanGraph {
+        deliverables: vec![deliverable("a", &["src/a.rs"], &[], Some(1.0)), b],
+        max_chained_dispatch: None,
+    };
+    let err = planner.submit_plan(graph).await.unwrap_err();
+    assert!(err.to_string().contains("between 0 and 1000000"), "{err}");
+}
+
+#[tokio::test]
+async fn submit_rejects_estimate_above_one_million_hours() {
+    let planner = BasicCpmPlanner::new();
+    let graph = PlanGraph {
+        deliverables: vec![with_estimate(
+            deliverable("a", &["src/a.rs"], &[], None),
+            estimate(1.0, 2.0, 1_000_001.0),
+        )],
+        max_chained_dispatch: None,
+    };
+    let err = planner.submit_plan(graph).await.unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "INVALID_GRAPH: deliverable 'a' has invalid estimate.pessimistic 1000001; must be a finite number between 0 and 1000000"
+    );
+}
+
+#[tokio::test]
+async fn submit_accepts_exactly_one_million_hours() {
+    let planner = BasicCpmPlanner::new();
+    let graph = PlanGraph {
+        deliverables: vec![deliverable("a", &["src/a.rs"], &[], Some(1_000_000.0))],
+        max_chained_dispatch: None,
+    };
+    assert!(planner.submit_plan(graph).await.is_ok());
+}
+
+#[tokio::test]
+async fn submit_rejects_more_than_5000_deliverables() {
+    let planner = BasicCpmPlanner::new();
+    let graph = PlanGraph {
+        deliverables: (0..5001)
+            .map(|i| deliverable(&format!("d{i}"), &[], &[], Some(1.0)))
+            .collect(),
+        max_chained_dispatch: None,
+    };
+    let err = planner.submit_plan(graph).await.unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "INVALID_GRAPH: plan has 5001 deliverables; maximum is 5000"
+    );
 }

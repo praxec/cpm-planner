@@ -2,10 +2,11 @@
 
 use crate::lint::{Severity, lint};
 use crate::metrics::{Scorecard, scorecard};
-use crate::monte_carlo::{MonteCarloRequest, monte_carlo};
+use crate::monte_carlo::{MAX_WORK, MonteCarloRequest, monte_carlo, work_size};
 use crate::plan::{PlanGraph, PlanId, PlannerError};
 use crate::planner::canonical_deliverable;
 use crate::resource_schedule::{ScheduleRequest, resource_schedule};
+use crate::revise::RevisionDiff;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -58,21 +59,16 @@ pub struct CompareRequest {
     pub weights: CompareWeights,
 }
 
-/// Structural difference of one variant against the first.
-// TODO(P4P merge): reconcile with `revise::RevisionDiff`.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct StructuralDiff {
-    pub added: Vec<String>,
-    pub removed: Vec<String>,
-    pub changed: Vec<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VariantComparison {
     pub plan_id: PlanId,
     pub variant: String,
     pub scorecard: Scorecard,
-    pub diff_vs_first: StructuralDiff,
+    /// Structural difference against the first input variant: `added`,
+    /// `removed` and `changed` (canonical definition differs) deliverable ids.
+    /// A comparison carries no runtime state, so `reopened` and
+    /// `released_locks` are always empty.
+    pub diff_vs_first: RevisionDiff,
     pub pareto_optimal: bool,
     pub score: f32,
     pub rank: u32,
@@ -84,6 +80,47 @@ pub struct Comparison {
     /// In input order; `rank` gives the ordering.
     pub variants: Vec<VariantComparison>,
     pub recommended: PlanId,
+}
+
+/// Most variants one comparison accepts.
+pub const MAX_COMPARE_VARIANTS: usize = 16;
+
+/// `INVALID_GRAPH` unless `2..=MAX_COMPARE_VARIANTS` variants are given.
+pub(crate) fn check_variant_count(n: usize) -> Result<(), PlannerError> {
+    if n < 2 {
+        return Err(PlannerError::InvalidGraph {
+            reason: "compare needs at least two variants".to_string(),
+        });
+    }
+    if n > MAX_COMPARE_VARIANTS {
+        return Err(PlannerError::InvalidGraph {
+            reason: format!("compare accepts at most {MAX_COMPARE_VARIANTS} variants"),
+        });
+    }
+    Ok(())
+}
+
+/// The Monte Carlo budget is shared: `iterations × (deliverables + edges)`
+/// summed over every variant must not exceed [`MAX_WORK`].
+fn check_shared_budget(
+    inputs: &[(PlanId, String, PlanGraph)],
+    req: &MonteCarloRequest,
+) -> Result<(), PlannerError> {
+    let iterations = u64::from(req.iterations);
+    let total = inputs.iter().fold(0u64, |sum, (_, _, g)| {
+        sum.saturating_add(iterations.saturating_mul(work_size(g) as u64))
+    });
+    if total > MAX_WORK {
+        return Err(PlannerError::InvalidGraph {
+            reason: format!(
+                "compare monte carlo budget exceeded ({} iterations × nodes+edges summed over \
+                 {} variants = {total} > {MAX_WORK})",
+                req.iterations,
+                inputs.len()
+            ),
+        });
+    }
+    Ok(())
 }
 
 const CRITERIA: [&str; 5] = [
@@ -110,7 +147,7 @@ fn dominates(a: &[f32; 5], b: &[f32; 5]) -> bool {
     a.iter().zip(b).all(|(x, y)| x <= y) && a.iter().zip(b).any(|(x, y)| x < y)
 }
 
-fn diff(first: &PlanGraph, other: &PlanGraph) -> StructuralDiff {
+fn diff(first: &PlanGraph, other: &PlanGraph) -> RevisionDiff {
     let canon = |g: &PlanGraph| -> BTreeMap<String, serde_json::Value> {
         g.deliverables
             .iter()
@@ -118,7 +155,7 @@ fn diff(first: &PlanGraph, other: &PlanGraph) -> StructuralDiff {
             .collect()
     };
     let (a, b) = (canon(first), canon(other));
-    StructuralDiff {
+    RevisionDiff {
         added: b.keys().filter(|k| !a.contains_key(*k)).cloned().collect(),
         removed: a.keys().filter(|k| !b.contains_key(*k)).cloned().collect(),
         changed: a
@@ -126,6 +163,8 @@ fn diff(first: &PlanGraph, other: &PlanGraph) -> StructuralDiff {
             .filter(|(k, v)| b.get(*k).is_some_and(|o| o != *v))
             .map(|(k, _)| k.clone())
             .collect(),
+        reopened: Vec::new(),
+        released_locks: Vec::new(),
     }
 }
 
@@ -154,14 +193,18 @@ fn rationale(i: usize, all: &[[f32; 5]]) -> String {
 }
 
 /// Compare `inputs` (plan id, variant name, graph) on the scorecard.
+///
+/// Accepts 2..=[`MAX_COMPARE_VARIANTS`] inputs (`INVALID_GRAPH` otherwise).
+/// With `monte_carlo`, the work budget is shared across variants (see
+/// [`MAX_WORK`]). Pure and CPU-bound: the server runs it off the async
+/// runtime.
 pub fn compare(
     inputs: &[(PlanId, String, PlanGraph)],
     req: &CompareRequest,
 ) -> Result<Comparison, PlannerError> {
-    if inputs.len() < 2 {
-        return Err(PlannerError::InvalidGraph {
-            reason: "compare needs at least two variants".to_string(),
-        });
+    check_variant_count(inputs.len())?;
+    if let Some(mc) = &req.monte_carlo {
+        check_shared_budget(inputs, mc)?;
     }
 
     let mut cards: Vec<Scorecard> = Vec::with_capacity(inputs.len());
