@@ -44,6 +44,8 @@ jobs:
               with:
                   components: rustfmt, clippy
             - uses: Swatinem/rust-cache@v2
+            - name: server.json version matches Cargo.toml
+              run: scripts/check-version-sync.sh
             - name: rustfmt
               run: cargo fmt --all --check
             - name: clippy
