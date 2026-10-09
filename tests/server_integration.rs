@@ -559,3 +559,47 @@ async fn plan_mark_status_failed_carries_reason() {
     // d1 was leased exactly once before being marked failed.
     assert_eq!(d1[2], json!(1));
 }
+
+#[tokio::test]
+async fn plan_acquire_cohort_accepts_ids_and_filter() {
+    let server = server();
+    let graph = json!({"deliverables": [
+        {"id": "a", "owned_files": ["a.rs"], "prerequisites": [], "estimated_effort_hours": 1.0, "metadata": {"executor": "claude"}},
+        {"id": "b", "owned_files": ["b.rs"], "prerequisites": [], "estimated_effort_hours": 1.0, "metadata": {"executor": "junior"}},
+        {"id": "c", "owned_files": ["c.rs"], "prerequisites": [], "estimated_effort_hours": 1.0, "metadata": {"executor": "junior"}}
+    ]});
+    let sub = server
+        .dispatch_call(call_args(TOOL_SUBMIT, json!({"graph": graph})))
+        .await
+        .unwrap();
+    let plan_id = sub["plan_id"].as_str().unwrap().to_string();
+    let resp = server
+        .dispatch_call(call_args(
+            TOOL_ACQUIRE_COHORT,
+            json!({"plan_id": plan_id, "caller_id": "w", "max_count": 5,
+                   "ids": ["a", "b"], "filter": {"metadata": {"executor": "junior"}}}),
+        ))
+        .await
+        .unwrap();
+    let ids: Vec<&str> = resp["deliverables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["b"]);
+}
+
+#[tokio::test]
+async fn plan_acquire_cohort_rejects_unknown_filter_keys() {
+    let server = server();
+    let plan_id = submit_plan(&server).await;
+    let result = server
+        .dispatch_call(call_args(
+            TOOL_ACQUIRE_COHORT,
+            json!({"plan_id": plan_id, "caller_id": "w", "max_count": 1,
+                   "filter": {"bogus": 1}}),
+        ))
+        .await;
+    assert!(result.is_err());
+}

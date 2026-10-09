@@ -505,6 +505,8 @@ impl Planner for BasicCpmPlanner {
             plan_id,
             caller_id,
             max_count,
+            ids,
+            metadata_filter,
         } = req;
         let now = self.now();
         let expires_at = now
@@ -522,7 +524,32 @@ impl Planner for BasicCpmPlanner {
                 audit_buf.push(make_expired_event(lock, now));
             }
 
-            // 2a. Lapse bound: a Ready deliverable whose lease has lapsed
+            // 2a. Targeting: validate requested ids, then work out which
+            //     deliverables this acquire considers. Manual deliverables
+            //     (metadata.kind == "manual") are never leased; a metadata
+            //     filter silently narrows the field.
+            if let Some(req_ids) = &ids {
+                for rid in req_ids {
+                    if !state.graph.deliverables.iter().any(|d| &d.id == rid) {
+                        return Err(PlannerError::DeliverableNotFound {
+                            plan_id: plan_id.0.clone(),
+                            deliverable_id: rid.clone(),
+                        });
+                    }
+                }
+            }
+            let is_requested = |id: &str| ids.as_ref().is_some_and(|v| v.iter().any(|r| r == id));
+            let is_manual =
+                |d: &Deliverable| d.metadata.get("kind").and_then(|k| k.as_str()) == Some("manual");
+            let matches_filter = |d: &Deliverable| {
+                metadata_filter
+                    .as_ref()
+                    .is_none_or(|f| f.iter().all(|(k, v)| d.metadata.get(k) == Some(v)))
+            };
+            let in_scope =
+                |d: &Deliverable| (ids.is_none() || is_requested(&d.id)) && matches_filter(d);
+
+            // 2b-prelim. Lapse bound: a Ready deliverable whose lease has lapsed
             //     environmentally MAX_LAPSES times is evidence of a broken
             //     ENVIRONMENT (drivers keep getting killed before they can
             //     report), not a broken deliverable. Do NOT auto-fail it —
@@ -530,12 +557,14 @@ impl Planner for BasicCpmPlanner {
             //     re-leasing it: skip it, leave the rest of the plan
             //     leasable, and report it in `blocked` so an operator
             //     intervenes (force_release with reset_counters).
-            let blocked: Vec<BlockedDeliverable> = state
+            let lapse_blocked: Vec<BlockedDeliverable> = state
                 .graph
                 .deliverables
                 .iter()
                 .filter(|d| {
-                    matches!(state.statuses.get(&d.id), Some(DeliverableStatus::Ready))
+                    in_scope(d)
+                        && !is_manual(d)
+                        && matches!(state.statuses.get(&d.id), Some(DeliverableStatus::Ready))
                         && !state.locks.contains_key(&d.id)
                         && state.lapse_count(&d.id) >= MAX_LAPSES
                 })
@@ -594,30 +623,92 @@ impl Planner for BasicCpmPlanner {
                 .map(|t| (t.id.as_str(), (t.float, t.earliest_start)))
                 .collect();
 
-            // 4. Build the ready set: status=Ready AND no lock currently held.
-            let mut ready: Vec<&Deliverable> = state
-                .graph
-                .deliverables
-                .iter()
-                .filter(|d| {
-                    matches!(state.statuses.get(&d.id), Some(DeliverableStatus::Ready))
+            // 4. Build the ready set (in scope, non-manual, Ready, unlocked,
+            //    not lapse-limited) and, for requested ids, classify every id
+            //    that cannot be leased. Without `ids`, only LAPSE_LIMIT is
+            //    reported (manual deliverables are skipped quietly).
+            let mut blocked: Vec<BlockedDeliverable> = Vec::new();
+            let mut ready: Vec<&Deliverable> = Vec::new();
+            if let Some(req_ids) = &ids {
+                let mut seen: HashSet<&str> = HashSet::new();
+                for rid in req_ids {
+                    if !seen.insert(rid.as_str()) {
+                        continue;
+                    }
+                    let d = state
+                        .graph
+                        .deliverables
+                        .iter()
+                        .find(|d| &d.id == rid)
+                        .expect("INVARIANT: requested ids validated above");
+                    if !matches_filter(d) {
+                        continue;
+                    }
+                    let mut block = |code: &str, reason: String| {
+                        blocked.push(BlockedDeliverable {
+                            id: d.id.clone(),
+                            code: code.to_string(),
+                            reason,
+                        });
+                    };
+                    let status = state.statuses.get(&d.id);
+                    if is_manual(d) {
+                        block("MANUAL", "manual deliverable; never leased".to_string());
+                    } else if state.locks.contains_key(&d.id) {
+                        block("LOCKED", "held by an active lease".to_string());
+                    } else if !matches!(status, Some(DeliverableStatus::Ready)) {
+                        block(
+                            "NOT_READY",
+                            format!(
+                                "status is {}",
+                                status.map_or("unknown".to_string(), |s| format!("{s:?}"))
+                            ),
+                        );
+                    } else if let Some(lb) = lapse_blocked.iter().find(|b| b.id == d.id) {
+                        block("LAPSE_LIMIT", lb.reason.clone());
+                    } else {
+                        ready.push(d);
+                    }
+                }
+            } else {
+                blocked = lapse_blocked.clone();
+                ready.extend(state.graph.deliverables.iter().filter(|d| {
+                    in_scope(d)
+                        && !is_manual(d)
+                        && matches!(state.statuses.get(&d.id), Some(DeliverableStatus::Ready))
                         && !state.locks.contains_key(&d.id)
-                        && !blocked.iter().any(|b| b.id == d.id)
-                })
-                .collect();
+                        && !lapse_blocked.iter().any(|b| b.id == d.id)
+                }));
+            }
             ready.sort_by_key(|d| priority_key(&d.id, &sched_by_id));
 
-            // 5. Greedy fill with file-disjointness check.
+            // 5. Greedy fill with file-disjointness check. Requested ids that
+            //    are skipped are reported as FILE_CONFLICT / MAX_COUNT.
             let mut selected: Vec<Deliverable> = Vec::new();
             let mut selected_files: HashSet<PathBuf> = HashSet::new();
             for candidate in ready {
                 if selected.len() == max_count {
-                    break;
+                    if ids.is_some() {
+                        blocked.push(BlockedDeliverable {
+                            id: candidate.id.clone(),
+                            code: "MAX_COUNT".to_string(),
+                            reason: format!("cohort already holds max_count ({max_count})"),
+                        });
+                    }
+                    continue;
                 }
                 let conflict = candidate.owned_files.iter().any(|f| {
                     selected_files.contains(f) || state.file_to_deliverable.contains_key(f)
                 });
                 if conflict {
+                    if ids.is_some() {
+                        blocked.push(BlockedDeliverable {
+                            id: candidate.id.clone(),
+                            code: "FILE_CONFLICT".to_string(),
+                            reason: "owned files overlap a held lock or an earlier pick"
+                                .to_string(),
+                        });
+                    }
                     continue;
                 }
                 for f in &candidate.owned_files {

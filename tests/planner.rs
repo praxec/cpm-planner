@@ -566,3 +566,153 @@ async fn submit_rejects_negative_effort() {
     let err = planner.submit_plan(graph).await.unwrap_err();
     assert!(err.to_string().starts_with("INVALID_GRAPH"), "got: {err}");
 }
+
+// ── Targeted / filtered acquire; manual deliverables (#14) ──────────────────
+
+fn with_meta(mut d: Deliverable, meta: serde_json::Value) -> Deliverable {
+    d.metadata = meta;
+    d
+}
+
+async fn submit_mixed() -> (BasicCpmPlanner, cpm_planner::plan::PlanId) {
+    let planner = BasicCpmPlanner::new();
+    let graph = PlanGraph {
+        deliverables: vec![
+            with_meta(
+                deliverable("code1", &["src/c1.rs"], &[], Some(1.0)),
+                serde_json::json!({"executor": "claude"}),
+            ),
+            with_meta(
+                deliverable("code2", &["src/c2.rs"], &[], Some(1.0)),
+                serde_json::json!({"executor": "claude"}),
+            ),
+            with_meta(
+                deliverable("ownerTask", &["src/o.rs"], &[], Some(1.0)),
+                serde_json::json!({"kind": "manual"}),
+            ),
+            with_meta(
+                deliverable("jun", &["src/j.rs"], &[], Some(1.0)),
+                serde_json::json!({"executor": "junior"}),
+            ),
+            deliverable("later", &["src/l.rs"], &["code1"], Some(1.0)),
+        ],
+        max_chained_dispatch: None,
+    };
+    let plan_id = planner.submit_plan(graph).await.unwrap();
+    (planner, plan_id)
+}
+
+fn cohort_ids(c: &cpm_planner::plan::Cohort) -> Vec<String> {
+    c.rows.iter().map(|r| r.deliverable.id.clone()).collect()
+}
+
+fn codes(c: &cpm_planner::plan::Cohort) -> Vec<(String, String)> {
+    c.blocked
+        .iter()
+        .map(|b| (b.id.clone(), b.code.clone()))
+        .collect()
+}
+
+fn sorted(mut v: Vec<String>) -> Vec<String> {
+    v.sort();
+    v
+}
+
+fn strs(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| s.to_string()).collect()
+}
+
+#[tokio::test]
+async fn unfiltered_acquire_never_leases_manual_deliverables() {
+    let (p, id) = submit_mixed().await;
+    let cohort = p
+        .acquire_cohort(AcquireRequest::new(id, caller("a"), 10))
+        .await
+        .unwrap();
+    assert!(!cohort_ids(&cohort).contains(&"ownerTask".to_string()));
+}
+
+#[tokio::test]
+async fn metadata_filter_leases_only_matching_deliverables() {
+    let (p, id) = submit_mixed().await;
+    let mut f = serde_json::Map::new();
+    f.insert("executor".into(), serde_json::json!("claude"));
+    let cohort = p
+        .acquire_cohort(AcquireRequest::new(id, caller("a"), 10).with_metadata_filter(f))
+        .await
+        .unwrap();
+    assert_eq!(sorted(cohort_ids(&cohort)), vec!["code1", "code2"]);
+}
+
+#[tokio::test]
+async fn ids_lease_only_the_requested_deliverables() {
+    let (p, id) = submit_mixed().await;
+    let cohort = p
+        .acquire_cohort(AcquireRequest::new(id, caller("a"), 10).with_ids(strs(&["jun"])))
+        .await
+        .unwrap();
+    assert_eq!(cohort_ids(&cohort), vec!["jun"]);
+}
+
+#[tokio::test]
+async fn requested_manual_deliverable_is_blocked_with_manual_code() {
+    let (p, id) = submit_mixed().await;
+    let cohort = p
+        .acquire_cohort(AcquireRequest::new(id, caller("a"), 10).with_ids(strs(&["ownerTask"])))
+        .await
+        .unwrap();
+    assert_eq!(codes(&cohort), vec![("ownerTask".into(), "MANUAL".into())]);
+}
+
+#[tokio::test]
+async fn requested_pending_deliverable_is_blocked_not_ready() {
+    let (p, id) = submit_mixed().await;
+    let cohort = p
+        .acquire_cohort(AcquireRequest::new(id, caller("a"), 10).with_ids(strs(&["later"])))
+        .await
+        .unwrap();
+    assert_eq!(codes(&cohort), vec![("later".into(), "NOT_READY".into())]);
+}
+
+#[tokio::test]
+async fn requested_locked_deliverable_is_blocked_locked() {
+    let (p, id) = submit_mixed().await;
+    p.acquire_cohort(AcquireRequest::new(id.clone(), caller("a"), 10).with_ids(strs(&["code1"])))
+        .await
+        .unwrap();
+    let cohort_b = p
+        .acquire_cohort(AcquireRequest::new(id, caller("b"), 10).with_ids(strs(&["code1"])))
+        .await
+        .unwrap();
+    assert_eq!(codes(&cohort_b), vec![("code1".into(), "LOCKED".into())]);
+}
+
+#[tokio::test]
+async fn requesting_unknown_id_is_deliverable_not_found() {
+    let (p, id) = submit_mixed().await;
+    let err = p
+        .acquire_cohort(AcquireRequest::new(id, caller("a"), 10).with_ids(strs(&["nope"])))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().starts_with("DELIVERABLE_NOT_FOUND"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn requested_ids_beyond_max_count_are_blocked_max_count() {
+    let (p, id) = submit_mixed().await;
+    let cohort = p
+        .acquire_cohort(AcquireRequest::new(id, caller("a"), 1).with_ids(strs(&["code1", "code2"])))
+        .await
+        .unwrap();
+    assert_eq!(
+        cohort
+            .blocked
+            .iter()
+            .map(|b| b.code.as_str())
+            .collect::<Vec<_>>(),
+        vec!["MAX_COUNT"]
+    );
+}

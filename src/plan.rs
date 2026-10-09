@@ -176,6 +176,12 @@ pub struct AcquireRequest {
     pub plan_id: PlanId,
     pub caller_id: CallerId,
     pub max_count: usize,
+    /// When set, only these deliverables are considered; each one that is
+    /// not leased is reported in `Cohort.blocked` with a reason code.
+    pub ids: Option<Vec<String>>,
+    /// When set, only deliverables whose `metadata` has every `(key, value)`
+    /// pair (JSON equality) are considered. Non-matches are silently skipped.
+    pub metadata_filter: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl AcquireRequest {
@@ -184,7 +190,24 @@ impl AcquireRequest {
             plan_id,
             caller_id,
             max_count,
+            ids: None,
+            metadata_filter: None,
         }
+    }
+
+    /// Restrict the acquire to these deliverable ids.
+    pub fn with_ids(mut self, ids: Vec<String>) -> Self {
+        self.ids = Some(ids);
+        self
+    }
+
+    /// Restrict the acquire to deliverables matching these metadata pairs.
+    pub fn with_metadata_filter(
+        mut self,
+        filter: serde_json::Map<String, serde_json::Value>,
+    ) -> Self {
+        self.metadata_filter = Some(filter);
+        self
     }
 }
 

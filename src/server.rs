@@ -105,6 +105,17 @@ struct AcquireCohortArgs {
     plan_id: String,
     caller_id: String,
     max_count: usize,
+    #[serde(default)]
+    ids: Option<Vec<String>>,
+    #[serde(default)]
+    filter: Option<AcquireFilter>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcquireFilter {
+    #[serde(default)]
+    metadata: Option<serde_json::Map<String, Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -227,14 +238,23 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                  A deliverable explicitly marked failed 3 times is \
                  circuit-broken to failed instead of re-leased; leases lost \
                  environmentally (TTL lapse, no terminal mark) never trip \
-                 that breaker but are bounded separately (LAPSE_LIMIT at 10).",
+                 that breaker but are bounded separately (LAPSE_LIMIT at 10). \
+                 Optional ids targets specific deliverables and filter.metadata \
+                 narrows by metadata equality; deliverables with \
+                 metadata.kind = \"manual\" are never leased.",
             ),
             schema_object(json!({
                 "type": "object",
                 "properties": {
                     "plan_id":   { "type": "string" },
                     "caller_id": { "type": "string" },
-                    "max_count": { "type": "integer", "minimum": 1 }
+                    "max_count": { "type": "integer", "minimum": 1 },
+                    "ids":       { "type": "array", "items": { "type": "string" } },
+                    "filter":    {
+                        "type": "object",
+                        "properties": { "metadata": { "type": "object" } },
+                        "additionalProperties": false
+                    }
                 },
                 "required": ["plan_id", "caller_id", "max_count"]
             })),
@@ -439,13 +459,20 @@ impl PlanServer {
 
     async fn handle_acquire_cohort(&self, args: Value) -> Result<Value, McpError> {
         let parsed: AcquireCohortArgs = parse_args(args)?;
+        let mut request = AcquireRequest::new(
+            PlanId(parsed.plan_id),
+            CallerId(parsed.caller_id),
+            parsed.max_count,
+        );
+        if let Some(ids) = parsed.ids {
+            request = request.with_ids(ids);
+        }
+        if let Some(filter) = parsed.filter.and_then(|f| f.metadata) {
+            request = request.with_metadata_filter(filter);
+        }
         let cohort: Cohort = self
             .planner
-            .acquire_cohort(AcquireRequest::new(
-                PlanId(parsed.plan_id),
-                CallerId(parsed.caller_id),
-                parsed.max_count,
-            ))
+            .acquire_cohort(request)
             .await
             .map_err(planner_error_to_mcp)?;
         // A SCALAR termination signal for declarative cohort drivers: a
@@ -649,5 +676,13 @@ but at 10 lapses acquire_cohort stops re-leasing that deliverable: it is
 skipped (the rest of the plan stays leasable) and reported in the acquire
 response's `blocked` list as {id, code:"LAPSE_LIMIT", reason}. Fix the
 environment, then clear it with plan.force_release {reset_counters: true}.
+
+Targeted acquire: plan.acquire_cohort accepts optional `ids` (only those
+deliverables are considered; unknown id -> DELIVERABLE_NOT_FOUND) and
+`filter: {"metadata": {key: value}}` (only deliverables whose metadata
+equals every pair; others are silently skipped). Deliverables with
+metadata.kind = "manual" are never leased. With `ids`, each requested id
+that is not leased appears in `blocked` with code MANUAL, NOT_READY,
+LOCKED, LAPSE_LIMIT, FILE_CONFLICT or MAX_COUNT.
 "#
 }
