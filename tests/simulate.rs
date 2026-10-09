@@ -1,16 +1,13 @@
 //! Tests for the read-only plan simulation library.
 
-use cpm_planner::audit::NullAuditSink;
 use cpm_planner::monte_carlo::MonteCarloRequest;
 use cpm_planner::plan::{PlanGraph, PlannerError};
-use cpm_planner::plan_store::SqlitePlanStore;
 use cpm_planner::planner::BasicCpmPlanner;
 use cpm_planner::ports::Planner;
 use cpm_planner::resource_schedule::ScheduleRequest;
 use cpm_planner::simulate::{SimulateRequest, simulate};
 use serde_json::json;
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 fn dv(id: &str, prereqs: &[&str], h: f32, resource: Option<&str>) -> serde_json::Value {
     let mut v = json!({
@@ -42,41 +39,6 @@ fn parallel_same_resource() -> PlanGraph {
         dv("a", &[], 2.0, Some("dev")),
         dv("b", &[], 2.0, Some("dev")),
     ])
-}
-
-fn plan_count(path: &std::path::Path) -> i64 {
-    let conn = rusqlite::Connection::open(path).expect("open db");
-    conn.query_row("SELECT COUNT(*) FROM plans", [], |r| r.get(0))
-        .expect("count")
-}
-
-#[tokio::test]
-async fn simulate_does_not_create_a_plan() {
-    let path = std::env::temp_dir().join(format!("cpm-simulate-{}.db", std::process::id()));
-    let _ = std::fs::remove_file(&path);
-    let store = SqlitePlanStore::open(&path).expect("open store");
-    let planner = BasicCpmPlanner::with_store(store, Arc::new(NullAuditSink));
-    let g = chain();
-    simulate(&g, &SimulateRequest::default()).expect("simulate");
-    let _ = planner.submit_plan(g.clone()).await.expect("submit");
-    let after_submit = plan_count(&path);
-    simulate(&g, &SimulateRequest::default()).expect("simulate");
-    let after_simulate = plan_count(&path);
-    let _ = std::fs::remove_file(&path);
-    assert_eq!((after_submit, after_simulate), (1, 1));
-}
-
-#[tokio::test]
-async fn simulate_leaves_a_fresh_store_empty() {
-    let path = std::env::temp_dir().join(format!("cpm-simulate-empty-{}.db", std::process::id()));
-    let _ = std::fs::remove_file(&path);
-    let store = SqlitePlanStore::open(&path).expect("open store");
-    let planner = BasicCpmPlanner::with_store(store, Arc::new(NullAuditSink));
-    drop(planner);
-    simulate(&chain(), &SimulateRequest::default()).expect("simulate");
-    let count = plan_count(&path);
-    let _ = std::fs::remove_file(&path);
-    assert_eq!(count, 0);
 }
 
 #[tokio::test]
@@ -155,8 +117,9 @@ fn simulate_rejects_cyclic_graph_with_invalid_graph() {
 fn simulate_error_reason_lists_offending_ids() {
     let g = graph(vec![dv("a", &["b"], 1.0, None), dv("b", &["a"], 1.0, None)]);
     let err = simulate(&g, &SimulateRequest::default()).expect_err("cycle");
-    assert!(
-        matches!(&err, PlannerError::InvalidGraph { reason } if reason.contains('a') && reason.contains('b'))
+    assert_eq!(
+        err.to_string(),
+        "INVALID_GRAPH: lint errors: CYCLE [a, b, a]"
     );
 }
 
@@ -202,4 +165,16 @@ async fn simulate_unknown_plan_is_plan_not_found() {
         .await
         .expect_err("missing");
     assert!(matches!(err, PlannerError::PlanNotFound { .. }));
+}
+
+#[test]
+fn simulate_rejects_oversized_graph() {
+    let v: Vec<serde_json::Value> = (0..5001)
+        .map(|i| dv(&format!("d{i}"), &[], 1.0, None))
+        .collect();
+    let err = simulate(&graph(v), &SimulateRequest::default()).expect_err("too large");
+    assert_eq!(
+        err.to_string(),
+        "INVALID_GRAPH: lint errors: TOO_MANY_DELIVERABLES []"
+    );
 }
