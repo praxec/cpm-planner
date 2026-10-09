@@ -223,3 +223,42 @@ fn compare_is_deterministic() {
         compare(&three(), &r).expect("second")
     );
 }
+
+// ── Limits (final-review I1) ────────────────────────────────────────────────
+
+/// `n` independent one-hour deliverables (no prerequisite edges).
+fn wide(n: usize) -> PlanGraph {
+    let v: Vec<_> = (0..n)
+        .map(|i| json!({"id": format!("d{i}"), "owned_files": [], "prerequisites": [], "estimated_effort_hours": 1.0}))
+        .collect();
+    serde_json::from_value(json!({ "deliverables": v })).expect("valid graph")
+}
+
+#[test]
+fn compare_rejects_more_than_16_variants() {
+    let inputs: Vec<_> = (0..17).map(|i| input(&format!("p{i}"), single())).collect();
+    let err = compare(&inputs, &CompareRequest::default()).unwrap_err();
+    assert!(
+        matches!(&err, PlannerError::InvalidGraph { reason } if reason.contains("at most 16")),
+        "got {err}"
+    );
+}
+
+#[test]
+fn compare_shared_monte_carlo_budget_is_enforced() {
+    // Each variant alone fits (50000 × 2001 ≈ 100M ≤ 200M); together they
+    // do not (≈ 200.1M).
+    let inputs = vec![input("a", wide(2001)), input("b", wide(2001))];
+    let request = CompareRequest {
+        monte_carlo: Some(MonteCarloRequest {
+            iterations: 50_000,
+            seed: 1,
+        }),
+        ..CompareRequest::default()
+    };
+    let err = compare(&inputs, &request).unwrap_err();
+    assert!(
+        matches!(&err, PlannerError::InvalidGraph { reason } if reason.contains("budget")),
+        "got {err}"
+    );
+}

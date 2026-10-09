@@ -2,7 +2,7 @@
 
 use crate::lint::{Severity, lint};
 use crate::metrics::{Scorecard, scorecard};
-use crate::monte_carlo::{MonteCarloRequest, monte_carlo};
+use crate::monte_carlo::{MAX_WORK, MonteCarloRequest, monte_carlo, work_size};
 use crate::plan::{PlanGraph, PlanId, PlannerError};
 use crate::planner::canonical_deliverable;
 use crate::resource_schedule::{ScheduleRequest, resource_schedule};
@@ -82,6 +82,47 @@ pub struct Comparison {
     pub recommended: PlanId,
 }
 
+/// Most variants one comparison accepts.
+pub const MAX_COMPARE_VARIANTS: usize = 16;
+
+/// `INVALID_GRAPH` unless `2..=MAX_COMPARE_VARIANTS` variants are given.
+pub(crate) fn check_variant_count(n: usize) -> Result<(), PlannerError> {
+    if n < 2 {
+        return Err(PlannerError::InvalidGraph {
+            reason: "compare needs at least two variants".to_string(),
+        });
+    }
+    if n > MAX_COMPARE_VARIANTS {
+        return Err(PlannerError::InvalidGraph {
+            reason: format!("compare accepts at most {MAX_COMPARE_VARIANTS} variants"),
+        });
+    }
+    Ok(())
+}
+
+/// The Monte Carlo budget is shared: `iterations × (deliverables + edges)`
+/// summed over every variant must not exceed [`MAX_WORK`].
+fn check_shared_budget(
+    inputs: &[(PlanId, String, PlanGraph)],
+    req: &MonteCarloRequest,
+) -> Result<(), PlannerError> {
+    let iterations = u64::from(req.iterations);
+    let total = inputs.iter().fold(0u64, |sum, (_, _, g)| {
+        sum.saturating_add(iterations.saturating_mul(work_size(g) as u64))
+    });
+    if total > MAX_WORK {
+        return Err(PlannerError::InvalidGraph {
+            reason: format!(
+                "compare monte carlo budget exceeded ({} iterations × nodes+edges summed over \
+                 {} variants = {total} > {MAX_WORK})",
+                req.iterations,
+                inputs.len()
+            ),
+        });
+    }
+    Ok(())
+}
+
 const CRITERIA: [&str; 5] = [
     "makespan",
     "p80",
@@ -152,14 +193,18 @@ fn rationale(i: usize, all: &[[f32; 5]]) -> String {
 }
 
 /// Compare `inputs` (plan id, variant name, graph) on the scorecard.
+///
+/// Accepts 2..=[`MAX_COMPARE_VARIANTS`] inputs (`INVALID_GRAPH` otherwise).
+/// With `monte_carlo`, the work budget is shared across variants (see
+/// [`MAX_WORK`]). Pure and CPU-bound: the server runs it off the async
+/// runtime.
 pub fn compare(
     inputs: &[(PlanId, String, PlanGraph)],
     req: &CompareRequest,
 ) -> Result<Comparison, PlannerError> {
-    if inputs.len() < 2 {
-        return Err(PlannerError::InvalidGraph {
-            reason: "compare needs at least two variants".to_string(),
-        });
+    check_variant_count(inputs.len())?;
+    if let Some(mc) = &req.monte_carlo {
+        check_shared_budget(inputs, mc)?;
     }
 
     let mut cards: Vec<Scorecard> = Vec::with_capacity(inputs.len());
