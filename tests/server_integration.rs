@@ -1070,7 +1070,7 @@ fn tool_definitions_match_tool_names() {
         .iter()
         .map(|s| (*s).to_string())
         .collect();
-    assert_eq!((names, expected.len()), (expected, 19));
+    assert_eq!((names, expected.len()), (expected, 22));
 }
 
 #[test]
@@ -1844,4 +1844,348 @@ async fn negative_earned_pct_is_invalid_actuals() {
         err.message,
         "INVALID_ACTUALS: earned_pct must be an integer 0..=100, got -1"
     );
+}
+
+// ── Earned value: plan.baseline / plan.ev / plan.snapshot (P5) ──────────────
+
+fn ev_t0() -> chrono::DateTime<chrono::Utc> {
+    use chrono::TimeZone;
+    chrono::Utc.with_ymd_and_hms(2026, 1, 5, 0, 0, 0).unwrap()
+}
+
+/// A server whose planner clock is frozen at [`ev_t0`] plus `hours`.
+fn clocked_server(hours: i64) -> PlanServer {
+    let now = ev_t0() + chrono::Duration::hours(hours);
+    let planner = BasicCpmPlanner::with_parts(
+        Arc::new(cpm_planner::audit::NullAuditSink),
+        std::time::Duration::from_secs(3600),
+        Arc::new(move || now),
+    );
+    PlanServer::new(Arc::new(planner))
+}
+
+async fn call_ok(server: &PlanServer, name: &str, args: Value) -> Value {
+    server
+        .dispatch_call(call_args(name, args))
+        .await
+        .unwrap_or_else(|e| panic!("{name} failed: {}", e.message))
+}
+
+async fn baselined_plan(server: &PlanServer) -> String {
+    let plan_id = submit_plan(server).await;
+    call_ok(
+        server,
+        "plan.baseline",
+        json!({ "plan_id": plan_id, "start": "2026-01-05T00:00:00Z" }),
+    )
+    .await;
+    plan_id
+}
+
+#[tokio::test]
+async fn plan_baseline_then_ev_roundtrip() {
+    let server = clocked_server(1);
+    let plan_id = submit_plan(&server).await;
+    let baseline = call_ok(&server, "plan.baseline", json!({ "plan_id": plan_id })).await;
+    let ev = call_ok(&server, "plan.ev", json!({ "plan_id": plan_id })).await;
+    assert_eq!(
+        (ev["baseline_number"].clone(), ev["bac"].clone()),
+        (baseline["baseline_number"].clone(), baseline["bac"].clone())
+    );
+}
+
+#[tokio::test]
+async fn plan_ev_before_baseline_returns_not_baselined() {
+    let server = clocked_server(0);
+    let plan_id = submit_plan(&server).await;
+    let err = call_err(&server, "plan.ev", json!({ "plan_id": plan_id })).await;
+    assert!(err.message.starts_with("NOT_BASELINED:"), "{}", err.message);
+}
+
+#[tokio::test]
+async fn plan_ev_reports_planned_value_at_as_of() {
+    let server = clocked_server(0);
+    let plan_id = baselined_plan(&server).await;
+    let ev = call_ok(
+        &server,
+        "plan.ev",
+        json!({ "plan_id": plan_id, "as_of": "2026-01-05T02:00:00Z" }),
+    )
+    .await;
+    assert_eq!(ev["pv"], json!(2.0));
+}
+
+#[tokio::test]
+async fn plan_ev_rejects_unparseable_as_of_as_invalid_params() {
+    let server = clocked_server(0);
+    let plan_id = baselined_plan(&server).await;
+    let err = call_err(
+        &server,
+        "plan.ev",
+        json!({ "plan_id": plan_id, "as_of": "yesterday" }),
+    )
+    .await;
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+}
+
+#[tokio::test]
+async fn plan_baseline_rejects_rebaseline_without_reason() {
+    let server = clocked_server(0);
+    let plan_id = baselined_plan(&server).await;
+    let err = call_err(&server, "plan.baseline", json!({ "plan_id": plan_id })).await;
+    assert!(err.message.starts_with("INVALID_GRAPH:"), "{}", err.message);
+}
+
+#[tokio::test]
+async fn plan_baseline_with_reason_returns_the_next_number() {
+    let server = clocked_server(0);
+    let plan_id = baselined_plan(&server).await;
+    let out = call_ok(
+        &server,
+        "plan.baseline",
+        json!({ "plan_id": plan_id, "reason": "scope change" }),
+    )
+    .await;
+    assert_eq!(out["baseline_number"], json!(2));
+}
+
+#[tokio::test]
+async fn plan_baseline_accepts_a_calendar() {
+    let server = clocked_server(0);
+    let plan_id = submit_plan(&server).await;
+    let out = call_ok(
+        &server,
+        "plan.baseline",
+        json!({ "plan_id": plan_id, "calendar": { "hours_per_day": 6, "workdays": ["mon"] } }),
+    )
+    .await;
+    assert_eq!(out["calendar"]["hours_per_day"], json!(6.0));
+}
+
+#[tokio::test]
+async fn plan_baseline_rejects_unknown_calendar_field_as_invalid_params() {
+    let server = clocked_server(0);
+    let plan_id = submit_plan(&server).await;
+    let err = call_err(
+        &server,
+        "plan.baseline",
+        json!({ "plan_id": plan_id, "calendar": { "hours": 8 } }),
+    )
+    .await;
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+}
+
+#[tokio::test]
+async fn plan_baseline_on_draft_variant_returns_variant_not_selected() {
+    let server = clocked_server(0);
+    let main = call_ok(
+        &server,
+        "plan.sync",
+        json!({ "graph": sample_graph(), "project": "p", "name": "web" }),
+    )
+    .await;
+    let alt = call_ok(
+        &server,
+        "plan.fork",
+        json!({ "plan_id": main["plan_id"], "variant": "alt" }),
+    )
+    .await;
+    let err = call_err(
+        &server,
+        "plan.baseline",
+        json!({ "plan_id": alt["plan_id"] }),
+    )
+    .await;
+    assert!(
+        err.message.starts_with("VARIANT_NOT_SELECTED"),
+        "{}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn plan_snapshot_markdown_contains_header_row() {
+    let server = clocked_server(1);
+    let plan_id = baselined_plan(&server).await;
+    let out = call_ok(
+        &server,
+        "plan.snapshot",
+        json!({ "plan_id": plan_id, "format": "markdown" }),
+    )
+    .await;
+    assert!(
+        out["export"]
+            .as_str()
+            .is_some_and(|md| md.starts_with("| date | PV | EV | AC | SPI | CPI | EAC |")),
+        "{out}"
+    );
+}
+
+#[tokio::test]
+async fn plan_snapshot_defaults_to_json_export() {
+    let server = clocked_server(1);
+    let plan_id = baselined_plan(&server).await;
+    let out = call_ok(&server, "plan.snapshot", json!({ "plan_id": plan_id })).await;
+    assert_eq!(out["export"][0]["pv"], out["summary"]["pv"]);
+}
+
+#[tokio::test]
+async fn plan_snapshot_rejects_unknown_format_as_invalid_params() {
+    let server = clocked_server(1);
+    let plan_id = baselined_plan(&server).await;
+    let err = call_err(
+        &server,
+        "plan.snapshot",
+        json!({ "plan_id": plan_id, "format": "csv" }),
+    )
+    .await;
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+}
+
+#[tokio::test]
+async fn plan_snapshots_with_low_spi_raise_alert() {
+    let server = clocked_server(0);
+    let plan_id = baselined_plan(&server).await;
+    let mut last = Value::Null;
+    for as_of in ["2026-01-05T02:00:00Z", "2026-01-05T03:00:00Z"] {
+        last = call_ok(
+            &server,
+            "plan.snapshot",
+            json!({ "plan_id": plan_id, "as_of": as_of }),
+        )
+        .await;
+    }
+    assert_eq!(last["summary"]["alerts"], json!(["SPI_BELOW_0_9"]));
+}
+
+/// Every `null` in an EV report must be a ratio its `undefined` list
+/// explains; returns the offending JSON paths.
+fn unexplained_nulls(report: &Value) -> Vec<String> {
+    fn walk(v: &Value, path: String, out: &mut Vec<String>) {
+        match v {
+            Value::Null => out.push(path),
+            Value::Array(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    walk(item, format!("{path}[{i}]"), out);
+                }
+            }
+            Value::Object(map) => {
+                for (k, item) in map {
+                    walk(item, format!("{path}.{k}"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let explained: Vec<String> = report["undefined"]
+        .as_array()
+        .map(|u| {
+            u.iter()
+                .filter_map(|e| e["field"].as_str().map(|f| format!(".{f}")))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut nulls = Vec::new();
+    walk(report, String::new(), &mut nulls);
+    nulls.retain(|p| !explained.contains(p));
+    let text = report.to_string();
+    if text.contains("NaN") || text.contains("inf") {
+        nulls.push(format!("non-finite literal in {text}"));
+    }
+    nulls
+}
+
+#[tokio::test]
+async fn plan_ev_never_serialises_unexplained_null_or_nan() {
+    let mut seed: u64 = 0x5eed_cafe;
+    let mut next = |n: u64| {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 33) % n
+    };
+    let rules = ["zero_hundred", "fifty_fifty", "weighted"];
+    let mut failures = Vec::new();
+    for case in 0..40 {
+        let server = clocked_server(0);
+        let count = 1 + next(5) as usize;
+        let deliverables: Vec<Value> = (0..count)
+            .map(|i| {
+                let prereqs: Vec<String> = (0..i)
+                    .filter(|_| next(3) == 0)
+                    .map(|p| format!("d{p}"))
+                    .collect();
+                let effort = [0.0, 0.5, 3.0, 12.0][next(4) as usize];
+                let rule = rules[next(3) as usize];
+                let mut d = json!({
+                    "id": format!("d{i}"),
+                    "owned_files": [format!("src/f{i}.rs")],
+                    "prerequisites": prereqs,
+                    "estimated_effort_hours": effort,
+                    "earning_rule": rule,
+                });
+                if next(2) == 0 {
+                    let rate = [0.0, 0.5, 2.0][next(3) as usize];
+                    d["metadata"] = json!({ "cost_rate": rate });
+                }
+                d
+            })
+            .collect();
+        let plan = call_ok(
+            &server,
+            TOOL_SUBMIT,
+            json!({ "graph": { "deliverables": deliverables } }),
+        )
+        .await;
+        let plan_id = plan["plan_id"].as_str().unwrap().to_string();
+        let mut baseline = json!({ "plan_id": plan_id, "start": "2026-01-05T00:00:00Z" });
+        if next(2) == 0 {
+            baseline["calendar"] = json!({ "hours_per_day": 8, "workdays": ["mon", "tue"] });
+        }
+        call_ok(&server, "plan.baseline", baseline).await;
+        let cohort = call_ok(
+            &server,
+            TOOL_ACQUIRE_COHORT,
+            json!({ "plan_id": plan_id, "caller_id": "w", "max_count": 10 }),
+        )
+        .await;
+        for d in cohort["deliverables"].as_array().into_iter().flatten() {
+            let mut mark = json!({
+                "plan_id": plan_id,
+                "deliverable_id": d["id"],
+                "caller_id": "w",
+                "status": { "status": "in_progress" },
+                "earned_pct": next(101),
+            });
+            if next(2) == 0 {
+                let hours = [0.0, 1.5, 40.0][next(3) as usize];
+                mark["actual_effort_hours"] = json!(hours);
+            }
+            call_ok(&server, TOOL_MARK_STATUS, mark).await;
+        }
+        let as_of = ev_t0() + chrono::Duration::hours(next(120) as i64 - 10);
+        let report = call_ok(
+            &server,
+            "plan.ev",
+            json!({ "plan_id": plan_id, "as_of": as_of.to_rfc3339() }),
+        )
+        .await;
+        let bad = unexplained_nulls(&report);
+        if !bad.is_empty() {
+            failures.push((case, bad));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:?}");
+}
+
+#[test]
+fn instructions_mention_every_tool() {
+    use rmcp::ServerHandler;
+    let text = server().get_info().instructions.unwrap_or_default();
+    let missing: Vec<&str> = cpm_planner::PLAN_TOOL_NAMES
+        .iter()
+        .copied()
+        .filter(|name| !text.contains(&format!("  {name} ")))
+        .collect();
+    assert_eq!(missing, Vec::<&str>::new());
 }

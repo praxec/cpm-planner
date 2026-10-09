@@ -35,6 +35,9 @@
 //! | `plan.select`            | [`Planner::select_variant`]   |
 //! | `plan.archive`           | [`Planner::archive`]          |
 //! | `plan.compare`           | [`Planner::compare_plans`]    |
+//! | `plan.baseline`          | [`BasicCpmPlanner::baseline`] |
+//! | `plan.ev`                | [`BasicCpmPlanner::earned_value`] |
+//! | `plan.snapshot`          | [`BasicCpmPlanner::snapshot`] |
 //!
 //! # Error mapping
 //!
@@ -44,7 +47,7 @@
 //! `OVERLAP_DETECTED:`, `MISSING_PREREQUISITE:`, `PLAN_NOT_FOUND:`,
 //! `DELIVERABLE_NOT_FOUND:`, `LAPSE_LIMIT:`, `PREREQUISITES_INCOMPLETE:`, `INVALID_GRAPH:`,
 //! `INVALID_CAPACITIES:`, `VARIANT_NOT_SELECTED:`, `ARCHIVE_REFUSED:`,
-//! `INVALID_PATH:`, `BACKEND_ERROR:`) are
+//! `INVALID_PATH:`, `INVALID_ACTUALS:`, `NOT_BASELINED:`, `BACKEND_ERROR:`) are
 //! stable machine-parseable signals — see `core::plan` for the contract.
 //! Malformed arguments yield `invalid_params` with the serde error.
 //!
@@ -60,6 +63,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::compare::{CompareRequest, CompareWeights};
+use crate::earned_value::{BaselineRequest, Calendar, SnapshotFormat, SnapshotRequest};
 use crate::edits::GraphEdit;
 use crate::monte_carlo::MonteCarloRequest;
 use crate::plan::{
@@ -71,6 +75,7 @@ use crate::ports::Planner;
 use crate::project::ProjectRoot;
 use crate::resource_schedule::{ScheduleRequest, resource_schedule};
 use crate::simulate::SimulateRequest;
+use chrono::{DateTime, Utc};
 use rmcp::ErrorData as McpError;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, Implementation, InitializeRequestParams,
@@ -107,8 +112,11 @@ pub const TOOL_FORK: &str = "plan.fork";
 pub const TOOL_SELECT: &str = "plan.select";
 pub const TOOL_ARCHIVE: &str = "plan.archive";
 pub const TOOL_COMPARE: &str = "plan.compare";
+pub const TOOL_BASELINE: &str = "plan.baseline";
+pub const TOOL_EV: &str = "plan.ev";
+pub const TOOL_SNAPSHOT: &str = "plan.snapshot";
 
-/// All nineteen MCP tool names exposed by [`PlanServer`], in declaration order.
+/// All twenty-two MCP tool names exposed by [`PlanServer`], in declaration order.
 pub const PLAN_TOOL_NAMES: &[&str] = &[
     TOOL_SUBMIT,
     TOOL_ACQUIRE_COHORT,
@@ -129,6 +137,9 @@ pub const PLAN_TOOL_NAMES: &[&str] = &[
     TOOL_SELECT,
     TOOL_ARCHIVE,
     TOOL_COMPARE,
+    TOOL_BASELINE,
+    TOOL_EV,
+    TOOL_SNAPSHOT,
 ];
 
 // ---------------------------------------------------------------------------
@@ -388,6 +399,41 @@ struct CompareArgs {
     weights: CompareWeights,
 }
 
+// ── Earned-value tool args ──────────────────────────────────────────────────
+
+/// `plan.baseline`: freeze the plan's schedule and budgets as a baseline.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BaselineArgs {
+    plan_id: String,
+    #[serde(default)]
+    start: Option<DateTime<Utc>>,
+    #[serde(default)]
+    calendar: Option<Calendar>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// `plan.ev`: the earned-value report against the latest baseline.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EvArgs {
+    plan_id: String,
+    #[serde(default)]
+    as_of: Option<DateTime<Utc>>,
+}
+
+/// `plan.snapshot`: append an EV snapshot and render the history.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotArgs {
+    plan_id: String,
+    #[serde(default)]
+    as_of: Option<DateTime<Utc>>,
+    #[serde(default)]
+    format: SnapshotFormat,
+}
+
 // ---------------------------------------------------------------------------
 // Per-tool response shapes
 // ---------------------------------------------------------------------------
@@ -525,6 +571,19 @@ fn weights_schema() -> Value {
             "criticality_risk": criterion(),
             "total_effort": criterion(),
             "peak_load": criterion()
+        },
+        "additionalProperties": false
+    })
+}
+
+fn calendar_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Working-time calendar: only working hours advance the PV clock. Omitted: wall-clock hours. A workday contributes hours_per_day hours starting at 00:00 local time.",
+        "properties": {
+            "hours_per_day": { "type": "number", "exclusiveMinimum": 0, "maximum": 24, "description": "Default 8." },
+            "workdays": { "type": "array", "minItems": 1, "items": { "type": "string", "enum": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] }, "description": "Default mon..fri." },
+            "utc_offset_minutes": { "type": "integer", "minimum": -1440, "maximum": 1440, "description": "Local offset from UTC; default 0." }
         },
         "additionalProperties": false
     })
@@ -1019,6 +1078,70 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                 "additionalProperties": false
             })),
         ),
+        Tool::new(
+            Cow::Borrowed(TOOL_BASELINE),
+            Cow::Borrowed(
+                "Freeze the plan's current CPM schedule (earliest start/finish) and budgets \
+                 (effort basis x metadata.cost_rate) as its next numbered baseline for earned \
+                 value. The first baseline is number 1; re-baselining needs a non-blank \
+                 `reason` (INVALID_GRAPH otherwise) and keeps actuals and snapshots. \
+                 Execution-side: the plan must be its line's selected, unarchived variant \
+                 (VARIANT_NOT_SELECTED / ARCHIVE_REFUSED). Audited as plan.ev.baselined.",
+            ),
+            schema_object(json!({
+                "type": "object",
+                "properties": {
+                    "plan_id": { "type": "string" },
+                    "start": { "type": "string", "format": "date-time", "description": "RFC 3339 instant the PV clock starts from; defaults to now." },
+                    "calendar": calendar_schema(),
+                    "reason": { "type": "string", "maxLength": 2048, "description": "Why the plan is re-baselined; required when a baseline exists." }
+                },
+                "required": ["plan_id"],
+                "additionalProperties": false
+            })),
+        ),
+        Tool::new(
+            Cow::Borrowed(TOOL_EV),
+            Cow::Borrowed(
+                "Earned-value report against the plan's latest baseline as of `as_of` \
+                 (default now): BAC, PV, EV, AC, SV, CV, SPI, CPI, EAC, ETC, VAC, TCPI, \
+                 per-deliverable rows, critical float consumed, SPI_BELOW_0_9 / \
+                 CPI_BELOW_0_9 alerts from the two latest snapshots, and deliverables \
+                 added since the baseline. A ratio whose denominator is 0 is null and \
+                 explained in `undefined`. Read-only; works on any variant. \
+                 NOT_BASELINED before plan.baseline.",
+            ),
+            schema_object(json!({
+                "type": "object",
+                "properties": {
+                    "plan_id": { "type": "string" },
+                    "as_of": { "type": "string", "format": "date-time", "description": "RFC 3339 status date; defaults to now." }
+                },
+                "required": ["plan_id"],
+                "additionalProperties": false
+            })),
+        ),
+        Tool::new(
+            Cow::Borrowed(TOOL_SNAPSHOT),
+            Cow::Borrowed(
+                "Compute the earned-value report (as plan.ev) and append it as a \
+                 snapshot. Returns the snapshot summary (alerts consider this snapshot \
+                 and the previous one) and an export of the newest 100 snapshots: a \
+                 list of summaries (format json, default) or a Markdown table with \
+                 columns date, PV, EV, AC, SPI, CPI, EAC (format markdown). \
+                 Execution-side like plan.baseline. NOT_BASELINED before plan.baseline.",
+            ),
+            schema_object(json!({
+                "type": "object",
+                "properties": {
+                    "plan_id": { "type": "string" },
+                    "as_of": { "type": "string", "format": "date-time", "description": "RFC 3339 status date; defaults to now." },
+                    "format": { "type": "string", "enum": ["json", "markdown"], "description": "Export format (default json)." }
+                },
+                "required": ["plan_id"],
+                "additionalProperties": false
+            })),
+        ),
     ]
 }
 
@@ -1044,7 +1167,7 @@ fn schema_object(value: Value) -> Arc<rmcp::model::JsonObject> {
 // PlanServer
 // ---------------------------------------------------------------------------
 
-/// MCP server façade exposing a [`BasicCpmPlanner`] over nineteen tools.
+/// MCP server façade exposing a [`BasicCpmPlanner`] over twenty-two tools.
 #[derive(Clone)]
 pub struct PlanServer {
     planner: Arc<BasicCpmPlanner>,
@@ -1184,6 +1307,9 @@ impl PlanServer {
             TOOL_SELECT => self.handle_select(args).await,
             TOOL_ARCHIVE => self.handle_archive(args).await,
             TOOL_COMPARE => self.handle_compare(args).await,
+            TOOL_BASELINE => self.handle_baseline(args).await,
+            TOOL_EV => self.handle_ev(args).await,
+            TOOL_SNAPSHOT => self.handle_snapshot(args).await,
             other => Err(McpError::invalid_params(
                 format!(
                     "Unknown tool '{other}'. Available: {}.",
@@ -1615,6 +1741,39 @@ impl PlanServer {
         let comparison = run_blocking(move || crate::compare::compare(&inputs, &request)).await?;
         to_value(&comparison)
     }
+
+    // ── Earned-value handlers ──────────────────────────────────────────────
+
+    async fn handle_baseline(&self, args: Value) -> Result<Value, McpError> {
+        let parsed: BaselineArgs = parse_args(args)?;
+        let mut request = BaselineRequest::new(PlanId(parsed.plan_id));
+        request.start = parsed.start;
+        request.calendar = parsed.calendar;
+        request.reason = parsed.reason;
+        let outcome = self
+            .planner
+            .baseline(request)
+            .await
+            .map_err(planner_error_to_mcp)?;
+        to_value(&outcome)
+    }
+
+    async fn handle_ev(&self, args: Value) -> Result<Value, McpError> {
+        let parsed: EvArgs = parse_args(args)?;
+        let planner = Arc::clone(&self.planner);
+        let plan_id = PlanId(parsed.plan_id);
+        let report = run_blocking(move || planner.earned_value(&plan_id, parsed.as_of)).await?;
+        to_value(&report)
+    }
+
+    async fn handle_snapshot(&self, args: Value) -> Result<Value, McpError> {
+        let parsed: SnapshotArgs = parse_args(args)?;
+        let mut request = SnapshotRequest::new(PlanId(parsed.plan_id)).with_format(parsed.format);
+        request.as_of = parsed.as_of;
+        let planner = Arc::clone(&self.planner);
+        let outcome = run_blocking(move || planner.snapshot(request)).await?;
+        to_value(&outcome)
+    }
 }
 
 /// Range checks the analysis tools apply before any work, as
@@ -1666,7 +1825,7 @@ impl ServerHandler for PlanServer {
             Implementation::new(self.server_name.clone(), self.server_version.clone());
         server_info.title = Some("cpm-planner".to_string());
         server_info.description = Some(
-            "MCP server exposing the open-source Praxec CPM planner via nineteen tools."
+            "MCP server exposing the open-source Praxec CPM planner via twenty-two tools."
                 .to_string(),
         );
 
@@ -1768,7 +1927,7 @@ fn planner_error_to_mcp(err: PlannerError) -> McpError {
 fn instructions() -> &'static str {
     r#"This is the cpm-planner MCP server — the open-source CPM planner.
 
-Tools (nineteen total, all `plan.<verb>`):
+Tools (twenty-two total, all `plan.<verb>`):
   plan.submit          — submit a PlanGraph, get a plan_id (idempotent on identical graphs)
                         a prerequisite is an id string or {id, consumes?, kind?: artifact|interface, lag_hours?}; a deliverable's duration_hours (calendar time; when absent the default is the effort estimate, explicit or estimator-derived) and lag_hours (minimum wait after a prerequisite finishes) drive the schedule
                         a milestone (milestone: true) is zero-length unless you give it an estimate or duration; it is still an ordinary deliverable someone must complete (accept or mark Complete), and it is not leased if metadata.kind=manual
@@ -1778,7 +1937,7 @@ Tools (nineteen total, all `plan.<verb>`):
   plan.acquire_cohort  — atomically acquire ready deliverables with no conflicting file claims (an owned_files entry may be {path, mode: "append"}: append claims on one path may be co-leased and are listed in the response's shared_paths; exclusive claims never overlap anything at once; plan.submit accepts a shared file only when the claimants are ordered by prerequisites, or all claims are append)
   plan.heartbeat       — refresh a held lock's TTL
   plan.mark_status     — set a deliverable's status (Complete/Failed releases the lock); lockless Complete/Ready/InProgress requires complete prerequisites (PREREQUISITES_INCOMPLETE) and is audited
-                        optional earned-value progress: earned_pct (integer 0..100, only with in_progress; accepted and ignored with complete), actual_effort_hours (total so far, finite 0..1000000; replaces leased hours as actual cost), evidence (<= 2048 chars, appended to the deliverable's list, at most 100 entries); violations are INVALID_ACTUALS. plan.select copies the actuals of every deliverable whose Complete status it carries. Every lease that ends (complete, failed, force_release, expiry, accept override, forced revise/select/archive) adds its hours (up to expiry for a lapsed lease) to the deliverable's leased hours
+                        optional earned-value progress: earned_pct (integer 0..100, only with in_progress; accepted and ignored with complete), actual_effort_hours (total so far, finite 0..1000000; replaces leased hours as actual cost), evidence (<= 2048 chars, appended to the deliverable's list, at most 100 entries); violations are INVALID_ACTUALS. plan.select copies the actuals of every deliverable whose Complete status it carries (leased hours add up; the carried deliverable's reported earned_pct and hours win; the newest 100 evidence entries are kept). Every lease that ends (complete, failed, force_release, expiry, accept override, forced revise/select/archive) adds its hours (up to expiry for a lapsed lease) to the deliverable's leased hours
   plan.status          — read-only snapshot ([id, status, attempt_count, failure_count, lapse_count] rows, critical_path (one real chain, always __start__ to __finish__), critical_ids, per-deliverable schedule (es/ef/ls/lf/float, hours; synthetic __start__/__finish__ endpoint rows have synthetic=true and critical=true; critical_ids lists only real deliverables), the ready set in acquire/ready priority order (smallest latest start first, i.e. longest remaining tail, then least float, then id), plan_complete, milestones (one row per `milestone: true` deliverable, or metadata.milestone == true: id, critical_path from __start__ to it, hours = its earliest finish, complete), held locks; for a named variant also name, variant, selected and definition_drift). __start__ and __finish__ are reserved deliverable ids (INVALID_GRAPH)
                         definition_drift: null when unknown (no root for the variant's project, no tracked file, file missing/unreadable/over 8 MiB); false when the file matches the last synced/exported bytes or its graph equals the head graph (re-formatting is not drift); true when the file's graph differs from the head or does not parse — so after an inline revise it is true until plan.export or plan.sync {path}
   plan.get             — return the submitted PlanGraph (deliverables, estimates, files, metadata) for a plan_id
@@ -1795,6 +1954,9 @@ Tools (nineteen total, all `plan.<verb>`):
   plan.select          — make a variant its line's selected (only executable) variant, carrying progress over (Complete statuses of identically defined deliverables, with their earned-value actuals); force releases locks on the previous variant
   plan.archive         — archive (archived defaults true) or unarchive a whole line or one variant; archived variants stay readable but refuse sync/select/execute
   plan.compare         — compare stored plans (plan_ids: 2..16 distinct ids, or plan line name in project, default the discovered root, for every live variant, at most 16) on the scorecard: Pareto front, weighted rank, recommended; weights must be finite and >= 0; the Monte Carlo budget (200000000) is shared across variants
+  plan.baseline        — freeze the plan's CPM schedule (es/ef) and budgets (effort basis x metadata.cost_rate, default 1) as its next numbered earned-value baseline; optional start (RFC 3339, default now) and calendar {hours_per_day (0 < h <= 24, default 8), workdays (default mon..fri), utc_offset_minutes (default 0)} (omitted: wall-clock hours); re-baselining needs a non-blank reason (<= 2048 chars, INVALID_GRAPH otherwise) and keeps actuals and snapshots; selected, unarchived variant only; audited as plan.ev.baselined
+  plan.ev              — earned-value report against the latest baseline as of as_of (RFC 3339, default now): bac, pv, ev, ac, sv, cv, spi, cpi, eac, etc, vac, tcpi, per-deliverable rows, critical_float_consumed_hours, alerts (SPI_BELOW_0_9 / CPI_BELOW_0_9 when below 0.9 on the two latest snapshots), excluded_unbaselined; a ratio with a zero denominator is null and explained in `undefined` (never NaN); read-only on any variant; NOT_BASELINED before plan.baseline
+  plan.snapshot        — compute the plan.ev report and append it as a snapshot; returns summary (alerts consider this snapshot and the previous one), snapshot_count and export of the newest 100 snapshots: a list of summaries (format "json", default) or a Markdown table with columns date, PV, EV, AC, SPI, CPI, EAC (format "markdown"); selected, unarchived variant only; NOT_BASELINED before plan.baseline
   plan.submit with a `name` (optional `project`/`variant`, variant defaults to "main") registers a named variant instead of an unnamed plan
   plan.lint, plan.simulate take exactly one of an inline graph, a stored plan_id, or a plan-file path; plan.schedule takes graph or plan_id; plan.schedule and plan.simulate reject what plan.submit rejects, and plan.lint reports it as findings
 
@@ -1814,7 +1976,7 @@ Errors carry stable prefixes: LOCK_HELD, LOCK_NOT_HELD, LOCK_EXPIRED,
 OVERLAP_DETECTED, MISSING_PREREQUISITE, PLAN_NOT_FOUND,
 DELIVERABLE_NOT_FOUND, LAPSE_LIMIT, PREREQUISITES_INCOMPLETE, INVALID_GRAPH,
 INVALID_CAPACITIES, VARIANT_NOT_SELECTED, ARCHIVE_REFUSED, INVALID_PATH,
-INVALID_ACTUALS, BACKEND_ERROR.
+INVALID_ACTUALS, NOT_BASELINED, BACKEND_ERROR.
 
 DeliverableStatus is internally tagged on `status`:
   {"status":"pending"} | {"status":"ready"} | {"status":"in_progress"} |
