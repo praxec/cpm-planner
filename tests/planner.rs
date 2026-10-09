@@ -24,6 +24,7 @@ fn deliverable(id: &str, files: &[&str], prereqs: &[&str], effort: Option<f32>) 
         estimated_effort_hours: effort,
         metadata: serde_json::Value::Null,
         duration_hours: None,
+        estimate: None,
         milestone: false,
     }
 }
@@ -1887,4 +1888,128 @@ async fn ordered_sharer_is_not_leased_while_predecessor_holds_the_file() {
         codes(&cohort),
         vec![("b".to_string(), "NOT_READY".to_string())]
     );
+}
+
+// ── P4 Task 0: three-point estimates ────────────────────────────────────────
+
+fn with_estimate(mut d: Deliverable, estimate: cpm_planner::plan::Estimate) -> Deliverable {
+    d.estimate = Some(estimate);
+    d
+}
+
+fn estimate(optimistic: f32, likely: f32, pessimistic: f32) -> cpm_planner::plan::Estimate {
+    cpm_planner::plan::Estimate {
+        optimistic,
+        likely,
+        pessimistic,
+    }
+}
+
+async fn scheduled_ef(planner: &BasicCpmPlanner, graph: PlanGraph, id: &str) -> f32 {
+    let plan_id = planner.submit_plan(graph).await.unwrap();
+    let status = planner.status(&plan_id).await.unwrap();
+    status
+        .schedule
+        .iter()
+        .find(|row| row.id == id)
+        .expect("scheduled row")
+        .ef
+}
+
+#[tokio::test]
+async fn estimate_likely_sets_scheduled_length_when_no_effort() {
+    let planner = BasicCpmPlanner::new();
+    let graph = PlanGraph {
+        deliverables: vec![with_estimate(
+            deliverable("a", &["src/a.rs"], &[], None),
+            estimate(1.0, 3.0, 5.0),
+        )],
+        max_chained_dispatch: None,
+    };
+    assert_eq!(scheduled_ef(&planner, graph, "a").await, 3.0);
+}
+
+#[tokio::test]
+async fn explicit_effort_beats_estimate_likely() {
+    let planner = BasicCpmPlanner::new();
+    let graph = PlanGraph {
+        deliverables: vec![with_estimate(
+            deliverable("a", &["src/a.rs"], &[], Some(2.0)),
+            estimate(1.0, 3.0, 5.0),
+        )],
+        max_chained_dispatch: None,
+    };
+    assert_eq!(scheduled_ef(&planner, graph, "a").await, 2.0);
+}
+
+#[tokio::test]
+async fn duration_beats_estimate() {
+    let planner = BasicCpmPlanner::new();
+    let mut d = with_estimate(
+        deliverable("a", &["src/a.rs"], &[], None),
+        estimate(1.0, 3.0, 5.0),
+    );
+    d.duration_hours = Some(7.0);
+    let graph = PlanGraph {
+        deliverables: vec![d],
+        max_chained_dispatch: None,
+    };
+    assert_eq!(scheduled_ef(&planner, graph, "a").await, 7.0);
+}
+
+#[tokio::test]
+async fn estimate_with_optimistic_above_likely_is_invalid_graph() {
+    let planner = BasicCpmPlanner::new();
+    let graph = PlanGraph {
+        deliverables: vec![with_estimate(
+            deliverable("a", &["src/a.rs"], &[], None),
+            estimate(3.0, 2.0, 4.0),
+        )],
+        max_chained_dispatch: None,
+    };
+    let err = planner.submit_plan(graph).await.unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "INVALID_GRAPH: deliverable 'a' estimate must satisfy 0 <= optimistic <= likely <= pessimistic"
+    );
+}
+
+#[tokio::test]
+async fn estimate_changes_plan_identity() {
+    let planner = BasicCpmPlanner::new();
+    let without = PlanGraph {
+        deliverables: vec![deliverable("a", &["src/a.rs"], &[], None)],
+        max_chained_dispatch: None,
+    };
+    let with = PlanGraph {
+        deliverables: vec![with_estimate(
+            deliverable("a", &["src/a.rs"], &[], None),
+            estimate(1.0, 3.0, 5.0),
+        )],
+        max_chained_dispatch: None,
+    };
+    assert_ne!(
+        planner.submit_plan(without).await.unwrap(),
+        planner.submit_plan(with).await.unwrap()
+    );
+}
+
+#[tokio::test]
+async fn submit_rejects_unknown_estimate_field() {
+    use rmcp::model::CallToolRequestParams;
+
+    let server = cpm_planner::PlanServer::new(Arc::new(BasicCpmPlanner::new()));
+    let args = serde_json::json!({
+        "graph": {
+            "deliverables": [{
+                "id": "a",
+                "owned_files": ["src/a.rs"],
+                "prerequisites": [],
+                "estimate": { "optimistic": 1.0, "likely": 2.0, "pessimistic": 3.0, "bogus": 4.0 }
+            }]
+        }
+    });
+    let request = CallToolRequestParams::new(cpm_planner::TOOL_SUBMIT.to_string())
+        .with_arguments(args.as_object().unwrap().clone());
+    assert!(server.dispatch_call(request).await.is_err());
 }

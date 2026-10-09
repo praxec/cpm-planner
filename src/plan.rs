@@ -254,6 +254,23 @@ impl From<PathBuf> for OwnedFile {
     }
 }
 
+/// Optional three-point effort estimate for a [`Deliverable`].
+///
+/// The three points must satisfy `0 <= optimistic <= likely <= pessimistic`
+/// and all be finite; [`crate::planner`] rejects violations as
+/// [`PlannerError::InvalidGraph`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Estimate {
+    /// Best-case effort in hours.
+    pub optimistic: f32,
+    /// Most-likely effort in hours; used as the scheduled length when no
+    /// explicit effort or duration is set.
+    pub likely: f32,
+    /// Worst-case effort in hours.
+    pub pessimistic: f32,
+}
+
 /// A single unit of work scheduled by the Planner.
 ///
 /// `owned_files` is the load-bearing field for concurrent dispatch: the
@@ -291,6 +308,12 @@ pub struct Deliverable {
     /// effort stays the cost basis. Must be finite and >= 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_hours: Option<f32>,
+
+    /// Optional three-point effort estimate. When neither `duration_hours`
+    /// nor `estimated_effort_hours` is set, `likely` is the scheduled length
+    /// and the basis for cost, DRAG and Monte Carlo sampling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate: Option<Estimate>,
 
     /// Free-form metadata. Conventionally carries model hints, human
     /// descriptions, links to specs, etc. The Planner does not interpret
@@ -903,6 +926,7 @@ mod tests {
                 estimated_effort_hours: Some(1.5),
                 metadata: serde_json::json!({"description": "smoke test"}),
                 duration_hours: None,
+                estimate: None,
                 milestone: false,
             }],
             max_chained_dispatch: Some(8),
@@ -964,6 +988,7 @@ mod tests {
                         estimated_effort_hours: Some(1.0),
                         metadata: serde_json::Value::Null,
                         duration_hours: None,
+                        estimate: None,
                         milestone: false,
                     },
                     lock: LockInfo {
@@ -982,6 +1007,7 @@ mod tests {
                         estimated_effort_hours: Some(2.0),
                         metadata: serde_json::Value::Null,
                         duration_hours: None,
+                        estimate: None,
                         milestone: false,
                     },
                     lock: LockInfo {

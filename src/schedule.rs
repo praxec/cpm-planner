@@ -77,15 +77,72 @@ fn endpoint_task(id: &str, dependencies: Vec<String>) -> Task {
     }
 }
 
+/// Kind-aware effort derived from `metadata`, used as the last resort when
+/// neither an explicit effort, a three-point estimate nor a milestone
+/// zero-length rule applies.
+fn derived_effort(d: &Deliverable, estimator: &EffortEstimator) -> f32 {
+    let kind = TaskKind::Custom {
+        description: d
+            .metadata
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+    };
+    // Coarse complexity hint from metadata; defaults to false.
+    let is_complex = d
+        .metadata
+        .get("complexity")
+        .or_else(|| d.metadata.get("is_complex"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    estimator.estimate(&kind, is_complex)
+}
+
+/// Scheduled length in hours for a deliverable. Precedence:
+/// `duration_hours`, else `estimated_effort_hours`, else `estimate.likely`,
+/// else `0.0` for a milestone with no duration, else the estimator's
+/// kind-aware effort.
+pub(crate) fn scheduled_length(d: &Deliverable, estimator: &EffortEstimator) -> f32 {
+    if let Some(hours) = d.duration_hours {
+        return hours;
+    }
+    if let Some(hours) = d.estimated_effort_hours {
+        return hours;
+    }
+    if let Some(estimate) = d.estimate {
+        return estimate.likely;
+    }
+    if d.is_milestone() {
+        return 0.0;
+    }
+    derived_effort(d, estimator)
+}
+
+/// Cost basis in hours for a deliverable: `estimated_effort_hours`, else
+/// `estimate.likely`, else `0.0` for a milestone, else the estimator's
+/// kind-aware effort. Unlike [`scheduled_length`] this ignores
+/// `duration_hours`: calendar time is not cost.
+#[allow(dead_code)] // consumed by later P4 analysis modules
+pub(crate) fn effort_basis(d: &Deliverable, estimator: &EffortEstimator) -> f32 {
+    if let Some(hours) = d.estimated_effort_hours {
+        return hours;
+    }
+    if let Some(estimate) = d.estimate {
+        return estimate.likely;
+    }
+    if d.is_milestone() {
+        return 0.0;
+    }
+    derived_effort(d, estimator)
+}
+
 /// Convert each [`Deliverable`] into a [`Task`] for the CPM kernel.
 ///
-/// Effort precedence: an explicit `estimated_effort_hours` on the
-/// deliverable always wins. When it is absent we ask `estimator` to derive
-/// a kind-aware estimate rather than falling back to the flat
-/// [`DEFAULT_EFFORT_HOURS`] placeholder. A `complexity` hint can be carried
-/// in `metadata` (boolean `complexity`/`is_complex`) to opt a deliverable
-/// into the configured complexity multiplier. A milestone is zero-length
-/// unless you give it an estimate or duration.
+/// The task's scheduled length comes from [`scheduled_length`]; a
+/// `complexity` hint can be carried in `metadata` (boolean
+/// `complexity`/`is_complex`) to opt a deliverable into the configured
+/// complexity multiplier.
 pub(crate) fn deliverable_to_task(d: &Deliverable, estimator: &EffortEstimator) -> Task {
     let description = d
         .metadata
@@ -95,26 +152,7 @@ pub(crate) fn deliverable_to_task(d: &Deliverable, estimator: &EffortEstimator) 
         .to_string();
     let kind = TaskKind::Custom { description };
 
-    let effort_hours = match d.estimated_effort_hours {
-        Some(explicit) => explicit,
-        // A milestone is zero-length unless it is given an estimate or a
-        // duration; the estimator is not consulted.
-        None if d.is_milestone() && d.duration_hours.is_none() => 0.0,
-        None => {
-            // Coarse complexity hint from metadata; defaults to false.
-            let is_complex = d
-                .metadata
-                .get("complexity")
-                .or_else(|| d.metadata.get("is_complex"))
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            estimator.estimate(&kind, is_complex)
-        }
-    };
-
-    // Calendar duration, when given, is the scheduled length; effort stays
-    // on the deliverable as the cost basis.
-    let scheduled_hours = d.duration_hours.unwrap_or(effort_hours);
+    let scheduled_hours = scheduled_length(d, estimator);
     // A repeated prerequisite id takes its largest lag, independent of order.
     let mut lag_by_dependency: std::collections::HashMap<String, f32> =
         std::collections::HashMap::new();

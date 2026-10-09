@@ -251,6 +251,11 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                                         ] } },
                                         "estimated_effort_hours": { "type": "number" },
                                         "duration_hours":         { "type": "number", "minimum": 0, "description": "Calendar time on the schedule; replaces effort as the scheduled length. Effort stays the cost basis." },
+                                        "estimate":               { "type": "object", "description": "Optional three-point effort estimate; `likely` is the scheduled length when no duration or effort is given and the basis for cost and Monte Carlo sampling.", "properties": {
+                                            "optimistic":  { "type": "number", "minimum": 0 },
+                                            "likely":      { "type": "number", "minimum": 0 },
+                                            "pessimistic": { "type": "number", "minimum": 0 }
+                                        }, "required": ["optimistic", "likely", "pessimistic"], "additionalProperties": false },
                                         "milestone":              { "type": "boolean", "description": "Acceptance point; reported in plan.status milestones with its own critical path." },
                                         "metadata":              {}
                                     },

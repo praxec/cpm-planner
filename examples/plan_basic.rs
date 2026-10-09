@@ -63,6 +63,7 @@ fn deliverable(
         estimated_effort_hours: Some(estimated_effort_hours),
         metadata: serde_json::Value::Null,
         duration_hours: None,
+        estimate: None,
         milestone: false,
     }
 }

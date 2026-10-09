@@ -267,6 +267,7 @@ fn hash_graph(graph: &PlanGraph) -> String {
                 "prerequisites": prereqs,
                 "estimated_effort_hours": d.estimated_effort_hours,
                 "duration_hours": d.duration_hours,
+                "estimate": d.estimate,
                 "metadata": d.metadata,
                 "milestone": d.milestone,
             })
@@ -337,6 +338,27 @@ fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
                     d.id
                 ),
             });
+        }
+    }
+
+    // Three-point estimates, when present, must be finite, non-negative
+    // and ordered optimistic <= likely <= pessimistic.
+    for d in &graph.deliverables {
+        if let Some(e) = d.estimate {
+            let ordered = e.optimistic.is_finite()
+                && e.likely.is_finite()
+                && e.pessimistic.is_finite()
+                && e.optimistic >= 0.0
+                && e.optimistic <= e.likely
+                && e.likely <= e.pessimistic;
+            if !ordered {
+                return Err(PlannerError::InvalidGraph {
+                    reason: format!(
+                        "deliverable '{}' estimate must satisfy 0 <= optimistic <= likely <= pessimistic",
+                        d.id
+                    ),
+                });
+            }
         }
     }
 
@@ -1551,6 +1573,7 @@ mod tests {
             estimated_effort_hours: effort,
             metadata,
             duration_hours: None,
+            estimate: None,
             milestone: false,
         }
     }

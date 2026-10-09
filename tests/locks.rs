@@ -28,6 +28,7 @@ fn deliverable(id: &str, files: &[&str], prereqs: &[&str], effort: Option<f32>) 
         estimated_effort_hours: effort,
         metadata: serde_json::Value::Null,
         duration_hours: None,
+        estimate: None,
         milestone: false,
     }
 }

@@ -58,7 +58,8 @@ pub use algorithm::CpmAlgorithm;
 pub use drag::{DragResult, diameter, drag};
 pub use estimator::{EffortEstimator, EstimationConfig};
 pub use plan::{
-    AcceptRequest, AcquireRequest, ForceReleaseRequest, HeartbeatRequest, MarkStatusRequest,
+    AcceptRequest, AcquireRequest, Estimate, ForceReleaseRequest, HeartbeatRequest,
+    MarkStatusRequest,
 };
 pub use plan_store::{DB_PATH_ENV, SqlitePlanStore};
 pub use planner::{
