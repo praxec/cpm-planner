@@ -159,6 +159,22 @@ pub(crate) fn release_file_claims(
     }
 }
 
+/// The single re-derivation rule: `Ready` if every prerequisite of `d` is
+/// `Complete` in `statuses`, else `Pending`. Used by the in-memory reaper, the
+/// startup reaper in the store, and plan revision.
+pub(crate) fn rederive_status(
+    d: &crate::plan::Deliverable,
+    statuses: &HashMap<String, DeliverableStatus>,
+) -> DeliverableStatus {
+    if crate::graph::prerequisite_ids(d)
+        .all(|p| statuses.get(p) == Some(&DeliverableStatus::Complete))
+    {
+        DeliverableStatus::Ready
+    } else {
+        DeliverableStatus::Pending
+    }
+}
+
 impl PlanState {
     pub(crate) fn new(
         graph: PlanGraph,
@@ -229,7 +245,17 @@ impl PlanState {
                     release_file_claims(&mut self.file_claims, &id, &deliverable.owned_files);
                 }
                 *self.lapse_counts.entry(id.clone()).or_insert(0) += 1;
-                self.statuses.insert(id, DeliverableStatus::Ready);
+                // Re-derive rather than assume Ready: after a revision the
+                // lease can sit above a prerequisite that is no longer Complete.
+                let status = self
+                    .graph
+                    .deliverables
+                    .iter()
+                    .find(|d| d.id == id)
+                    .map_or(DeliverableStatus::Ready, |d| {
+                        rederive_status(d, &self.statuses)
+                    });
+                self.statuses.insert(id, status);
                 reaped.push(info);
             }
         }
@@ -265,5 +291,46 @@ mod tests {
         assert!(ex.conflicts_with(FileMode::Append));
         assert!(ap.conflicts_with(FileMode::Exclusive));
         assert!(!ap.conflicts_with(FileMode::Append));
+    }
+
+    #[test]
+    fn reaped_lease_with_incomplete_prerequisites_becomes_pending() {
+        use crate::plan::{CallerId, Deliverable, PlanId, Prerequisite};
+        let dl = |id: &str, pre: &[&str]| Deliverable {
+            id: id.to_string(),
+            owned_files: vec![],
+            prerequisites: pre
+                .iter()
+                .map(|p| Prerequisite::Id((*p).to_string()))
+                .collect(),
+            estimated_effort_hours: Some(1.0),
+            duration_hours: None,
+            estimate: None,
+            metadata: serde_json::json!({}),
+            milestone: false,
+        };
+        let graph = PlanGraph {
+            deliverables: vec![dl("a", &[]), dl("b", &["a"])],
+            max_chained_dispatch: None,
+        };
+        let cpm = crate::schedule::compute_cpm(&graph).expect("valid");
+        let statuses = HashMap::from([
+            ("a".to_string(), DeliverableStatus::Ready),
+            ("b".to_string(), DeliverableStatus::InProgress),
+        ]);
+        let mut state = PlanState::new(graph, statuses, cpm);
+        let now = Utc::now();
+        state.locks.insert(
+            "b".into(),
+            LockInfo {
+                plan_id: PlanId("p".into()),
+                deliverable_id: "b".into(),
+                caller_id: CallerId("w".into()),
+                acquired_at: now,
+                expires_at: now - chrono::Duration::hours(1),
+            },
+        );
+        state.reap_expired(now);
+        assert_eq!(state.statuses["b"], DeliverableStatus::Pending);
     }
 }

@@ -229,6 +229,43 @@ impl Default for BasicCpmPlanner {
 // Graph validation + hashing
 // ---------------------------------------------------------------------------
 
+/// Canonical JSON form of one deliverable: prerequisites and owned files
+/// sorted so declaration order never matters. Shared by `hash_graph` and
+/// plan revision's "did the definition change" test.
+pub(crate) fn canonical_deliverable(d: &Deliverable) -> serde_json::Value {
+    let mut prereqs: Vec<serde_json::Value> = d
+        .prerequisites
+        .iter()
+        .map(|p| {
+            json!({
+                "id": p.id(),
+                "consumes": p.consumes(),
+                "kind": p.kind(),
+                "lag_hours": p.lag_hours() + 0.0,
+            })
+        })
+        .collect();
+    // Full-key order (serialised form) so duplicate-id edges hash
+    // independently of submission order.
+    prereqs.sort_by_cached_key(ToString::to_string);
+    let mut files: Vec<serde_json::Value> = d
+        .owned_files
+        .iter()
+        .map(|f| json!({ "path": f.path().to_string_lossy(), "mode": f.mode() }))
+        .collect();
+    files.sort_by_cached_key(ToString::to_string);
+    json!({
+        "id": d.id,
+        "owned_files": files,
+        "prerequisites": prereqs,
+        "estimated_effort_hours": d.estimated_effort_hours,
+        "duration_hours": d.duration_hours,
+        "estimate": d.estimate,
+        "metadata": d.metadata,
+        "milestone": d.milestone,
+    })
+}
+
 /// Deterministic content hash of a [`PlanGraph`]. Same logical graph -> same
 /// hash regardless of the order `deliverables` were submitted in. This is
 /// what lets `submit_plan` be idempotent.
@@ -239,39 +276,7 @@ fn hash_graph(graph: &PlanGraph) -> String {
     let mut deliverables: Vec<_> = graph
         .deliverables
         .iter()
-        .map(|d| {
-            let mut prereqs: Vec<serde_json::Value> = d
-                .prerequisites
-                .iter()
-                .map(|p| {
-                    json!({
-                        "id": p.id(),
-                        "consumes": p.consumes(),
-                        "kind": p.kind(),
-                        "lag_hours": p.lag_hours() + 0.0,
-                    })
-                })
-                .collect();
-            // Full-key order (serialised form) so duplicate-id edges hash
-            // independently of submission order.
-            prereqs.sort_by_cached_key(ToString::to_string);
-            let mut files: Vec<serde_json::Value> = d
-                .owned_files
-                .iter()
-                .map(|f| json!({ "path": f.path().to_string_lossy(), "mode": f.mode() }))
-                .collect();
-            files.sort_by_cached_key(ToString::to_string);
-            json!({
-                "id": d.id,
-                "owned_files": files,
-                "prerequisites": prereqs,
-                "estimated_effort_hours": d.estimated_effort_hours,
-                "duration_hours": d.duration_hours,
-                "estimate": d.estimate,
-                "metadata": d.metadata,
-                "milestone": d.milestone,
-            })
-        })
+        .map(canonical_deliverable)
         .collect();
     deliverables.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
 
@@ -294,7 +299,7 @@ fn hash_graph(graph: &PlanGraph) -> String {
 
 /// Reject graphs that fail any structural invariant. Returns
 /// [`PlannerError::InvalidGraph`] with a precise `reason` on first failure.
-fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
+pub(crate) fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
     for d in &graph.deliverables {
         if d.id == START_ID || d.id == FINISH_ID {
             return Err(PlannerError::InvalidGraph {

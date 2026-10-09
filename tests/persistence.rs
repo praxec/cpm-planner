@@ -921,3 +921,32 @@ async fn stored_graph_with_reserved_endpoint_id_is_left_unrecomputed() {
         .unwrap();
     assert_eq!(v, 0);
 }
+
+#[tokio::test]
+async fn startup_reap_with_incomplete_prerequisites_becomes_pending() {
+    let db = TempDb::new();
+    let plan_id = {
+        let planner = open_planner(&db.path);
+        planner.submit_plan(chain_graph()).await.expect("submit")
+    };
+    {
+        // d2 holds an expired lease while its prerequisite d1 is not complete
+        // (as after a revision): in_progress + an expired lock row.
+        let conn = rusqlite::Connection::open(&db.path).expect("open");
+        let in_progress = serde_json::to_string(&DeliverableStatus::InProgress).expect("json");
+        conn.execute(
+            "UPDATE deliverable_statuses SET status = ?1 WHERE deliverable_id = 'd2'",
+            rusqlite::params![in_progress],
+        )
+        .expect("set status");
+        conn.execute(
+            "INSERT INTO locks (plan_id, deliverable_id, caller_id, acquired_at_us, expires_at_us)
+             VALUES (?1, 'd2', 'w', 0, 1)",
+            rusqlite::params![plan_id.0],
+        )
+        .expect("insert lock");
+    }
+    let planner = open_planner(&db.path);
+    let status = planner.status(&plan_id).await.expect("status");
+    assert_eq!(status.deliverables[1].1, DeliverableStatus::Pending);
+}
