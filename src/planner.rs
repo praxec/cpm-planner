@@ -35,9 +35,9 @@ use std::time::Duration;
 
 use crate::audit::{AuditEvent, AuditSink, NullAuditSink};
 use crate::plan::{
-    AcquireRequest, Cohort, CohortRow, Deliverable, DeliverableStatus, ForceReleaseRequest,
-    HeartbeatRequest, LockInfo, MarkStatusRequest, PlanDefinition, PlanGraph, PlanId, PlanStatus,
-    PlannerError, ScheduleRow,
+    AcquireRequest, BlockedDeliverable, Cohort, CohortRow, Deliverable, DeliverableStatus,
+    ForceReleaseRequest, HeartbeatRequest, LockInfo, MarkStatusRequest, PlanDefinition, PlanGraph,
+    PlanId, PlanStatus, PlannerError, ScheduleRow,
 };
 use crate::plan_store::SqlitePlanStore;
 use crate::ports::Planner;
@@ -430,6 +430,21 @@ fn make_force_released_event(lock: &LockInfo, reason: &str) -> AuditEvent {
         }))
 }
 
+fn make_counters_reset_event(
+    plan_id: &PlanId,
+    deliverable_id: &str,
+    reason: &str,
+    lapse_count: u32,
+    failure_count: u32,
+) -> AuditEvent {
+    AuditEvent::new("counters_reset").with_payload(json!({
+        "plan_id": plan_id.as_str(),
+        "deliverable_id": deliverable_id,
+        "reason": reason,
+        "previous": { "lapse_count": lapse_count, "failure_count": failure_count },
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Priority ordering for cohort selection
 // ---------------------------------------------------------------------------
@@ -512,21 +527,28 @@ impl Planner for BasicCpmPlanner {
             //     ENVIRONMENT (drivers keep getting killed before they can
             //     report), not a broken deliverable. Do NOT auto-fail it —
             //     that would misdiagnose a healthy deliverable — but stop
-            //     re-leasing: fail the acquire loudly with the stable
-            //     LAPSE_LIMIT error so an operator intervenes. The Err
-            //     rolls this transaction back, so the check is stable
-            //     across retries.
-            if let Some(d) = state.graph.deliverables.iter().find(|d| {
-                matches!(state.statuses.get(&d.id), Some(DeliverableStatus::Ready))
-                    && !state.locks.contains_key(&d.id)
-                    && state.lapse_count(&d.id) >= MAX_LAPSES
-            }) {
-                return Err(PlannerError::LapseLimit {
-                    deliverable_id: d.id.clone(),
-                    lapse_count: state.lapse_count(&d.id),
-                    max_lapses: MAX_LAPSES,
-                });
-            }
+            //     re-leasing it: skip it, leave the rest of the plan
+            //     leasable, and report it in `blocked` so an operator
+            //     intervenes (force_release with reset_counters).
+            let blocked: Vec<BlockedDeliverable> = state
+                .graph
+                .deliverables
+                .iter()
+                .filter(|d| {
+                    matches!(state.statuses.get(&d.id), Some(DeliverableStatus::Ready))
+                        && !state.locks.contains_key(&d.id)
+                        && state.lapse_count(&d.id) >= MAX_LAPSES
+                })
+                .map(|d| BlockedDeliverable {
+                    id: d.id.clone(),
+                    code: "LAPSE_LIMIT".to_string(),
+                    reason: format!(
+                        "lease lapsed {} times (limit {MAX_LAPSES}); clear with \
+                         plan.force_release {{reset_counters: true}}",
+                        state.lapse_count(&d.id)
+                    ),
+                })
+                .collect();
 
             // 2b. Circuit-break: a Ready deliverable that has already been
             //     EXPLICITLY marked failed MAX_ATTEMPTS times is a poison
@@ -580,6 +602,7 @@ impl Planner for BasicCpmPlanner {
                 .filter(|d| {
                     matches!(state.statuses.get(&d.id), Some(DeliverableStatus::Ready))
                         && !state.locks.contains_key(&d.id)
+                        && !blocked.iter().any(|b| b.id == d.id)
                 })
                 .collect();
             ready.sort_by_key(|d| priority_key(&d.id, &sched_by_id));
@@ -641,6 +664,7 @@ impl Planner for BasicCpmPlanner {
             Ok(Cohort {
                 plan_id: plan_id.clone(),
                 rows,
+                blocked,
             })
         })?;
 
@@ -905,6 +929,7 @@ impl Planner for BasicCpmPlanner {
             plan_id,
             deliverable_id,
             reason,
+            reset_counters,
         } = req;
         let deliverable_id = deliverable_id.as_str();
         let reason = reason.as_str();
@@ -943,6 +968,40 @@ impl Planner for BasicCpmPlanner {
                     .statuses
                     .insert(deliverable_id.to_string(), DeliverableStatus::Ready);
                 audit_buf.push(make_force_released_event(&lock, reason));
+            }
+
+            if reset_counters {
+                let lapse_count = state.lapse_counts.remove(deliverable_id).unwrap_or(0);
+                let failure_count = state.failure_counts.remove(deliverable_id).unwrap_or(0);
+                // A circuit-broken deliverable is Failed; revive it.
+                if matches!(
+                    state.statuses.get(deliverable_id),
+                    Some(DeliverableStatus::Failed { .. })
+                ) {
+                    let prereqs_complete = state
+                        .graph
+                        .deliverables
+                        .iter()
+                        .find(|d| d.id == deliverable_id)
+                        .is_some_and(|d| {
+                            d.prerequisites.iter().all(|p| {
+                                matches!(state.statuses.get(p), Some(DeliverableStatus::Complete))
+                            })
+                        });
+                    let revived = if prereqs_complete {
+                        DeliverableStatus::Ready
+                    } else {
+                        DeliverableStatus::Pending
+                    };
+                    state.statuses.insert(deliverable_id.to_string(), revived);
+                }
+                audit_buf.push(make_counters_reset_event(
+                    &plan_id,
+                    deliverable_id,
+                    reason,
+                    lapse_count,
+                    failure_count,
+                ));
             }
 
             Ok(())

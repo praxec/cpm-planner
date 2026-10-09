@@ -378,6 +378,25 @@ async fn plan_force_release_roundtrip() {
     );
 }
 
+#[tokio::test]
+async fn plan_force_release_accepts_reset_counters() {
+    let server = server();
+    let plan_id = submit_plan(&server).await;
+    let result = server
+        .dispatch_call(call_args(
+            TOOL_FORCE_RELEASE,
+            json!({
+                "plan_id": plan_id,
+                "deliverable_id": "d1",
+                "reason": "reset",
+                "reset_counters": true
+            }),
+        ))
+        .await
+        .expect("plan.force_release accepts reset_counters");
+    assert_eq!(result["ok"], true);
+}
+
 // ── Roundtrip: plan.get ─────────────────────────────────────────────────────
 
 #[tokio::test]

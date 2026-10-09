@@ -142,6 +142,8 @@ struct ForceReleaseArgs {
     plan_id: String,
     deliverable_id: String,
     reason: String,
+    #[serde(default)]
+    reset_counters: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -313,7 +315,11 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                 "properties": {
                     "plan_id":        { "type": "string" },
                     "deliverable_id": { "type": "string" },
-                    "reason":         { "type": "string" }
+                    "reason":         { "type": "string" },
+                    "reset_counters": {
+                        "type": "boolean",
+                        "description": "Also clear lapse and failure counters (revives a circuit-broken deliverable)."
+                    }
                 },
                 "required": ["plan_id", "deliverable_id", "reason"]
             })),
@@ -506,11 +512,14 @@ impl PlanServer {
     async fn handle_force_release(&self, args: Value) -> Result<Value, McpError> {
         let parsed: ForceReleaseArgs = parse_args(args)?;
         self.planner
-            .force_release(ForceReleaseRequest::new(
-                PlanId(parsed.plan_id),
-                parsed.deliverable_id,
-                parsed.reason,
-            ))
+            .force_release(
+                ForceReleaseRequest::new(
+                    PlanId(parsed.plan_id),
+                    parsed.deliverable_id,
+                    parsed.reason,
+                )
+                .reset_counters(parsed.reset_counters),
+            )
             .await
             .map_err(planner_error_to_mcp)?;
         to_value(&OkResponse::new())
@@ -619,7 +628,7 @@ Tools (seven total, all `plan.<verb>`):
   plan.mark_status     — set a deliverable's status (Complete/Failed releases the lock)
   plan.status          — read-only snapshot ([id, status, attempt_count, failure_count, lapse_count] rows, critical_path (one real chain), critical_ids, per-deliverable schedule (es/ef/ls/lf/float, hours), the ready set ordered by float, held locks)
   plan.get             — return the submitted PlanGraph (deliverables, estimates, files, metadata) for a plan_id
-  plan.force_release   — operator escape hatch; emits audit event with `reason`
+  plan.force_release   — operator escape hatch; emits audit event with `reason`; optional reset_counters:true also clears lapse/failure counters and revives a circuit-broken deliverable
 
 Errors carry stable prefixes: LOCK_HELD, LOCK_NOT_HELD, LOCK_EXPIRED,
 OVERLAP_DETECTED, MISSING_PREREQUISITE, PLAN_NOT_FOUND,
@@ -636,7 +645,9 @@ by the next acquire_cohort (reason "circuit-break: exceeded 3 failed
 attempts") instead of being re-leased forever. A lease that lapses via
 TTL with no terminal mark (driver killed/timed out) increments
 lapse_count instead: environmental losses never trip the failure breaker,
-but at 10 lapses acquire_cohort refuses to re-lease and errors LAPSE_LIMIT
-so an operator can fix the environment.
+but at 10 lapses acquire_cohort stops re-leasing that deliverable: it is
+skipped (the rest of the plan stays leasable) and reported in the acquire
+response's `blocked` list as {id, code:"LAPSE_LIMIT", reason}. Fix the
+environment, then clear it with plan.force_release {reset_counters: true}.
 "#
 }

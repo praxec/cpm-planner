@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- One lapse-limited deliverable no longer fails `plan.acquire_cohort` for the whole plan; it is reported in the new `blocked` list (#17).
 - `plan.status` `critical_path` is now one real prerequisite chain (each id is a
   prerequisite of the next) and `critical_path_hours` is the project length
   (maximum earliest finish) — previously every zero-float task was chained and
@@ -21,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `plan.force_release` `reset_counters: true` clears lapse/failure counters and revives circuit-broken deliverables.
 - `plan.status` returns `critical_ids` (every zero-float deliverable),
   `schedule` (per-deliverable es/ef/ls/lf/float/critical, in hours) and
   `ready` (ready, unlocked deliverables in cohort priority order) (#15).

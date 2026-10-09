@@ -307,13 +307,15 @@ async fn poison_deliverable_circuit_breaks_after_max_failed_attempts() {
     assert!(again.rows.is_empty(), "failed deliverable re-leased later");
 }
 
-/// Runaway protection: environmental lapses never auto-fail a
-/// deliverable, but an infinitely-crashing environment must not spin
-/// forever either. At MAX_LAPSES lapses, acquire_cohort refuses to
-/// re-lease and surfaces the stable LAPSE_LIMIT error naming the
-/// environmental (not implementation) cause.
-#[tokio::test]
-async fn lapse_limit_stops_releasing_with_stable_prefix_error() {
+/// Planner whose lease on "stuck" has lapsed `MAX_LAPSES` times (the final
+/// reap happens on the next acquire). "healthy" is independent and
+/// file-disjoint; it is released between rounds without counting a lapse.
+async fn planner_with_lapse_limited_stuck() -> (
+    BasicCpmPlanner,
+    Arc<MemoryAuditSink>,
+    TestClock,
+    cpm_planner::plan::PlanId,
+) {
     let audit = Arc::new(MemoryAuditSink::new());
     let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
     let clock = TestClock::new(t0);
@@ -323,107 +325,218 @@ async fn lapse_limit_stops_releasing_with_stable_prefix_error() {
         Duration::from_secs(60),
         Arc::new(move || clock_arc.read()),
     );
-
     let graph = PlanGraph {
-        deliverables: vec![deliverable("doomed-env", &["src/d.rs"], &[], Some(1.0))],
+        deliverables: vec![
+            deliverable("stuck", &["src/stuck.rs"], &[], Some(1.0)),
+            deliverable("healthy", &["src/healthy.rs"], &[], Some(1.0)),
+        ],
         max_chained_dispatch: None,
     };
     let plan_id = planner.submit_plan(graph).await.unwrap();
-
-    // MAX_LAPSES leases, every one lost to the environment.
     for lapse in 1..=MAX_LAPSES {
         let cohort = planner
             .acquire_cohort(AcquireRequest::new(
                 plan_id.clone(),
-                caller(&format!("killed-{lapse}")).clone(),
-                1,
+                caller(&format!("killed-{lapse}")),
+                5,
             ))
             .await
             .unwrap();
-        assert_eq!(cohort.rows.len(), 1, "lease {lapse} must be granted");
+        assert!(cohort_ids(&cohort).contains(&"stuck".to_string()));
+        planner
+            .force_release(ForceReleaseRequest::new(
+                plan_id.clone(),
+                "healthy",
+                "reset",
+            ))
+            .await
+            .unwrap();
         clock.set(t0 + chrono::Duration::minutes(5 * i64::from(lapse)));
     }
+    (planner, audit, clock, plan_id)
+}
 
-    // The next acquire must fail loudly instead of leasing an 11th time.
-    let err = planner
-        .acquire_cohort(AcquireRequest::new(
-            plan_id.clone(),
-            caller("fresh").clone(),
-            1,
-        ))
+fn cohort_ids(cohort: &cpm_planner::plan::Cohort) -> Vec<String> {
+    cohort
+        .rows
+        .iter()
+        .map(|r| r.deliverable.id.clone())
+        .collect()
+}
+
+fn status_of(status: &cpm_planner::plan::PlanStatus, id: &str) -> DeliverableStatus {
+    status
+        .deliverables
+        .iter()
+        .find(|row| row.0 == id)
+        .expect("deliverable present in status")
+        .1
+        .clone()
+}
+
+fn lapse_count_of(status: &cpm_planner::plan::PlanStatus, id: &str) -> u32 {
+    status
+        .deliverables
+        .iter()
+        .find(|row| row.0 == id)
+        .expect("deliverable present in status")
+        .4
+}
+
+#[tokio::test]
+async fn acquire_skips_lapse_limited_deliverable_and_leases_the_rest() {
+    let (planner, _audit, _clock, plan_id) = planner_with_lapse_limited_stuck().await;
+    let cohort = planner
+        .acquire_cohort(AcquireRequest::new(plan_id, caller("fresh"), 5))
         .await
-        .expect_err("lapse limit must stop the re-lease loop");
-    assert!(
-        matches!(&err, PlannerError::LapseLimit { deliverable_id, lapse_count, max_lapses }
-            if deliverable_id == "doomed-env"
-                && *lapse_count == MAX_LAPSES
-                && *max_lapses == MAX_LAPSES),
-        "expected LapseLimit, got {err}"
-    );
-    let msg = err.to_string();
-    assert!(
-        msg.starts_with("LAPSE_LIMIT:"),
-        "stable prefix missing: {msg}"
-    );
-    assert!(
-        msg.contains("environmental"),
-        "message must name the environmental cause: {msg}"
-    );
+        .unwrap();
+    assert_eq!(cohort_ids(&cohort), vec!["healthy"]);
+}
 
-    // The deliverable is NOT auto-failed — it is healthy as far as anyone
-    // knows — and its failure budget is untouched. The Err rolled back the
-    // in-flight reap, so the durable lapse count stays at the limit.
-    let status = planner.status(&plan_id).await.unwrap();
-    let (_, d_status, _, failures, lapses) = &status.deliverables[0];
-    assert!(
-        !matches!(d_status, DeliverableStatus::Failed { .. }),
-        "lapse limit must not auto-fail; got {d_status:?}"
-    );
-    assert_eq!(*failures, 0);
-    assert_eq!(*lapses, MAX_LAPSES - 1, "final reap rolled back with Err");
-
-    // Every subsequent acquire keeps failing the same way (stable, loud).
-    let err2 = planner
-        .acquire_cohort(AcquireRequest::new(
-            plan_id.clone(),
-            caller("again").clone(),
-            1,
-        ))
+#[tokio::test]
+async fn acquire_reports_lapse_limited_deliverable_as_blocked() {
+    let (planner, _audit, _clock, plan_id) = planner_with_lapse_limited_stuck().await;
+    let cohort = planner
+        .acquire_cohort(AcquireRequest::new(plan_id, caller("fresh"), 5))
         .await
-        .expect_err("still lapse-limited");
-    assert!(err2.to_string().starts_with("LAPSE_LIMIT:"));
+        .unwrap();
+    assert_eq!(
+        cohort
+            .blocked
+            .iter()
+            .map(|b| (b.id.as_str(), b.code.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("stuck", "LAPSE_LIMIT")]
+    );
+}
 
-    // Operator escape hatch: clear the (long-expired) lease, then
-    // explicitly mark the deliverable terminal to unblock the plan
-    // (here: give up on it).
+#[tokio::test]
+async fn blocked_reason_names_the_reset_counters_remediation() {
+    let (planner, _audit, _clock, plan_id) = planner_with_lapse_limited_stuck().await;
+    let cohort = planner
+        .acquire_cohort(AcquireRequest::new(plan_id, caller("fresh"), 5))
+        .await
+        .unwrap();
+    assert!(
+        cohort.blocked[0]
+            .reason
+            .contains("plan.force_release {reset_counters: true}")
+    );
+}
+
+#[tokio::test]
+async fn lapse_limit_error_message_keeps_prefix() {
+    let err = PlannerError::LapseLimit {
+        deliverable_id: "stuck".to_string(),
+        lapse_count: MAX_LAPSES,
+        max_lapses: MAX_LAPSES,
+    };
+    assert!(err.to_string().starts_with("LAPSE_LIMIT:"));
+}
+
+#[tokio::test]
+async fn force_release_with_reset_counters_makes_deliverable_acquirable_again() {
+    let (planner, _audit, _clock, plan_id) = planner_with_lapse_limited_stuck().await;
     planner
-        .force_release(ForceReleaseRequest::new(
-            plan_id.clone(),
-            "doomed-env",
-            "operator: environment unrecoverable",
-        ))
+        .acquire_cohort(AcquireRequest::new(plan_id.clone(), caller("fresh"), 5))
         .await
         .unwrap();
     planner
-        .mark_status(MarkStatusRequest::new(
-            plan_id.clone(),
-            "doomed-env",
-            caller("operator").clone(),
-            DeliverableStatus::Failed {
-                reason: "operator: environment unrecoverable".to_string(),
-            },
-        ))
+        .force_release(
+            ForceReleaseRequest::new(plan_id.clone(), "stuck", "env fixed").reset_counters(true),
+        )
         .await
         .unwrap();
     let cohort = planner
-        .acquire_cohort(AcquireRequest::new(
-            plan_id.clone(),
-            caller("after-triage").clone(),
-            1,
-        ))
+        .acquire_cohort(AcquireRequest::new(plan_id, caller("again"), 5))
         .await
-        .expect("plan proceeds after operator triage");
-    assert!(cohort.rows.is_empty(), "nothing else to lease");
+        .unwrap();
+    assert!(cohort_ids(&cohort).contains(&"stuck".to_string()));
+}
+
+#[tokio::test]
+async fn force_release_without_reset_keeps_lapse_count() {
+    let (planner, _audit, _clock, plan_id) = planner_with_lapse_limited_stuck().await;
+    planner
+        .acquire_cohort(AcquireRequest::new(plan_id.clone(), caller("fresh"), 5))
+        .await
+        .unwrap();
+    planner
+        .force_release(
+            ForceReleaseRequest::new(plan_id.clone(), "stuck", "no reset").reset_counters(false),
+        )
+        .await
+        .unwrap();
+    let status = planner.status(&plan_id).await.unwrap();
+    assert_eq!(lapse_count_of(&status, "stuck"), MAX_LAPSES);
+}
+
+#[tokio::test]
+async fn reset_counters_revives_circuit_broken_deliverable() {
+    let planner = BasicCpmPlanner::new();
+    let graph = PlanGraph {
+        deliverables: vec![deliverable("poison", &["src/poison.rs"], &[], Some(1.0))],
+        max_chained_dispatch: None,
+    };
+    let plan_id = planner.submit_plan(graph).await.unwrap();
+    for attempt in 1..=MAX_ATTEMPTS {
+        let who = caller(&format!("builder-{attempt}"));
+        planner
+            .acquire_cohort(AcquireRequest::new(plan_id.clone(), who.clone(), 1))
+            .await
+            .unwrap();
+        planner
+            .mark_status(MarkStatusRequest::new(
+                plan_id.clone(),
+                "poison",
+                who.clone(),
+                DeliverableStatus::Failed {
+                    reason: "broke".to_string(),
+                },
+            ))
+            .await
+            .unwrap();
+        planner
+            .mark_status(MarkStatusRequest::new(
+                plan_id.clone(),
+                "poison",
+                who,
+                DeliverableStatus::Ready,
+            ))
+            .await
+            .unwrap();
+    }
+    // The next acquire circuit-breaks it to Failed.
+    planner
+        .acquire_cohort(AcquireRequest::new(plan_id.clone(), caller("fresh"), 1))
+        .await
+        .unwrap();
+    planner
+        .force_release(
+            ForceReleaseRequest::new(plan_id.clone(), "poison", "fixed").reset_counters(true),
+        )
+        .await
+        .unwrap();
+    let status = planner.status(&plan_id).await.unwrap();
+    assert!(matches!(
+        status_of(&status, "poison"),
+        DeliverableStatus::Ready
+    ));
+}
+
+#[tokio::test]
+async fn reset_counters_emits_audit_event() {
+    let (planner, audit, _clock, plan_id) = planner_with_lapse_limited_stuck().await;
+    planner
+        .force_release(ForceReleaseRequest::new(plan_id, "stuck", "env fixed").reset_counters(true))
+        .await
+        .unwrap();
+    let events = audit.snapshot();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.event_type == "counters_reset" && e.payload["deliverable_id"] == "stuck")
+    );
 }
 
 /// A deliverable that completes normally on its first lease is untouched

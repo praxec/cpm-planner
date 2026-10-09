@@ -237,6 +237,9 @@ pub struct ForceReleaseRequest {
     pub plan_id: PlanId,
     pub deliverable_id: String,
     pub reason: String,
+    /// Also clear the deliverable's lapse and failure counters (revives a
+    /// lapse-limited or circuit-broken deliverable). Defaults to `false`.
+    pub reset_counters: bool,
 }
 
 impl ForceReleaseRequest {
@@ -249,7 +252,14 @@ impl ForceReleaseRequest {
             plan_id,
             deliverable_id: deliverable_id.into(),
             reason: reason.into(),
+            reset_counters: false,
         }
+    }
+
+    /// Set whether the lapse and failure counters are cleared too.
+    pub fn reset_counters(mut self, yes: bool) -> Self {
+        self.reset_counters = yes;
+        self
     }
 }
 
@@ -300,6 +310,18 @@ pub struct CohortRow {
 pub struct Cohort {
     pub plan_id: PlanId,
     pub rows: Vec<CohortRow>,
+    /// Deliverables the acquire considered but did not lease, and why.
+    pub blocked: Vec<BlockedDeliverable>,
+}
+
+/// A deliverable the acquire considered but did not lease, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockedDeliverable {
+    pub id: String,
+    /// Stable code: "LAPSE_LIMIT" (later: "NOT_READY", "LOCKED",
+    /// "FILE_CONFLICT", "MANUAL").
+    pub code: String,
+    pub reason: String,
 }
 
 /// Error returned when a [`FlatCohort`] wire payload cannot be decoded into a
@@ -334,6 +356,8 @@ struct FlatCohort {
     plan_id: PlanId,
     deliverables: Vec<Deliverable>,
     locks: Vec<LockInfo>,
+    #[serde(default)]
+    blocked: Vec<BlockedDeliverable>,
 }
 
 impl From<Cohort> for FlatCohort {
@@ -348,6 +372,7 @@ impl From<Cohort> for FlatCohort {
             plan_id: cohort.plan_id,
             deliverables,
             locks,
+            blocked: cohort.blocked,
         }
     }
 }
@@ -375,6 +400,7 @@ impl TryFrom<FlatCohort> for Cohort {
         Ok(Cohort {
             plan_id: flat.plan_id,
             rows,
+            blocked: flat.blocked,
         })
     }
 }
@@ -522,14 +548,15 @@ pub enum PlannerError {
     /// driving process was killed or timed out) more times than the
     /// runaway bound allows. These are ENVIRONMENTAL losses, not
     /// implementation failures, so the deliverable is NOT auto-failed;
-    /// instead `acquire_cohort` refuses to re-lease until an operator
-    /// intervenes (fix the environment, then `mark_status` or
-    /// `force_release`).
+    /// instead `acquire_cohort` skips it and reports it in
+    /// [`Cohort::blocked`] until an operator intervenes (fix the
+    /// environment, then `force_release` with `reset_counters`). No longer
+    /// returned by `acquire_cohort`; kept for wire compatibility.
     #[error(
         "LAPSE_LIMIT: deliverable {deliverable_id} lost {lapse_count} leases to environmental \
          lapses (TTL expiry with no terminal mark — killed/timed-out drivers, NOT implementation \
          failures; bound {max_lapses}); fix the environment, then mark_status the deliverable to \
-         proceed"
+         proceed; clear it with plan.force_release {{reset_counters: true}}"
     )]
     LapseLimit {
         deliverable_id: String,
@@ -616,6 +643,7 @@ mod tests {
         let now = chrono::Utc::now();
         let cohort = Cohort {
             plan_id: plan_id.clone(),
+            blocked: vec![],
             rows: vec![
                 CohortRow {
                     deliverable: Deliverable {
