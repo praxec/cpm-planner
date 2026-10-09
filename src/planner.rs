@@ -248,7 +248,7 @@ fn hash_graph(graph: &PlanGraph) -> String {
                         "id": p.id(),
                         "consumes": p.consumes(),
                         "kind": p.kind(),
-                        "lag_hours": p.lag_hours(),
+                        "lag_hours": p.lag_hours() + 0.0,
                     })
                 })
                 .collect();

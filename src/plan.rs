@@ -24,8 +24,9 @@
 //!   are idempotent.
 //! - [`crate::ports::Planner::acquire_cohort`] returns a [`Cohort`]: a batch
 //!   of deliverables whose prerequisites are all [`DeliverableStatus::Complete`]
-//!   and whose owned-file sets are mutually disjoint *and* disjoint from every
-//!   currently held lock. The batch is locked atomically (PA3 guarantees this).
+//!   and whose owned-file claims do not conflict with each other or with any
+//!   currently held lock (exclusive conflicts with anything; append/append
+//!   may share). The batch is locked atomically (PA3 guarantees this).
 //! - [`crate::ports::Planner::mark_status`] with `Complete` or `Failed`
 //!   releases the lock. A caller-id mismatch on the held lock yields
 //!   [`PlannerError::LockNotHeld`].
@@ -185,23 +186,45 @@ pub enum FileMode {
     Append,
 }
 
-impl FileMode {
-    fn is_exclusive(&self) -> bool {
-        *self == Self::Exclusive
-    }
-}
-
 /// One entry of `owned_files`: a bare path (exclusive) or `{path, mode}`.
 /// A bare path round-trips as a plain string.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(untagged, from = "OwnedFileWire")]
 pub enum OwnedFile {
     Path(PathBuf),
     Claim {
         path: PathBuf,
-        #[serde(default, skip_serializing_if = "FileMode::is_exclusive")]
-        mode: FileMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<FileMode>,
     },
+}
+
+/// Strict wire form of [`OwnedFile`]: the object form rejects unknown keys.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OwnedFileWire {
+    Path(PathBuf),
+    Claim(OwnedClaimWire),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnedClaimWire {
+    path: PathBuf,
+    #[serde(default)]
+    mode: Option<FileMode>,
+}
+
+impl From<OwnedFileWire> for OwnedFile {
+    fn from(w: OwnedFileWire) -> Self {
+        match w {
+            OwnedFileWire::Path(p) => Self::Path(p),
+            OwnedFileWire::Claim(c) => Self::Claim {
+                path: c.path,
+                mode: c.mode,
+            },
+        }
+    }
 }
 
 impl OwnedFile {
@@ -214,7 +237,7 @@ impl OwnedFile {
     pub fn mode(&self) -> FileMode {
         match self {
             Self::Path(_) => FileMode::Exclusive,
-            Self::Claim { mode, .. } => *mode,
+            Self::Claim { mode, .. } => mode.unwrap_or_default(),
         }
     }
 }
@@ -234,9 +257,10 @@ impl From<PathBuf> for OwnedFile {
 /// A single unit of work scheduled by the Planner.
 ///
 /// `owned_files` is the load-bearing field for concurrent dispatch: the
-/// Planner guarantees that two deliverables with overlapping `owned_files`
-/// will never be returned in the same [`Cohort`] and will never both hold
-/// active locks. This is the only mechanism the Planner uses to prevent
+/// Planner guarantees that two deliverables with conflicting `owned_files`
+/// claims (exclusive conflicts with anything; append/append may share) will
+/// never be returned in the same [`Cohort`] and will never both hold active
+/// locks. This is the only mechanism the Planner uses to prevent
 /// write-write conflicts; implementations of [`crate::ports::Planner`]
 /// must therefore reject any plan that contains a deliverable whose
 /// `owned_files` are not specified up front.
@@ -247,8 +271,8 @@ pub struct Deliverable {
     pub id: String,
 
     /// Exact file paths the implementer is going to write while completing
-    /// this deliverable. Disjointness across this set is the lock-contention
-    /// invariant; see [`crate::ports::Planner::acquire_cohort`] semantics.
+    /// this deliverable. The absence of conflicting claims across deliverables
+    /// is the lock-contention invariant; see [`crate::ports::Planner::acquire_cohort`] semantics.
     pub owned_files: Vec<OwnedFile>,
 
     /// Ids of other deliverables in the same plan that must reach
@@ -672,8 +696,8 @@ pub struct PlanStatus {
     /// begins with `__start__` and ends with `__finish__` (synthetic
     /// endpoints; an empty plan is just those two).
     pub critical_path: Vec<String>,
-    /// Project length in hours: the maximum earliest finish, equal to the
-    /// effort summed along `critical_path`.
+    /// Scheduled length plus lags along `critical_path` (= `__finish__`
+    /// earliest finish).
     pub critical_path_hours: f32,
     /// Every lock currently active across the plan.
     pub locks_held: Vec<LockInfo>,

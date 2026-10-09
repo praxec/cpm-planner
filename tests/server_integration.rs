@@ -473,7 +473,12 @@ async fn plan_get_round_trips_mixed_prerequisite_forms() {
 #[tokio::test]
 async fn plan_get_round_trips_mixed_file_forms() {
     let server = server();
-    let files = json!(["a.rs", { "path": "b.rs", "mode": "append" }, { "path": "c.rs" }]);
+    let files = json!([
+        "a.rs",
+        { "path": "b.rs", "mode": "append" },
+        { "path": "c.rs" },
+        { "path": "d.rs", "mode": "exclusive" }
+    ]);
     let submitted = server
         .dispatch_call(call_args(
             TOOL_SUBMIT,
@@ -499,6 +504,18 @@ async fn submit_rejects_unknown_prerequisite_field() {
     let graph = json!({ "deliverables": [
         { "id": "a", "owned_files": ["a.rs"], "prerequisites": [] },
         { "id": "b", "owned_files": ["b.rs"], "prerequisites": [{ "id": "a", "lag_hour": 2 }] }
+    ]});
+    let result = server
+        .dispatch_call(call_args(TOOL_SUBMIT, json!({ "graph": graph })))
+        .await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn submit_rejects_unknown_owned_file_field() {
+    let server = server();
+    let graph = json!({ "deliverables": [
+        { "id": "a", "owned_files": [{ "path": "x", "mod": "append" }], "prerequisites": [] }
     ]});
     let result = server
         .dispatch_call(call_args(TOOL_SUBMIT, json!({ "graph": graph })))

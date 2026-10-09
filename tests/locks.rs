@@ -36,7 +36,7 @@ fn appending(id: &str, path: &str) -> Deliverable {
     let mut d = deliverable(id, &[], &[], Some(1.0));
     d.owned_files = vec![cpm_planner::plan::OwnedFile::Claim {
         path: PathBuf::from(path),
-        mode: cpm_planner::plan::FileMode::Append,
+        mode: Some(cpm_planner::plan::FileMode::Append),
     }];
     d
 }
@@ -1155,10 +1155,9 @@ async fn cohort_reports_shared_append_paths() {
 }
 
 #[tokio::test]
-async fn exclusive_claim_conflicts_with_held_append_claim() {
+async fn unordered_exclusive_and_append_claims_are_rejected_at_submit() {
     let planner = BasicCpmPlanner::new();
-    let mut exclusive = deliverable("c", &["REGISTRY.md"], &[], Some(1.0));
-    exclusive.prerequisites = vec![];
+    let exclusive = deliverable("c", &["REGISTRY.md"], &[], Some(1.0));
     let err = planner
         .submit_plan(PlanGraph {
             deliverables: vec![

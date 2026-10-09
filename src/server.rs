@@ -238,7 +238,7 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                                             { "type": "object", "properties": {
                                                 "path": { "type": "string" },
                                                 "mode": { "type": "string", "enum": ["exclusive", "append"] }
-                                            }, "required": ["path"] }
+                                            }, "required": ["path"], "additionalProperties": false }
                                         ] } },
                                         "prerequisites":         { "type": "array", "description": "Each item is a deliverable id string, or an object {id, consumes?, kind?: artifact|interface, lag_hours?}.", "items": { "oneOf": [
                                             { "type": "string" },
@@ -251,6 +251,7 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                                         ] } },
                                         "estimated_effort_hours": { "type": "number" },
                                         "duration_hours":         { "type": "number", "minimum": 0, "description": "Calendar time on the schedule; replaces effort as the scheduled length. Effort stays the cost basis." },
+                                        "milestone":              { "type": "boolean", "description": "Acceptance point; reported in plan.status milestones with its own critical path." },
                                         "metadata":              {}
                                     },
                                     "required": ["id", "owned_files", "prerequisites"]
@@ -268,7 +269,7 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
         Tool::new(
             Cow::Borrowed(TOOL_ACQUIRE_COHORT),
             Cow::Borrowed(
-                "Acquire up to max_count ready, file-disjoint deliverables \
+                "Acquire up to max_count ready deliverables with no conflicting file claims \
                  atomically. Returns the cohort plus per-deliverable locks. \
                  A deliverable explicitly marked failed 3 times is \
                  circuit-broken to failed instead of re-leased; leases lost \
@@ -775,10 +776,11 @@ fn instructions() -> &'static str {
 Tools (eight total, all `plan.<verb>`):
   plan.submit          — submit a PlanGraph, get a plan_id (idempotent on identical graphs)
                         a prerequisite is an id string or {id, consumes?, kind?: artifact|interface, lag_hours?}; a deliverable's duration_hours (calendar time; when absent the default is the effort estimate, explicit or estimator-derived) and lag_hours (minimum wait after a prerequisite finishes) drive the schedule
-  plan.acquire_cohort  — atomically acquire ready, file-disjoint deliverables (an owned_files entry may be {path, mode: "append"}: append claims on one path may be co-leased and are listed in the response's shared_paths; exclusive claims never overlap anything at once; plan.submit accepts a shared file only when the claimants are ordered by prerequisites, or all claims are append)
+                        a milestone (milestone: true) is zero-length unless you give it an estimate or duration; it is still an ordinary deliverable someone must complete (accept or mark Complete), and it is not leased if metadata.kind=manual
+  plan.acquire_cohort  — atomically acquire ready deliverables with no conflicting file claims (an owned_files entry may be {path, mode: "append"}: append claims on one path may be co-leased and are listed in the response's shared_paths; exclusive claims never overlap anything at once; plan.submit accepts a shared file only when the claimants are ordered by prerequisites, or all claims are append)
   plan.heartbeat       — refresh a held lock's TTL
   plan.mark_status     — set a deliverable's status (Complete/Failed releases the lock); lockless Complete/Ready/InProgress requires complete prerequisites (PREREQUISITES_INCOMPLETE) and is audited
-  plan.status          — read-only snapshot ([id, status, attempt_count, failure_count, lapse_count] rows, critical_path (one real chain, always __start__ to __finish__), critical_ids, per-deliverable schedule (es/ef/ls/lf/float, hours; synthetic __start__/__finish__ endpoint rows have synthetic=true), the ready set ordered by float, plan_complete, milestones (one row per `milestone: true` deliverable, or metadata.milestone == true: id, critical_path from __start__ to it, hours = its earliest finish, complete), held locks). __start__ and __finish__ are reserved deliverable ids (INVALID_GRAPH)
+  plan.status          — read-only snapshot ([id, status, attempt_count, failure_count, lapse_count] rows, critical_path (one real chain, always __start__ to __finish__), critical_ids, per-deliverable schedule (es/ef/ls/lf/float, hours; synthetic __start__/__finish__ endpoint rows have synthetic=true and critical=true; critical_ids lists only real deliverables), the ready set ordered by float, plan_complete, milestones (one row per `milestone: true` deliverable, or metadata.milestone == true: id, critical_path from __start__ to it, hours = its earliest finish, complete), held locks). __start__ and __finish__ are reserved deliverable ids (INVALID_GRAPH)
   plan.get             — return the submitted PlanGraph (deliverables, estimates, files, metadata) for a plan_id
   plan.force_release   — operator escape hatch; emits audit event with `reason`; optional reset_counters:true also clears lapse/failure counters and revives a circuit-broken deliverable
   plan.accept          — a manager/owner marks a deliverable Complete without a lease (audited; evidence required; override_lock to take over a live lease)

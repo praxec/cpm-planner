@@ -859,7 +859,64 @@ async fn stored_p2_plan_gains_endpoints_after_reopen() {
     }
     let status = open_planner(&db.path).status(&plan_id).await.unwrap();
     assert_eq!(
-        status.critical_path.first().map(String::as_str),
-        Some("__start__")
+        status.critical_path,
+        vec!["__start__", "P0a", "P0b", "__finish__"]
     );
+}
+
+#[tokio::test]
+async fn append_holders_survive_reopen() {
+    let db = TempDb::new();
+    let append = |id: &str| {
+        let mut d = effort_deliverable(id, &[], 1.0);
+        d.owned_files = vec![cpm_planner::plan::OwnedFile::Claim {
+            path: PathBuf::from("REGISTRY.md"),
+            mode: Some(cpm_planner::plan::FileMode::Append),
+        }];
+        d
+    };
+    let mut exclusive = effort_deliverable("c", &["a", "b"], 1.0);
+    exclusive.owned_files = vec!["REGISTRY.md".into()];
+    let plan_id = {
+        let planner = open_planner(&db.path);
+        let plan_id = planner
+            .submit_plan(PlanGraph {
+                deliverables: vec![append("a"), append("b"), exclusive],
+                max_chained_dispatch: None,
+            })
+            .await
+            .unwrap();
+        let cohort = planner
+            .acquire_cohort(AcquireRequest::new(plan_id.clone(), caller("c1"), 3))
+            .await
+            .unwrap();
+        assert_eq!(cohort.rows.len(), 2);
+        plan_id
+    };
+    let status = open_planner(&db.path).status(&plan_id).await.unwrap();
+    assert_eq!(status.locks_held.len(), 2);
+}
+
+#[tokio::test]
+async fn stored_graph_with_reserved_endpoint_id_is_left_unrecomputed() {
+    let db = TempDb::new();
+    let plan_id = submit_parallel_chains(&db.path).await;
+    {
+        let conn = rusqlite::Connection::open(&db.path).unwrap();
+        conn.execute(
+            "UPDATE plans SET graph = replace(graph, '\"P0b\"', '\"__finish__\"'), cpm_version = 0",
+            [],
+        )
+        .unwrap();
+    }
+    drop(open_planner(&db.path));
+    let v: i64 = rusqlite::Connection::open(&db.path)
+        .unwrap()
+        .query_row(
+            "SELECT cpm_version FROM plans WHERE plan_id = ?1",
+            [&plan_id.0],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(v, 0);
 }

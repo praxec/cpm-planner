@@ -84,7 +84,8 @@ fn endpoint_task(id: &str, dependencies: Vec<String>) -> Task {
 /// a kind-aware estimate rather than falling back to the flat
 /// [`DEFAULT_EFFORT_HOURS`] placeholder. A `complexity` hint can be carried
 /// in `metadata` (boolean `complexity`/`is_complex`) to opt a deliverable
-/// into the configured complexity multiplier.
+/// into the configured complexity multiplier. A milestone is zero-length
+/// unless you give it an estimate or duration.
 pub(crate) fn deliverable_to_task(d: &Deliverable, estimator: &EffortEstimator) -> Task {
     let description = d
         .metadata
@@ -96,6 +97,9 @@ pub(crate) fn deliverable_to_task(d: &Deliverable, estimator: &EffortEstimator) 
 
     let effort_hours = match d.estimated_effort_hours {
         Some(explicit) => explicit,
+        // A milestone is zero-length unless it is given an estimate or a
+        // duration; the estimator is not consulted.
+        None if d.is_milestone() && d.duration_hours.is_none() => 0.0,
         None => {
             // Coarse complexity hint from metadata; defaults to false.
             let is_complex = d

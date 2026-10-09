@@ -109,6 +109,10 @@ pub(crate) fn add_file_claims(
     for f in files {
         match f.mode() {
             FileMode::Exclusive => {
+                debug_assert!(
+                    !matches!(claims.get(f.path()), Some(FileClaim::Append(_))),
+                    "exclusive claim by {deliverable_id} on a path held by append claims"
+                );
                 claims.insert(
                     f.path().to_path_buf(),
                     FileClaim::Exclusive(deliverable_id.to_string()),
@@ -116,6 +120,10 @@ pub(crate) fn add_file_claims(
             }
             FileMode::Append => match claims.entry(f.path().to_path_buf()) {
                 std::collections::hash_map::Entry::Occupied(mut e) => {
+                    debug_assert!(
+                        matches!(e.get(), FileClaim::Append(_)),
+                        "append claim by {deliverable_id} on a path held exclusively"
+                    );
                     if let FileClaim::Append(set) = e.get_mut() {
                         set.insert(deliverable_id.to_string());
                     }
@@ -237,7 +245,7 @@ mod tests {
     fn releasing_one_append_holder_keeps_the_other_claim() {
         let files = vec![OwnedFile::Claim {
             path: PathBuf::from("R.md"),
-            mode: FileMode::Append,
+            mode: Some(FileMode::Append),
         }];
         let mut claims = HashMap::new();
         add_file_claims(&mut claims, "a", &files);

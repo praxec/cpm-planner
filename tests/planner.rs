@@ -1509,7 +1509,7 @@ async fn metadata_milestone_flag_is_honoured() {
     )];
     let plan_id = submit(&planner, graph).await;
     let status = planner.status(&plan_id).await.unwrap();
-    assert_eq!(status.milestones[0].id, "m");
+    assert!(status.milestones.len() == 1 && status.milestones[0].id == "m");
 }
 
 #[tokio::test]
@@ -1535,6 +1535,48 @@ async fn milestone_complete_reflects_status() {
     }
     let status = planner.status(&plan_id).await.unwrap();
     assert!(status.milestones[0].complete);
+}
+
+#[tokio::test]
+async fn milestone_incomplete_before_completion() {
+    let planner = BasicCpmPlanner::new();
+    let plan_id = submit(&planner, milestone_graph()).await;
+    complete(&planner, &plan_id, "a").await;
+    let status = planner.status(&plan_id).await.unwrap();
+    assert!(!status.milestones[0].complete);
+}
+
+#[tokio::test]
+async fn downstream_milestone_path_excludes_unrelated_branch() {
+    let planner = BasicCpmPlanner::new();
+    let plan_id = submit(
+        &planner,
+        vec![
+            deliverable("a", &["src/a.rs"], &[], Some(1.0)),
+            milestone("m1", &["a"]),
+            deliverable("c", &["src/c.rs"], &[], Some(2.0)),
+            milestone("m2", &["c"]),
+        ],
+    )
+    .await;
+    let status = planner.status(&plan_id).await.unwrap();
+    let m2 = status.milestones.iter().find(|m| m.id == "m2").unwrap();
+    assert_eq!(m2.critical_path, ["__start__", "c", "m2"]);
+}
+
+#[tokio::test]
+async fn milestone_without_estimate_is_zero_length() {
+    let planner = BasicCpmPlanner::new();
+    let mut m = deliverable("m", &[], &["a"], None);
+    m.milestone = true;
+    let plan_id = submit(
+        &planner,
+        vec![deliverable("a", &["src/a.rs"], &[], Some(2.0)), m],
+    )
+    .await;
+    let status = planner.status(&plan_id).await.unwrap();
+    let row = status.schedule.iter().find(|r| r.id == "m").unwrap();
+    assert_eq!(row.ef, 2.0);
 }
 
 #[tokio::test]
@@ -1693,7 +1735,7 @@ async fn unordered_append_and_exclusive_claims_are_rejected() {
     let mut a = deliverable("a", &[], &[], Some(1.0));
     a.owned_files = vec![cpm_planner::plan::OwnedFile::Claim {
         path: "REGISTRY.md".into(),
-        mode: cpm_planner::plan::FileMode::Append,
+        mode: Some(cpm_planner::plan::FileMode::Append),
     }];
     let graph = PlanGraph {
         deliverables: vec![a, deliverable("b", &["REGISTRY.md"], &[], Some(1.0))],

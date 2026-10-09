@@ -11,7 +11,7 @@
 //!
 //! `TransactionBehavior::Immediate` takes the database write lock at
 //! `BEGIN`, so the whole read-modify-write of an `acquire_cohort` (ready
-//! check + within-cohort file disjointness + disjoint-from-held-locks +
+//! check + within-cohort file-claim conflicts + conflicts with held locks +
 //! lock insert + status flip to `in_progress`) is serialised across
 //! processes. Two concurrent acquirers — even in different OS processes —
 //! can never both observe the same "ready and unlocked" deliverable, so
@@ -401,6 +401,14 @@ fn recompute_stale_results(conn: &Connection) -> anyhow::Result<()> {
                 continue;
             }
         };
+        if graph
+            .deliverables
+            .iter()
+            .any(|d| d.id == crate::plan::START_ID || d.id == crate::plan::FINISH_ID)
+        {
+            tracing::warn!(%plan_id, "stored graph uses a reserved endpoint id; leaving cached result as is");
+            continue;
+        }
         match crate::schedule::compute_cpm(&graph) {
             Ok(result) => {
                 conn.execute(
