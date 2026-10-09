@@ -35,8 +35,9 @@ use std::time::Duration;
 
 use crate::audit::{AuditEvent, AuditSink, NullAuditSink};
 use crate::plan::{
-    CallerId, Cohort, CohortRow, Deliverable, DeliverableStatus, LockInfo, PlanDefinition,
-    PlanGraph, PlanId, PlanStatus, PlannerError, ScheduleRow,
+    AcceptRequest, AcquireRequest, BlockedDeliverable, CallerId, Cohort, CohortRow, Deliverable,
+    DeliverableStatus, ForceReleaseRequest, HeartbeatRequest, LockInfo, MarkStatusRequest,
+    PlanDefinition, PlanGraph, PlanId, PlanStatus, PlannerError, ScheduleRow,
 };
 use crate::plan_store::SqlitePlanStore;
 use crate::ports::Planner;
@@ -51,6 +52,15 @@ use crate::locks::PlanState;
 /// Default TTL applied to newly acquired locks. Five minutes is the
 /// open-source default called out in SPEC §33 PA3.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// Default ceiling for a per-call lease TTL (`ttl_seconds`). Eight hours
+/// is generous enough for long-running work while still bounding a
+/// forgotten lease; override with `CPM_MAX_TTL_SECS` on the server or
+/// [`BasicCpmPlanner::with_max_ttl`] as a library.
+pub const DEFAULT_MAX_TTL: Duration = Duration::from_secs(8 * 60 * 60);
+
+/// Hard ceiling for the configurable maximum lease TTL (30 days).
+pub const MAX_TTL_CEILING: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// Circuit-breaker: maximum number of times a deliverable may be
 /// EXPLICITLY marked failed (via [`Planner::mark_status`] with
@@ -112,6 +122,7 @@ pub struct BasicCpmPlanner {
     store: SqlitePlanStore,
     audit: Arc<dyn AuditSink>,
     ttl: Duration,
+    max_ttl: Duration,
     clock: ClockFn,
 }
 
@@ -132,6 +143,14 @@ impl BasicCpmPlanner {
     /// Override the lock TTL. Useful for short-lived integration tests.
     pub fn with_ttl(mut self, ttl: Duration) -> Self {
         self.ttl = ttl;
+        self
+    }
+
+    /// Override the maximum lease TTL a caller may request via
+    /// `ttl_seconds`. Requested values above this are clamped down to it.
+    /// The value is itself capped at [`MAX_TTL_CEILING`] (30 days).
+    pub fn with_max_ttl(mut self, max_ttl: Duration) -> Self {
+        self.max_ttl = max_ttl.min(MAX_TTL_CEILING);
         self
     }
 
@@ -168,12 +187,19 @@ impl BasicCpmPlanner {
             store,
             audit,
             ttl,
+            max_ttl: DEFAULT_MAX_TTL,
             clock,
         }
     }
 
     fn now(&self) -> DateTime<Utc> {
         (self.clock)()
+    }
+
+    /// Effective lease TTL for one call: the caller-requested value (or
+    /// the planner default) clamped to the configured maximum.
+    fn effective_ttl(&self, requested: Option<Duration>) -> Duration {
+        requested.unwrap_or(self.ttl).min(self.max_ttl)
     }
 
     /// Flush buffered audit events. Called after the mutex is dropped so a
@@ -418,6 +444,134 @@ fn make_circuit_break_event(
     }))
 }
 
+/// Missing (non-Complete) prerequisites of `deliverable_id`.
+fn incomplete_prerequisites(state: &PlanState, deliverable_id: &str) -> Vec<String> {
+    state
+        .graph
+        .deliverables
+        .iter()
+        .find(|d| d.id == deliverable_id)
+        .map(|d| {
+            d.prerequisites
+                .iter()
+                .filter(|p| !matches!(state.statuses.get(*p), Some(DeliverableStatus::Complete)))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Mark a deliverable `Complete`: release any lock (and its file index,
+/// emitting a released event), set the status, and promote dependents whose
+/// prerequisites are now all complete. Shared by `mark_status` and `accept`.
+fn complete_deliverable(
+    state: &mut PlanState,
+    deliverable_id: &str,
+    audit_buf: &mut Vec<AuditEvent>,
+    release_reason: &str,
+) {
+    if let Some(lock) = state.locks.remove(deliverable_id) {
+        // Callers verified the deliverable exists; a held lock implies the
+        // graph entry exists.
+        let owned_files: Vec<PathBuf> = match state
+            .graph
+            .deliverables
+            .iter()
+            .find(|d| d.id == deliverable_id)
+        {
+            Some(d) => d.owned_files.clone(),
+            None => unreachable!(
+                "deliverable {deliverable_id} present in locks but missing from graph — \
+                 invariant broken"
+            ),
+        };
+        for f in &owned_files {
+            state.file_to_deliverable.remove(f);
+        }
+        audit_buf.push(make_released_event(&lock, release_reason));
+    }
+
+    state
+        .statuses
+        .insert(deliverable_id.to_string(), DeliverableStatus::Complete);
+
+    let dependents: Vec<String> = state
+        .graph
+        .deliverables
+        .iter()
+        .filter(|d| d.prerequisites.iter().any(|p| p == deliverable_id))
+        .map(|d| d.id.clone())
+        .collect();
+    for dep_id in dependents {
+        let dep = match state.graph.deliverables.iter().find(|d| d.id == dep_id) {
+            Some(d) => d,
+            None => unreachable!("dependent id {dep_id} present in graph but not findable"),
+        };
+        let all_done = dep
+            .prerequisites
+            .iter()
+            .all(|p| matches!(state.statuses.get(p), Some(DeliverableStatus::Complete)));
+        let currently_pending = matches!(
+            state.statuses.get(&dep_id),
+            Some(DeliverableStatus::Pending)
+        );
+        if all_done && currently_pending {
+            state.statuses.insert(dep_id, DeliverableStatus::Ready);
+        }
+    }
+}
+
+fn make_accepted_event(
+    req: &AcceptRequest,
+    overrode_lock_of: Option<&str>,
+    previous_status: &DeliverableStatus,
+) -> AuditEvent {
+    AuditEvent::new("plan.deliverable.accepted")
+        .with_actor(req.accepted_by.as_str())
+        .with_payload(json!({
+            "plan_id": req.plan_id.as_str(),
+            "deliverable_id": req.deliverable_id,
+            "accepted_by": req.accepted_by,
+            "evidence": req.evidence,
+            "overrode_lock_of": overrode_lock_of,
+            "previous_status": previous_status,
+        }))
+}
+
+fn make_completed_without_lease_event(
+    plan_id: &PlanId,
+    deliverable_id: &str,
+    caller_id: &CallerId,
+    previous_status: &DeliverableStatus,
+) -> AuditEvent {
+    AuditEvent::new("plan.deliverable.completed_without_lease")
+        .with_actor(caller_id.as_str())
+        .with_payload(json!({
+            "plan_id": plan_id.as_str(),
+            "deliverable_id": deliverable_id,
+            "caller_id": caller_id.as_str(),
+            "previous_status": previous_status,
+        }))
+}
+
+fn make_marked_without_lease_event(
+    plan_id: &PlanId,
+    deliverable_id: &str,
+    caller_id: &CallerId,
+    status: &DeliverableStatus,
+    previous_status: &DeliverableStatus,
+) -> AuditEvent {
+    AuditEvent::new("plan.deliverable.marked_without_lease")
+        .with_actor(caller_id.as_str())
+        .with_payload(json!({
+            "plan_id": plan_id.as_str(),
+            "deliverable_id": deliverable_id,
+            "caller_id": caller_id.as_str(),
+            "status": status,
+            "previous_status": previous_status,
+        }))
+}
+
 fn make_force_released_event(lock: &LockInfo, reason: &str) -> AuditEvent {
     AuditEvent::new("plan.lock.force_released")
         .with_actor(lock.caller_id.as_str())
@@ -426,6 +580,23 @@ fn make_force_released_event(lock: &LockInfo, reason: &str) -> AuditEvent {
             "deliverable_id": lock.deliverable_id,
             "last_caller_id": lock.caller_id.as_str(),
             "reason": reason,
+        }))
+}
+
+fn make_counters_reset_event(
+    plan_id: &PlanId,
+    deliverable_id: &str,
+    reason: &str,
+    lapse_count: u32,
+    failure_count: u32,
+) -> AuditEvent {
+    AuditEvent::new("plan.deliverable.counters_reset")
+        .with_actor("operator")
+        .with_payload(json!({
+            "plan_id": plan_id.as_str(),
+            "deliverable_id": deliverable_id,
+            "reason": reason,
+            "previous": { "lapse_count": lapse_count, "failure_count": failure_count },
         }))
 }
 
@@ -484,48 +655,64 @@ impl Planner for BasicCpmPlanner {
         })
     }
 
-    async fn acquire_cohort(
-        &self,
-        plan_id: &PlanId,
-        caller_id: &CallerId,
-        max_count: usize,
-    ) -> Result<Cohort, PlannerError> {
+    async fn acquire_cohort(&self, req: AcquireRequest) -> Result<Cohort, PlannerError> {
+        let AcquireRequest {
+            plan_id,
+            caller_id,
+            max_count,
+            ids,
+            metadata_filter,
+            ttl,
+        } = req;
         let now = self.now();
         let expires_at = now
-            + chrono::Duration::from_std(self.ttl)
+            + chrono::Duration::from_std(self.effective_ttl(ttl))
                 .expect("INVARIANT: planner TTL fits in chrono::Duration");
 
         // Whole acquire body runs inside one immediate sqlite transaction —
         // that's what gives us atomicity against concurrent acquirers,
         // including acquirers in other OS processes.
         let mut audit_buf: Vec<AuditEvent> = Vec::new();
-        let cohort = self.store.mutate_plan(plan_id, |state| {
+        let cohort = self.store.mutate_plan(&plan_id, |state| {
             // 1. Reap expired locks, emitting expiry events.
             let reaped = state.reap_expired(now);
             for lock in &reaped {
                 audit_buf.push(make_expired_event(lock, now));
             }
 
-            // 2a. Lapse bound: a Ready deliverable whose lease has lapsed
+            // 2a. Targeting: validate requested ids, then work out which
+            //     deliverables this acquire considers. Manual deliverables
+            //     (metadata.kind == "manual") are never leased; a metadata
+            //     filter silently narrows the field.
+            if let Some(req_ids) = &ids {
+                for rid in req_ids {
+                    if !state.graph.deliverables.iter().any(|d| &d.id == rid) {
+                        return Err(PlannerError::DeliverableNotFound {
+                            plan_id: plan_id.0.clone(),
+                            deliverable_id: rid.clone(),
+                        });
+                    }
+                }
+            }
+            let is_requested = |id: &str| ids.as_ref().is_some_and(|v| v.iter().any(|r| r == id));
+            let is_manual =
+                |d: &Deliverable| d.metadata.get("kind").and_then(|k| k.as_str()) == Some("manual");
+            let matches_filter = |d: &Deliverable| {
+                metadata_filter
+                    .as_ref()
+                    .is_none_or(|f| f.iter().all(|(k, v)| d.metadata.get(k) == Some(v)))
+            };
+            let in_scope =
+                |d: &Deliverable| (ids.is_none() || is_requested(&d.id)) && matches_filter(d);
+
+            // 2b-prelim. Lapse bound: a Ready deliverable whose lease has lapsed
             //     environmentally MAX_LAPSES times is evidence of a broken
             //     ENVIRONMENT (drivers keep getting killed before they can
             //     report), not a broken deliverable. Do NOT auto-fail it —
             //     that would misdiagnose a healthy deliverable — but stop
-            //     re-leasing: fail the acquire loudly with the stable
-            //     LAPSE_LIMIT error so an operator intervenes. The Err
-            //     rolls this transaction back, so the check is stable
-            //     across retries.
-            if let Some(d) = state.graph.deliverables.iter().find(|d| {
-                matches!(state.statuses.get(&d.id), Some(DeliverableStatus::Ready))
-                    && !state.locks.contains_key(&d.id)
-                    && state.lapse_count(&d.id) >= MAX_LAPSES
-            }) {
-                return Err(PlannerError::LapseLimit {
-                    deliverable_id: d.id.clone(),
-                    lapse_count: state.lapse_count(&d.id),
-                    max_lapses: MAX_LAPSES,
-                });
-            }
+            //     re-leasing it: skip it, leave the rest of the plan
+            //     leasable, and report it in `blocked` so an operator
+            //     intervenes (force_release with reset_counters).
 
             // 2b. Circuit-break: a Ready deliverable that has already been
             //     EXPLICITLY marked failed MAX_ATTEMPTS times is a poison
@@ -552,7 +739,7 @@ impl Planner for BasicCpmPlanner {
                 // execution_policy's classification — the deliverable is out.
                 let reason = format!("circuit-break: exceeded {MAX_ATTEMPTS} failed attempts");
                 audit_buf.push(make_circuit_break_event(
-                    plan_id,
+                    &plan_id,
                     &id,
                     failures,
                     FailureClass::Permanent,
@@ -563,6 +750,30 @@ impl Planner for BasicCpmPlanner {
                     .insert(id, DeliverableStatus::Failed { reason });
             }
 
+            // 2c. Lapse-limited set, computed AFTER the circuit-break so a
+            //     deliverable at both caps is reported only as Failed.
+            let lapse_blocked: Vec<BlockedDeliverable> = state
+                .graph
+                .deliverables
+                .iter()
+                .filter(|d| {
+                    in_scope(d)
+                        && !is_manual(d)
+                        && matches!(state.statuses.get(&d.id), Some(DeliverableStatus::Ready))
+                        && !state.locks.contains_key(&d.id)
+                        && state.lapse_count(&d.id) >= MAX_LAPSES
+                })
+                .map(|d| BlockedDeliverable {
+                    id: d.id.clone(),
+                    code: "LAPSE_LIMIT".to_string(),
+                    reason: format!(
+                        "lease lapsed {} times (limit {MAX_LAPSES}); clear with \
+                         plan.force_release {{reset_counters: true}}",
+                        state.lapse_count(&d.id)
+                    ),
+                })
+                .collect();
+
             // 3. Build the (float, ES) lookup table.
             let sched_by_id: HashMap<&str, (f32, f32)> = state
                 .cached_result
@@ -571,29 +782,93 @@ impl Planner for BasicCpmPlanner {
                 .map(|t| (t.id.as_str(), (t.float, t.earliest_start)))
                 .collect();
 
-            // 4. Build the ready set: status=Ready AND no lock currently held.
-            let mut ready: Vec<&Deliverable> = state
-                .graph
-                .deliverables
-                .iter()
-                .filter(|d| {
-                    matches!(state.statuses.get(&d.id), Some(DeliverableStatus::Ready))
+            // 4. Build the ready set (in scope, non-manual, Ready, unlocked,
+            //    not lapse-limited) and, for requested ids, classify every id
+            //    that cannot be leased. Without `ids`, only LAPSE_LIMIT is
+            //    reported (manual deliverables are skipped quietly).
+            let mut blocked: Vec<BlockedDeliverable> = Vec::new();
+            let mut ready: Vec<&Deliverable> = Vec::new();
+            if let Some(req_ids) = &ids {
+                let mut seen: HashSet<&str> = HashSet::new();
+                for rid in req_ids {
+                    if !seen.insert(rid.as_str()) {
+                        continue;
+                    }
+                    let d = state
+                        .graph
+                        .deliverables
+                        .iter()
+                        .find(|d| &d.id == rid)
+                        .expect("INVARIANT: requested ids validated above");
+                    if !matches_filter(d) {
+                        continue;
+                    }
+                    let mut block = |code: &str, reason: String| {
+                        blocked.push(BlockedDeliverable {
+                            id: d.id.clone(),
+                            code: code.to_string(),
+                            reason,
+                        });
+                    };
+                    let status = state.statuses.get(&d.id);
+                    if is_manual(d) {
+                        block("MANUAL", "manual deliverable; never leased".to_string());
+                    } else if state.locks.contains_key(&d.id) {
+                        block("LOCKED", "held by an active lease".to_string());
+                    } else if !matches!(status, Some(DeliverableStatus::Ready)) {
+                        block(
+                            "NOT_READY",
+                            format!(
+                                "status is {}",
+                                status.map_or("unknown".to_string(), |s| format!("{s:?}"))
+                            ),
+                        );
+                    } else if let Some(lb) = lapse_blocked.iter().find(|b| b.id == d.id) {
+                        block("LAPSE_LIMIT", lb.reason.clone());
+                    } else {
+                        ready.push(d);
+                    }
+                }
+            } else {
+                blocked = lapse_blocked.clone();
+                ready.extend(state.graph.deliverables.iter().filter(|d| {
+                    in_scope(d)
+                        && !is_manual(d)
+                        && matches!(state.statuses.get(&d.id), Some(DeliverableStatus::Ready))
                         && !state.locks.contains_key(&d.id)
-                })
-                .collect();
+                        && !lapse_blocked.iter().any(|b| b.id == d.id)
+                }));
+            }
             ready.sort_by_key(|d| priority_key(&d.id, &sched_by_id));
 
-            // 5. Greedy fill with file-disjointness check.
+            // 5. Greedy fill with file-disjointness check. Requested ids that
+            //    are skipped are reported as FILE_CONFLICT / MAX_COUNT.
             let mut selected: Vec<Deliverable> = Vec::new();
             let mut selected_files: HashSet<PathBuf> = HashSet::new();
             for candidate in ready {
                 if selected.len() == max_count {
-                    break;
+                    if ids.is_none() {
+                        break;
+                    }
+                    blocked.push(BlockedDeliverable {
+                        id: candidate.id.clone(),
+                        code: "MAX_COUNT".to_string(),
+                        reason: format!("cohort already holds max_count ({max_count})"),
+                    });
+                    continue;
                 }
                 let conflict = candidate.owned_files.iter().any(|f| {
                     selected_files.contains(f) || state.file_to_deliverable.contains_key(f)
                 });
                 if conflict {
+                    if ids.is_some() {
+                        blocked.push(BlockedDeliverable {
+                            id: candidate.id.clone(),
+                            code: "FILE_CONFLICT".to_string(),
+                            reason: "owned files overlap a held lock or an earlier pick"
+                                .to_string(),
+                        });
+                    }
                     continue;
                 }
                 for f in &candidate.owned_files {
@@ -640,6 +915,7 @@ impl Planner for BasicCpmPlanner {
             Ok(Cohort {
                 plan_id: plan_id.clone(),
                 rows,
+                blocked,
             })
         })?;
 
@@ -647,15 +923,17 @@ impl Planner for BasicCpmPlanner {
         Ok(cohort)
     }
 
-    async fn mark_status(
-        &self,
-        plan_id: &PlanId,
-        deliverable_id: &str,
-        caller_id: &CallerId,
-        status: DeliverableStatus,
-    ) -> Result<(), PlannerError> {
+    async fn mark_status(&self, req: MarkStatusRequest) -> Result<(), PlannerError> {
+        let MarkStatusRequest {
+            plan_id,
+            deliverable_id,
+            caller_id,
+            status,
+        } = req;
+        let deliverable_id = deliverable_id.as_str();
+        let caller_id = &caller_id;
         let mut audit_buf: Vec<AuditEvent> = Vec::new();
-        self.store.mutate_plan(plan_id, |state| {
+        self.store.mutate_plan(&plan_id, |state| {
             // Deliverable existence.
             if !state
                 .graph
@@ -679,14 +957,62 @@ impl Planner for BasicCpmPlanner {
                 });
             }
 
-            // Lock release on terminal status.
-            let release_reason: Option<&'static str> = match &status {
-                DeliverableStatus::Complete => Some("completed"),
-                DeliverableStatus::Failed { .. } => Some("failed"),
-                _ => None,
-            };
+            let is_complete = matches!(status, DeliverableStatus::Complete);
+            let previous_status = state
+                .statuses
+                .get(deliverable_id)
+                .cloned()
+                .unwrap_or(DeliverableStatus::Pending);
 
-            if let Some(reason) = release_reason
+            // No lock and already Complete: only an idempotent Complete is
+            // allowed; a late holder of an overridden lease cannot undo an
+            // accept.
+            if !state.locks.contains_key(deliverable_id)
+                && matches!(previous_status, DeliverableStatus::Complete)
+                && !is_complete
+            {
+                return Err(PlannerError::LockNotHeld {
+                    caller_id: caller_id.0.clone(),
+                    deliverable_id: deliverable_id.to_string(),
+                });
+            }
+
+            // Completing without a lease: every prerequisite must be done,
+            // and the bypass is audited.
+            if is_complete && !state.locks.contains_key(deliverable_id) {
+                // Already Complete: idempotent no-op, nothing to audit.
+                if matches!(
+                    state.statuses.get(deliverable_id),
+                    Some(DeliverableStatus::Complete)
+                ) {
+                    return Ok(());
+                }
+                let missing = incomplete_prerequisites(state, deliverable_id);
+                if !missing.is_empty() {
+                    return Err(PlannerError::PrerequisitesIncomplete {
+                        plan_id: plan_id.0.clone(),
+                        deliverable_id: deliverable_id.to_string(),
+                        missing,
+                    });
+                }
+                audit_buf.push(make_completed_without_lease_event(
+                    &plan_id,
+                    deliverable_id,
+                    caller_id,
+                    &previous_status,
+                ));
+            } else if !is_complete && !state.locks.contains_key(deliverable_id) {
+                audit_buf.push(make_marked_without_lease_event(
+                    &plan_id,
+                    deliverable_id,
+                    caller_id,
+                    &status,
+                    &previous_status,
+                ));
+            }
+
+            // Lock release on Failed.
+            if matches!(status, DeliverableStatus::Failed { .. })
                 && let Some(lock) = state.locks.remove(deliverable_id)
             {
                 // Deliverable existence was verified at the top of
@@ -706,7 +1032,7 @@ impl Planner for BasicCpmPlanner {
                 for f in &owned_files {
                     state.file_to_deliverable.remove(f);
                 }
-                audit_buf.push(make_released_event(&lock, reason));
+                audit_buf.push(make_released_event(&lock, "failed"));
             }
 
             // An EXPLICIT Failed mark is a real implementation attempt —
@@ -727,38 +1053,12 @@ impl Planner for BasicCpmPlanner {
                     .or_insert(0) += 1;
             }
 
-            // Set status.
-            state
-                .statuses
-                .insert(deliverable_id.to_string(), status.clone());
-
-            // Advance dependents to Ready if all their prereqs are Complete.
-            if matches!(status, DeliverableStatus::Complete) {
-                let dependents: Vec<String> = state
-                    .graph
-                    .deliverables
-                    .iter()
-                    .filter(|d| d.prerequisites.iter().any(|p| p == deliverable_id))
-                    .map(|d| d.id.clone())
-                    .collect();
-                for dep_id in dependents {
-                    let dep = match state.graph.deliverables.iter().find(|d| d.id == dep_id) {
-                        Some(d) => d,
-                        None => {
-                            unreachable!("dependent id {dep_id} present in graph but not findable")
-                        }
-                    };
-                    let all_done = dep.prerequisites.iter().all(|p| {
-                        matches!(state.statuses.get(p), Some(DeliverableStatus::Complete))
-                    });
-                    let currently_pending = matches!(
-                        state.statuses.get(&dep_id),
-                        Some(DeliverableStatus::Pending)
-                    );
-                    if all_done && currently_pending {
-                        state.statuses.insert(dep_id, DeliverableStatus::Ready);
-                    }
-                }
+            if is_complete {
+                complete_deliverable(state, deliverable_id, &mut audit_buf, "completed");
+            } else {
+                state
+                    .statuses
+                    .insert(deliverable_id.to_string(), status.clone());
             }
 
             Ok(())
@@ -775,18 +1075,22 @@ impl Planner for BasicCpmPlanner {
         Ok(())
     }
 
-    async fn heartbeat(
-        &self,
-        plan_id: &PlanId,
-        deliverable_id: &str,
-        caller_id: &CallerId,
-    ) -> Result<(), PlannerError> {
+    async fn heartbeat(&self, req: HeartbeatRequest) -> Result<(), PlannerError> {
+        let HeartbeatRequest {
+            plan_id,
+            deliverable_id,
+            caller_id,
+            ttl,
+        } = req;
+        let deliverable_id = deliverable_id.as_str();
+        let caller_id = &caller_id;
         let now = self.now();
+        let explicit_ttl = ttl.is_some();
         let expires_at = now
-            + chrono::Duration::from_std(self.ttl)
+            + chrono::Duration::from_std(self.effective_ttl(ttl))
                 .expect("INVARIANT: planner TTL fits in chrono::Duration");
 
-        self.store.mutate_plan(plan_id, |state| {
+        self.store.mutate_plan(&plan_id, |state| {
             let lock =
                 state
                     .locks
@@ -812,7 +1116,14 @@ impl Planner for BasicCpmPlanner {
                 });
             }
 
-            lock.expires_at = expires_at;
+            // A heartbeat without an explicit ttl never shortens a lease
+            // (e.g. one acquired with a long ttl_seconds); an explicit ttl
+            // sets now + ttl.
+            lock.expires_at = if explicit_ttl {
+                expires_at
+            } else {
+                lock.expires_at.max(expires_at)
+            };
             Ok(())
         })
     }
@@ -872,7 +1183,7 @@ impl Planner for BasicCpmPlanner {
                 .collect();
             // Same ordering as acquire_cohort (shared priority_key). Membership is a
             // superset: acquire may still skip deliverables at the failure or lapse
-            // cap or whose files overlap a held lock.
+            // cap, manual deliverables, or ones whose files overlap a held lock.
             let sched_by_id: HashMap<&str, (f32, f32)> = state
                 .cached_result
                 .tasks
@@ -895,14 +1206,86 @@ impl Planner for BasicCpmPlanner {
         })
     }
 
-    async fn force_release(
-        &self,
-        plan_id: &PlanId,
-        deliverable_id: &str,
-        reason: &str,
-    ) -> Result<(), PlannerError> {
+    async fn accept(&self, req: AcceptRequest) -> Result<(), PlannerError> {
         let mut audit_buf: Vec<AuditEvent> = Vec::new();
-        self.store.mutate_plan(plan_id, |state| {
+        let plan_id = req.plan_id.clone();
+        let deliverable_id = req.deliverable_id.as_str();
+        let now = self.now();
+        self.store.mutate_plan(&plan_id, |state| {
+            if !state
+                .graph
+                .deliverables
+                .iter()
+                .any(|d| d.id == deliverable_id)
+            {
+                return Err(PlannerError::DeliverableNotFound {
+                    plan_id: plan_id.0.clone(),
+                    deliverable_id: deliverable_id.to_string(),
+                });
+            }
+
+            // Only LIVE leases block acceptance: reap expired ones first.
+            for lock in &state.reap_expired(now) {
+                audit_buf.push(make_expired_event(lock, now));
+            }
+
+            // Already Complete: idempotent no-op (no state change, no audit).
+            let previous_status = state
+                .statuses
+                .get(deliverable_id)
+                .cloned()
+                .unwrap_or(DeliverableStatus::Pending);
+            if matches!(previous_status, DeliverableStatus::Complete) {
+                return Ok(());
+            }
+
+            // ANY live lease needs an explicit override, whoever the
+            // acceptor claims to be.
+            let mut overrode: Option<String> = None;
+            if let Some(lock) = state.locks.get(deliverable_id) {
+                if !req.override_lock {
+                    return Err(PlannerError::LockHeld {
+                        plan_id: plan_id.0.clone(),
+                        deliverable_id: deliverable_id.to_string(),
+                        holder: lock.caller_id.0.clone(),
+                    });
+                }
+                overrode = Some(lock.caller_id.0.clone());
+            }
+
+            let missing = incomplete_prerequisites(state, deliverable_id);
+            if !missing.is_empty() {
+                return Err(PlannerError::PrerequisitesIncomplete {
+                    plan_id: plan_id.0.clone(),
+                    deliverable_id: deliverable_id.to_string(),
+                    missing,
+                });
+            }
+
+            complete_deliverable(state, deliverable_id, &mut audit_buf, "accepted");
+            audit_buf.push(make_accepted_event(
+                &req,
+                overrode.as_deref(),
+                &previous_status,
+            ));
+            Ok(())
+        })?;
+
+        self.flush_audit(audit_buf).await;
+        Ok(())
+    }
+
+    async fn force_release(&self, req: ForceReleaseRequest) -> Result<(), PlannerError> {
+        let ForceReleaseRequest {
+            plan_id,
+            deliverable_id,
+            reason,
+            reset_counters,
+        } = req;
+        let deliverable_id = deliverable_id.as_str();
+        let reason = reason.as_str();
+        let mut audit_buf: Vec<AuditEvent> = Vec::new();
+        self.store.mutate_plan(&plan_id, |state| {
             if !state
                 .graph
                 .deliverables
@@ -936,6 +1319,40 @@ impl Planner for BasicCpmPlanner {
                     .statuses
                     .insert(deliverable_id.to_string(), DeliverableStatus::Ready);
                 audit_buf.push(make_force_released_event(&lock, reason));
+            }
+
+            if reset_counters {
+                let lapse_count = state.lapse_counts.remove(deliverable_id).unwrap_or(0);
+                let failure_count = state.failure_counts.remove(deliverable_id).unwrap_or(0);
+                // A circuit-broken deliverable is Failed; revive it.
+                if matches!(
+                    state.statuses.get(deliverable_id),
+                    Some(DeliverableStatus::Failed { .. })
+                ) {
+                    let prereqs_complete = state
+                        .graph
+                        .deliverables
+                        .iter()
+                        .find(|d| d.id == deliverable_id)
+                        .is_some_and(|d| {
+                            d.prerequisites.iter().all(|p| {
+                                matches!(state.statuses.get(p), Some(DeliverableStatus::Complete))
+                            })
+                        });
+                    let revived = if prereqs_complete {
+                        DeliverableStatus::Ready
+                    } else {
+                        DeliverableStatus::Pending
+                    };
+                    state.statuses.insert(deliverable_id.to_string(), revived);
+                }
+                audit_buf.push(make_counters_reset_event(
+                    &plan_id,
+                    deliverable_id,
+                    reason,
+                    lapse_count,
+                    failure_count,
+                ));
             }
 
             Ok(())

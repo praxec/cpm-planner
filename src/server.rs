@@ -6,7 +6,7 @@
 
 //! MCP tool surface for the open-source CPM planner.
 //!
-//! [`PlanServer`] wraps an `Arc<BasicCpmPlanner>` and exposes the seven
+//! [`PlanServer`] wraps an `Arc<BasicCpmPlanner>` and exposes the eight
 //! [`Planner`] trait methods as MCP tools so any MCP-speaking agent
 //! (Claude Code, Cursor, custom orchestrator, or the §33 LLM executor)
 //! can drive the planner over the standard MCP protocol.
@@ -22,6 +22,7 @@
 //! | `plan.status`            | [`Planner::status`]           |
 //! | `plan.get`               | [`Planner::get_plan`]         |
 //! | `plan.force_release`     | [`Planner::force_release`]    |
+//! | `plan.accept`            | [`Planner::accept`]           |
 //!
 //! # Error mapping
 //!
@@ -29,7 +30,7 @@
 //! responses whose `message` is the variant's `Display` output. The
 //! variant prefixes (`LOCK_HELD:`, `LOCK_NOT_HELD:`, `LOCK_EXPIRED:`,
 //! `OVERLAP_DETECTED:`, `MISSING_PREREQUISITE:`, `PLAN_NOT_FOUND:`,
-//! `DELIVERABLE_NOT_FOUND:`, `LAPSE_LIMIT:`, `INVALID_GRAPH:`,
+//! `DELIVERABLE_NOT_FOUND:`, `LAPSE_LIMIT:`, `PREREQUISITES_INCOMPLETE:`, `INVALID_GRAPH:`,
 //! `BACKEND_ERROR:`) are
 //! stable machine-parseable signals — see `core::plan` for the contract.
 //! Malformed arguments yield `invalid_params` with the serde error.
@@ -43,9 +44,11 @@
 
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::plan::{
-    CallerId, Cohort, DeliverableStatus, PlanDefinition, PlanGraph, PlanId, PlanStatus,
+    AcceptRequest, AcquireRequest, CallerId, Cohort, DeliverableStatus, ForceReleaseRequest,
+    HeartbeatRequest, MarkStatusRequest, PlanDefinition, PlanGraph, PlanId, PlanStatus,
     PlannerError,
 };
 use crate::ports::Planner;
@@ -73,8 +76,9 @@ pub const TOOL_MARK_STATUS: &str = "plan.mark_status";
 pub const TOOL_STATUS: &str = "plan.status";
 pub const TOOL_GET: &str = "plan.get";
 pub const TOOL_FORCE_RELEASE: &str = "plan.force_release";
+pub const TOOL_ACCEPT: &str = "plan.accept";
 
-/// All seven MCP tool names exposed by [`PlanServer`], in declaration order.
+/// All eight MCP tool names exposed by [`PlanServer`], in declaration order.
 pub const PLAN_TOOL_NAMES: &[&str] = &[
     TOOL_SUBMIT,
     TOOL_ACQUIRE_COHORT,
@@ -83,6 +87,7 @@ pub const PLAN_TOOL_NAMES: &[&str] = &[
     TOOL_STATUS,
     TOOL_GET,
     TOOL_FORCE_RELEASE,
+    TOOL_ACCEPT,
 ];
 
 // ---------------------------------------------------------------------------
@@ -105,6 +110,30 @@ struct AcquireCohortArgs {
     plan_id: String,
     caller_id: String,
     max_count: usize,
+    #[serde(default)]
+    ids: Option<Vec<String>>,
+    #[serde(default)]
+    filter: Option<AcquireFilter>,
+    #[serde(default)]
+    ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcquireFilter {
+    #[serde(default)]
+    metadata: Option<serde_json::Map<String, Value>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcceptArgs {
+    plan_id: String,
+    deliverable_id: String,
+    accepted_by: String,
+    evidence: String,
+    #[serde(default)]
+    override_lock: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,6 +142,8 @@ struct HeartbeatArgs {
     plan_id: String,
     deliverable_id: String,
     caller_id: String,
+    #[serde(default)]
+    ttl_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -142,6 +173,8 @@ struct ForceReleaseArgs {
     plan_id: String,
     deliverable_id: String,
     reason: String,
+    #[serde(default)]
+    reset_counters: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -171,7 +204,7 @@ impl OkResponse {
 // Tool-list construction
 // ---------------------------------------------------------------------------
 
-/// Build the seven `Tool` definitions advertised in `list_tools`.
+/// Build the eight `Tool` definitions advertised in `list_tools`.
 ///
 /// Each tool carries an inline JSON Schema describing its arguments. The
 /// schemas are hand-written rather than derived because the workspace's
@@ -225,14 +258,30 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                  A deliverable explicitly marked failed 3 times is \
                  circuit-broken to failed instead of re-leased; leases lost \
                  environmentally (TTL lapse, no terminal mark) never trip \
-                 that breaker but are bounded separately (LAPSE_LIMIT at 10).",
+                 that breaker but are bounded separately (LAPSE_LIMIT at 10). \
+                 Optional ttl_seconds sets the lease TTL (clamped to the \
+                 server maximum). Optional ids targets specific deliverables \
+                 and filter.metadata narrows by metadata equality; \
+                 deliverables with metadata.kind = \"manual\" are never \
+                 leased. ids that do not match filter.metadata are ignored \
+                 (not reported in blocked). The response carries blocked \
+                 [{id, code, reason}], blocked_count, and needs_operator \
+                 (true when any blocked code is LAPSE_LIMIT: clear with \
+                 plan.force_release {reset_counters: true}).",
             ),
             schema_object(json!({
                 "type": "object",
                 "properties": {
                     "plan_id":   { "type": "string" },
                     "caller_id": { "type": "string" },
-                    "max_count": { "type": "integer", "minimum": 1 }
+                    "max_count": { "type": "integer", "minimum": 1 },
+                    "ids":       { "type": "array", "minItems": 1, "items": { "type": "string" } },
+                    "ttl_seconds": { "type": "integer", "minimum": 1 },
+                    "filter":    {
+                        "type": "object",
+                        "properties": { "metadata": { "type": "object" } },
+                        "additionalProperties": false
+                    }
                 },
                 "required": ["plan_id", "caller_id", "max_count"]
             })),
@@ -240,14 +289,17 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
         Tool::new(
             Cow::Borrowed(TOOL_HEARTBEAT),
             Cow::Borrowed(
-                "Refresh the TTL on a held lock; LOCK_NOT_HELD or LOCK_EXPIRED on failure.",
+                "Refresh the TTL on a held lock; LOCK_NOT_HELD or LOCK_EXPIRED on failure. \
+                 Optional ttl_seconds sets the new TTL (clamped to the server \
+                 maximum); without it the lease is never shortened.",
             ),
             schema_object(json!({
                 "type": "object",
                 "properties": {
                     "plan_id":        { "type": "string" },
                     "deliverable_id": { "type": "string" },
-                    "caller_id":      { "type": "string" }
+                    "caller_id":      { "type": "string" },
+                    "ttl_seconds":    { "type": "integer", "minimum": 1 }
                 },
                 "required": ["plan_id", "deliverable_id", "caller_id"]
             })),
@@ -256,7 +308,11 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
             Cow::Borrowed(TOOL_MARK_STATUS),
             Cow::Borrowed(
                 "Set a deliverable's status. Complete/Failed releases the lock; \
-                 caller_id mismatch yields LOCK_NOT_HELD.",
+                 caller_id mismatch yields LOCK_NOT_HELD. Without a lock, \
+                 Complete requires all prerequisites complete \
+                 (PREREQUISITES_INCOMPLETE) and is audited; other lockless \
+                 marks are audited too, and an already-complete deliverable \
+                 cannot be changed (LOCK_NOT_HELD).",
             ),
             schema_object(json!({
                 "type": "object",
@@ -313,9 +369,36 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                 "properties": {
                     "plan_id":        { "type": "string" },
                     "deliverable_id": { "type": "string" },
-                    "reason":         { "type": "string" }
+                    "reason":         { "type": "string" },
+                    "reset_counters": {
+                        "type": "boolean",
+                        "description": "Also clear lapse and failure counters (revives a circuit-broken deliverable)."
+                    }
                 },
                 "required": ["plan_id", "deliverable_id", "reason"]
+            })),
+        ),
+        Tool::new(
+            Cow::Borrowed(TOOL_ACCEPT),
+            Cow::Borrowed(
+                "Manager/owner acceptance: mark a deliverable Complete without \
+                 holding its lease. Requires all prerequisites Complete and \
+                 evidence; audited. A live lease held by someone else is refused \
+                 (LOCK_HELD) unless override_lock is true.",
+            ),
+            schema_object(json!({
+                "type": "object",
+                "properties": {
+                    "plan_id":        { "type": "string" },
+                    "deliverable_id": { "type": "string" },
+                    "accepted_by":    { "type": "string" },
+                    "evidence":       { "type": "string" },
+                    "override_lock": {
+                        "type": "boolean",
+                        "description": "Take over a live lease held by another caller."
+                    }
+                },
+                "required": ["plan_id", "deliverable_id", "accepted_by", "evidence"]
             })),
         ),
     ]
@@ -343,7 +426,7 @@ fn schema_object(value: Value) -> Arc<rmcp::model::JsonObject> {
 // PlanServer
 // ---------------------------------------------------------------------------
 
-/// MCP server façade exposing a [`BasicCpmPlanner`] over seven tools.
+/// MCP server façade exposing a [`BasicCpmPlanner`] over eight tools.
 #[derive(Clone)]
 pub struct PlanServer {
     planner: Arc<BasicCpmPlanner>,
@@ -407,6 +490,7 @@ impl PlanServer {
             TOOL_STATUS => self.handle_status(args).await,
             TOOL_GET => self.handle_get(args).await,
             TOOL_FORCE_RELEASE => self.handle_force_release(args).await,
+            TOOL_ACCEPT => self.handle_accept(args).await,
             other => Err(McpError::invalid_params(
                 format!(
                     "Unknown tool '{other}'. Available: {}.",
@@ -433,13 +517,29 @@ impl PlanServer {
 
     async fn handle_acquire_cohort(&self, args: Value) -> Result<Value, McpError> {
         let parsed: AcquireCohortArgs = parse_args(args)?;
+        if parsed.ids.as_ref().is_some_and(Vec::is_empty) {
+            return Err(McpError::invalid_params(
+                "ids must be non-empty when provided",
+                None,
+            ));
+        }
+        let mut request = AcquireRequest::new(
+            PlanId(parsed.plan_id),
+            CallerId(parsed.caller_id),
+            parsed.max_count,
+        );
+        if let Some(ids) = parsed.ids {
+            request = request.with_ids(ids);
+        }
+        if let Some(filter) = parsed.filter.and_then(|f| f.metadata) {
+            request = request.with_metadata_filter(filter);
+        }
+        if let Some(ttl) = ttl_from_seconds(parsed.ttl_seconds)? {
+            request = request.with_ttl(ttl);
+        }
         let cohort: Cohort = self
             .planner
-            .acquire_cohort(
-                &PlanId(parsed.plan_id),
-                &CallerId(parsed.caller_id),
-                parsed.max_count,
-            )
+            .acquire_cohort(request)
             .await
             .map_err(planner_error_to_mcp)?;
         // A SCALAR termination signal for declarative cohort drivers: a
@@ -449,21 +549,29 @@ impl PlanServer {
         // `exhausted == true` rather than inspecting `rows`. True when this
         // acquisition returned no rows (nothing ready / all complete).
         let exhausted = cohort.rows.is_empty();
+        let blocked_count = cohort.blocked.len();
+        let needs_operator = cohort.blocked.iter().any(|b| b.code == "LAPSE_LIMIT");
         let mut value = to_value(&cohort)?;
         if let Some(obj) = value.as_object_mut() {
             obj.insert("exhausted".to_string(), Value::Bool(exhausted));
+            obj.insert("blocked_count".to_string(), json!(blocked_count));
+            obj.insert("needs_operator".to_string(), Value::Bool(needs_operator));
         }
         Ok(value)
     }
 
     async fn handle_heartbeat(&self, args: Value) -> Result<Value, McpError> {
         let parsed: HeartbeatArgs = parse_args(args)?;
+        let mut request = HeartbeatRequest::new(
+            PlanId(parsed.plan_id),
+            parsed.deliverable_id,
+            CallerId(parsed.caller_id),
+        );
+        if let Some(ttl) = ttl_from_seconds(parsed.ttl_seconds)? {
+            request = request.with_ttl(ttl);
+        }
         self.planner
-            .heartbeat(
-                &PlanId(parsed.plan_id),
-                &parsed.deliverable_id,
-                &CallerId(parsed.caller_id),
-            )
+            .heartbeat(request)
             .await
             .map_err(planner_error_to_mcp)?;
         to_value(&OkResponse::new())
@@ -472,12 +580,12 @@ impl PlanServer {
     async fn handle_mark_status(&self, args: Value) -> Result<Value, McpError> {
         let parsed: MarkStatusArgs = parse_args(args)?;
         self.planner
-            .mark_status(
-                &PlanId(parsed.plan_id),
-                &parsed.deliverable_id,
-                &CallerId(parsed.caller_id),
+            .mark_status(MarkStatusRequest::new(
+                PlanId(parsed.plan_id),
+                parsed.deliverable_id,
+                CallerId(parsed.caller_id),
                 parsed.status,
-            )
+            ))
             .await
             .map_err(planner_error_to_mcp)?;
         to_value(&OkResponse::new())
@@ -503,13 +611,33 @@ impl PlanServer {
         to_value(&definition)
     }
 
+    async fn handle_accept(&self, args: Value) -> Result<Value, McpError> {
+        let parsed: AcceptArgs = parse_args(args)?;
+        self.planner
+            .accept(
+                AcceptRequest::new(
+                    PlanId(parsed.plan_id),
+                    parsed.deliverable_id,
+                    parsed.accepted_by,
+                    parsed.evidence,
+                )
+                .override_lock(parsed.override_lock),
+            )
+            .await
+            .map_err(planner_error_to_mcp)?;
+        to_value(&OkResponse::new())
+    }
+
     async fn handle_force_release(&self, args: Value) -> Result<Value, McpError> {
         let parsed: ForceReleaseArgs = parse_args(args)?;
         self.planner
             .force_release(
-                &PlanId(parsed.plan_id),
-                &parsed.deliverable_id,
-                &parsed.reason,
+                ForceReleaseRequest::new(
+                    PlanId(parsed.plan_id),
+                    parsed.deliverable_id,
+                    parsed.reason,
+                )
+                .reset_counters(parsed.reset_counters),
             )
             .await
             .map_err(planner_error_to_mcp)?;
@@ -527,7 +655,7 @@ impl ServerHandler for PlanServer {
             Implementation::new(self.server_name.clone(), self.server_version.clone());
         server_info.title = Some("cpm-planner".to_string());
         server_info.description = Some(
-            "MCP server exposing the open-source Praxec CPM planner via seven tools.".to_string(),
+            "MCP server exposing the open-source Praxec CPM planner via eight tools.".to_string(),
         );
 
         let mut info = InitializeResult::default();
@@ -586,6 +714,22 @@ fn parse_args<T: serde::de::DeserializeOwned>(args: Value) -> Result<T, McpError
         .map_err(|e| McpError::invalid_params(format!("invalid arguments: {e}"), None))
 }
 
+/// Convert an optional wire `ttl_seconds` into a lease TTL.
+///
+/// `None` means "use the planner default". `Some(0)` is rejected here, at
+/// the server layer, as invalid params; positive values pass through and
+/// the planner clamps them to its configured maximum.
+fn ttl_from_seconds(secs: Option<u64>) -> Result<Option<Duration>, McpError> {
+    match secs {
+        None => Ok(None),
+        Some(0) => Err(McpError::invalid_params(
+            "ttl_seconds must be >= 1 when provided",
+            None,
+        )),
+        Some(s) => Ok(Some(Duration::from_secs(s))),
+    }
+}
+
 /// Serialise a response into a JSON `Value`, mapping serde failures to
 /// `internal_error`. Each response type is a small struct or a wire type
 /// that already derives `Serialize`; this fallible boundary exists so the
@@ -612,18 +756,24 @@ fn planner_error_to_mcp(err: PlannerError) -> McpError {
 fn instructions() -> &'static str {
     r#"This is the cpm-planner MCP server — the open-source CPM planner.
 
-Tools (seven total, all `plan.<verb>`):
+Tools (eight total, all `plan.<verb>`):
   plan.submit          — submit a PlanGraph, get a plan_id (idempotent on identical graphs)
   plan.acquire_cohort  — atomically acquire ready, file-disjoint deliverables
   plan.heartbeat       — refresh a held lock's TTL
-  plan.mark_status     — set a deliverable's status (Complete/Failed releases the lock)
+  plan.mark_status     — set a deliverable's status (Complete/Failed releases the lock); lockless Complete requires complete prerequisites (PREREQUISITES_INCOMPLETE) and is audited
   plan.status          — read-only snapshot ([id, status, attempt_count, failure_count, lapse_count] rows, critical_path (one real chain), critical_ids, per-deliverable schedule (es/ef/ls/lf/float, hours), the ready set ordered by float, held locks)
   plan.get             — return the submitted PlanGraph (deliverables, estimates, files, metadata) for a plan_id
-  plan.force_release   — operator escape hatch; emits audit event with `reason`
+  plan.force_release   — operator escape hatch; emits audit event with `reason`; optional reset_counters:true also clears lapse/failure counters and revives a circuit-broken deliverable
+  plan.accept          — a manager/owner marks a deliverable Complete without a lease (audited; evidence required; override_lock to take over a live lease)
+
+Leases default to 5 minutes. Pass ttl_seconds (≤ server max, default 8h)
+on acquire/heartbeat for long-running work, and heartbeat at least every
+ttl/3.
 
 Errors carry stable prefixes: LOCK_HELD, LOCK_NOT_HELD, LOCK_EXPIRED,
 OVERLAP_DETECTED, MISSING_PREREQUISITE, PLAN_NOT_FOUND,
-DELIVERABLE_NOT_FOUND, LAPSE_LIMIT, INVALID_GRAPH, BACKEND_ERROR.
+DELIVERABLE_NOT_FOUND, LAPSE_LIMIT, PREREQUISITES_INCOMPLETE, INVALID_GRAPH,
+BACKEND_ERROR.
 
 DeliverableStatus is internally tagged on `status`:
   {"status":"pending"} | {"status":"ready"} | {"status":"in_progress"} |
@@ -636,7 +786,22 @@ by the next acquire_cohort (reason "circuit-break: exceeded 3 failed
 attempts") instead of being re-leased forever. A lease that lapses via
 TTL with no terminal mark (driver killed/timed out) increments
 lapse_count instead: environmental losses never trip the failure breaker,
-but at 10 lapses acquire_cohort refuses to re-lease and errors LAPSE_LIMIT
-so an operator can fix the environment.
+but at 10 lapses acquire_cohort stops re-leasing that deliverable: it is
+skipped (the rest of the plan stays leasable) and reported in the acquire
+response's `blocked` list as {id, code:"LAPSE_LIMIT", reason}. Fix the
+environment, then clear it with plan.force_release {reset_counters: true}.
+The response also carries scalar `blocked_count` and `needs_operator`.
+exhausted:true with needs_operator:true means the plan is stalled on
+lapse-limited deliverables (clear with plan.force_release {reset_counters:
+true}), not drained.
+
+Targeted acquire: plan.acquire_cohort accepts optional `ids` (only those
+deliverables are considered; unknown id -> DELIVERABLE_NOT_FOUND) and
+`filter: {"metadata": {key: value}}` (only deliverables whose metadata
+equals every pair; others are silently skipped). ids that do not match
+filter.metadata are ignored (not reported in blocked). Deliverables with
+metadata.kind = "manual" are never leased. With `ids`, each requested id
+that is not leased appears in `blocked` with code MANUAL, NOT_READY,
+LOCKED, LAPSE_LIMIT, FILE_CONFLICT or MAX_COUNT.
 "#
 }

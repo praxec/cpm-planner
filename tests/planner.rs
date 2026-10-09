@@ -8,7 +8,10 @@ use std::sync::Arc;
 
 use cpm_planner::BasicCpmPlanner;
 use cpm_planner::audit::MemoryAuditSink;
-use cpm_planner::plan::{CallerId, Deliverable, DeliverableStatus, PlanGraph, PlannerError};
+use cpm_planner::plan::{
+    AcceptRequest, AcquireRequest, CallerId, Deliverable, DeliverableStatus, ForceReleaseRequest,
+    HeartbeatRequest, MarkStatusRequest, PlanGraph, PlanId, PlannerError,
+};
 use cpm_planner::ports::Planner;
 
 fn deliverable(id: &str, files: &[&str], prereqs: &[&str], effort: Option<f32>) -> Deliverable {
@@ -124,7 +127,11 @@ async fn acquire_cohort_returns_critical_path_first() {
     };
     let plan_id = planner.submit_plan(graph).await.unwrap();
     let cohort = planner
-        .acquire_cohort(&plan_id, &caller("c1"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("c1").clone(),
+            1,
+        ))
         .await
         .unwrap();
     assert_eq!(cohort.rows.len(), 1);
@@ -144,7 +151,11 @@ async fn acquire_cohort_skips_deliverables_with_unmet_prerequisites() {
     };
     let plan_id = planner.submit_plan(graph).await.unwrap();
     let cohort = planner
-        .acquire_cohort(&plan_id, &caller("c1"), 10)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("c1").clone(),
+            10,
+        ))
         .await
         .unwrap();
     // Only root is Ready; leaf is Pending until root completes.
@@ -175,7 +186,11 @@ async fn acquire_cohort_filters_overlapping_files_within_cohort() {
     };
     let plan_id = planner.submit_plan(graph).await.unwrap();
     let cohort = planner
-        .acquire_cohort(&plan_id, &caller("c1"), 5)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("c1").clone(),
+            5,
+        ))
         .await
         .unwrap();
     // All three are file-disjoint, so all three should land in the cohort.
@@ -211,14 +226,22 @@ async fn acquire_cohort_excludes_files_locked_by_other_callers() {
     };
     let plan_id = planner.submit_plan(graph).await.unwrap();
     let c1 = planner
-        .acquire_cohort(&plan_id, &caller("c1"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("c1").clone(),
+            1,
+        ))
         .await
         .unwrap();
     assert_eq!(c1.rows.len(), 1);
     let first_id = c1.rows[0].deliverable.id.clone();
 
     let c2 = planner
-        .acquire_cohort(&plan_id, &caller("c2"), 10)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("c2").clone(),
+            10,
+        ))
         .await
         .unwrap();
     for row in &c2.rows {
@@ -242,13 +265,22 @@ async fn mark_status_complete_releases_lock_and_advances_dependents() {
     };
     let plan_id = planner.submit_plan(graph).await.unwrap();
     let cohort = planner
-        .acquire_cohort(&plan_id, &caller("c1"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("c1").clone(),
+            1,
+        ))
         .await
         .unwrap();
     assert_eq!(cohort.rows[0].deliverable.id, "root");
 
     planner
-        .mark_status(&plan_id, "root", &caller("c1"), DeliverableStatus::Complete)
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
+            "root",
+            caller("c1").clone(),
+            DeliverableStatus::Complete,
+        ))
         .await
         .unwrap();
 
@@ -264,7 +296,11 @@ async fn mark_status_complete_releases_lock_and_advances_dependents() {
 
     // Re-acquire should now offer leaf.
     let next = planner
-        .acquire_cohort(&plan_id, &caller("c1"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("c1").clone(),
+            1,
+        ))
         .await
         .unwrap();
     assert_eq!(next.rows.len(), 1);
@@ -280,12 +316,21 @@ async fn mark_status_with_wrong_caller_id_fails_with_lock_not_held() {
     };
     let plan_id = planner.submit_plan(graph).await.unwrap();
     planner
-        .acquire_cohort(&plan_id, &caller("c1"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("c1").clone(),
+            1,
+        ))
         .await
         .unwrap();
 
     let err = planner
-        .mark_status(&plan_id, "a", &caller("c2"), DeliverableStatus::Complete)
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
+            "a",
+            caller("c2").clone(),
+            DeliverableStatus::Complete,
+        ))
         .await
         .unwrap_err();
     match err {
@@ -309,7 +354,11 @@ async fn heartbeat_extends_ttl() {
     };
     let plan_id = planner.submit_plan(graph).await.unwrap();
     let cohort = planner
-        .acquire_cohort(&plan_id, &caller("c1"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("c1").clone(),
+            1,
+        ))
         .await
         .unwrap();
     let original_expiry = cohort.rows[0].lock.expires_at;
@@ -318,7 +367,11 @@ async fn heartbeat_extends_ttl() {
     tokio::task::yield_now().await;
 
     planner
-        .heartbeat(&plan_id, "a", &caller("c1"))
+        .heartbeat(HeartbeatRequest::new(
+            plan_id.clone(),
+            "a",
+            caller("c1").clone(),
+        ))
         .await
         .unwrap();
 
@@ -339,11 +392,19 @@ async fn heartbeat_with_wrong_caller_fails() {
     };
     let plan_id = planner.submit_plan(graph).await.unwrap();
     planner
-        .acquire_cohort(&plan_id, &caller("c1"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("c1").clone(),
+            1,
+        ))
         .await
         .unwrap();
     let err = planner
-        .heartbeat(&plan_id, "a", &caller("c2"))
+        .heartbeat(HeartbeatRequest::new(
+            plan_id.clone(),
+            "a",
+            caller("c2").clone(),
+        ))
         .await
         .unwrap_err();
     assert!(matches!(err, PlannerError::LockNotHeld { .. }));
@@ -377,12 +438,20 @@ async fn force_release_reverts_to_ready_and_audits_reason() {
     };
     let plan_id = planner.submit_plan(graph).await.unwrap();
     planner
-        .acquire_cohort(&plan_id, &caller("c1"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("c1").clone(),
+            1,
+        ))
         .await
         .unwrap();
 
     planner
-        .force_release(&plan_id, "a", "operator override: caller offline")
+        .force_release(ForceReleaseRequest::new(
+            plan_id.clone(),
+            "a",
+            "operator override: caller offline",
+        ))
         .await
         .unwrap();
 
@@ -457,7 +526,11 @@ async fn status_ready_is_sorted_by_float_ascending() {
 async fn status_ready_excludes_locked_deliverables() {
     let (planner, plan_id) = submit_diamond_with_spare().await;
     planner
-        .acquire_cohort(&plan_id, &caller("w1"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("w1").clone(),
+            1,
+        ))
         .await
         .unwrap();
     let status = planner.status(&plan_id).await.unwrap();
@@ -468,7 +541,11 @@ async fn status_ready_excludes_locked_deliverables() {
 async fn acquire_cohort_prefers_lowest_float() {
     let (planner, plan_id) = submit_diamond_with_spare().await;
     let cohort = planner
-        .acquire_cohort(&plan_id, &caller("w1"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("w1").clone(),
+            1,
+        ))
         .await
         .unwrap();
     let ids: Vec<&str> = cohort
@@ -488,4 +565,578 @@ async fn submit_rejects_negative_effort() {
     };
     let err = planner.submit_plan(graph).await.unwrap_err();
     assert!(err.to_string().starts_with("INVALID_GRAPH"), "got: {err}");
+}
+
+// ── Targeted / filtered acquire; manual deliverables (#14) ──────────────────
+
+fn with_meta(mut d: Deliverable, meta: serde_json::Value) -> Deliverable {
+    d.metadata = meta;
+    d
+}
+
+async fn submit_mixed() -> (BasicCpmPlanner, cpm_planner::plan::PlanId) {
+    let planner = BasicCpmPlanner::new();
+    let graph = PlanGraph {
+        deliverables: vec![
+            with_meta(
+                deliverable("code1", &["src/c1.rs"], &[], Some(1.0)),
+                serde_json::json!({"executor": "claude"}),
+            ),
+            with_meta(
+                deliverable("code2", &["src/c2.rs"], &[], Some(1.0)),
+                serde_json::json!({"executor": "claude"}),
+            ),
+            with_meta(
+                deliverable("ownerTask", &["src/o.rs"], &[], Some(1.0)),
+                serde_json::json!({"kind": "manual"}),
+            ),
+            with_meta(
+                deliverable("jun", &["src/j.rs"], &[], Some(1.0)),
+                serde_json::json!({"executor": "junior"}),
+            ),
+            deliverable("later", &["src/l.rs"], &["code1"], Some(1.0)),
+        ],
+        max_chained_dispatch: None,
+    };
+    let plan_id = planner.submit_plan(graph).await.unwrap();
+    (planner, plan_id)
+}
+
+fn cohort_ids(c: &cpm_planner::plan::Cohort) -> Vec<String> {
+    c.rows.iter().map(|r| r.deliverable.id.clone()).collect()
+}
+
+fn codes(c: &cpm_planner::plan::Cohort) -> Vec<(String, String)> {
+    c.blocked
+        .iter()
+        .map(|b| (b.id.clone(), b.code.clone()))
+        .collect()
+}
+
+fn sorted(mut v: Vec<String>) -> Vec<String> {
+    v.sort();
+    v
+}
+
+fn strs(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| s.to_string()).collect()
+}
+
+#[tokio::test]
+async fn unfiltered_acquire_never_leases_manual_deliverables() {
+    let (p, id) = submit_mixed().await;
+    let cohort = p
+        .acquire_cohort(AcquireRequest::new(id, caller("a"), 10))
+        .await
+        .unwrap();
+    assert_eq!(sorted(cohort_ids(&cohort)), vec!["code1", "code2", "jun"]);
+}
+
+#[tokio::test]
+async fn metadata_filter_leases_only_matching_deliverables() {
+    let (p, id) = submit_mixed().await;
+    let mut f = serde_json::Map::new();
+    f.insert("executor".into(), serde_json::json!("claude"));
+    let cohort = p
+        .acquire_cohort(AcquireRequest::new(id, caller("a"), 10).with_metadata_filter(f))
+        .await
+        .unwrap();
+    assert_eq!(sorted(cohort_ids(&cohort)), vec!["code1", "code2"]);
+}
+
+#[tokio::test]
+async fn ids_lease_only_the_requested_deliverables() {
+    let (p, id) = submit_mixed().await;
+    let cohort = p
+        .acquire_cohort(AcquireRequest::new(id, caller("a"), 10).with_ids(strs(&["jun"])))
+        .await
+        .unwrap();
+    assert_eq!(cohort_ids(&cohort), vec!["jun"]);
+}
+
+#[tokio::test]
+async fn requested_manual_deliverable_is_blocked_with_manual_code() {
+    let (p, id) = submit_mixed().await;
+    let cohort = p
+        .acquire_cohort(AcquireRequest::new(id, caller("a"), 10).with_ids(strs(&["ownerTask"])))
+        .await
+        .unwrap();
+    assert_eq!(codes(&cohort), vec![("ownerTask".into(), "MANUAL".into())]);
+}
+
+#[tokio::test]
+async fn requested_pending_deliverable_is_blocked_not_ready() {
+    let (p, id) = submit_mixed().await;
+    let cohort = p
+        .acquire_cohort(AcquireRequest::new(id, caller("a"), 10).with_ids(strs(&["later"])))
+        .await
+        .unwrap();
+    let b = &cohort.blocked[0];
+    assert!(b.id == "later" && b.code == "NOT_READY" && b.reason.contains("Pending"));
+}
+
+#[tokio::test]
+async fn requested_locked_deliverable_is_blocked_locked() {
+    let (p, id) = submit_mixed().await;
+    p.acquire_cohort(AcquireRequest::new(id.clone(), caller("a"), 10).with_ids(strs(&["code1"])))
+        .await
+        .unwrap();
+    let cohort_b = p
+        .acquire_cohort(AcquireRequest::new(id, caller("b"), 10).with_ids(strs(&["code1"])))
+        .await
+        .unwrap();
+    assert_eq!(codes(&cohort_b), vec![("code1".into(), "LOCKED".into())]);
+}
+
+#[tokio::test]
+async fn requesting_unknown_id_is_deliverable_not_found() {
+    let (p, id) = submit_mixed().await;
+    let err = p
+        .acquire_cohort(AcquireRequest::new(id, caller("a"), 10).with_ids(strs(&["nope"])))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().starts_with("DELIVERABLE_NOT_FOUND"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn requested_ids_beyond_max_count_are_blocked_max_count() {
+    let (p, id) = submit_mixed().await;
+    let cohort = p
+        .acquire_cohort(AcquireRequest::new(id, caller("a"), 1).with_ids(strs(&["code1", "code2"])))
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            cohort_ids(&cohort),
+            cohort
+                .blocked
+                .iter()
+                .map(|b| b.code.as_str())
+                .collect::<Vec<_>>()
+        ),
+        (vec!["code1".to_string()], vec!["MAX_COUNT"])
+    );
+}
+
+// ── plan.accept and audited lockless completion (#24) ───────────────────────
+
+async fn submit_accept_graph() -> (BasicCpmPlanner, PlanId) {
+    submit_accept_graph_with(BasicCpmPlanner::new()).await
+}
+
+async fn submit_accept_graph_with(planner: BasicCpmPlanner) -> (BasicCpmPlanner, PlanId) {
+    let graph = PlanGraph {
+        deliverables: vec![
+            deliverable("a", &["src/a.rs"], &[], Some(1.0)),
+            deliverable("b", &["src/b.rs"], &["a"], Some(1.0)),
+            with_meta(
+                deliverable("sign", &["src/s.rs"], &["a"], Some(1.0)),
+                serde_json::json!({"kind": "manual"}),
+            ),
+        ],
+        max_chained_dispatch: None,
+    };
+    let plan_id = planner.submit_plan(graph).await.unwrap();
+    (planner, plan_id)
+}
+
+async fn status_of(planner: &BasicCpmPlanner, plan_id: &PlanId, id: &str) -> DeliverableStatus {
+    planner
+        .status(plan_id)
+        .await
+        .unwrap()
+        .deliverables
+        .iter()
+        .find(|(d, _, _, _, _)| d == id)
+        .map(|(_, s, _, _, _)| s.clone())
+        .unwrap()
+}
+
+fn accept(plan_id: &PlanId, id: &str) -> AcceptRequest {
+    AcceptRequest::new(plan_id.clone(), id, "owner", "reviewed the PR")
+}
+
+#[tokio::test]
+async fn accept_completes_a_ready_deliverable_without_a_lease() {
+    let (planner, plan_id) = submit_accept_graph().await;
+    planner.accept(accept(&plan_id, "a")).await.unwrap();
+    assert_eq!(
+        status_of(&planner, &plan_id, "a").await,
+        DeliverableStatus::Complete
+    );
+}
+
+#[tokio::test]
+async fn accept_promotes_dependents_to_ready() {
+    let (planner, plan_id) = submit_accept_graph().await;
+    planner.accept(accept(&plan_id, "a")).await.unwrap();
+    assert_eq!(
+        status_of(&planner, &plan_id, "b").await,
+        DeliverableStatus::Ready
+    );
+}
+
+#[tokio::test]
+async fn accept_completes_a_manual_deliverable() {
+    let (planner, plan_id) = submit_accept_graph().await;
+    planner.accept(accept(&plan_id, "a")).await.unwrap();
+    planner.accept(accept(&plan_id, "sign")).await.unwrap();
+    assert_eq!(
+        status_of(&planner, &plan_id, "sign").await,
+        DeliverableStatus::Complete
+    );
+}
+
+#[tokio::test]
+async fn accept_rejects_incomplete_prerequisites() {
+    let (planner, plan_id) = submit_accept_graph().await;
+    let err = planner.accept(accept(&plan_id, "b")).await.unwrap_err();
+    assert!(
+        err.to_string().starts_with("PREREQUISITES_INCOMPLETE"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn accept_rejects_foreign_live_lock_without_override() {
+    let (planner, plan_id) = submit_accept_graph().await;
+    planner
+        .acquire_cohort(AcquireRequest::new(plan_id.clone(), caller("worker"), 1))
+        .await
+        .unwrap();
+    let err = planner.accept(accept(&plan_id, "a")).await.unwrap_err();
+    assert!(err.to_string().starts_with("LOCK_HELD"), "got: {err}");
+}
+
+#[tokio::test]
+async fn accept_with_override_releases_foreign_lock_and_completes() {
+    let (planner, plan_id) = submit_accept_graph().await;
+    planner
+        .acquire_cohort(AcquireRequest::new(plan_id.clone(), caller("worker"), 1))
+        .await
+        .unwrap();
+    planner
+        .accept(accept(&plan_id, "a").override_lock(true))
+        .await
+        .unwrap();
+    assert_eq!(
+        status_of(&planner, &plan_id, "a").await,
+        DeliverableStatus::Complete
+    );
+}
+
+#[tokio::test]
+async fn accept_emits_accepted_audit_event_with_evidence() {
+    let audit = Arc::new(MemoryAuditSink::new());
+    let (planner, plan_id) =
+        submit_accept_graph_with(BasicCpmPlanner::with_audit(audit.clone())).await;
+    planner.accept(accept(&plan_id, "a")).await.unwrap();
+    let evt = audit
+        .snapshot()
+        .into_iter()
+        .find(|e| e.event_type == "plan.deliverable.accepted")
+        .expect("accepted event present");
+    assert_eq!(evt.payload["evidence"], "reviewed the PR");
+}
+
+#[tokio::test]
+async fn lockless_mark_complete_rejects_incomplete_prerequisites() {
+    let (planner, plan_id) = submit_accept_graph().await;
+    let err = planner
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
+            "b",
+            caller("w"),
+            DeliverableStatus::Complete,
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().starts_with("PREREQUISITES_INCOMPLETE"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn lockless_mark_complete_emits_completed_without_lease_event() {
+    let audit = Arc::new(MemoryAuditSink::new());
+    let (planner, plan_id) =
+        submit_accept_graph_with(BasicCpmPlanner::with_audit(audit.clone())).await;
+    planner
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
+            "a",
+            caller("w"),
+            DeliverableStatus::Complete,
+        ))
+        .await
+        .unwrap();
+    assert!(
+        audit
+            .snapshot()
+            .iter()
+            .any(|e| e.event_type == "plan.deliverable.completed_without_lease")
+    );
+}
+
+#[tokio::test]
+async fn ids_and_filter_intersect() {
+    let (p, id) = submit_mixed().await;
+    let mut f = serde_json::Map::new();
+    f.insert("executor".into(), serde_json::json!("claude"));
+    let cohort = p
+        .acquire_cohort(
+            AcquireRequest::new(id, caller("a"), 10)
+                .with_ids(strs(&["code1", "jun"]))
+                .with_metadata_filter(f),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cohort_ids(&cohort), vec!["code1"]);
+}
+
+#[tokio::test]
+async fn unfiltered_acquire_lists_no_manual_entries_in_blocked() {
+    let (p, id) = submit_mixed().await;
+    let cohort = p
+        .acquire_cohort(AcquireRequest::new(id, caller("a"), 10))
+        .await
+        .unwrap();
+    assert!(cohort.blocked.iter().all(|b| b.code != "MANUAL"));
+}
+
+#[tokio::test]
+async fn accept_by_name_matching_holder_still_requires_override() {
+    let (planner, plan_id) = submit_accept_graph().await;
+    planner
+        .acquire_cohort(AcquireRequest::new(plan_id.clone(), caller("w1"), 1))
+        .await
+        .unwrap();
+    let err = planner
+        .accept(AcceptRequest::new(plan_id.clone(), "a", "w1", "self"))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().starts_with("LOCK_HELD"), "got: {err}");
+}
+
+#[tokio::test]
+async fn accepting_complete_deliverable_emits_no_second_event() {
+    let audit = Arc::new(MemoryAuditSink::new());
+    let (planner, plan_id) =
+        submit_accept_graph_with(BasicCpmPlanner::with_audit(audit.clone())).await;
+    planner.accept(accept(&plan_id, "a")).await.unwrap();
+    planner.accept(accept(&plan_id, "a")).await.unwrap();
+    let n = audit
+        .snapshot()
+        .iter()
+        .filter(|e| e.event_type == "plan.deliverable.accepted")
+        .count();
+    assert_eq!(n, 1);
+}
+
+#[tokio::test]
+async fn accept_rescues_failed_deliverable() {
+    let (planner, plan_id) = submit_accept_graph().await;
+    planner
+        .acquire_cohort(AcquireRequest::new(plan_id.clone(), caller("w"), 1))
+        .await
+        .unwrap();
+    planner
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
+            "a",
+            caller("w"),
+            DeliverableStatus::Failed {
+                reason: "boom".to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+    planner.accept(accept(&plan_id, "a")).await.unwrap();
+    assert_eq!(
+        status_of(&planner, &plan_id, "a").await,
+        DeliverableStatus::Complete
+    );
+}
+
+#[tokio::test]
+async fn accepted_event_records_previous_status() {
+    let audit = Arc::new(MemoryAuditSink::new());
+    let (planner, plan_id) =
+        submit_accept_graph_with(BasicCpmPlanner::with_audit(audit.clone())).await;
+    planner.accept(accept(&plan_id, "a")).await.unwrap();
+    let evt = audit
+        .snapshot()
+        .into_iter()
+        .find(|e| e.event_type == "plan.deliverable.accepted")
+        .unwrap();
+    assert_eq!(evt.payload["previous_status"]["status"], "ready");
+}
+
+#[tokio::test]
+async fn accepted_event_records_overridden_lock_holder() {
+    let audit = Arc::new(MemoryAuditSink::new());
+    let (planner, plan_id) =
+        submit_accept_graph_with(BasicCpmPlanner::with_audit(audit.clone())).await;
+    planner
+        .acquire_cohort(AcquireRequest::new(plan_id.clone(), caller("w1"), 1))
+        .await
+        .unwrap();
+    planner
+        .accept(AcceptRequest::new(plan_id.clone(), "a", "w1", "x").override_lock(true))
+        .await
+        .unwrap();
+    let evt = audit
+        .snapshot()
+        .into_iter()
+        .find(|e| e.event_type == "plan.deliverable.accepted")
+        .unwrap();
+    assert_eq!(evt.payload["overrode_lock_of"], "w1");
+}
+
+#[tokio::test]
+async fn lockless_mark_complete_on_complete_deliverable_emits_no_second_event() {
+    let audit = Arc::new(MemoryAuditSink::new());
+    let (planner, plan_id) =
+        submit_accept_graph_with(BasicCpmPlanner::with_audit(audit.clone())).await;
+    for _ in 0..2 {
+        planner
+            .mark_status(MarkStatusRequest::new(
+                plan_id.clone(),
+                "a",
+                caller("w"),
+                DeliverableStatus::Complete,
+            ))
+            .await
+            .unwrap();
+    }
+    let n = audit
+        .snapshot()
+        .iter()
+        .filter(|e| e.event_type == "plan.deliverable.completed_without_lease")
+        .count();
+    assert_eq!(n, 1);
+}
+
+#[tokio::test]
+async fn overridden_holder_cannot_fail_an_accepted_deliverable() {
+    let (planner, plan_id) = submit_accept_graph().await;
+    planner
+        .acquire_cohort(AcquireRequest::new(plan_id.clone(), caller("w1"), 1))
+        .await
+        .unwrap();
+    planner
+        .accept(accept(&plan_id, "a").override_lock(true))
+        .await
+        .unwrap();
+    let err = planner
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
+            "a",
+            caller("w1"),
+            DeliverableStatus::Failed {
+                reason: "late".to_string(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().starts_with("LOCK_NOT_HELD"), "got: {err}");
+}
+
+#[tokio::test]
+async fn lockless_failed_mark_is_audited() {
+    let audit = Arc::new(MemoryAuditSink::new());
+    let (planner, plan_id) =
+        submit_accept_graph_with(BasicCpmPlanner::with_audit(audit.clone())).await;
+    planner
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
+            "a",
+            caller("w"),
+            DeliverableStatus::Failed {
+                reason: "nope".to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+    let evt = audit
+        .snapshot()
+        .into_iter()
+        .find(|e| e.event_type == "plan.deliverable.marked_without_lease")
+        .expect("marked_without_lease event present");
+    assert_eq!(
+        (
+            evt.payload["deliverable_id"].clone(),
+            evt.payload["caller_id"].clone(),
+            evt.payload["status"]["status"].clone(),
+            evt.payload["previous_status"]["status"].clone(),
+        ),
+        (
+            serde_json::json!("a"),
+            serde_json::json!("w"),
+            serde_json::json!("failed"),
+            serde_json::json!("ready"),
+        )
+    );
+}
+
+#[tokio::test]
+async fn completed_without_lease_event_records_previous_status() {
+    let audit = Arc::new(MemoryAuditSink::new());
+    let (planner, plan_id) =
+        submit_accept_graph_with(BasicCpmPlanner::with_audit(audit.clone())).await;
+    planner
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
+            "a",
+            caller("w"),
+            DeliverableStatus::Complete,
+        ))
+        .await
+        .unwrap();
+    let evt = audit
+        .snapshot()
+        .into_iter()
+        .find(|e| e.event_type == "plan.deliverable.completed_without_lease")
+        .unwrap();
+    assert_eq!(evt.payload["previous_status"]["status"], "ready");
+}
+
+#[tokio::test]
+async fn with_max_ttl_is_capped_at_thirty_days() {
+    let planner =
+        BasicCpmPlanner::new().with_max_ttl(std::time::Duration::from_secs(365 * 24 * 60 * 60));
+    let plan_id = planner
+        .submit_plan(PlanGraph {
+            deliverables: vec![deliverable("a", &["src/a.rs"], &[], Some(1.0))],
+            max_chained_dispatch: None,
+        })
+        .await
+        .unwrap();
+    let cohort = planner
+        .acquire_cohort(
+            AcquireRequest::new(plan_id, caller("w"), 1)
+                .with_ttl(std::time::Duration::from_secs(365 * 24 * 60 * 60)),
+        )
+        .await
+        .unwrap();
+    let lock = &cohort.rows[0].lock;
+    assert_eq!(
+        (lock.expires_at - lock.acquired_at).num_seconds(),
+        30 * 24 * 60 * 60
+    );
+}
+
+#[test]
+fn legacy_cohort_payload_without_blocked_deserializes() {
+    let cohort: cpm_planner::plan::Cohort = serde_json::from_value(serde_json::json!({
+        "plan_id": "p1",
+        "deliverables": [],
+        "locks": []
+    }))
+    .unwrap();
+    assert!(cohort.blocked.is_empty());
 }

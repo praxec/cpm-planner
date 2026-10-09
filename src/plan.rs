@@ -35,6 +35,7 @@
 //!   Implementations MUST emit an audit event carrying the supplied `reason`.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -167,6 +168,183 @@ pub enum DeliverableStatus {
     },
 }
 
+/// Request bundle for [`crate::ports::Planner::acquire_cohort`].
+///
+/// Public fields mirror the historical positional arguments so callers can
+/// construct it directly or via [`AcquireRequest::new`].
+#[derive(Debug, Clone)]
+pub struct AcquireRequest {
+    pub plan_id: PlanId,
+    pub caller_id: CallerId,
+    pub max_count: usize,
+    /// When set, only these deliverables are considered; each one that is
+    /// not leased is reported in `Cohort.blocked` with a reason code.
+    pub ids: Option<Vec<String>>,
+    /// When set, only deliverables whose `metadata` has every `(key, value)`
+    /// pair (JSON equality) are considered. Non-matches are silently skipped.
+    pub metadata_filter: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Requested lease TTL for this call. `None` uses the planner
+    /// default; the planner clamps the value to its configured maximum.
+    pub ttl: Option<Duration>,
+}
+
+impl AcquireRequest {
+    pub fn new(plan_id: PlanId, caller_id: CallerId, max_count: usize) -> Self {
+        Self {
+            plan_id,
+            caller_id,
+            max_count,
+            ids: None,
+            metadata_filter: None,
+            ttl: None,
+        }
+    }
+
+    /// Restrict the acquire to these deliverable ids.
+    pub fn with_ids(mut self, ids: Vec<String>) -> Self {
+        self.ids = Some(ids);
+        self
+    }
+
+    /// Restrict the acquire to deliverables matching these metadata pairs.
+    pub fn with_metadata_filter(
+        mut self,
+        filter: serde_json::Map<String, serde_json::Value>,
+    ) -> Self {
+        self.metadata_filter = Some(filter);
+        self
+    }
+
+    /// Request a lease TTL for this acquire. `None` (the default) uses
+    /// the planner default TTL; the planner clamps the value to its
+    /// configured maximum.
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = Some(ttl);
+        self
+    }
+}
+
+/// Request bundle for [`crate::ports::Planner::mark_status`].
+#[derive(Debug, Clone)]
+pub struct MarkStatusRequest {
+    pub plan_id: PlanId,
+    pub deliverable_id: String,
+    pub caller_id: CallerId,
+    pub status: DeliverableStatus,
+}
+
+impl MarkStatusRequest {
+    pub fn new(
+        plan_id: PlanId,
+        deliverable_id: impl Into<String>,
+        caller_id: CallerId,
+        status: DeliverableStatus,
+    ) -> Self {
+        Self {
+            plan_id,
+            deliverable_id: deliverable_id.into(),
+            caller_id,
+            status,
+        }
+    }
+}
+
+/// Request bundle for [`crate::ports::Planner::heartbeat`].
+#[derive(Debug, Clone)]
+pub struct HeartbeatRequest {
+    pub plan_id: PlanId,
+    pub deliverable_id: String,
+    pub caller_id: CallerId,
+    /// Requested lease TTL for this heartbeat. `None` uses the planner
+    /// default; the planner clamps the value to its configured maximum.
+    pub ttl: Option<Duration>,
+}
+
+impl HeartbeatRequest {
+    pub fn new(plan_id: PlanId, deliverable_id: impl Into<String>, caller_id: CallerId) -> Self {
+        Self {
+            plan_id,
+            deliverable_id: deliverable_id.into(),
+            caller_id,
+            ttl: None,
+        }
+    }
+
+    /// Request a lease TTL for this heartbeat. `None` (the default)
+    /// uses the planner default TTL; the planner clamps the value to
+    /// its configured maximum.
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = Some(ttl);
+        self
+    }
+}
+
+/// Request bundle for [`crate::ports::Planner::force_release`].
+#[derive(Debug, Clone)]
+pub struct ForceReleaseRequest {
+    pub plan_id: PlanId,
+    pub deliverable_id: String,
+    pub reason: String,
+    /// Also clear the deliverable's lapse and failure counters (revives a
+    /// lapse-limited or circuit-broken deliverable). Defaults to `false`.
+    pub reset_counters: bool,
+}
+
+impl ForceReleaseRequest {
+    pub fn new(
+        plan_id: PlanId,
+        deliverable_id: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            plan_id,
+            deliverable_id: deliverable_id.into(),
+            reason: reason.into(),
+            reset_counters: false,
+        }
+    }
+
+    /// Set whether the lapse and failure counters are cleared too.
+    pub fn reset_counters(mut self, yes: bool) -> Self {
+        self.reset_counters = yes;
+        self
+    }
+}
+
+/// Request bundle for [`crate::ports::Planner::accept`].
+#[derive(Debug, Clone)]
+pub struct AcceptRequest {
+    pub plan_id: PlanId,
+    pub deliverable_id: String,
+    pub accepted_by: String,
+    pub evidence: String,
+    /// Take over a live lease held by someone else. Defaults to `false`.
+    pub override_lock: bool,
+}
+
+impl AcceptRequest {
+    pub fn new(
+        plan_id: PlanId,
+        deliverable_id: impl Into<String>,
+        accepted_by: impl Into<String>,
+        evidence: impl Into<String>,
+    ) -> Self {
+        Self {
+            plan_id,
+            deliverable_id: deliverable_id.into(),
+            accepted_by: accepted_by.into(),
+            evidence: evidence.into(),
+            override_lock: false,
+        }
+    }
+
+    /// Set whether a live lease held by another caller may be taken over.
+    pub fn override_lock(mut self, yes: bool) -> Self {
+        self.override_lock = yes;
+        self
+    }
+}
+
 /// Snapshot of a held lock. The Planner records one [`LockInfo`] per
 /// acquired deliverable and surfaces them in [`Cohort::locks`] and
 /// [`PlanStatus::locks_held`].
@@ -214,6 +392,19 @@ pub struct CohortRow {
 pub struct Cohort {
     pub plan_id: PlanId,
     pub rows: Vec<CohortRow>,
+    /// Deliverables the acquire considered but did not lease, and why.
+    pub blocked: Vec<BlockedDeliverable>,
+}
+
+/// A deliverable the acquire considered but did not lease, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockedDeliverable {
+    pub id: String,
+    /// Stable code; the authoritative list is "MANUAL", "NOT_READY",
+    /// "LOCKED", "LAPSE_LIMIT", "FILE_CONFLICT" and "MAX_COUNT" (see the
+    /// server `instructions()` for when each applies).
+    pub code: String,
+    pub reason: String,
 }
 
 /// Error returned when a [`FlatCohort`] wire payload cannot be decoded into a
@@ -248,6 +439,8 @@ struct FlatCohort {
     plan_id: PlanId,
     deliverables: Vec<Deliverable>,
     locks: Vec<LockInfo>,
+    #[serde(default)]
+    blocked: Vec<BlockedDeliverable>,
 }
 
 impl From<Cohort> for FlatCohort {
@@ -262,6 +455,7 @@ impl From<Cohort> for FlatCohort {
             plan_id: cohort.plan_id,
             deliverables,
             locks,
+            blocked: cohort.blocked,
         }
     }
 }
@@ -289,6 +483,7 @@ impl TryFrom<FlatCohort> for Cohort {
         Ok(Cohort {
             plan_id: flat.plan_id,
             rows,
+            blocked: flat.blocked,
         })
     }
 }
@@ -332,7 +527,8 @@ pub struct PlanStatus {
     /// `(float, es, id)` ascending. Same ordering as
     /// [`crate::ports::Planner::acquire_cohort`] (shared `priority_key`);
     /// membership is a superset: acquire may still skip deliverables at the
-    /// failure or lapse cap or whose files overlap a held lock.
+    /// failure or lapse cap, manual deliverables, or whose files overlap a
+    /// held lock.
     #[serde(default)]
     pub ready: Vec<String>,
 }
@@ -436,19 +632,33 @@ pub enum PlannerError {
     /// driving process was killed or timed out) more times than the
     /// runaway bound allows. These are ENVIRONMENTAL losses, not
     /// implementation failures, so the deliverable is NOT auto-failed;
-    /// instead `acquire_cohort` refuses to re-lease until an operator
-    /// intervenes (fix the environment, then `mark_status` or
-    /// `force_release`).
+    /// instead `acquire_cohort` skips it and reports it in
+    /// [`Cohort::blocked`] until an operator intervenes (fix the
+    /// environment, then `force_release` with `reset_counters`). No longer
+    /// returned by `acquire_cohort`; kept for wire compatibility.
     #[error(
         "LAPSE_LIMIT: deliverable {deliverable_id} lost {lapse_count} leases to environmental \
          lapses (TTL expiry with no terminal mark — killed/timed-out drivers, NOT implementation \
          failures; bound {max_lapses}); fix the environment, then mark_status the deliverable to \
-         proceed"
+         proceed; clear it with plan.force_release {{reset_counters: true}}"
     )]
     LapseLimit {
         deliverable_id: String,
         lapse_count: u32,
         max_lapses: u32,
+    },
+
+    /// A deliverable cannot be completed without a lease (or accepted)
+    /// while some of its prerequisites are not yet `Complete`.
+    #[error(
+        "PREREQUISITES_INCOMPLETE: {deliverable_id} in plan {plan_id} has incomplete \
+         prerequisites [{}]",
+        missing.join(", ")
+    )]
+    PrerequisitesIncomplete {
+        plan_id: String,
+        deliverable_id: String,
+        missing: Vec<String>,
     },
 
     /// The submitted graph fails a structural invariant: duplicate ids,
@@ -530,6 +740,7 @@ mod tests {
         let now = chrono::Utc::now();
         let cohort = Cohort {
             plan_id: plan_id.clone(),
+            blocked: vec![],
             rows: vec![
                 CohortRow {
                     deliverable: Deliverable {

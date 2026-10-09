@@ -55,9 +55,9 @@ pub(crate) struct PlanState {
     /// restart), keyed by deliverable id. A missing entry means zero.
     /// Environmental losses, not implementation failures — they never
     /// trip the failure circuit-breaker. A separate generous bound
-    /// ([`crate::planner::MAX_LAPSES`]) turns an infinitely-crashing
-    /// environment into a loud `LAPSE_LIMIT` error instead of an
-    /// unbounded re-lease loop.
+    /// ([`crate::planner::MAX_LAPSES`]) stops an infinitely-crashing
+    /// environment from causing an unbounded re-lease loop: acquire skips
+    /// the deliverable and reports it in `blocked` with code `LAPSE_LIMIT`.
     pub(crate) lapse_counts: HashMap<String, u32>,
 
     /// Currently held locks keyed by deliverable id. A deliverable is

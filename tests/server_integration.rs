@@ -14,8 +14,8 @@
 use std::sync::Arc;
 
 use cpm_planner::{
-    BasicCpmPlanner, PlanServer, TOOL_ACQUIRE_COHORT, TOOL_FORCE_RELEASE, TOOL_HEARTBEAT,
-    TOOL_MARK_STATUS, TOOL_STATUS, TOOL_SUBMIT,
+    BasicCpmPlanner, PlanServer, TOOL_ACCEPT, TOOL_ACQUIRE_COHORT, TOOL_FORCE_RELEASE,
+    TOOL_HEARTBEAT, TOOL_MARK_STATUS, TOOL_STATUS, TOOL_SUBMIT,
 };
 use rmcp::model::{CallToolRequestParams, JsonObject};
 use serde_json::{Value, json};
@@ -378,6 +378,46 @@ async fn plan_force_release_roundtrip() {
     );
 }
 
+#[tokio::test]
+async fn plan_force_release_accepts_reset_counters() {
+    let server = server();
+    let plan_id = submit_plan(&server).await;
+    let result = server
+        .dispatch_call(call_args(
+            TOOL_FORCE_RELEASE,
+            json!({
+                "plan_id": plan_id,
+                "deliverable_id": "d1",
+                "reason": "reset",
+                "reset_counters": true
+            }),
+        ))
+        .await
+        .expect("plan.force_release accepts reset_counters");
+    assert_eq!(result["ok"], true);
+}
+
+// ── Roundtrip: plan.accept ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn plan_accept_roundtrip() {
+    let server = server();
+    let plan_id = submit_plan(&server).await;
+    let resp = server
+        .dispatch_call(call_args(
+            TOOL_ACCEPT,
+            json!({
+                "plan_id": plan_id,
+                "deliverable_id": "d1",
+                "accepted_by": "owner",
+                "evidence": "reviewed"
+            }),
+        ))
+        .await
+        .expect("plan.accept returns Ok");
+    assert_eq!(resp["ok"], true);
+}
+
 // ── Roundtrip: plan.get ─────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -539,4 +579,165 @@ async fn plan_mark_status_failed_carries_reason() {
     // Third element of each status row is the lease attempt_count —
     // d1 was leased exactly once before being marked failed.
     assert_eq!(d1[2], json!(1));
+}
+
+#[tokio::test]
+async fn plan_acquire_cohort_accepts_ids_and_filter() {
+    let server = server();
+    let graph = json!({"deliverables": [
+        {"id": "a", "owned_files": ["a.rs"], "prerequisites": [], "estimated_effort_hours": 1.0, "metadata": {"executor": "claude"}},
+        {"id": "b", "owned_files": ["b.rs"], "prerequisites": [], "estimated_effort_hours": 1.0, "metadata": {"executor": "junior"}},
+        {"id": "c", "owned_files": ["c.rs"], "prerequisites": [], "estimated_effort_hours": 1.0, "metadata": {"executor": "junior"}}
+    ]});
+    let sub = server
+        .dispatch_call(call_args(TOOL_SUBMIT, json!({"graph": graph})))
+        .await
+        .unwrap();
+    let plan_id = sub["plan_id"].as_str().unwrap().to_string();
+    let resp = server
+        .dispatch_call(call_args(
+            TOOL_ACQUIRE_COHORT,
+            json!({"plan_id": plan_id, "caller_id": "w", "max_count": 5,
+                   "ids": ["a", "b"], "filter": {"metadata": {"executor": "junior"}}}),
+        ))
+        .await
+        .unwrap();
+    let ids: Vec<&str> = resp["deliverables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["b"]);
+}
+
+#[tokio::test]
+async fn plan_acquire_cohort_rejects_unknown_filter_keys() {
+    let server = server();
+    let plan_id = submit_plan(&server).await;
+    let result = server
+        .dispatch_call(call_args(
+            TOOL_ACQUIRE_COHORT,
+            json!({"plan_id": plan_id, "caller_id": "w", "max_count": 1,
+                   "filter": {"bogus": 1}}),
+        ))
+        .await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn plan_acquire_cohort_rejects_empty_ids() {
+    let server = server();
+    let plan_id = submit_plan(&server).await;
+    let err = server
+        .dispatch_call(call_args(
+            TOOL_ACQUIRE_COHORT,
+            json!({"plan_id": plan_id, "caller_id": "w", "max_count": 1, "ids": []}),
+        ))
+        .await
+        .expect_err("empty ids must be rejected");
+    assert_eq!(err.message, "ids must be non-empty when provided");
+}
+
+#[tokio::test]
+async fn plan_acquire_cohort_rejects_zero_ttl() {
+    let server = server();
+    let plan_id = submit_plan(&server).await;
+    let err = server
+        .dispatch_call(call_args(
+            TOOL_ACQUIRE_COHORT,
+            json!({"plan_id": plan_id, "caller_id": "w", "max_count": 1, "ttl_seconds": 0}),
+        ))
+        .await
+        .expect_err("ttl_seconds 0 must be rejected");
+    assert!(
+        err.message.contains("ttl_seconds"),
+        "zero ttl must be an invalid-params error naming ttl_seconds; got: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn plan_heartbeat_accepts_ttl_seconds() {
+    let server = server();
+    let plan_id = submit_plan(&server).await;
+    let _ = server
+        .dispatch_call(call_args(
+            TOOL_ACQUIRE_COHORT,
+            json!({"plan_id": plan_id, "caller_id": "orchestrator-001", "max_count": 4}),
+        ))
+        .await
+        .expect("acquire ok");
+    let resp = server
+        .dispatch_call(call_args(
+            TOOL_HEARTBEAT,
+            json!({
+                "plan_id": plan_id,
+                "deliverable_id": "d1",
+                "caller_id": "orchestrator-001",
+                "ttl_seconds": 3600
+            }),
+        ))
+        .await
+        .expect("plan.heartbeat accepts ttl_seconds");
+    assert_eq!(resp["ok"].as_bool(), Some(true));
+}
+
+// ── acquire response: blocked_count / needs_operator ────────────────────────
+
+#[tokio::test]
+async fn plan_acquire_cohort_reports_needs_operator_when_lapse_limited() {
+    use chrono::{Duration as ChronoDuration, TimeZone, Utc};
+    use std::sync::Mutex;
+
+    let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let now = Arc::new(Mutex::new(t0));
+    let clock_now = now.clone();
+    let planner = BasicCpmPlanner::with_parts(
+        Arc::new(cpm_planner::audit::NullAuditSink),
+        std::time::Duration::from_secs(60),
+        Arc::new(move || *clock_now.lock().unwrap()),
+    );
+    let server = PlanServer::new(Arc::new(planner));
+    let plan_id = submit_plan(&server).await;
+
+    let acquire = || {
+        call_args(
+            TOOL_ACQUIRE_COHORT,
+            json!({ "plan_id": plan_id, "caller_id": "w", "max_count": 1 }),
+        )
+    };
+    for round in 1..=cpm_planner::MAX_LAPSES {
+        server.dispatch_call(acquire()).await.expect("acquire ok");
+        *now.lock().unwrap() = t0 + ChronoDuration::minutes(5 * i64::from(round));
+    }
+    let resp = server.dispatch_call(acquire()).await.expect("acquire ok");
+    assert_eq!(
+        (
+            resp["exhausted"].clone(),
+            resp["blocked_count"].clone(),
+            resp["needs_operator"].clone()
+        ),
+        (json!(true), json!(1), json!(true))
+    );
+}
+
+#[tokio::test]
+async fn plan_acquire_cohort_without_blocked_does_not_need_operator() {
+    let server = server();
+    let plan_id = submit_plan(&server).await;
+    let resp = server
+        .dispatch_call(call_args(
+            TOOL_ACQUIRE_COHORT,
+            json!({ "plan_id": plan_id, "caller_id": "w", "max_count": 1 }),
+        ))
+        .await
+        .expect("acquire ok");
+    assert_eq!(
+        (
+            resp["blocked_count"].clone(),
+            resp["needs_operator"].clone()
+        ),
+        (json!(0), json!(false))
+    );
 }
