@@ -221,20 +221,115 @@ impl BasicCpmPlanner {
         self
     }
 
-    /// Drift of a variant's plan file against its last sync: `Some(file hash
-    /// != stored content hash)` when the variant has a source path, the
-    /// planner's root is the variant's project and the file is readable;
-    /// `None` (unknown) otherwise.
-    fn definition_drift(&self, info: &VariantInfo) -> Option<bool> {
-        let root = self.project_root.as_ref()?;
-        if root.project_key() != info.project {
-            return None;
+    /// The project root given with [`Self::with_project_root`], if any. The
+    /// MCP server reads its root from here (one source of truth).
+    pub fn project_root(&self) -> Option<&ProjectRoot> {
+        self.project_root.as_ref()
+    }
+
+    /// The `(plan id, label, head graph)` inputs of a comparison, read in one
+    /// store snapshot: `plan_ids` in the given order (an unnamed plan is
+    /// labelled by its id) or every non-archived variant of the line `plan`
+    /// (sorted by variant). Both or neither, duplicate ids, or a count
+    /// outside `2..=`[`crate::compare::MAX_COMPARE_VARIANTS`] is
+    /// `INVALID_GRAPH`; an unknown plan or line is `PLAN_NOT_FOUND`. Pair it
+    /// with the pure, CPU-bound [`crate::compare::compare`].
+    pub fn compare_inputs(
+        &self,
+        req: &ComparePlansRequest,
+    ) -> Result<Vec<(PlanId, String, PlanGraph)>, PlannerError> {
+        if let Some(ids) = &req.plan_ids {
+            let distinct: HashSet<&str> = ids.iter().map(|id| id.0.as_str()).collect();
+            if distinct.len() != ids.len() {
+                return Err(PlannerError::InvalidGraph {
+                    reason: "plan_ids must be distinct".to_string(),
+                });
+            }
+            crate::compare::check_variant_count(ids.len())?;
         }
-        let rel = info.source_path.as_deref()?;
-        let stored = info.content_hash.as_deref()?;
-        let file = root.resolve_plan_file(rel).ok()?;
-        let hash = root.file_hash(&file).ok()?;
-        Some(hash != stored)
+        self.store.read_tx(|tx| {
+            let targets: Vec<(PlanId, Option<String>)> = match (&req.plan_ids, &req.plan) {
+                (Some(ids), None) => ids.iter().map(|id| (id.clone(), None)).collect(),
+                (None, Some((project, name))) => {
+                    crate::portfolio::live_variants(tx, project, name)?
+                        .into_iter()
+                        .map(|(variant, id)| (id, Some(variant)))
+                        .collect()
+                }
+                _ => {
+                    return Err(PlannerError::InvalidGraph {
+                        reason: "compare takes exactly one of plan_ids or plan".to_string(),
+                    });
+                }
+            };
+            crate::compare::check_variant_count(targets.len())?;
+            targets
+                .into_iter()
+                .map(|(id, label)| {
+                    let (_, graph) = crate::portfolio::revision_graph(tx, &id, None)?;
+                    let label = match label {
+                        Some(variant) => variant,
+                        None => crate::portfolio::variant_info(tx, &id)?
+                            .map_or_else(|| id.0.clone(), |info| info.variant),
+                    };
+                    Ok((id, label, graph))
+                })
+                .collect::<Result<Vec<_>, PlannerError>>()
+        })
+    }
+
+    /// Refuse an export over `file` that would clobber work (see
+    /// [`Planner::export_plan`]): another variant's tracked plan file, or
+    /// this variant's own file while it holds local edits that were never
+    /// synced.
+    fn check_export_target(
+        &self,
+        plan_id: &PlanId,
+        root: &ProjectRoot,
+        file: &crate::project::PlanFileRef,
+    ) -> Result<(), PlannerError> {
+        let project = root.project_key();
+        let trackers = self.store.read_tx(|tx| {
+            crate::portfolio::variants_tracking(tx, &project, &file.rel_path)?
+                .into_iter()
+                .map(|id| {
+                    let info = crate::portfolio::variant_info(tx, &id)?;
+                    let (_, head) = crate::portfolio::revision_graph(tx, &id, None)?;
+                    let recorded = crate::portfolio::revision_content_hashes(tx, &id)?;
+                    Ok((id, info, hash_graph(&head), recorded))
+                })
+                .collect::<Result<Vec<_>, PlannerError>>()
+        })?;
+        for (id, info, head_hash, mut recorded) in trackers {
+            let Some(info) = info else { continue };
+            if id != *plan_id {
+                return Err(PlannerError::InvalidPath {
+                    reason: format!(
+                        "{} is the tracked plan file of variant '{}' of '{}'; pass force to \
+                         overwrite it",
+                        file.rel_path, info.variant, info.name
+                    ),
+                });
+            }
+            if definition_drift(Some(root), &info, &head_hash) != Some(true) {
+                continue;
+            }
+            // Drifted: refuse only if the file holds content no revision of
+            // this variant recorded (local edits). A file that merely lags
+            // the head (e.g. after an inline revise) is safe to re-export.
+            recorded.extend(info.content_hash.clone());
+            recorded.insert(head_hash);
+            if has_local_edits(root, file, &recorded) {
+                return Err(PlannerError::InvalidPath {
+                    reason: format!(
+                        "{} has local edits that were never synced (definition drift); sync it \
+                         or pass force to overwrite it",
+                        file.rel_path
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn now(&self) -> DateTime<Utc> {
@@ -265,6 +360,55 @@ impl BasicCpmPlanner {
 impl Default for BasicCpmPlanner {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Drift of a variant's plan file against its head graph (`head_hash`, the
+/// [`hash_graph`] of the head read in the same snapshot as `info`).
+///
+/// `None` (unknown) unless there is a root for the variant's project, the
+/// variant has a source path, and that file is readable within
+/// [`crate::project::MAX_PLAN_FILE_BYTES`]. Otherwise: `Some(false)` when the
+/// file's bytes hash to the stored content hash; else the file is parsed and
+/// `Some(file graph != head graph)` (canonically, so re-formatting is not
+/// drift); an unparseable file is `Some(true)`.
+fn definition_drift(
+    root: Option<&ProjectRoot>,
+    info: &VariantInfo,
+    head_hash: &str,
+) -> Option<bool> {
+    let root = root?;
+    if root.project_key() != info.project {
+        return None;
+    }
+    let rel = info.source_path.as_deref()?;
+    let file = root.resolve_plan_file(rel).ok()?;
+    let bytes = root.read_bytes(&file).ok()?;
+    if info.content_hash.as_deref() == Some(crate::project::content_hash(&bytes).as_str()) {
+        return Some(false);
+    }
+    match serde_json::from_slice::<PlanGraph>(&bytes) {
+        Ok(graph) => Some(hash_graph(&graph) != head_hash),
+        Err(_) => Some(true),
+    }
+}
+
+/// True when `file` exists and its content matches none of `recorded` (by
+/// byte hash or canonical graph hash). An unreadable file counts as none.
+fn has_local_edits(
+    root: &ProjectRoot,
+    file: &crate::project::PlanFileRef,
+    recorded: &HashSet<String>,
+) -> bool {
+    let Ok(bytes) = root.read_bytes(file) else {
+        return false;
+    };
+    if recorded.contains(&crate::project::content_hash(&bytes)) {
+        return false;
+    }
+    match serde_json::from_slice::<PlanGraph>(&bytes) {
+        Ok(graph) => !recorded.contains(&hash_graph(&graph)),
+        Err(_) => true,
     }
 }
 
@@ -691,18 +835,36 @@ fn sync_outcome(
 /// slug).
 const MAX_PROJECT_LEN: usize = 512;
 
+/// Characters refused in a project key: controls (newlines included) and
+/// invisible Unicode format/separator characters that can disguise how the
+/// key reads when echoed (zero-width, bidi embeddings/overrides/isolates,
+/// word joiners, BOM, line/paragraph separators, interlinear annotations).
+fn is_disallowed_project_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{206F}'
+                | '\u{FEFF}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{FFF9}'..='\u{FFFB}'
+        )
+}
+
 /// Reject a malformed `(project, name, variant)` with `INVALID_PATH`. The
-/// project key is echoed by tools and audit events, so control characters
-/// (newlines included) are refused.
+/// project key is echoed by tools and audit events, so control and
+/// invisible format characters are refused.
 fn validate_variant_key(req: &SyncRequest) -> Result<(), PlannerError> {
     if req.project.is_empty() || req.project.chars().count() > MAX_PROJECT_LEN {
         return Err(PlannerError::InvalidPath {
             reason: format!("project must be 1..={MAX_PROJECT_LEN} characters"),
         });
     }
-    if req.project.chars().any(char::is_control) {
+    if req.project.chars().any(is_disallowed_project_char) {
         return Err(PlannerError::InvalidPath {
-            reason: "project must not contain control characters".to_string(),
+            reason: "project must not contain control or invisible format characters".to_string(),
         });
     }
     crate::project::validate_slug("name", &req.name)?;
@@ -1003,7 +1165,7 @@ impl Planner for BasicCpmPlanner {
             project_root,
         } = req;
         crate::project::validate_slug("variant", &variant)?;
-        let (head, info, exists) = self.store.read_tx(|tx| {
+        let (head, info, exists, line_archived) = self.store.read_tx(|tx| {
             let (_, head) = crate::portfolio::revision_graph(tx, &plan_id, None)?;
             let info = crate::portfolio::variant_info(tx, &plan_id)?.ok_or_else(|| {
                 PlannerError::InvalidPath {
@@ -1011,10 +1173,16 @@ impl Planner for BasicCpmPlanner {
                 }
             })?;
             let exists = crate::portfolio::has_variant(tx, &info.project, &info.name, &variant)?;
-            Ok((head, info, exists))
+            let line_archived = crate::portfolio::line_is_archived(tx, &info.project, &info.name)?;
+            Ok((head, info, exists, line_archived))
         })?;
-        // Checked again inside the creating transaction; failing here first
-        // avoids writing a plan file for a fork that cannot be registered.
+        // Both are checked again inside the creating transaction; failing
+        // here first avoids writing a plan file for a fork that cannot be
+        // registered. Forking FROM an archived variant of a live line is
+        // allowed: the source stays readable and the new draft is live.
+        if line_archived {
+            return Err(crate::portfolio::line_archived(&info.name));
+        }
         if exists {
             return Err(crate::portfolio::variant_exists(&variant, &info.name));
         }
@@ -1023,9 +1191,7 @@ impl Planner for BasicCpmPlanner {
             Some(root) if root.project_key() != info.project => {
                 return Err(PlannerError::InvalidPath {
                     reason: format!(
-                        "project root '{}' is not the project '{}' of plan {}",
-                        root.project_key(),
-                        info.project,
+                        "the project root belongs to a different project than plan {}",
                         plan_id.0
                     ),
                 });
@@ -1042,18 +1208,26 @@ impl Planner for BasicCpmPlanner {
             variant.clone(),
             graph,
         );
+        let mut written = None;
         if let Some(root) = &root {
             let file = root.plan_file(&info.name, &variant)?;
             let hash = root.write_new_graph(&file, &sync_req.graph)?;
             sync_req = sync_req
-                .with_source_path(file.rel_path)
-                .with_content_hash(hash);
+                .with_source_path(file.rel_path.clone())
+                .with_content_hash(hash.clone());
+            written = Some((root, file, hash));
         }
         let graph_hash = hash_graph(&sync_req.graph);
         let now = self.now();
-        let synced = self.store.write_tx(|tx| {
-            crate::portfolio::sync_new(tx, sync_req, &graph_hash, now, initial_plan)
-        })?;
+        let synced = self
+            .store
+            .write_tx(|tx| crate::portfolio::sync_new(tx, sync_req, &graph_hash, now, initial_plan))
+            .inspect_err(|_| {
+                // The fork was never registered: do not leave its file behind.
+                if let Some((root, file, hash)) = &written {
+                    root.remove_plan_file_if_unchanged(file, hash);
+                }
+            })?;
         let (outcome, events) = sync_outcome(synced, &info.project, info.name, variant, now);
         self.flush_audit(events).await;
         Ok(outcome)
@@ -1063,40 +1237,8 @@ impl Planner for BasicCpmPlanner {
         &self,
         req: ComparePlansRequest,
     ) -> Result<crate::compare::Comparison, PlannerError> {
-        let ComparePlansRequest {
-            plan_ids,
-            plan,
-            request,
-        } = req;
-        let inputs = self.store.read_tx(|tx| {
-            let targets: Vec<(PlanId, Option<String>)> = match (plan_ids, plan) {
-                (Some(ids), None) => ids.into_iter().map(|id| (id, None)).collect(),
-                (None, Some((project, name))) => {
-                    crate::portfolio::live_variants(tx, &project, &name)?
-                        .into_iter()
-                        .map(|(variant, id)| (id, Some(variant)))
-                        .collect()
-                }
-                _ => {
-                    return Err(PlannerError::InvalidGraph {
-                        reason: "compare takes exactly one of plan_ids or plan".to_string(),
-                    });
-                }
-            };
-            targets
-                .into_iter()
-                .map(|(id, label)| {
-                    let (_, graph) = crate::portfolio::revision_graph(tx, &id, None)?;
-                    let label = match label {
-                        Some(variant) => variant,
-                        None => crate::portfolio::variant_info(tx, &id)?
-                            .map_or_else(|| id.0.clone(), |info| info.variant),
-                    };
-                    Ok((id, label, graph))
-                })
-                .collect::<Result<Vec<_>, PlannerError>>()
-        })?;
-        crate::compare::compare(&inputs, &request)
+        let inputs = self.compare_inputs(&req)?;
+        crate::compare::compare(&inputs, &req.request)
     }
 
     async fn export_plan(
@@ -1104,23 +1246,22 @@ impl Planner for BasicCpmPlanner {
         plan_id: &PlanId,
         root: &ProjectRoot,
         path: Option<&str>,
+        force: bool,
     ) -> Result<String, PlannerError> {
         let (graph, info) = self.store.read_tx(|tx| {
             let (_, graph) = crate::portfolio::revision_graph(tx, plan_id, None)?;
             Ok((graph, crate::portfolio::variant_info(tx, plan_id)?))
         })?;
-        let file = match (path, info) {
+        let file = match (path, &info) {
             (Some(path), _) => root.resolve_plan_file(path)?,
             (None, Some(info)) if info.project == root.project_key() => {
                 root.plan_file(&info.name, &info.variant)?
             }
-            (None, Some(info)) => {
+            (None, Some(_)) => {
                 return Err(PlannerError::InvalidPath {
                     reason: format!(
-                        "plan {} belongs to project '{}', not '{}'; give a path",
-                        plan_id.0,
-                        info.project,
-                        root.project_key()
+                        "plan {} belongs to a different project; give a path",
+                        plan_id.0
                     ),
                 });
             }
@@ -1130,7 +1271,19 @@ impl Planner for BasicCpmPlanner {
                 });
             }
         };
-        root.write_graph(&file, &graph)?;
+        if !force {
+            self.check_export_target(plan_id, root, &file)?;
+        }
+        let hash = root.write_graph(&file, &graph)?;
+        // Exported to its own tracked file: the file now matches the head,
+        // so record its hash (drift stays false).
+        if let Some(info) = &info
+            && info.project == root.project_key()
+            && info.source_path.as_deref() == Some(file.rel_path.as_str())
+        {
+            self.store
+                .write_tx(|tx| crate::portfolio::set_content_hash(tx, plan_id, &hash))?;
+        }
         Ok(file.rel_path)
     }
 
@@ -1725,79 +1878,82 @@ impl Planner for BasicCpmPlanner {
     }
 
     async fn status(&self, plan_id: &PlanId) -> Result<PlanStatus, PlannerError> {
-        let (mut status, info) = self.store.read_plan_and_variant(plan_id, |state| {
-            // Preserve insertion order from the original graph for stable UI.
-            let deliverables: Vec<(String, DeliverableStatus, u32, u32, u32)> = state
-                .graph
-                .deliverables
-                .iter()
-                .map(|d| {
-                    let status = state
-                        .statuses
-                        .get(&d.id)
-                        .cloned()
-                        .unwrap_or(DeliverableStatus::Pending);
-                    (
-                        d.id.clone(),
-                        status,
-                        state.attempt_count(&d.id),
-                        state.failure_count(&d.id),
-                        state.lapse_count(&d.id),
-                    )
-                })
-                .collect();
-
-            let schedule = crate::schedule::schedule_rows(&state.graph, &state.cached_result);
-            let mut ready_rows: Vec<&ScheduleRow> = schedule
-                .iter()
-                .filter(|r| {
-                    matches!(state.statuses.get(&r.id), Some(DeliverableStatus::Ready))
-                        && !state.locks.contains_key(&r.id)
-                })
-                .collect();
-            // Same ordering as acquire_cohort (shared priority_key). Membership is a
-            // superset: acquire may still skip deliverables at the failure or lapse
-            // cap, manual deliverables, or ones whose files overlap a held lock.
-            let sched_by_id: HashMap<&str, (f32, f32)> = state
-                .cached_result
-                .tasks
-                .iter()
-                .map(|t| (t.id.as_str(), (t.latest_start, t.float)))
-                .collect();
-            ready_rows.sort_by_key(|r| priority_key(&r.id, &sched_by_id));
-            let ready: Vec<String> = ready_rows.iter().map(|r| r.id.clone()).collect();
-
-            let milestones =
-                crate::schedule::milestone_rows(&state.graph, &state.cached_result, |id| {
-                    matches!(state.statuses.get(id), Some(DeliverableStatus::Complete))
-                });
-
-            PlanStatus {
-                plan_id: plan_id.clone(),
-                milestones,
-                critical_ids: state
-                    .cached_result
-                    .critical_ids
+        let ((mut status, head_hash), info) =
+            self.store.read_plan_and_variant(plan_id, |state| {
+                // Preserve insertion order from the original graph for stable UI.
+                let deliverables: Vec<(String, DeliverableStatus, u32, u32, u32)> = state
+                    .graph
+                    .deliverables
                     .iter()
-                    .filter(|id| id.as_str() != START_ID && id.as_str() != FINISH_ID)
-                    .cloned()
-                    .collect(),
-                plan_complete: all_complete(state),
-                schedule,
-                ready,
-                deliverables,
-                critical_path: state.cached_result.critical_path.clone(),
-                critical_path_hours: state.cached_result.critical_path_duration,
-                locks_held: state.locks.values().cloned().collect(),
-                name: None,
-                variant: None,
-                selected: None,
-                definition_drift: None,
-            }
-        })?;
+                    .map(|d| {
+                        let status = state
+                            .statuses
+                            .get(&d.id)
+                            .cloned()
+                            .unwrap_or(DeliverableStatus::Pending);
+                        (
+                            d.id.clone(),
+                            status,
+                            state.attempt_count(&d.id),
+                            state.failure_count(&d.id),
+                            state.lapse_count(&d.id),
+                        )
+                    })
+                    .collect();
+
+                let schedule = crate::schedule::schedule_rows(&state.graph, &state.cached_result);
+                let mut ready_rows: Vec<&ScheduleRow> = schedule
+                    .iter()
+                    .filter(|r| {
+                        matches!(state.statuses.get(&r.id), Some(DeliverableStatus::Ready))
+                            && !state.locks.contains_key(&r.id)
+                    })
+                    .collect();
+                // Same ordering as acquire_cohort (shared priority_key). Membership is a
+                // superset: acquire may still skip deliverables at the failure or lapse
+                // cap, manual deliverables, or ones whose files overlap a held lock.
+                let sched_by_id: HashMap<&str, (f32, f32)> = state
+                    .cached_result
+                    .tasks
+                    .iter()
+                    .map(|t| (t.id.as_str(), (t.latest_start, t.float)))
+                    .collect();
+                ready_rows.sort_by_key(|r| priority_key(&r.id, &sched_by_id));
+                let ready: Vec<String> = ready_rows.iter().map(|r| r.id.clone()).collect();
+
+                let milestones =
+                    crate::schedule::milestone_rows(&state.graph, &state.cached_result, |id| {
+                        matches!(state.statuses.get(id), Some(DeliverableStatus::Complete))
+                    });
+
+                let status = PlanStatus {
+                    plan_id: plan_id.clone(),
+                    milestones,
+                    critical_ids: state
+                        .cached_result
+                        .critical_ids
+                        .iter()
+                        .filter(|id| id.as_str() != START_ID && id.as_str() != FINISH_ID)
+                        .cloned()
+                        .collect(),
+                    plan_complete: all_complete(state),
+                    schedule,
+                    ready,
+                    deliverables,
+                    critical_path: state.cached_result.critical_path.clone(),
+                    critical_path_hours: state.cached_result.critical_path_duration,
+                    locks_held: state.locks.values().cloned().collect(),
+                    name: None,
+                    variant: None,
+                    selected: None,
+                    definition_drift: None,
+                };
+                (status, hash_graph(&state.graph))
+            })?;
         if let Some(info) = info {
-            // File I/O outside the read snapshot.
-            status.definition_drift = self.definition_drift(&info);
+            // File I/O outside the read snapshot; the head hash is from it.
+            status.definition_drift =
+                definition_drift(self.project_root.as_ref(), &info, &head_hash);
             status.name = Some(info.name);
             status.variant = Some(info.variant);
             status.selected = Some(info.selected);

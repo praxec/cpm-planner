@@ -2202,7 +2202,7 @@ async fn export_writes_head_graph_to_variant_file() {
         .sync_plan(SyncRequest::new(key, "web", "main", chain_plus_c()))
         .await
         .unwrap();
-    let rel = planner.export_plan(&id, &root, None).await.unwrap();
+    let rel = planner.export_plan(&id, &root, None, false).await.unwrap();
     let (written, _) = root
         .read_graph(&root.resolve_plan_file(&rel).unwrap())
         .unwrap();
@@ -2218,7 +2218,7 @@ async fn export_returns_the_variant_file_path() {
         .await
         .unwrap()
         .plan_id;
-    let rel = planner.export_plan(&id, &root, None).await.unwrap();
+    let rel = planner.export_plan(&id, &root, None, false).await.unwrap();
     assert_eq!(rel, ".cpm-planner/plans/web/main.json");
 }
 
@@ -2231,7 +2231,7 @@ async fn export_does_not_sync_the_written_file() {
         .await
         .unwrap()
         .plan_id;
-    planner.export_plan(&id, &root, None).await.unwrap();
+    planner.export_plan(&id, &root, None, false).await.unwrap();
     let lines = planner
         .list_plans(&root.project_key(), false)
         .await
@@ -2244,7 +2244,10 @@ async fn export_of_unnamed_plan_requires_path() {
     let (_dir, root) = project_dir();
     let planner = BasicCpmPlanner::new();
     let id = planner.submit_plan(chain()).await.unwrap();
-    let err = planner.export_plan(&id, &root, None).await.unwrap_err();
+    let err = planner
+        .export_plan(&id, &root, None, false)
+        .await
+        .unwrap_err();
     assert!(matches!(err, PlannerError::InvalidPath { .. }));
 }
 
@@ -2254,7 +2257,12 @@ async fn export_of_unnamed_plan_writes_given_path() {
     let planner = BasicCpmPlanner::new();
     let id = planner.submit_plan(chain()).await.unwrap();
     planner
-        .export_plan(&id, &root, Some(".cpm-planner/plans/adhoc/draft.json"))
+        .export_plan(
+            &id,
+            &root,
+            Some(".cpm-planner/plans/adhoc/draft.json"),
+            false,
+        )
         .await
         .unwrap();
     assert!(
@@ -2270,7 +2278,7 @@ async fn export_rejects_path_escape() {
     let planner = BasicCpmPlanner::new();
     let id = planner.submit_plan(chain()).await.unwrap();
     let err = planner
-        .export_plan(&id, &root, Some("../outside.json"))
+        .export_plan(&id, &root, Some("../outside.json"), false)
         .await
         .unwrap_err();
     assert!(matches!(err, PlannerError::InvalidPath { .. }));
@@ -2281,6 +2289,415 @@ async fn export_of_another_projects_variant_needs_a_path() {
     let (_dir, root) = project_dir();
     let planner = BasicCpmPlanner::new();
     let id = sync(&planner, "web", "main", chain()).await;
-    let err = planner.export_plan(&id, &root, None).await.unwrap_err();
+    let err = planner
+        .export_plan(&id, &root, None, false)
+        .await
+        .unwrap_err();
     assert!(matches!(err, PlannerError::InvalidPath { .. }));
+}
+
+// ---------------------------------------------------------------------
+// Final-review fixes: drift, fork safety, export guards, carry-over
+// ---------------------------------------------------------------------
+
+/// Write `g` as compact (non-pretty) JSON to `<name>/<variant>` and sync it
+/// from there, as a hand-edited file would be.
+async fn sync_compact_file(
+    planner: &BasicCpmPlanner,
+    dir: &tempfile::TempDir,
+    root: &ProjectRoot,
+    name: &str,
+    variant: &str,
+    g: PlanGraph,
+) -> PlanId {
+    let f = root.plan_file(name, variant).unwrap();
+    let path = dir.path().join(&f.rel_path);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let bytes = serde_json::to_vec(&g).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    planner
+        .sync_plan(
+            SyncRequest::new(root.project_key(), name, variant, g)
+                .with_source_path(f.rel_path)
+                .with_content_hash(cpm_planner::project::content_hash(&bytes)),
+        )
+        .await
+        .expect("harness: sync compact file")
+        .plan_id
+}
+
+fn plan_path(dir: &tempfile::TempDir, name: &str, variant: &str) -> PathBuf {
+    dir.path()
+        .join(format!(".cpm-planner/plans/{name}/{variant}.json"))
+}
+
+#[tokio::test]
+async fn identical_inline_sync_keeps_drift_false() {
+    let (dir, root) = project_dir();
+    let planner = rooted(&root);
+    let id = sync_compact_file(&planner, &dir, &root, "web", "main", chain()).await;
+    planner
+        .sync_plan(SyncRequest::new(root.project_key(), "web", "main", chain()))
+        .await
+        .unwrap();
+    assert_eq!(
+        planner.status(&id).await.unwrap().definition_drift,
+        Some(false)
+    );
+}
+
+#[tokio::test]
+async fn export_to_own_source_keeps_drift_false() {
+    let (dir, root) = project_dir();
+    let planner = rooted(&root);
+    let id = sync_compact_file(&planner, &dir, &root, "web", "main", chain()).await;
+    planner.export_plan(&id, &root, None, false).await.unwrap();
+    assert_eq!(
+        planner.status(&id).await.unwrap().definition_drift,
+        Some(false)
+    );
+}
+
+#[tokio::test]
+async fn export_to_own_source_records_the_written_hash() {
+    let (dir, root) = project_dir();
+    let db = TempDb::new();
+    let planner = db.planner().with_project_root(root.clone());
+    let id = sync_compact_file(&planner, &dir, &root, "web", "main", chain()).await;
+    planner.export_plan(&id, &root, None, false).await.unwrap();
+    let written =
+        cpm_planner::project::content_hash(&std::fs::read(plan_path(&dir, "web", "main")).unwrap());
+    let stored: String = rusqlite::Connection::open(&db.path)
+        .unwrap()
+        .query_row(
+            "SELECT content_hash FROM variants WHERE plan_id = ?1",
+            [&id.0],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, written);
+}
+
+#[tokio::test]
+async fn reformatted_file_with_same_graph_is_not_drift() {
+    let (dir, root) = project_dir();
+    let planner = rooted(&root);
+    let id = sync_file(&planner, &root, "web", "main", chain()).await;
+    std::fs::write(
+        plan_path(&dir, "web", "main"),
+        serde_json::to_vec(&chain()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        planner.status(&id).await.unwrap().definition_drift,
+        Some(false)
+    );
+}
+
+#[tokio::test]
+async fn inline_revise_of_file_backed_variant_reports_drift() {
+    let (_dir, root) = project_dir();
+    let planner = rooted(&root);
+    let id = sync_file(&planner, &root, "web", "main", chain()).await;
+    planner
+        .revise_plan(ReviseRequest::new(id.clone(), chain_plus_c()))
+        .await
+        .unwrap();
+    assert_eq!(
+        planner.status(&id).await.unwrap().definition_drift,
+        Some(true)
+    );
+}
+
+#[tokio::test]
+async fn status_drift_is_none_for_oversized_file() {
+    let (dir, root) = project_dir();
+    let planner = rooted(&root);
+    let id = sync_file(&planner, &root, "web", "main", chain()).await;
+    std::fs::write(
+        plan_path(&dir, "web", "main"),
+        vec![b' '; 8 * 1024 * 1024 + 1],
+    )
+    .unwrap();
+    assert_eq!(planner.status(&id).await.unwrap().definition_drift, None);
+}
+
+#[tokio::test]
+async fn sync_rejects_bidi_override_in_project() {
+    let planner = BasicCpmPlanner::new();
+    let err = planner
+        .sync_plan(SyncRequest::new("proj\u{202E}lmth", "web", "main", chain()))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PlannerError::InvalidPath { .. }));
+}
+
+#[tokio::test]
+async fn fork_into_archived_line_writes_no_file() {
+    let (dir, root) = project_dir();
+    let planner = rooted(&root);
+    let main = sync_file(&planner, &root, "web", "main", chain()).await;
+    planner
+        .archive(&root.project_key(), "web", None, true, false)
+        .await
+        .unwrap();
+    let _ = planner.fork_plan(ForkRequest::new(main, "alt")).await;
+    assert!(!plan_path(&dir, "web", "alt").exists());
+}
+
+#[tokio::test]
+async fn fork_on_archived_line_is_refused() {
+    let (_dir, root) = project_dir();
+    let planner = rooted(&root);
+    let main = sync_file(&planner, &root, "web", "main", chain()).await;
+    planner
+        .archive(&root.project_key(), "web", None, true, false)
+        .await
+        .unwrap();
+    let err = planner
+        .fork_plan(ForkRequest::new(main, "alt"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PlannerError::ArchiveRefused { .. }));
+}
+
+#[tokio::test]
+async fn fork_from_archived_variant_of_live_line_is_allowed() {
+    let planner = BasicCpmPlanner::new();
+    let (_, alt) = main_and_alt(&planner).await;
+    planner
+        .archive(PROJECT, "web", Some("alt"), true, false)
+        .await
+        .unwrap();
+    let outcome = planner
+        .fork_plan(ForkRequest::new(alt, "third"))
+        .await
+        .unwrap();
+    assert!(outcome.created);
+}
+
+#[tokio::test]
+async fn fork_sync_failure_removes_written_file() {
+    let (dir, root) = project_dir();
+    let db = TempDb::new();
+    let planner = db.planner().with_project_root(root.clone());
+    let main = sync_file(&planner, &root, "web", "main", chain()).await;
+    // Every later variant insert fails, after the fork wrote its file.
+    db.sql(
+        "CREATE TRIGGER inject_fork_failure BEFORE INSERT ON variants
+         BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+    );
+    let _ = planner.fork_plan(ForkRequest::new(main, "alt")).await;
+    assert!(!plan_path(&dir, "web", "alt").exists());
+}
+
+#[tokio::test]
+async fn fork_with_foreign_root_does_not_echo_project_keys() {
+    let (_dir, root) = project_dir();
+    let (_other_dir, other) = project_dir();
+    let planner = BasicCpmPlanner::new();
+    let main = sync_file(&planner, &root, "web", "main", chain()).await;
+    let err = planner
+        .fork_plan(ForkRequest::new(main, "alt").with_project_root(other.clone()))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, PlannerError::InvalidPath { reason }
+            if reason.contains("a different project") && !reason.contains(&other.project_key())),
+        "got {err}"
+    );
+}
+
+#[tokio::test]
+async fn foreign_project_root_export_is_invalid_path() {
+    let (_dir, root) = project_dir();
+    let (_other_dir, other) = project_dir();
+    let planner = BasicCpmPlanner::new();
+    let id = sync_file(&planner, &root, "web", "main", chain()).await;
+    let err = planner
+        .export_plan(&id, &other, None, false)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, PlannerError::InvalidPath { reason }
+            if reason.contains("a different project") && !reason.contains(&root.project_key())),
+        "got {err}"
+    );
+}
+
+#[tokio::test]
+async fn export_refuses_another_variants_tracked_file() {
+    let (_dir, root) = project_dir();
+    let planner = rooted(&root);
+    sync_file(&planner, &root, "web", "main", chain()).await;
+    let other = planner.submit_plan(chain_plus_c()).await.unwrap();
+    let err = planner
+        .export_plan(
+            &other,
+            &root,
+            Some(".cpm-planner/plans/web/main.json"),
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PlannerError::InvalidPath { .. }), "got {err}");
+}
+
+#[tokio::test]
+async fn export_refuses_to_overwrite_unsynced_local_edits() {
+    let (dir, root) = project_dir();
+    let planner = rooted(&root);
+    let id = sync_file(&planner, &root, "web", "main", chain()).await;
+    std::fs::write(
+        plan_path(&dir, "web", "main"),
+        serde_json::to_vec(&chain_plus_c()).unwrap(),
+    )
+    .unwrap();
+    let err = planner
+        .export_plan(&id, &root, None, false)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PlannerError::InvalidPath { .. }), "got {err}");
+}
+
+#[tokio::test]
+async fn forced_export_overwrites_unsynced_local_edits() {
+    let (dir, root) = project_dir();
+    let planner = rooted(&root);
+    let id = sync_file(&planner, &root, "web", "main", chain()).await;
+    std::fs::write(
+        plan_path(&dir, "web", "main"),
+        serde_json::to_vec(&chain_plus_c()).unwrap(),
+    )
+    .unwrap();
+    planner.export_plan(&id, &root, None, true).await.unwrap();
+    let (written, _) = root
+        .read_graph(&root.plan_file("web", "main").unwrap())
+        .unwrap();
+    assert_eq!(ids(&written), vec!["a", "b"]);
+}
+
+#[tokio::test]
+async fn export_after_inline_revise_refreshes_the_lagging_file() {
+    let (_dir, root) = project_dir();
+    let planner = rooted(&root);
+    let id = sync_file(&planner, &root, "web", "main", chain()).await;
+    planner
+        .revise_plan(ReviseRequest::new(id.clone(), chain_plus_c()))
+        .await
+        .unwrap();
+    planner.export_plan(&id, &root, None, false).await.unwrap();
+    assert_eq!(
+        planner.status(&id).await.unwrap().definition_drift,
+        Some(false)
+    );
+}
+
+#[tokio::test]
+async fn un_carry_restores_failed_status() {
+    let planner = BasicCpmPlanner::new();
+    let main = sync(&planner, "web", "main", chain()).await;
+    let changed_a = graph(vec![
+        deliverable("a", &["src/a.rs"], &[], 5.0),
+        deliverable("b", &["src/b.rs"], &["a"], 2.0),
+    ]);
+    let alt = sync(&planner, "web", "alt", changed_a).await;
+    let failed = DeliverableStatus::Failed {
+        reason: "flaky".into(),
+    };
+    planner.select_variant(&alt, false).await.unwrap();
+    planner
+        .mark_status(MarkStatusRequest::new(
+            alt.clone(),
+            "b",
+            CallerId("w1".into()),
+            failed.clone(),
+        ))
+        .await
+        .unwrap();
+    planner.select_variant(&main, false).await.unwrap();
+    complete_next(&planner, &main, "a").await;
+    complete_next(&planner, &main, "b").await;
+    // `b` is carried Complete, then un-carried above the changed `a`.
+    planner.select_variant(&alt, false).await.unwrap();
+    assert_eq!(status_of(&planner, &alt, "b").await, failed);
+}
+
+#[tokio::test]
+async fn three_level_transitive_un_carry() {
+    let planner = BasicCpmPlanner::new();
+    let three = |a_effort| {
+        graph(vec![
+            deliverable("a", &["src/a.rs"], &[], a_effort),
+            deliverable("b", &["src/b.rs"], &["a"], 2.0),
+            deliverable("c", &["src/c.rs"], &["b"], 1.0),
+        ])
+    };
+    let main = sync(&planner, "web", "main", three(1.0)).await;
+    let alt = sync(&planner, "web", "alt", three(5.0)).await;
+    for id in ["a", "b", "c"] {
+        complete_next(&planner, &main, id).await;
+    }
+    planner.select_variant(&alt, false).await.unwrap();
+    assert_eq!(
+        status_of(&planner, &alt, "c").await,
+        DeliverableStatus::Pending
+    );
+}
+
+#[tokio::test]
+async fn compare_by_name_with_fewer_than_two_live_variants_is_rejected() {
+    let planner = BasicCpmPlanner::new();
+    sync(&planner, "web", "main", chain()).await;
+    let err = planner
+        .compare_plans(ComparePlansRequest::by_plan(
+            PROJECT,
+            "web",
+            CompareRequest::default(),
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, PlannerError::InvalidGraph { .. }),
+        "got {err}"
+    );
+}
+
+#[tokio::test]
+async fn compare_by_name_on_archived_line_is_rejected() {
+    let planner = BasicCpmPlanner::new();
+    main_and_alt(&planner).await;
+    planner
+        .archive(PROJECT, "web", None, true, false)
+        .await
+        .unwrap();
+    let err = planner
+        .compare_plans(ComparePlansRequest::by_plan(
+            PROJECT,
+            "web",
+            CompareRequest::default(),
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, PlannerError::InvalidGraph { .. }),
+        "got {err}"
+    );
+}
+
+#[tokio::test]
+async fn compare_by_ids_rejects_duplicates() {
+    let planner = BasicCpmPlanner::new();
+    let (main, _) = main_and_alt(&planner).await;
+    let err = planner
+        .compare_plans(ComparePlansRequest::by_ids(
+            vec![main.clone(), main],
+            CompareRequest::default(),
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, PlannerError::InvalidGraph { .. }),
+        "got {err}"
+    );
 }

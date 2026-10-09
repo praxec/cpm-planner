@@ -309,6 +309,8 @@ struct ExportArgs {
     plan_id: String,
     #[serde(default)]
     path: Option<String>,
+    #[serde(default)]
+    force: bool,
 }
 
 /// `plan.revise`: replace a plan's graph in place, carrying progress over.
@@ -368,6 +370,8 @@ struct CompareArgs {
     plan_ids: Option<Vec<String>>,
     #[serde(default)]
     plan: Option<String>,
+    #[serde(default)]
+    project: Option<String>,
     #[serde(default)]
     schedule: Option<ScheduleRequest>,
     #[serde(default)]
@@ -525,7 +529,8 @@ fn capacities_schema() -> Value {
     })
 }
 
-/// Build the eleven `Tool` definitions advertised in `list_tools`.
+/// Build the `Tool` definitions advertised in `list_tools` (one per
+/// [`PLAN_TOOL_NAMES`] entry).
 ///
 /// Each tool carries an inline JSON Schema describing its arguments. The
 /// schemas are hand-written rather than derived because the workspace's
@@ -849,13 +854,17 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                 "Write the head graph of `plan_id` under the project root and return its \
                  root-relative path: to `path` when given (confined to \
                  .cpm-planner/plans/<name>/<variant>.json), else to its own variant \
-                 file. The written file is not synced.",
+                 file. Refuses (INVALID_PATH) another variant's tracked plan file, or \
+                 the variant's own file while it holds local edits never synced, \
+                 unless force. The written file is not synced; exporting to the \
+                 variant's own tracked file records its hash, so drift is false.",
             ),
             schema_object(json!({
                 "type": "object",
                 "properties": {
                     "plan_id": { "type": "string" },
-                    "path": path_schema()
+                    "path": path_schema(),
+                    "force": { "type": "boolean", "description": "Overwrite another variant's tracked file or unsynced local edits." }
                 },
                 "required": ["plan_id"],
                 "additionalProperties": false
@@ -942,14 +951,17 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
             Cow::Borrowed(
                 "Compare stored plans on the scorecard, returning the Pareto front, \
                  weighted rank and a recommended plan. Give exactly one of `plan_ids` \
-                 (two or more plans) or `plan` (a line name: every non-archived \
-                 variant). Read-only. Weights must be finite and >= 0.",
+                 (2 to 16 distinct plans) or `plan` (a line name in `project`: every \
+                 non-archived variant, at most 16). Read-only. Weights must be finite \
+                 and >= 0. With monte_carlo, iterations × (deliverables + prerequisite \
+                 edges) summed over all variants must not exceed 200000000.",
             ),
             schema_object(json!({
                 "type": "object",
                 "properties": {
-                    "plan_ids": { "type": "array", "minItems": 2, "items": { "type": "string" } },
+                    "plan_ids": { "type": "array", "minItems": 2, "maxItems": 16, "uniqueItems": true, "items": { "type": "string" } },
                     "plan": { "type": "string", "description": "Plan line name; compares every live variant." },
+                    "project": { "type": "string", "description": "Project key of `plan`; defaults to the discovered project root." },
                     "schedule": {
                         "type": "object",
                         "description": "Level every variant (same inputs as plan.schedule).",
@@ -1006,9 +1018,6 @@ pub struct PlanServer {
     planner: Arc<BasicCpmPlanner>,
     server_name: String,
     server_version: String,
-    /// Optional discovered project root; enables path-based portfolio tools
-    /// and supplies the default project key.
-    project_root: Option<ProjectRoot>,
 }
 
 impl PlanServer {
@@ -1018,16 +1027,7 @@ impl PlanServer {
             planner,
             server_name: "cpm-planner".to_string(),
             server_version: env!("CARGO_PKG_VERSION").to_string(),
-            project_root: None,
         }
-    }
-
-    /// Give the server a discovered project root. Path-based tools then read
-    /// and write under `<root>/.cpm-planner/plans/`, and the default project
-    /// key is `root.project_key()`.
-    pub fn with_project_root(mut self, root: ProjectRoot) -> Self {
-        self.project_root = Some(root);
-        self
     }
 
     /// Override the advertised server identity. Defaults to
@@ -1044,10 +1044,13 @@ impl PlanServer {
         &self.planner
     }
 
-    /// The discovered project root, or `INVALID_PATH` when the server has
-    /// none and the tool needs one.
+    /// The planner's project root ([`BasicCpmPlanner::project_root`], the
+    /// single source of truth), or `INVALID_PATH` when there is none and the
+    /// tool needs one. Path-based tools read and write under
+    /// `<root>/.cpm-planner/plans/`; the default project key is
+    /// `root.project_key()`.
     fn project_root(&self) -> Result<&ProjectRoot, McpError> {
-        self.project_root.as_ref().ok_or_else(|| {
+        self.planner.project_root().ok_or_else(|| {
             McpError::internal_error(
                 "INVALID_PATH: no project root (set CPM_PROJECT_ROOT or run inside a repo)",
                 None,
@@ -1395,10 +1398,20 @@ impl PlanServer {
             None => self.default_project()?,
         };
         let (name, variant) = match (&source, parsed.name, parsed.variant) {
-            (Some((file, _)), name, variant) => (
-                name.unwrap_or_else(|| file.name.clone()),
-                variant.unwrap_or_else(|| file.variant.clone()),
-            ),
+            (Some((file, _)), name, variant) => {
+                // The path names the variant: an explicit name, variant or
+                // project may only repeat it.
+                let root_key = self.project_root()?.project_key();
+                if name.as_ref().is_some_and(|n| *n != file.name)
+                    || variant.as_ref().is_some_and(|v| *v != file.variant)
+                    || project != root_key
+                {
+                    return Err(planner_error_to_mcp(PlannerError::InvalidPath {
+                        reason: "name/variant/project must match the plan file path".to_string(),
+                    }));
+                }
+                (file.name.clone(), file.variant.clone())
+            }
             (None, Some(name), variant) => (name, variant.unwrap_or_else(|| "main".to_string())),
             (None, None, _) => {
                 return Err(McpError::invalid_params(
@@ -1440,7 +1453,12 @@ impl PlanServer {
         let root = self.project_root()?;
         let path = self
             .planner
-            .export_plan(&PlanId(parsed.plan_id), root, parsed.path.as_deref())
+            .export_plan(
+                &PlanId(parsed.plan_id),
+                root,
+                parsed.path.as_deref(),
+                parsed.force,
+            )
             .await
             .map_err(planner_error_to_mcp)?;
         to_value(&ExportResponse { path })
@@ -1516,10 +1534,18 @@ impl PlanServer {
         };
         let compare = match (parsed.plan_ids, parsed.plan) {
             (Some(ids), None) => {
+                let distinct: std::collections::HashSet<&str> =
+                    ids.iter().map(String::as_str).collect();
+                if distinct.len() != ids.len() {
+                    return Err(McpError::invalid_params("plan_ids must be distinct", None));
+                }
                 ComparePlansRequest::by_ids(ids.into_iter().map(PlanId).collect(), request)
             }
             (None, Some(name)) => {
-                let project = self.default_project()?;
+                let project = match parsed.project {
+                    Some(project) => project,
+                    None => self.default_project()?,
+                };
                 ComparePlansRequest::by_plan(project, name, request)
             }
             _ => {
@@ -1529,11 +1555,13 @@ impl PlanServer {
                 ));
             }
         };
-        let comparison = self
+        // Gather inputs from the store, then score off the async runtime.
+        let inputs = self
             .planner
-            .compare_plans(compare)
-            .await
+            .compare_inputs(&compare)
             .map_err(planner_error_to_mcp)?;
+        let request = compare.request;
+        let comparison = run_blocking(move || crate::compare::compare(&inputs, &request)).await?;
         to_value(&comparison)
     }
 }
@@ -1698,21 +1726,22 @@ Tools (nineteen total, all `plan.<verb>`):
   plan.acquire_cohort  — atomically acquire ready deliverables with no conflicting file claims (an owned_files entry may be {path, mode: "append"}: append claims on one path may be co-leased and are listed in the response's shared_paths; exclusive claims never overlap anything at once; plan.submit accepts a shared file only when the claimants are ordered by prerequisites, or all claims are append)
   plan.heartbeat       — refresh a held lock's TTL
   plan.mark_status     — set a deliverable's status (Complete/Failed releases the lock); lockless Complete/Ready/InProgress requires complete prerequisites (PREREQUISITES_INCOMPLETE) and is audited
-  plan.status          — read-only snapshot ([id, status, attempt_count, failure_count, lapse_count] rows, critical_path (one real chain, always __start__ to __finish__), critical_ids, per-deliverable schedule (es/ef/ls/lf/float, hours; synthetic __start__/__finish__ endpoint rows have synthetic=true and critical=true; critical_ids lists only real deliverables), the ready set in acquire/ready priority order (smallest latest start first, i.e. longest remaining tail, then least float, then id), plan_complete, milestones (one row per `milestone: true` deliverable, or metadata.milestone == true: id, critical_path from __start__ to it, hours = its earliest finish, complete), held locks). __start__ and __finish__ are reserved deliverable ids (INVALID_GRAPH)
+  plan.status          — read-only snapshot ([id, status, attempt_count, failure_count, lapse_count] rows, critical_path (one real chain, always __start__ to __finish__), critical_ids, per-deliverable schedule (es/ef/ls/lf/float, hours; synthetic __start__/__finish__ endpoint rows have synthetic=true and critical=true; critical_ids lists only real deliverables), the ready set in acquire/ready priority order (smallest latest start first, i.e. longest remaining tail, then least float, then id), plan_complete, milestones (one row per `milestone: true` deliverable, or metadata.milestone == true: id, critical_path from __start__ to it, hours = its earliest finish, complete), held locks; for a named variant also name, variant, selected and definition_drift). __start__ and __finish__ are reserved deliverable ids (INVALID_GRAPH)
+                        definition_drift: null when unknown (no root for the variant's project, no tracked file, file missing/unreadable/over 8 MiB); false when the file matches the last synced/exported bytes or its graph equals the head graph (re-formatting is not drift); true when the file's graph differs from the head or does not parse — so after an inline revise it is true until plan.export or plan.sync {path}
   plan.get             — return the submitted PlanGraph (deliverables, estimates, files, metadata) for a plan_id
   plan.force_release   — operator escape hatch; emits audit event with `reason`; optional reset_counters:true also clears lapse/failure counters and revives a circuit-broken deliverable
   plan.accept          — a manager/owner marks a deliverable Complete without a lease (audited; evidence required; override_lock to take over a live lease)
   plan.lint            — static checks without submitting: cycles (with the loop), redundant edges, edges without rationale, interface edges not targeting a contract, deliverables feeding no milestone, unordered file overlaps
   plan.schedule        — level a graph against resource capacities (`metadata.owner` by default): makespan, per-deliverable start/finish, per-resource load, driving chain (dependency vs resource waits), project and feeding buffers; capacities is required and every resource carrying work needs >= 1 unit (INVALID_CAPACITIES: lists the missing ones); project_buffer_pct 0..100 (default 25)
   plan.simulate        — read-only what-if: lint, critical path, schedule, milestones, optional resource schedule (schedule: same inputs as plan.schedule) and Monte Carlo (monte_carlo: iterations 1..50000, default 2000; seed, default 0xC0FFEE, reproducible on the same platform and build; iterations × (deliverables + prerequisite edges) must not exceed 200000000), and the scorecard; persists nothing
-  plan.sync            — register or update one variant of a named plan line from a plan file (path: .cpm-planner/plans/<name>/<variant>.json, tracked by content hash for drift) or an inline graph (requires name; variant defaults to "main"); project defaults to the discovered root; force releases live locks of removed deliverables
+  plan.sync            — register or update one variant of a named plan line from a plan file (path: .cpm-planner/plans/<name>/<variant>.json, tracked by content hash for drift; any name/variant/project given must match the path) or an inline graph (requires name; variant defaults to "main"); project defaults to the discovered root; force releases live locks of removed deliverables
   plan.list            — list every plan line of project (default: discovered root), variants sorted; archived omitted unless include_archived
-  plan.export          — write the head graph of a plan_id to its variant file (or a confined path) and return the root-relative path; the file is not synced
+  plan.export          — write the head graph of a plan_id to its variant file (or a confined path) and return the root-relative path; refuses another variant's tracked file or unsynced local edits unless force; the file is not synced (exporting to the variant's own tracked file records its hash)
   plan.revise          — replace a plan's graph in place, carrying progress over; returns the new revision and diff; force releases live locks of removed deliverables
-  plan.fork            — copy a named variant's head graph, apply ordered edits, register it as a new draft (not selected) variant
+  plan.fork            — copy a named variant's head graph, apply ordered edits, register it as a new draft (not selected) variant; an archived line is refused (ARCHIVE_REFUSED) before any file is written
   plan.select          — make a variant its line's selected (only executable) variant, carrying progress over; force releases locks on the previous variant
   plan.archive         — archive (archived defaults true) or unarchive a whole line or one variant; archived variants stay readable but refuse sync/select/execute
-  plan.compare         — compare stored plans (plan_ids, or plan line name for every live variant) on the scorecard: Pareto front, weighted rank, recommended; weights must be finite and >= 0
+  plan.compare         — compare stored plans (plan_ids: 2..16 distinct ids, or plan line name in project, default the discovered root, for every live variant, at most 16) on the scorecard: Pareto front, weighted rank, recommended; weights must be finite and >= 0; the Monte Carlo budget (200000000) is shared across variants
   plan.submit with a `name` (optional `project`/`variant`, variant defaults to "main") registers a named variant instead of an unnamed plan
   plan.lint, plan.simulate take exactly one of an inline graph, a stored plan_id, or a plan-file path; plan.schedule takes graph or plan_id; plan.schedule and plan.simulate reject what plan.submit rejects, and plan.lint reports it as findings
 

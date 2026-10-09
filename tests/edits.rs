@@ -327,3 +327,24 @@ fn graph_edit_op_tag_round_trips() {
     let back: GraphEdit = serde_json::from_str(&wire).expect("deserializes");
     assert_eq!(back, edit);
 }
+
+#[test]
+fn final_validation_error_names_the_applied_edit_count() {
+    let result = apply_edits(
+        &graph(),
+        &[
+            GraphEdit::SetEffort {
+                id: "b".into(),
+                hours: 2.0,
+            },
+            GraphEdit::AddEdge {
+                from: "b".into(),
+                to: "a".into(),
+                consumes: None,
+            },
+        ],
+    );
+    assert!(
+        invalid_reason(result.expect_err("cycle rejected")).starts_with("after applying 2 edits: ")
+    );
+}

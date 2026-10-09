@@ -9,9 +9,11 @@
 //! returned values after commit.
 //!
 //! `variants.content_hash` holds the hash of the plan file's bytes after a
-//! file-backed sync (`source_path` set), or the canonical graph hash after an
-//! inline sync or a revise. Drift detection may compare it against a file's
-//! hash only when `source_path` is set; otherwise it is not a file hash.
+//! file-backed sync (`source_path` set) or an export to the variant's own
+//! tracked file, or the canonical graph hash after an inline sync that
+//! changed the graph or a revise. An inline sync that leaves the graph
+//! unchanged keeps it. Drift detection uses it only as a shortcut (equal
+//! bytes: no drift) and otherwise compares the file's graph with the head.
 //!
 //! Revision numbering: a variant is created at revision 1. A legacy
 //! (unnamed) plan has no `revisions` rows until its first revision, which
@@ -161,11 +163,13 @@ pub(crate) fn sync(
     // Unchanged means the same canonical graph, whatever the file bytes.
     if stored_graph(tx, &row.plan_id)?.is_some_and(|g| hash_graph(&g) == graph_hash) {
         // The file may have been re-formatted or moved: track it, but the
-        // plan itself has not changed.
+        // plan itself has not changed. An inline sync carries no file hash
+        // and leaves the tracked one alone.
         tx.execute(
-            "UPDATE variants SET content_hash = ?1, source_path = COALESCE(?2, source_path)
+            "UPDATE variants SET content_hash = COALESCE(?1, content_hash),
+                 source_path = COALESCE(?2, source_path)
              WHERE plan_id = ?3",
-            params![content_hash, req.source_path, row.plan_id.0],
+            params![req.content_hash, req.source_path, row.plan_id.0],
         )
         .map_err(backend)?;
         return Ok(Synced::Unchanged {
@@ -454,6 +458,63 @@ pub(crate) fn live_variants(
     .map_err(backend)
 }
 
+/// True when the line `(project, name)` exists and is archived.
+pub(crate) fn line_is_archived(
+    tx: &Transaction<'_>,
+    project: &str,
+    name: &str,
+) -> Result<bool, PlannerError> {
+    Ok(line(tx, project, name)?.is_some_and(|l| l.archived))
+}
+
+/// Plan ids of `project`'s variants whose tracked `source_path` is
+/// `rel_path`, sorted.
+pub(crate) fn variants_tracking(
+    tx: &Transaction<'_>,
+    project: &str,
+    rel_path: &str,
+) -> Result<Vec<PlanId>, PlannerError> {
+    let mut stmt = tx
+        .prepare(
+            "SELECT plan_id FROM variants WHERE project = ?1 AND source_path = ?2
+             ORDER BY plan_id",
+        )
+        .map_err(backend)?;
+    stmt.query_map(params![project, rel_path], |r| Ok(PlanId(r.get(0)?)))
+        .map_err(backend)?
+        .collect::<Result<_, _>>()
+        .map_err(backend)
+}
+
+/// Every revision's recorded content hash of `plan_id` (file hashes for
+/// file-backed syncs, canonical graph hashes otherwise).
+pub(crate) fn revision_content_hashes(
+    tx: &Transaction<'_>,
+    plan_id: &PlanId,
+) -> Result<HashSet<String>, PlannerError> {
+    let mut stmt = tx
+        .prepare("SELECT content_hash FROM revisions WHERE plan_id = ?1")
+        .map_err(backend)?;
+    stmt.query_map(params![plan_id.0], |r| r.get(0))
+        .map_err(backend)?
+        .collect::<Result<_, _>>()
+        .map_err(backend)
+}
+
+/// Record `content_hash` as the hash of the variant's tracked file.
+pub(crate) fn set_content_hash(
+    tx: &Transaction<'_>,
+    plan_id: &PlanId,
+    content_hash: &str,
+) -> Result<(), PlannerError> {
+    tx.execute(
+        "UPDATE variants SET content_hash = ?1 WHERE plan_id = ?2",
+        params![content_hash, plan_id.0],
+    )
+    .map_err(backend)?;
+    Ok(())
+}
+
 /// Refuse to revise an effectively archived variant (its line or itself)
 /// with `ARCHIVE_REFUSED`, as sync does. Unnamed plans always pass.
 pub(crate) fn ensure_revisable(tx: &Transaction<'_>, plan_id: &PlanId) -> Result<(), PlannerError> {
@@ -629,7 +690,7 @@ fn variant_plan_id(
     .map_err(backend)
 }
 
-fn line_archived(name: &str) -> PlannerError {
+pub(crate) fn line_archived(name: &str) -> PlannerError {
     PlannerError::ArchiveRefused {
         reason: format!("plan line '{name}' is archived"),
     }
@@ -713,8 +774,9 @@ pub(crate) struct Selected {
 /// pressure is lost) and a `Complete` status is copied onto a deliverable
 /// that is not `Complete` and not leased. A carried `Complete` whose new
 /// variant has any non-`Complete` prerequisite (checked transitively after
-/// carrying) is not carried after all, matching revise's reopen rule.
-/// Finally every unleased `Ready`/`Pending` deliverable of the new variant
+/// carrying) is not carried after all, matching revise's reopen rule: it
+/// gets back the status it had before carrying (a `Failed` keeps its reason,
+/// an `InProgress` is untouched). Finally every unleased `Ready`/`Pending` deliverable of the new variant
 /// is re-derived.
 pub(crate) fn select(
     tx: &Transaction<'_>,
@@ -833,6 +895,9 @@ fn carry_progress(old: &PlanState, new: &mut PlanState) -> Vec<String> {
         .map(|d| (d.id.as_str(), d))
         .collect();
     let mut carried = Vec::new();
+    // Status each carried deliverable had before carrying, restored if the
+    // carry is undone.
+    let mut before: HashMap<String, Option<DeliverableStatus>> = HashMap::new();
     for d in &new.graph.deliverables {
         let Some(o) = old_by_id.get(d.id.as_str()) else {
             continue;
@@ -855,8 +920,10 @@ fn carry_progress(old: &PlanState, new: &mut PlanState) -> Vec<String> {
         let new_open = new.statuses.get(id) != Some(&DeliverableStatus::Complete)
             && !new.locks.contains_key(id);
         if old_complete && new_open {
-            new.statuses
+            let previous = new
+                .statuses
                 .insert(id.to_string(), DeliverableStatus::Complete);
+            before.insert(id.to_string(), previous);
             carried.push(id.to_string());
         }
     }
@@ -880,8 +947,14 @@ fn carry_progress(old: &PlanState, new: &mut PlanState) -> Vec<String> {
             break;
         }
         for id in open_above {
-            // Placeholder; the re-derivation below sets Ready/Pending.
-            new.statuses.insert(id.clone(), DeliverableStatus::Pending);
+            // Restore the pre-carry status (a Failed keeps its reason, an
+            // InProgress stays); the re-derivation below only touches
+            // Ready/Pending.
+            let previous = before
+                .remove(&id)
+                .flatten()
+                .unwrap_or(DeliverableStatus::Pending);
+            new.statuses.insert(id.clone(), previous);
             kept.remove(&id);
         }
     }

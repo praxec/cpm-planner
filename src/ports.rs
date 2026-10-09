@@ -162,15 +162,20 @@ pub trait Planner: Send + Sync {
     /// path and file content hash); otherwise it is registered inline. A
     /// request root of another project is `INVALID_PATH`. An unnamed plan is
     /// `INVALID_PATH: fork requires a named plan`; an existing variant is
-    /// `INVALID_PATH: variant '<v>' of '<name>' already exists`. If the sync
-    /// fails after the file was written, the file is left in place.
+    /// `INVALID_PATH: variant '<v>' of '<name>' already exists`. Forking into
+    /// an archived line is `ARCHIVE_REFUSED` before anything is written;
+    /// forking from an archived variant of a live line is allowed. If the
+    /// sync fails after the file was written, the file is removed (best
+    /// effort, only while it still holds the bytes the fork wrote).
     async fn fork_plan(&self, req: ForkRequest) -> Result<SyncOutcome, PlannerError>;
 
     /// Compare plans on the scorecard ([`crate::compare::compare`]): either
-    /// `plan_ids` (two or more plans, in the given order; an unnamed plan is
-    /// labelled by its id) or every non-archived variant of the line `plan`
-    /// (sorted by variant). Giving both or neither is `INVALID_GRAPH`; an
-    /// unknown plan or line is `PLAN_NOT_FOUND`. Read-only.
+    /// `plan_ids` (2..=16 distinct plans, in the given order; an unnamed plan
+    /// is labelled by its id) or every non-archived variant of the line
+    /// `plan` (sorted by variant). Giving both or neither, duplicate ids, or
+    /// fewer than two or more than 16 variants is `INVALID_GRAPH`; an unknown
+    /// plan or line is `PLAN_NOT_FOUND`. The Monte Carlo work budget is
+    /// shared across variants. Read-only.
     async fn compare_plans(&self, req: ComparePlansRequest) -> Result<Comparison, PlannerError>;
 
     /// Write the head graph of `plan_id` under `root` and return the file's
@@ -178,12 +183,17 @@ pub trait Planner: Send + Sync {
     /// `.cpm-planner/plans/<name>/<variant>.json`), else to the named
     /// variant's own file `<name>/<variant>.json`, which requires `root` to
     /// be the variant's project. An unnamed plan requires `path`. An
-    /// existing file is replaced. The written file is NOT synced: the
-    /// caller syncs it if it wants the variant to track it.
+    /// existing file is replaced, except (unless `force`) another variant's
+    /// tracked plan file, or this variant's own file while it holds local
+    /// edits never synced (drifted content no revision recorded), which are
+    /// `INVALID_PATH`. The written file is NOT synced, except that exporting
+    /// to the variant's own tracked file records the written hash, so its
+    /// drift is false afterwards.
     async fn export_plan(
         &self,
         plan_id: &PlanId,
         root: &ProjectRoot,
         path: Option<&str>,
+        force: bool,
     ) -> Result<String, PlannerError>;
 }
