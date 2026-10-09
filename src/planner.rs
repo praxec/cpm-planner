@@ -744,13 +744,13 @@ impl Planner for BasicCpmPlanner {
             }
 
             // If a lock exists it must belong to caller_id.
-            if let Some(lock) = state.locks.get(deliverable_id) {
-                if lock.caller_id != *caller_id {
-                    return Err(PlannerError::LockNotHeld {
-                        caller_id: caller_id.0.clone(),
-                        deliverable_id: deliverable_id.to_string(),
-                    });
-                }
+            if let Some(lock) = state.locks.get(deliverable_id)
+                && lock.caller_id != *caller_id
+            {
+                return Err(PlannerError::LockNotHeld {
+                    caller_id: caller_id.0.clone(),
+                    deliverable_id: deliverable_id.to_string(),
+                });
             }
 
             // Lock release on terminal status.
@@ -760,27 +760,27 @@ impl Planner for BasicCpmPlanner {
                 _ => None,
             };
 
-            if let Some(reason) = release_reason {
-                if let Some(lock) = state.locks.remove(deliverable_id) {
-                    // Deliverable existence was verified at the top of
-                    // `mark_status`; `.find()` is guaranteed to succeed.
-                    let owned_files: Vec<PathBuf> = match state
-                        .graph
-                        .deliverables
-                        .iter()
-                        .find(|d| d.id == deliverable_id)
-                    {
-                        Some(d) => d.owned_files.clone(),
-                        None => unreachable!(
-                            "deliverable {deliverable_id} present in locks but missing from \
-                             graph — invariant broken"
-                        ),
-                    };
-                    for f in &owned_files {
-                        state.file_to_deliverable.remove(f);
-                    }
-                    audit_buf.push(make_released_event(&lock, reason));
+            if let Some(reason) = release_reason
+                && let Some(lock) = state.locks.remove(deliverable_id)
+            {
+                // Deliverable existence was verified at the top of
+                // `mark_status`; `.find()` is guaranteed to succeed.
+                let owned_files: Vec<PathBuf> = match state
+                    .graph
+                    .deliverables
+                    .iter()
+                    .find(|d| d.id == deliverable_id)
+                {
+                    Some(d) => d.owned_files.clone(),
+                    None => unreachable!(
+                        "deliverable {deliverable_id} present in locks but missing from \
+                         graph — invariant broken"
+                    ),
+                };
+                for f in &owned_files {
+                    state.file_to_deliverable.remove(f);
                 }
+                audit_buf.push(make_released_event(&lock, reason));
             }
 
             // An EXPLICIT Failed mark is a real implementation attempt —

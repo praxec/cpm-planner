@@ -82,11 +82,11 @@ impl SqlitePlanStore {
         if path.as_os_str() == ":memory:" {
             return Self::open_in_memory();
         }
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("creating parent directory for {}", path.display()))?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating parent directory for {}", path.display()))?;
         }
         let conn = Connection::open(path)
             .with_context(|| format!("opening sqlite database at {}", path.display()))?;

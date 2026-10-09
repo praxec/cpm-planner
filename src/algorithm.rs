@@ -263,19 +263,19 @@ impl CpmAlgorithm {
                 let task_effort = tasks[i].effort_hours;
 
                 // Find minimum LS of all successors
-                if let Some(succ_ids) = successors.get(&task_id) {
-                    if !succ_ids.is_empty() {
-                        let min_succ_ls = succ_ids
-                            .iter()
-                            .filter_map(|sid| task_map.get(sid).map(|&idx| tasks[idx].latest_start))
-                            .filter(|&ls| ls < f32::MAX)
-                            .fold(f32::MAX, f32::min);
+                if let Some(succ_ids) = successors.get(&task_id)
+                    && !succ_ids.is_empty()
+                {
+                    let min_succ_ls = succ_ids
+                        .iter()
+                        .filter_map(|sid| task_map.get(sid).map(|&idx| tasks[idx].latest_start))
+                        .filter(|&ls| ls < f32::MAX)
+                        .fold(f32::MAX, f32::min);
 
-                        if min_succ_ls < f32::MAX && min_succ_ls < tasks[i].latest_finish {
-                            tasks[i].latest_finish = min_succ_ls;
-                            tasks[i].latest_start = min_succ_ls - task_effort;
-                            changed = true;
-                        }
+                    if min_succ_ls < f32::MAX && min_succ_ls < tasks[i].latest_finish {
+                        tasks[i].latest_finish = min_succ_ls;
+                        tasks[i].latest_start = min_succ_ls - task_effort;
+                        changed = true;
                     }
                 }
             }
