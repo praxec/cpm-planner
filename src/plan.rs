@@ -318,11 +318,33 @@ pub struct PlanStatus {
     /// Ids on the longest dependency chain, in execution order. Empty
     /// when the plan has no deliverables.
     pub critical_path: Vec<String>,
-    /// Sum of `estimated_effort_hours` along `critical_path`. Deliverables
-    /// without an estimate contribute zero.
+    /// Project length in hours: the maximum earliest finish, equal to the
+    /// effort summed along `critical_path`.
     pub critical_path_hours: f32,
     /// Every lock currently active across the plan.
     pub locks_held: Vec<LockInfo>,
+    /// Every zero-float deliverable, sorted by `(es, id)`.
+    #[serde(default)]
+    pub critical_ids: Vec<String>,
+    /// Per-deliverable CPM schedule, in graph insertion order.
+    #[serde(default)]
+    pub schedule: Vec<ScheduleRow>,
+    /// Deliverables with status `Ready` and no live lock, sorted by
+    /// `(float, es, id)` ascending.
+    #[serde(default)]
+    pub ready: Vec<String>,
+}
+
+/// One deliverable's CPM schedule, in hours from plan start.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScheduleRow {
+    pub id: String,
+    pub es: f32,
+    pub ef: f32,
+    pub ls: f32,
+    pub lf: f32,
+    pub float: f32,
+    pub critical: bool,
 }
 
 /// Errors returned by [`crate::ports::Planner`] methods.

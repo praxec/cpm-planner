@@ -580,7 +580,7 @@ Tools (six total, all `plan.<verb>`):
   plan.acquire_cohort  — atomically acquire ready, file-disjoint deliverables
   plan.heartbeat       — refresh a held lock's TTL
   plan.mark_status     — set a deliverable's status (Complete/Failed releases the lock)
-  plan.status          — read-only snapshot ([id, status, attempt_count, failure_count, lapse_count] rows, critical path, held locks)
+  plan.status          — read-only snapshot ([id, status, attempt_count, failure_count, lapse_count] rows, critical_path (one real chain), critical_ids, per-deliverable schedule (es/ef/ls/lf/float, hours), the ready set ordered by float, held locks)
   plan.force_release   — operator escape hatch; emits audit event with `reason`
 
 Errors carry stable prefixes: LOCK_HELD, LOCK_NOT_HELD, LOCK_EXPIRED,

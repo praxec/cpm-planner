@@ -36,7 +36,7 @@ use std::time::Duration;
 use crate::audit::{AuditEvent, AuditSink, NullAuditSink};
 use crate::plan::{
     CallerId, Cohort, CohortRow, Deliverable, DeliverableStatus, LockInfo, PlanGraph, PlanId,
-    PlanStatus, PlannerError,
+    PlanStatus, PlannerError, ScheduleRow,
 };
 use crate::plan_store::SqlitePlanStore;
 use crate::ports::Planner;
@@ -463,34 +463,21 @@ fn make_force_released_event(lock: &LockInfo, reason: &str) -> AuditEvent {
 // Priority ordering for cohort selection
 // ---------------------------------------------------------------------------
 
-/// Sort key for the ready-set priority pass. Critical-path tasks come first
-/// (in CP execution order), then non-critical tasks by ascending
-/// `earliest_start`. Ties broken by `deliverable_id` for determinism.
+/// Sort key for the ready-set priority pass: least total float first
+/// (critical work leads), then earliest start, then id for determinism.
 fn priority_key(
     deliverable_id: &str,
-    cp_positions: &HashMap<&str, usize>,
-    es_by_id: &HashMap<&str, f32>,
-) -> (u8, i64, String) {
-    if let Some(pos) = cp_positions.get(deliverable_id) {
-        // Tier 0 = critical path; position drives order.
-        (0, *pos as i64, deliverable_id.to_string())
-    } else {
-        // Tier 1 = non-critical; ES drives order (scaled to integer for Ord).
-        // Every deliverable in the ready set was turned into a Task and fed
-        // through CPM, so its id MUST be present in `es_by_id`. A miss means
-        // the ready set and the cached CPM result have diverged — an
-        // invariant breach, not a "default to time 0" situation, since
-        // defaulting would confidently mis-order the cohort.
-        let es = match es_by_id.get(deliverable_id) {
-            Some(&es) => es,
-            None => unreachable!(
-                "deliverable '{deliverable_id}' is in the ready set but absent from the cached \
-                 CPM earliest-start table — ready set and CPM result are out of sync"
-            ),
-        };
-        let es_scaled = (es * 1000.0).round() as i64;
-        (1, es_scaled, deliverable_id.to_string())
-    }
+    sched_by_id: &HashMap<&str, (f32, f32)>,
+) -> (i64, i64, String) {
+    let (float, es) = match sched_by_id.get(deliverable_id) {
+        Some(&v) => v,
+        None => unreachable!(
+            "deliverable '{deliverable_id}' is in the ready set but absent from the cached \
+             CPM schedule — ready set and CPM result are out of sync"
+        ),
+    };
+    let scale = |h: f32| (h * 1000.0).round() as i64;
+    (scale(float), scale(es), deliverable_id.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -630,19 +617,12 @@ impl Planner for BasicCpmPlanner {
                     .insert(id, DeliverableStatus::Failed { reason });
             }
 
-            // 3. Build CP priority + ES lookup tables.
-            let cp_positions: HashMap<&str, usize> = state
-                .cached_result
-                .critical_path
-                .iter()
-                .enumerate()
-                .map(|(i, id)| (id.as_str(), i))
-                .collect();
-            let es_by_id: HashMap<&str, f32> = state
+            // 3. Build the (float, ES) lookup table.
+            let sched_by_id: HashMap<&str, (f32, f32)> = state
                 .cached_result
                 .tasks
                 .iter()
-                .map(|t| (t.id.as_str(), t.earliest_start))
+                .map(|t| (t.id.as_str(), (t.float, t.earliest_start)))
                 .collect();
 
             // 4. Build the ready set: status=Ready AND no lock currently held.
@@ -655,7 +635,7 @@ impl Planner for BasicCpmPlanner {
                         && !state.locks.contains_key(&d.id)
                 })
                 .collect();
-            ready.sort_by_key(|d| priority_key(&d.id, &cp_positions, &es_by_id));
+            ready.sort_by_key(|d| priority_key(&d.id, &sched_by_id));
 
             // 5. Greedy fill with file-disjointness check.
             let mut selected: Vec<Deliverable> = Vec::new();
@@ -914,8 +894,42 @@ impl Planner for BasicCpmPlanner {
                 })
                 .collect();
 
+            let task_of = |id: &str| state.cached_result.tasks.iter().find(|t| t.id == id);
+            let schedule: Vec<ScheduleRow> = state
+                .graph
+                .deliverables
+                .iter()
+                .filter_map(|d| task_of(&d.id))
+                .map(|t| ScheduleRow {
+                    id: t.id.clone(),
+                    es: t.earliest_start,
+                    ef: t.earliest_finish,
+                    ls: t.latest_start,
+                    lf: t.latest_finish,
+                    float: t.float,
+                    critical: t.is_critical,
+                })
+                .collect();
+            let mut ready_rows: Vec<&ScheduleRow> = schedule
+                .iter()
+                .filter(|r| {
+                    matches!(state.statuses.get(&r.id), Some(DeliverableStatus::Ready))
+                        && !state.locks.contains_key(&r.id)
+                })
+                .collect();
+            ready_rows.sort_by(|a, b| {
+                a.float
+                    .total_cmp(&b.float)
+                    .then(a.es.total_cmp(&b.es))
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            let ready: Vec<String> = ready_rows.iter().map(|r| r.id.clone()).collect();
+
             PlanStatus {
                 plan_id: plan_id.clone(),
+                critical_ids: state.cached_result.critical_ids.clone(),
+                schedule,
+                ready,
                 deliverables,
                 critical_path: state.cached_result.critical_path.clone(),
                 critical_path_hours: state.cached_result.critical_path_duration,
@@ -1026,36 +1040,26 @@ mod tests {
         assert!(complex.effort_hours > simple.effort_hours);
     }
 
-    #[test]
-    fn priority_key_critical_tier_orders_by_position() {
-        let mut cp = HashMap::new();
-        cp.insert("A", 0usize);
-        cp.insert("B", 1usize);
-        let es: HashMap<&str, f32> = HashMap::new();
-        let ka = priority_key("A", &cp, &es);
-        let kb = priority_key("B", &cp, &es);
-        assert!(ka < kb);
+    fn sched<'a>(entries: &[(&'a str, f32, f32)]) -> HashMap<&'a str, (f32, f32)> {
+        entries.iter().map(|&(id, f, e)| (id, (f, e))).collect()
     }
 
     #[test]
-    fn priority_key_noncritical_uses_es() {
-        let cp: HashMap<&str, usize> = HashMap::new();
-        let mut es = HashMap::new();
-        es.insert("X", 1.0_f32);
-        es.insert("Y", 3.0_f32);
-        let kx = priority_key("X", &cp, &es);
-        let ky = priority_key("Y", &cp, &es);
-        // Both tier 1, X has earlier ES so sorts first.
-        assert_eq!(kx.0, 1);
-        assert!(kx < ky);
+    fn priority_key_orders_lower_float_first() {
+        let s = sched(&[("A", 0.0, 5.0), ("B", 2.0, 0.0)]);
+        assert!(priority_key("A", &s) < priority_key("B", &s));
     }
 
     #[test]
-    #[should_panic(expected = "absent from the cached CPM earliest-start table")]
-    fn priority_key_missing_es_is_invariant_breach() {
-        let cp: HashMap<&str, usize> = HashMap::new();
-        let es: HashMap<&str, f32> = HashMap::new();
-        // Non-critical deliverable with no ES entry must panic, not default.
-        let _ = priority_key("ghost", &cp, &es);
+    fn priority_key_breaks_float_ties_by_es() {
+        let s = sched(&[("X", 1.0, 3.0), ("Y", 1.0, 1.0)]);
+        assert!(priority_key("Y", &s) < priority_key("X", &s));
+    }
+
+    #[test]
+    #[should_panic(expected = "absent from the cached CPM schedule")]
+    fn priority_key_missing_entry_is_invariant_breach() {
+        let s: HashMap<&str, (f32, f32)> = HashMap::new();
+        let _ = priority_key("ghost", &s);
     }
 }
