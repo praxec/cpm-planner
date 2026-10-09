@@ -41,3 +41,8 @@ uuid = { version = "1", features = ["v4", "serde"] }
 rand = "0.10.3"
 rand_distr = "0.6.0"
 rand_chacha = "0.10.0"
+cap-std = "4.0.3"
+cap-fs-ext = "4.0.3"
+
+[dev-dependencies]
+tempfile = "3.27.0"

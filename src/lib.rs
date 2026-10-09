@@ -56,6 +56,7 @@ pub mod plan_store;
 pub mod planner;
 mod portfolio;
 pub mod ports;
+pub mod project;
 pub mod resource_schedule;
 pub mod revise;
 pub mod risk;
