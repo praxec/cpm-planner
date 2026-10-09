@@ -21,8 +21,9 @@ use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc, Weekday};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Working-time calendar for the EV clock.
+/// Working-time calendar for the EV clock. Unknown fields are rejected.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Calendar {
     /// Working hours per workday, in (0, 24]. A workday contributes these
     /// hours starting at 00:00 local time.
@@ -347,6 +348,12 @@ pub fn build_baseline(
         });
     }
     let bac = rows.iter().map(|r| f64::from(r.budget)).sum::<f64>() as f32;
+    if !bac.is_finite() {
+        return Err(PlannerError::InvalidGraph {
+            reason: "budget at completion (sum of effort x cost_rate) exceeds the f32 range"
+                .to_string(),
+        });
+    }
     Ok(Baseline {
         number,
         start,
@@ -479,18 +486,25 @@ pub fn compute_ev(
     let cpm = compute_cpm(graph)?;
     let critical_float = (finish_of(&cpm) - baseline.finish_hours).max(0.0);
 
-    let mut alerts = Vec::new();
-    if let [.., a, b] = previous_snapshots {
-        let low = |v: Option<f32>| v.is_some_and(|x| x < 0.9);
-        if low(a.spi) && low(b.spi) {
-            alerts.push("SPI_BELOW_0_9".to_string());
-        }
-        if low(a.cpi) && low(b.cpi) {
-            alerts.push("CPI_BELOW_0_9".to_string());
+    let alerts = trend_alerts(previous_snapshots);
+    for (field, v) in [
+        ("pv", pv),
+        ("ev", ev),
+        ("ac", ac),
+        ("sv", ev - pv),
+        ("cv", ev - ac),
+    ] {
+        if !(v as f32).is_finite() {
+            return Err(PlannerError::InvalidGraph {
+                reason: format!(
+                    "earned-value total {field} exceeds the f32 range (check cost_rate and \
+                     reported hours)"
+                ),
+            });
         }
     }
 
-    Ok(EvReport {
+    let report = EvReport {
         as_of,
         baseline_number: baseline.number,
         bac: baseline.bac,
@@ -521,7 +535,103 @@ pub fn compute_ev(
             v.sort();
             v
         },
-    })
+    };
+    Ok(report)
+}
+
+/// Trend alerts over chronological snapshot ratios: `SPI_BELOW_0_9` /
+/// `CPI_BELOW_0_9` when the metric is defined and below 0.9 on both of the
+/// two most recent entries. Fewer than two entries raise nothing.
+pub fn trend_alerts(snapshots: &[EvSummary]) -> Vec<String> {
+    let mut alerts = Vec::new();
+    if let [.., a, b] = snapshots {
+        let low = |v: Option<f32>| v.is_some_and(|x| x < 0.9);
+        if low(a.spi) && low(b.spi) {
+            alerts.push("SPI_BELOW_0_9".to_string());
+        }
+        if low(a.cpi) && low(b.cpi) {
+            alerts.push("CPI_BELOW_0_9".to_string());
+        }
+    }
+    alerts
+}
+
+/// The stored summary of one EV snapshot: the report's totals and ratios
+/// (an undefined ratio stays `None`, serialised as `null`) and the alerts
+/// raised when it was taken.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotSummary {
+    pub taken_at: DateTime<Utc>,
+    pub as_of: DateTime<Utc>,
+    pub baseline_number: u32,
+    pub bac: f32,
+    pub pv: f32,
+    pub ev: f32,
+    pub ac: f32,
+    pub sv: f32,
+    pub cv: f32,
+    pub spi: Option<f32>,
+    pub cpi: Option<f32>,
+    pub eac: Option<f32>,
+    pub etc: Option<f32>,
+    pub vac: Option<f32>,
+    pub tcpi: Option<f32>,
+    pub alerts: Vec<String>,
+}
+
+impl SnapshotSummary {
+    /// Summarise `report`, taken at `taken_at`.
+    pub fn from_report(report: &EvReport, taken_at: DateTime<Utc>) -> Self {
+        Self {
+            taken_at,
+            as_of: report.as_of,
+            baseline_number: report.baseline_number,
+            bac: report.bac,
+            pv: report.pv,
+            ev: report.ev,
+            ac: report.ac,
+            sv: report.sv,
+            cv: report.cv,
+            spi: report.spi,
+            cpi: report.cpi,
+            eac: report.eac,
+            etc: report.etc,
+            vac: report.vac,
+            tcpi: report.tcpi,
+            alerts: report.alerts.clone(),
+        }
+    }
+
+    /// The ratios trend alerts look at.
+    pub fn ratios(&self) -> EvSummary {
+        EvSummary {
+            spi: self.spi,
+            cpi: self.cpi,
+        }
+    }
+}
+
+/// Render snapshots (in the given order) as a Markdown table with columns
+/// date (the `as_of` instant, UTC, to the minute), PV, EV, AC, SPI, CPI
+/// and EAC. Values have two decimals; an undefined ratio is `n/a`.
+pub fn render_snapshots_markdown(snapshots: &[SnapshotSummary]) -> String {
+    let ratio = |v: Option<f32>| v.map_or_else(|| "n/a".to_string(), |x| format!("{x:.2}"));
+    let mut out = String::from(
+        "| date | PV | EV | AC | SPI | CPI | EAC |\n|---|---:|---:|---:|---:|---:|---:|\n",
+    );
+    for s in snapshots {
+        out.push_str(&format!(
+            "| {} | {:.2} | {:.2} | {:.2} | {} | {} | {} |\n",
+            s.as_of.format("%Y-%m-%dT%H:%MZ"),
+            s.pv,
+            s.ev,
+            s.ac,
+            ratio(s.spi),
+            ratio(s.cpi),
+            ratio(s.eac),
+        ));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1584,5 +1694,101 @@ mod tests {
             }
         }
         assert!(mismatches.is_empty(), "{mismatches:?}");
+    }
+
+    // ── P5 Task 3: snapshot support ─────────────────────────────────────
+
+    #[test]
+    fn trend_alerts_fire_spi_when_two_latest_are_low() {
+        let a = trend_alerts(&[snap(0.8, 1.0), snap(0.85, 1.0)]);
+        assert_eq!(a, vec!["SPI_BELOW_0_9".to_string()]);
+    }
+
+    #[test]
+    fn baseline_rejects_budget_total_beyond_f32() {
+        let heavy = |id: &str| {
+            let mut d = deliverable(id, 1.0, &[]);
+            d.metadata = serde_json::json!({ "cost_rate": 3.0e38 });
+            d
+        };
+        let g = graph(vec![heavy("a"), heavy("b")]);
+        let cpm = compute_cpm(&g).unwrap();
+        let e = build_baseline(&g, &cpm, at(2026, 1, 5, 0), None, 1);
+        assert!(matches!(e, Err(PlannerError::InvalidGraph { .. })));
+    }
+
+    #[test]
+    fn ev_rejects_actual_cost_beyond_f32() {
+        let mut br = row("a", 0.0, 10.0, 100.0);
+        br.cost_rate = 3.0e38;
+        let b = baseline(vec![br]);
+        let g = graph(vec![deliverable("a", 100.0, &[])]);
+        let actuals = HashMap::from([(
+            "a".to_string(),
+            Actuals {
+                actual_hours: Some(1.0e6),
+                ..Actuals::default()
+            },
+        )]);
+        let as_of = b.start + Duration::hours(5);
+        let e = compute_ev(
+            &b,
+            &g,
+            &HashMap::new(),
+            &HashMap::new(),
+            &actuals,
+            as_of,
+            &[],
+        );
+        assert!(matches!(e, Err(PlannerError::InvalidGraph { .. })));
+    }
+
+    #[test]
+    fn calendar_rejects_unknown_fields() {
+        let c = serde_json::from_value::<Calendar>(serde_json::json!({ "hours": 8 }));
+        assert!(c.is_err());
+    }
+
+    fn summary_of(r: &EvReport) -> SnapshotSummary {
+        SnapshotSummary::from_report(r, r.as_of)
+    }
+
+    #[test]
+    fn snapshot_summary_carries_report_spi() {
+        let r = textbook();
+        assert_eq!(summary_of(&r).spi, r.spi);
+    }
+
+    #[test]
+    fn snapshot_markdown_starts_with_header_row() {
+        let md = render_snapshots_markdown(&[summary_of(&textbook())]);
+        assert!(md.starts_with("| date | PV | EV | AC | SPI | CPI | EAC |\n"));
+    }
+
+    #[test]
+    fn snapshot_markdown_renders_one_row_per_snapshot() {
+        let s = summary_of(&textbook());
+        let md = render_snapshots_markdown(&[s.clone(), s]);
+        assert_eq!(md.lines().count(), 4);
+    }
+
+    #[test]
+    fn snapshot_markdown_row_shows_textbook_values() {
+        let md = render_snapshots_markdown(&[summary_of(&textbook())]);
+        assert_eq!(
+            md.lines().nth(2),
+            Some("| 2026-01-05T10:00Z | 50.00 | 40.00 | 48.00 | 0.80 | 0.83 | 120.00 |")
+        );
+    }
+
+    #[test]
+    fn snapshot_markdown_renders_undefined_ratio_as_na() {
+        let r = one(EarningRule::ZeroHundred, DeliverableStatus::Pending, None);
+        let md = render_snapshots_markdown(&[summary_of(&r)]);
+        assert!(
+            md.lines()
+                .nth(2)
+                .is_some_and(|l| l.ends_with("| n/a | n/a |"))
+        );
     }
 }
