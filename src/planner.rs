@@ -541,6 +541,9 @@ fn make_portfolio_revised_event(
 /// Audit trail of a committed revision: reaped (expired) locks, locks the
 /// forced revision released, then the revision itself.
 fn revision_events(plan_id: &PlanId, revised: &Revised, now: DateTime<Utc>) -> Vec<AuditEvent> {
+    if revised.no_op {
+        return Vec::new();
+    }
     let mut events: Vec<AuditEvent> = revised
         .reaped
         .iter()
@@ -557,7 +560,25 @@ fn revision_events(plan_id: &PlanId, revised: &Revised, now: DateTime<Utc>) -> V
         revised.revision,
         &revised.diff,
     ));
+    if let Some(count) = revised.completed {
+        events.push(make_plan_completed_event(plan_id, count));
+    }
     events
+}
+
+/// Longest `project` key accepted by `sync_plan` (a path-derived key, not a
+/// slug).
+const MAX_PROJECT_LEN: usize = 512;
+
+/// Reject a malformed `(project, name, variant)` with `INVALID_PATH`.
+fn validate_variant_key(req: &SyncRequest) -> Result<(), PlannerError> {
+    if req.project.is_empty() || req.project.chars().count() > MAX_PROJECT_LEN {
+        return Err(PlannerError::InvalidPath {
+            reason: format!("project must be 1..={MAX_PROJECT_LEN} characters"),
+        });
+    }
+    crate::project::validate_slug("name", &req.name)?;
+    crate::project::validate_slug("variant", &req.variant)
 }
 
 fn make_acquired_event(lock: &LockInfo, owned_files: &[OwnedFile]) -> AuditEvent {
@@ -692,7 +713,7 @@ fn complete_deliverable(
 }
 
 /// True when every deliverable in the plan is `Complete`.
-fn all_complete(state: &PlanState) -> bool {
+pub(crate) fn all_complete(state: &PlanState) -> bool {
     state
         .graph
         .deliverables
@@ -831,6 +852,7 @@ impl Planner for BasicCpmPlanner {
     }
 
     async fn sync_plan(&self, req: SyncRequest) -> Result<SyncOutcome, PlannerError> {
+        validate_variant_key(&req)?;
         validate_graph(&req.graph)?;
         let graph_hash = hash_graph(&req.graph);
         let now = self.now();

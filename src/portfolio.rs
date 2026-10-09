@@ -8,6 +8,11 @@
 //! tables as ONE atomic step. Audit events are built by the planner from the
 //! returned values after commit.
 //!
+//! `variants.content_hash` holds the hash of the plan file's bytes after a
+//! file-backed sync (`source_path` set), or the canonical graph hash after an
+//! inline sync or a revise. Drift detection may compare it against a file's
+//! hash only when `source_path` is set; otherwise it is not a file hash.
+//!
 //! Revision numbering: a variant is created at revision 1. A legacy
 //! (unnamed) plan has no `revisions` rows until its first revision, which
 //! backfills revision 1 with the original graph.
@@ -21,7 +26,7 @@ use crate::plan::{
     VariantSummary,
 };
 use crate::plan_store::{backend, insert_plan, load_plan_state, replace_plan_state};
-use crate::planner::hash_graph;
+use crate::planner::{all_complete, hash_graph};
 use crate::revise::{RevisionDiff, plan_revision};
 
 /// A committed revision, with what the planner needs to audit it.
@@ -32,6 +37,12 @@ pub(crate) struct Revised {
     pub(crate) reaped: Vec<LockInfo>,
     /// Live locks the forced revision released.
     pub(crate) released: Vec<LockInfo>,
+    /// True when the graph was identical to the head: nothing was written
+    /// and nothing is audited.
+    pub(crate) no_op: bool,
+    /// `Some(deliverable count)` when this revision flipped the plan from
+    /// not-all-complete to all-complete (audited as `plan.completed`).
+    pub(crate) completed: Option<usize>,
 }
 
 /// What a sync did.
@@ -228,8 +239,22 @@ pub(crate) fn revise(
     let mut state = load_plan_state(tx, plan_id)?.ok_or_else(|| PlannerError::PlanNotFound {
         plan_id: plan_id.0.clone(),
     })?;
+    let new_hash = hash_graph(&graph);
+    if hash_graph(&state.graph) == new_hash {
+        return Ok(Revised {
+            revision: max_revision(tx, plan_id)?.unwrap_or(1),
+            diff: RevisionDiff::default(),
+            reaped: Vec::new(),
+            released: Vec::new(),
+            no_op: true,
+            completed: None,
+        });
+    }
     let reaped = state.reap_expired(now);
+    let was_complete = all_complete(&state);
     let (new_state, diff) = plan_revision(&state, &graph, force, now)?;
+    let completed =
+        (!was_complete && all_complete(&new_state)).then_some(new_state.graph.deliverables.len());
     let released: Vec<LockInfo> = diff
         .released_locks
         .iter()
@@ -237,19 +262,26 @@ pub(crate) fn revise(
         .collect();
     replace_plan_state(tx, plan_id, &new_state)?;
 
-    let new_hash = hash_graph(&graph);
-    // An unnamed plan's dedup row must name the graph it now holds; named
-    // plans have no dedup row and never gain one.
-    let had_dedup = tx
-        .execute(
+    // An unnamed plan (no `variants` row) must be found by the global dedup
+    // under the graph it now holds; named plans are never in that map. If
+    // another unnamed plan already owns the new hash, that mapping is kept
+    // and the revised plan stays reachable by its id only.
+    let named: bool = tx
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM variants WHERE plan_id = ?1)",
+            params![plan_id.0],
+            |r| r.get(0),
+        )
+        .map_err(backend)?;
+    if !named {
+        tx.execute(
             "DELETE FROM submit_dedup WHERE plan_id = ?1",
             params![plan_id.0],
         )
-        .map_err(backend)?
-        > 0;
-    if had_dedup {
+        .map_err(backend)?;
         tx.execute(
-            "INSERT OR IGNORE INTO submit_dedup (graph_hash, plan_id) VALUES (?1, ?2)",
+            "INSERT INTO submit_dedup (graph_hash, plan_id) VALUES (?1, ?2)
+             ON CONFLICT (graph_hash) DO NOTHING",
             params![new_hash, plan_id.0],
         )
         .map_err(backend)?;
@@ -300,6 +332,8 @@ pub(crate) fn revise(
         diff,
         reaped,
         released,
+        no_op: false,
+        completed,
     })
 }
 

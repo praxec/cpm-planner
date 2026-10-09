@@ -449,7 +449,11 @@ fn migrate_v2_cpm_version(conn: &Connection) -> anyhow::Result<()> {
 }
 
 /// Portfolio tables: named plan lines, their variants (each one plan row),
-/// and every variant's revision history. Legacy plans have no rows here.
+/// and every variant's revision history. Legacy plans have no rows here
+/// until their first revision (`revisions` only). `variants.content_hash`
+/// is the plan file's content hash when `source_path` is set (file-backed
+/// sync) and the canonical graph hash otherwise (inline sync, revise); drift
+/// detection compares against a file hash only when `source_path` is set.
 fn migrate_v3_portfolio(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS plan_lines (

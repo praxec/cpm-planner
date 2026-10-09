@@ -758,3 +758,146 @@ async fn revision_rows_survive_reopen() {
     let (revision, _) = db.planner().revision_graph(&plan_id, None).await.unwrap();
     assert_eq!(revision, 2);
 }
+
+// ---------------------------------------------------------------------
+// Fix round 1
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn sync_rejects_invalid_name_slug() {
+    let planner = BasicCpmPlanner::new();
+    let err = planner
+        .sync_plan(sync_req("Web Plan", "main", chain()))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PlannerError::InvalidPath { .. }));
+}
+
+#[tokio::test]
+async fn sync_rejects_invalid_variant_slug() {
+    let planner = BasicCpmPlanner::new();
+    let err = planner
+        .sync_plan(sync_req("web", "../main", chain()))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PlannerError::InvalidPath { .. }));
+}
+
+#[tokio::test]
+async fn sync_rejects_empty_project() {
+    let planner = BasicCpmPlanner::new();
+    let err = planner
+        .sync_plan(SyncRequest::new("", "web", "main", chain()))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PlannerError::InvalidPath { .. }));
+}
+
+#[tokio::test]
+async fn sync_rejects_overlong_project() {
+    let planner = BasicCpmPlanner::new();
+    let err = planner
+        .sync_plan(SyncRequest::new("p".repeat(513), "web", "main", chain()))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PlannerError::InvalidPath { .. }));
+}
+
+#[tokio::test]
+async fn identical_revise_is_a_no_op() {
+    let (planner, sink) = audited();
+    let plan_id = sync(&planner, "web", "main", chain()).await;
+    sink.clear();
+    let out = planner
+        .revise_plan(ReviseRequest::new(plan_id, chain()))
+        .await
+        .unwrap();
+    assert_eq!(
+        (out.0, out.1, sink.event_types().len()),
+        (1, cpm_planner::revise::RevisionDiff::default(), 0)
+    );
+}
+
+#[tokio::test]
+async fn revising_unnamed_plan_onto_another_plans_hash_keeps_both_reachable() {
+    let planner = BasicCpmPlanner::new();
+    let first = planner.submit_plan(chain()).await.unwrap();
+    let second = planner.submit_plan(chain_plus_c()).await.unwrap();
+    planner
+        .revise_plan(ReviseRequest::new(first.clone(), chain_plus_c()))
+        .await
+        .unwrap();
+    let dedup = planner.submit_plan(chain_plus_c()).await.unwrap();
+    let first_reachable = planner.status(&first).await.is_ok();
+    assert_eq!((dedup, first_reachable), (second, true));
+}
+
+#[tokio::test]
+async fn revising_named_plan_never_enters_global_dedup() {
+    let planner = BasicCpmPlanner::new();
+    let named = sync(&planner, "web", "main", chain()).await;
+    planner
+        .revise_plan(ReviseRequest::new(named.clone(), chain_plus_c()))
+        .await
+        .unwrap();
+    let unnamed = planner.submit_plan(chain_plus_c()).await.unwrap();
+    assert_ne!(named, unnamed);
+}
+
+#[tokio::test]
+async fn revise_that_completes_the_plan_emits_plan_completed() {
+    let (planner, sink) = audited();
+    let a_and_c = graph(vec![
+        deliverable("a", &["src/a.rs"], &[], 1.0),
+        deliverable("c", &["src/c.rs"], &[], 1.0),
+    ]);
+    let plan_id = planner.submit_plan(a_and_c).await.unwrap();
+    acquire_a(&planner, &plan_id).await;
+    planner
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
+            "a",
+            CallerId("w1".into()),
+            DeliverableStatus::Complete,
+        ))
+        .await
+        .unwrap();
+    let only_a = graph(vec![deliverable("a", &["src/a.rs"], &[], 1.0)]);
+    planner
+        .revise_plan(ReviseRequest::new(plan_id, only_a))
+        .await
+        .unwrap();
+    assert!(sink.event_types().contains(&"plan.completed".to_string()));
+}
+
+#[tokio::test]
+async fn refused_revision_emits_no_audit_events() {
+    let (planner, sink) = audited();
+    let plan_id = planner.submit_plan(chain_plus_c()).await.unwrap();
+    acquire_a(&planner, &plan_id).await;
+    sink.clear();
+    let without_a = graph(vec![deliverable("c", &["src/c.rs"], &[], 1.0)]);
+    let _ = planner
+        .revise_plan(ReviseRequest::new(plan_id, without_a))
+        .await;
+    assert!(sink.event_types().is_empty());
+}
+
+#[tokio::test]
+async fn unnamed_plan_without_dedup_row_regains_it_on_revise() {
+    let planner = BasicCpmPlanner::new();
+    let first = planner.submit_plan(chain()).await.unwrap();
+    planner.submit_plan(chain_plus_c()).await.unwrap();
+    // `first` loses its dedup row: the other plan owns this hash.
+    planner
+        .revise_plan(ReviseRequest::new(first.clone(), chain_plus_c()))
+        .await
+        .unwrap();
+    let only_c = graph(vec![deliverable("c", &["src/c.rs"], &[], 1.0)]);
+    planner
+        .revise_plan(ReviseRequest::new(first.clone(), only_c.clone()))
+        .await
+        .unwrap();
+    let dedup = planner.submit_plan(only_c).await.unwrap();
+    assert_eq!(dedup, first);
+}
