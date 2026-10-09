@@ -5,6 +5,12 @@
 //! Costs are in hours multiplied by each deliverable's `metadata.cost_rate`
 //! (finite, >= 0, default 1.0). Every division is guarded; an undefined ratio
 //! becomes `None` plus an [`Undefined`] entry, never NaN or infinity.
+//!
+//! Rows are taken from the baseline only. Deliverables added after the
+//! baseline contribute nothing to BAC, PV, EV or AC until re-baseline; they
+//! are listed in [`EvReport::excluded_unbaselined`]. Cost rates are frozen in
+//! the baseline, so later rate edits (or removed deliverables) do not change
+//! budget or AC.
 
 use crate::estimator::EffortEstimator;
 use crate::plan::{Deliverable, DeliverableStatus, FINISH_ID, PlanGraph, PlannerError, START_ID};
@@ -72,6 +78,13 @@ pub struct BaselineRow {
     pub ef: f32,
     /// Budget = effort basis x cost rate.
     pub budget: f32,
+    /// Cost rate captured at baseline time; AC uses this, not the live graph.
+    #[serde(default = "one")]
+    pub cost_rate: f32,
+}
+
+fn one() -> f32 {
+    1.0
 }
 
 /// A frozen schedule/budget baseline.
@@ -143,6 +156,9 @@ pub struct EvReport {
     pub rows: Vec<EvRow>,
     pub critical_float_consumed_hours: f32,
     pub alerts: Vec<String>,
+    /// Ids in the live graph but absent from the baseline (sorted, synthetic
+    /// endpoints excluded). They contribute nothing until re-baseline.
+    pub excluded_unbaselined: Vec<String>,
 }
 
 fn weekday_from_name(name: &str) -> Option<Weekday> {
@@ -339,6 +355,7 @@ pub fn build_baseline(
             es: t.earliest_start,
             ef: t.earliest_finish,
             budget: budget_of(d, &estimator)?,
+            cost_rate: cost_rate(d)?,
         });
     }
     let bac = rows.iter().map(|r| f64::from(r.budget)).sum::<f64>() as f32;
@@ -356,9 +373,18 @@ pub fn build_baseline(
 ///
 /// Critical-float consumption is approximated as
 /// `max(0, current __finish__ EF - baseline finish)`.
+/// Rows are taken from the baseline only. Deliverables added after the baseline
+/// contribute nothing to BAC, PV, EV or AC until re-baseline.
+///
+/// `critical_float_consumed_hours` reflects only graph/estimate changes: it
+/// ignores statuses, actuals and `as_of`, so it does not show execution
+/// slippage, and it includes scope added after the baseline.
+///
+/// Reported `actual_hours` that is non-finite or negative is treated as
+/// absent (AC falls back to leased hours). TCPI can be negative when AC > BAC.
+///
 /// Alerts need the two most recent entries of `previous_snapshots`
 /// (chronological) to both have the metric below 0.9.
-#[allow(clippy::too_many_arguments)]
 pub fn compute_ev(
     baseline: &Baseline,
     graph: &PlanGraph,
@@ -373,11 +399,6 @@ pub fn compute_ev(
         as_of,
         baseline.calendar.as_ref(),
     )?);
-    let by_id: HashMap<&str, &Deliverable> = graph
-        .deliverables
-        .iter()
-        .map(|d| (d.id.as_str(), d))
-        .collect();
     let (mut pv, mut ev, mut ac) = (0.0_f64, 0.0_f64, 0.0_f64);
     let mut rows = Vec::with_capacity(baseline.rows.len());
     for r in &baseline.rows {
@@ -396,13 +417,14 @@ pub fn compute_ev(
         let rule = rules.get(&r.id).copied().unwrap_or_default();
         let reported = act.and_then(|a| a.earned_pct).map(|p| p.min(100));
         let pct = earned_pct(rule, &status, reported);
-        let rate = match by_id.get(r.id.as_str()) {
-            Some(d) => cost_rate(d)?,
-            None => 1.0,
-        };
+        let rate = r.cost_rate;
+        let valid = |h: f32| h.is_finite() && h >= 0.0;
         let hours = act
-            .map(|a| a.actual_hours.unwrap_or(a.leased_hours))
-            .filter(|h| h.is_finite() && *h >= 0.0)
+            .map(|a| match a.actual_hours {
+                Some(h) if valid(h) => h,
+                _ => a.leased_hours,
+            })
+            .filter(|h| valid(*h))
             .unwrap_or(0.0);
         let row_ev = budget * pct / 100.0;
         let row_ac = f64::from(rate) * f64::from(hours);
@@ -419,19 +441,23 @@ pub fn compute_ev(
             status,
         });
     }
-    let bac = f64::from(baseline.bac);
+    let bac: f64 = baseline.rows.iter().map(|r| f64::from(r.budget)).sum();
     let mut undefined = Vec::new();
-    let mut ratio = |field: &str, v: Option<f64>, reason: &str| -> Option<f32> {
-        match v.filter(|x| x.is_finite()) {
-            Some(x) => Some(x as f32),
-            None => {
-                undefined.push(Undefined {
-                    field: field.to_string(),
-                    reason: reason.to_string(),
-                });
-                None
-            }
+    // `None` input = guarded division; a value that overflows f32 is also undefined.
+    let mut ratio = |field: &str, v: Option<f64>, reason: &str| -> Option<f64> {
+        let out = v.filter(|x| (*x as f32).is_finite());
+        if out.is_none() {
+            let reason = if v.is_some() {
+                "result is not finite as f32"
+            } else {
+                reason
+            };
+            undefined.push(Undefined {
+                field: field.to_string(),
+                reason: reason.to_string(),
+            });
         }
+        out
     };
     let spi = ratio(
         "spi",
@@ -443,23 +469,24 @@ pub fn compute_ev(
         (ac != 0.0).then(|| ev / ac),
         "AC is 0, no cost recorded yet",
     );
-    let eac_v = match cpi {
-        Some(c) if c != 0.0 => Some(bac / f64::from(c)),
-        _ => None,
-    };
     let eac_reason = if cpi.is_none() {
         "CPI is undefined"
     } else {
         "CPI is 0, nothing earned for the cost spent"
     };
-    let eac = ratio("eac", eac_v, eac_reason);
-    let etc = ratio("etc", eac.map(|e| f64::from(e) - ac), "EAC is undefined");
-    let vac = ratio("vac", eac.map(|e| bac - f64::from(e)), "EAC is undefined");
+    let eac = ratio(
+        "eac",
+        cpi.filter(|c| *c != 0.0).map(|c| bac / c),
+        eac_reason,
+    );
+    let etc = ratio("etc", eac.map(|e| e - ac), "EAC is undefined");
+    let vac = ratio("vac", eac.map(|e| bac - e), "EAC is undefined");
     let tcpi = ratio(
         "tcpi",
-        (bac - ac != 0.0).then(|| (bac - ev) / (bac - ac)),
+        ((bac - ac).abs() > 1e-9 * bac.max(1.0)).then(|| (bac - ev) / (bac - ac)),
         "BAC - AC is 0, no budget remains",
     );
+    let out = |v: Option<f64>| v.map(|x| x as f32);
 
     let cpm = compute_cpm(graph)?;
     let critical_float = (finish_of(&cpm) - baseline.finish_hours).max(0.0);
@@ -484,23 +511,35 @@ pub fn compute_ev(
         ac: ac as f32,
         sv: (ev - pv) as f32,
         cv: (ev - ac) as f32,
-        spi,
-        cpi,
-        eac,
-        etc,
-        vac,
-        tcpi,
+        spi: out(spi),
+        cpi: out(cpi),
+        eac: out(eac),
+        etc: out(etc),
+        vac: out(vac),
+        tcpi: out(tcpi),
         undefined,
         rows,
         critical_float_consumed_hours: critical_float,
         alerts,
+        excluded_unbaselined: {
+            let known: std::collections::HashSet<&str> =
+                baseline.rows.iter().map(|r| r.id.as_str()).collect();
+            let mut v: Vec<String> = graph
+                .deliverables
+                .iter()
+                .filter(|d| d.id != START_ID && d.id != FINISH_ID && !known.contains(d.id.as_str()))
+                .map(|d| d.id.clone())
+                .collect();
+            v.sort();
+            v
+        },
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use chrono::{TimeZone, Timelike};
 
     const EPS: f32 = 1e-3;
 
@@ -541,6 +580,7 @@ mod tests {
             es,
             ef,
             budget,
+            cost_rate: 1.0,
         }
     }
 
@@ -877,12 +917,10 @@ mod tests {
     }
 
     fn ac_for(actual: Option<f32>, leased: f32, rate: Option<f64>) -> f32 {
-        let b = baseline(vec![row("a", 0.0, 10.0, 100.0)]);
-        let mut d = deliverable("a", 100.0, &[]);
-        if let Some(r) = rate {
-            d.metadata = serde_json::json!({ "cost_rate": r });
-        }
-        let g = graph(vec![d]);
+        let mut br = row("a", 0.0, 10.0, 100.0);
+        br.cost_rate = rate.unwrap_or(1.0) as f32;
+        let b = baseline(vec![br]);
+        let g = graph(vec![deliverable("a", 100.0, &[])]);
         let actuals = HashMap::from([(
             "a".to_string(),
             Actuals {
@@ -1263,7 +1301,299 @@ mod tests {
     }
 
     #[test]
-    fn reports_are_deterministic() {
-        assert_eq!(textbook(), textbook());
+    fn report_is_independent_of_map_insertion_order() {
+        let b = baseline(vec![row("a", 0.0, 10.0, 50.0), row("b", 0.0, 10.0, 50.0)]);
+        let g = graph(vec![
+            deliverable("a", 50.0, &[]),
+            deliverable("b", 50.0, &[]),
+        ]);
+        let act = |h: f32| Actuals {
+            actual_hours: Some(h),
+            ..Actuals::default()
+        };
+        let fwd = HashMap::from([("a".to_string(), act(3.0)), ("b".to_string(), act(4.0))]);
+        let mut rev = HashMap::new();
+        rev.insert("b".to_string(), act(4.0));
+        rev.insert("a".to_string(), act(3.0));
+        let e = HashMap::new();
+        assert_eq!(
+            report(&b, &g, &e, &e2(), &fwd, 5),
+            report(&b, &g, &e, &e2(), &rev, 5)
+        );
+    }
+
+    fn e2() -> HashMap<String, EarningRule> {
+        HashMap::new()
+    }
+
+    #[test]
+    fn removed_deliverable_keeps_baselined_cost_rate() {
+        let mut br = row("a", 0.0, 10.0, 100.0);
+        br.cost_rate = 2.0;
+        let b = baseline(vec![br]);
+        let g = graph(vec![]);
+        let actuals = HashMap::from([(
+            "a".to_string(),
+            Actuals {
+                actual_hours: Some(5.0),
+                ..Actuals::default()
+            },
+        )]);
+        let r = report(&b, &g, &HashMap::new(), &HashMap::new(), &actuals, 5);
+        assert!(near(r.ac, 10.0));
+    }
+
+    #[test]
+    fn rate_edit_after_baseline_does_not_change_ac() {
+        let b = baseline(vec![row("a", 0.0, 10.0, 100.0)]);
+        let mut d = deliverable("a", 100.0, &[]);
+        d.metadata = serde_json::json!({ "cost_rate": 9.0 });
+        let actuals = HashMap::from([(
+            "a".to_string(),
+            Actuals {
+                actual_hours: Some(5.0),
+                ..Actuals::default()
+            },
+        )]);
+        let r = report(
+            &b,
+            &graph(vec![d]),
+            &HashMap::new(),
+            &HashMap::new(),
+            &actuals,
+            5,
+        );
+        assert!(near(r.ac, 5.0));
+    }
+
+    #[test]
+    fn invalid_rate_added_after_baseline_does_not_fail_compute() {
+        let b = baseline(vec![row("a", 0.0, 10.0, 100.0)]);
+        let mut d = deliverable("a", 100.0, &[]);
+        d.metadata = serde_json::json!({ "cost_rate": -4.0 });
+        let r = compute_ev(
+            &b,
+            &graph(vec![d]),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            b.start,
+            &[],
+        );
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn baseline_captures_cost_rate_per_row() {
+        let mut d = deliverable("a", 10.0, &[]);
+        d.metadata = serde_json::json!({ "cost_rate": 3.0 });
+        let g = graph(vec![d]);
+        let cpm = compute_cpm(&g).unwrap();
+        let b = build_baseline(&g, &cpm, at(2026, 1, 5, 0), None, 1).unwrap();
+        assert!(near(b.rows[0].cost_rate, 3.0));
+    }
+
+    #[test]
+    fn deliverable_added_after_baseline_is_excluded_and_listed() {
+        let b = baseline(vec![row("a", 0.0, 10.0, 100.0)]);
+        let g = graph(vec![
+            deliverable("z", 40.0, &[]),
+            deliverable("a", 100.0, &[]),
+            deliverable("m", 40.0, &[]),
+        ]);
+        let r = report(&b, &g, &HashMap::new(), &HashMap::new(), &HashMap::new(), 5);
+        assert_eq!(
+            r.excluded_unbaselined,
+            vec!["m".to_string(), "z".to_string()]
+        );
+    }
+
+    #[test]
+    fn unbaselined_deliverable_adds_nothing_to_bac() {
+        let b = baseline(vec![row("a", 0.0, 10.0, 100.0)]);
+        let g = graph(vec![
+            deliverable("a", 100.0, &[]),
+            deliverable("z", 40.0, &[]),
+        ]);
+        let r = report(&b, &g, &HashMap::new(), &HashMap::new(), &HashMap::new(), 5);
+        assert!(near(r.bac, 100.0));
+    }
+
+    #[test]
+    fn negative_reported_hours_fall_back_to_leased() {
+        assert!(near(ac_for(Some(-2.0), 3.0, None), 3.0));
+    }
+
+    #[test]
+    fn non_finite_reported_hours_fall_back_to_leased() {
+        assert!(near(ac_for(Some(f32::NAN), 3.0, None), 3.0));
+    }
+
+    #[test]
+    fn as_of_before_start_gives_zero_pv() {
+        let b = baseline(vec![row("a", 0.0, 10.0, 100.0)]);
+        let g = graph(vec![deliverable("a", 100.0, &[])]);
+        let r = report(
+            &b,
+            &g,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            -5,
+        );
+        assert!(near(r.pv, 0.0));
+    }
+
+    #[test]
+    fn as_of_before_start_leaves_spi_null_with_reason() {
+        let b = baseline(vec![row("a", 0.0, 10.0, 100.0)]);
+        let g = graph(vec![deliverable("a", 100.0, &[])]);
+        let r = report(
+            &b,
+            &g,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            -5,
+        );
+        assert!(r.spi.is_none() && undefined_reason(&r, "spi").is_some());
+    }
+
+    #[test]
+    fn pv_is_flat_over_a_weekend_on_a_working_calendar() {
+        // Task spans 40 working hours (a full work week); Fri 2026-01-09 00:00 + 8h = 40h elapsed.
+        let mut b = baseline(vec![row("a", 0.0, 80.0, 100.0)]);
+        b.calendar = Some(Calendar::default());
+        let g = graph(vec![deliverable("a", 100.0, &[])]);
+        let at_fri_end = compute_ev(
+            &b,
+            &g,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            at(2026, 1, 9, 12),
+            &[],
+        )
+        .unwrap();
+        let mon = compute_ev(
+            &b,
+            &g,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            at(2026, 1, 12, 0),
+            &[],
+        )
+        .unwrap();
+        assert!(near(at_fri_end.pv, mon.pv));
+    }
+
+    #[test]
+    fn eac_reason_when_cpi_is_zero_is_explained() {
+        let b = baseline(vec![row("a", 0.0, 10.0, 100.0)]);
+        let g = graph(vec![deliverable("a", 100.0, &[])]);
+        let actuals = HashMap::from([(
+            "a".to_string(),
+            Actuals {
+                actual_hours: Some(10.0),
+                ..Actuals::default()
+            },
+        )]);
+        let r = report(&b, &g, &HashMap::new(), &HashMap::new(), &actuals, 5);
+        assert_eq!(
+            undefined_reason(&r, "eac").as_deref(),
+            Some("CPI is 0, nothing earned for the cost spent")
+        );
+    }
+
+    #[test]
+    fn tcpi_is_negative_when_ac_exceeds_bac() {
+        let b = baseline(vec![row("a", 0.0, 10.0, 100.0)]);
+        let g = graph(vec![deliverable("a", 100.0, &[])]);
+        let st = statuses(&[("a", DeliverableStatus::InProgress)]);
+        let rules = HashMap::from([("a".to_string(), EarningRule::Weighted)]);
+        let actuals = HashMap::from([(
+            "a".to_string(),
+            Actuals {
+                earned_pct: Some(50),
+                actual_hours: Some(150.0),
+                ..Actuals::default()
+            },
+        )]);
+        let r = report(&b, &g, &st, &rules, &actuals, 5);
+        assert!(near(r.tcpi.unwrap(), -1.0));
+    }
+
+    #[test]
+    fn f32_overflow_in_a_ratio_becomes_undefined() {
+        let b = baseline(vec![
+            row("a", 0.0, 10.0, 3.0e38),
+            row("b", 0.0, 10.0, 3.0e38),
+        ]);
+        let g = graph(vec![deliverable("a", 1.0, &[]), deliverable("b", 1.0, &[])]);
+        let st = statuses(&[("a", DeliverableStatus::Complete)]);
+        let actuals = HashMap::from([(
+            "a".to_string(),
+            Actuals {
+                actual_hours: Some(1.0e-30),
+                ..Actuals::default()
+            },
+        )]);
+        let r = report(&b, &g, &st, &HashMap::new(), &actuals, 5);
+        assert!(r.cpi.is_none() && undefined_reason(&r, "cpi").is_some());
+    }
+
+    #[test]
+    fn alert_needs_both_of_the_two_previous_snapshots() {
+        // Oldest is low, but the latest two are (low, healthy): no alert.
+        assert!(alerts_with(&[snap(0.5, 1.0), snap(0.5, 1.0), snap(1.0, 1.0)]).is_empty());
+    }
+
+    #[test]
+    fn elapsed_matches_naive_minute_loop_over_random_spans() {
+        let mut seed: u64 = 0x5eed_1234_abcd_ef01;
+        let mut next = move |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        let names = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+        let mut mismatches = Vec::new();
+        for case in 0..60 {
+            let start = at(2026, 1, 3, 0) + Duration::minutes(next(60 * 24 * 14) as i64);
+            let span = Duration::minutes(next(60 * 24 * 40) as i64 + 1);
+            let off = next(2881) as i32 - 1440;
+            let n_days = 1 + next(7) as usize;
+            let first = next(7) as usize;
+            let workdays: Vec<String> = (0..n_days)
+                .map(|i| names[(first + i) % 7].to_string())
+                .collect();
+            let hpd = [8.0_f32, 6.5, 24.0][next(3) as usize];
+            let c = Calendar {
+                hours_per_day: hpd,
+                workdays: workdays.clone(),
+                utc_offset_minutes: off,
+            };
+            let got = elapsed_hours(start, start + span, Some(&c)).unwrap();
+            let mut naive = 0u64;
+            let window = (f64::from(hpd) * 60.0) as i64;
+            let mut m = start;
+            let end = start + span;
+            while m < end {
+                let local = m + Duration::minutes(i64::from(off));
+                let name = names[local.weekday().num_days_from_monday() as usize];
+                let mins = i64::from(local.hour()) * 60 + i64::from(local.minute());
+                if workdays.iter().any(|w| w == name) && mins < window {
+                    naive += 1;
+                }
+                m += Duration::minutes(1);
+            }
+            let want = naive as f32 / 60.0;
+            if (got - want).abs() > 1e-2 {
+                mismatches.push((case, got, want));
+            }
+        }
+        assert!(mismatches.is_empty(), "{mismatches:?}");
     }
 }
