@@ -629,6 +629,78 @@ impl ReviseRequest {
     }
 }
 
+/// Request bundle for [`crate::ports::Planner::fork_plan`]: copy the head
+/// graph of the named variant `plan_id`, apply `edits`, and register the
+/// result as the new draft variant `variant` of the same plan line.
+#[derive(Debug, Clone)]
+pub struct ForkRequest {
+    pub plan_id: PlanId,
+    pub variant: String,
+    /// Applied in order with [`crate::edits::apply_edits`].
+    pub edits: Vec<crate::edits::GraphEdit>,
+    /// Where to write the new variant's plan file. Falls back to the
+    /// planner's own root; with neither, the variant is registered inline.
+    pub project_root: Option<crate::project::ProjectRoot>,
+}
+
+impl ForkRequest {
+    pub fn new(plan_id: PlanId, variant: impl Into<String>) -> Self {
+        Self {
+            plan_id,
+            variant: variant.into(),
+            edits: Vec::new(),
+            project_root: None,
+        }
+    }
+
+    /// Set the edits applied to the copied graph.
+    pub fn with_edits(mut self, edits: Vec<crate::edits::GraphEdit>) -> Self {
+        self.edits = edits;
+        self
+    }
+
+    /// Write the new variant's file under `root`.
+    pub fn with_project_root(mut self, root: crate::project::ProjectRoot) -> Self {
+        self.project_root = Some(root);
+        self
+    }
+}
+
+/// Request bundle for [`crate::ports::Planner::compare_plans`]. Exactly one
+/// of `plan_ids` (two or more plans, any variants or unnamed plans) or
+/// `plan` (`(project, name)`: every non-archived variant of that line) is
+/// given.
+#[derive(Debug, Clone)]
+pub struct ComparePlansRequest {
+    pub plan_ids: Option<Vec<PlanId>>,
+    pub plan: Option<(String, String)>,
+    pub request: crate::compare::CompareRequest,
+}
+
+impl ComparePlansRequest {
+    /// Compare the given plans, in this order.
+    pub fn by_ids(plan_ids: Vec<PlanId>, request: crate::compare::CompareRequest) -> Self {
+        Self {
+            plan_ids: Some(plan_ids),
+            plan: None,
+            request,
+        }
+    }
+
+    /// Compare every non-archived variant of the line `(project, name)`.
+    pub fn by_plan(
+        project: impl Into<String>,
+        name: impl Into<String>,
+        request: crate::compare::CompareRequest,
+    ) -> Self {
+        Self {
+            plan_ids: None,
+            plan: Some((project.into(), name.into())),
+            request,
+        }
+    }
+}
+
 /// One variant of a plan line, as reported by
 /// [`crate::ports::Planner::list_plans`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -902,6 +974,22 @@ pub struct PlanStatus {
     /// One row per milestone deliverable, in graph order.
     #[serde(default)]
     pub milestones: Vec<MilestoneRow>,
+    /// Plan line name of a named variant; `None` for an unnamed plan.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Variant name of a named variant; `None` for an unnamed plan.
+    #[serde(default)]
+    pub variant: Option<String>,
+    /// Whether this variant is its line's selected (executable) variant;
+    /// `None` for an unnamed plan.
+    #[serde(default)]
+    pub selected: Option<bool>,
+    /// `Some(true)` when the variant's plan file no longer matches what was
+    /// last synced (by content hash), `Some(false)` when it matches. `None`
+    /// (unknown) when the variant has no source file, the planner has no
+    /// project root for the variant's project, or the file is unreadable.
+    #[serde(default)]
+    pub definition_drift: Option<bool>,
 }
 
 /// A milestone's schedule summary, reported by [`PlanStatus::milestones`].

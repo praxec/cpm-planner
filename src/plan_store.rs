@@ -356,6 +356,23 @@ impl SqlitePlanStore {
         Ok(f(&state))
     }
 
+    /// [`Self::read_plan`] that also returns, from the same snapshot, the
+    /// named variant owning the plan (`None` for an unnamed plan).
+    pub(crate) fn read_plan_and_variant<R>(
+        &self,
+        plan_id: &PlanId,
+        f: impl FnOnce(&PlanState) -> R,
+    ) -> Result<(R, Option<crate::portfolio::VariantInfo>), PlannerError> {
+        self.read_tx(|tx| {
+            let state =
+                load_plan_state(tx, plan_id)?.ok_or_else(|| PlannerError::PlanNotFound {
+                    plan_id: plan_id.0.clone(),
+                })?;
+            let info = crate::portfolio::variant_info(tx, plan_id)?;
+            Ok((f(&state), info))
+        })
+    }
+
     /// Run `f` inside ONE `BEGIN IMMEDIATE` transaction and commit on `Ok`.
     /// An `Err` from `f` rolls everything back. For multi-table writes
     /// (the portfolio operations) that do not fit [`Self::mutate_plan`].

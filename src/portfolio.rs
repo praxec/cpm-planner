@@ -356,6 +356,104 @@ pub(crate) fn revise(
     })
 }
 
+/// [`sync`] that only ever creates: an existing `(project, name, variant)`
+/// is `INVALID_PATH: variant '<v>' of '<name>' already exists`, checked in
+/// the same transaction as the insert. Used by fork.
+pub(crate) fn sync_new(
+    tx: &Transaction<'_>,
+    req: SyncRequest,
+    graph_hash: &str,
+    now: DateTime<Utc>,
+    build: impl FnOnce(PlanGraph) -> Result<(PlanId, PlanState), PlannerError>,
+) -> Result<Synced, PlannerError> {
+    if find_variant(tx, &req)?.is_some() {
+        return Err(variant_exists(&req.variant, &req.name));
+    }
+    sync(tx, req, graph_hash, now, build)
+}
+
+/// True when the line `(project, name)` has a variant `variant`.
+pub(crate) fn has_variant(
+    tx: &Transaction<'_>,
+    project: &str,
+    name: &str,
+    variant: &str,
+) -> Result<bool, PlannerError> {
+    Ok(variant_plan_id(tx, project, name, variant)?.is_some())
+}
+
+pub(crate) fn variant_exists(variant: &str, name: &str) -> PlannerError {
+    PlannerError::InvalidPath {
+        reason: format!("variant '{variant}' of '{name}' already exists"),
+    }
+}
+
+/// Identity and file tracking of the named variant owning a plan.
+pub(crate) struct VariantInfo {
+    pub(crate) project: String,
+    pub(crate) name: String,
+    pub(crate) variant: String,
+    /// True for its line's selected variant.
+    pub(crate) selected: bool,
+    pub(crate) source_path: Option<String>,
+    /// See the module docs: a file hash only when `source_path` is set.
+    pub(crate) content_hash: Option<String>,
+}
+
+/// The [`VariantInfo`] of `plan_id`; `None` for an unnamed (or unknown) plan.
+pub(crate) fn variant_info(
+    tx: &Transaction<'_>,
+    plan_id: &PlanId,
+) -> Result<Option<VariantInfo>, PlannerError> {
+    tx.query_row(
+        "SELECT v.project, v.name, v.variant, l.selected_variant, v.source_path, v.content_hash
+         FROM variants v
+         LEFT JOIN plan_lines l ON l.project = v.project AND l.name = v.name
+         WHERE v.plan_id = ?1",
+        params![plan_id.0],
+        |r| {
+            let variant: String = r.get(2)?;
+            let selected: Option<String> = r.get(3)?;
+            Ok(VariantInfo {
+                project: r.get(0)?,
+                name: r.get(1)?,
+                selected: selected.as_deref() == Some(variant.as_str()),
+                variant,
+                source_path: r.get(4)?,
+                content_hash: r.get(5)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(backend)
+}
+
+/// `(variant, plan_id)` of every non-archived variant of the line
+/// `(project, name)`, sorted by variant; empty for an archived line. An
+/// unknown line is `PLAN_NOT_FOUND`.
+pub(crate) fn live_variants(
+    tx: &Transaction<'_>,
+    project: &str,
+    name: &str,
+) -> Result<Vec<(String, PlanId)>, PlannerError> {
+    let line_row = line(tx, project, name)?.ok_or_else(|| line_not_found(project, name))?;
+    if line_row.archived {
+        return Ok(Vec::new());
+    }
+    let mut stmt = tx
+        .prepare(
+            "SELECT variant, plan_id FROM variants
+             WHERE project = ?1 AND name = ?2 AND archived = 0 ORDER BY variant",
+        )
+        .map_err(backend)?;
+    stmt.query_map(params![project, name], |r| {
+        Ok((r.get(0)?, PlanId(r.get(1)?)))
+    })
+    .map_err(backend)?
+    .collect::<Result<_, _>>()
+    .map_err(backend)
+}
+
 /// Refuse to revise an effectively archived variant (its line or itself)
 /// with `ARCHIVE_REFUSED`, as sync does. Unnamed plans always pass.
 pub(crate) fn ensure_revisable(tx: &Transaction<'_>, plan_id: &PlanId) -> Result<(), PlannerError> {

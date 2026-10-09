@@ -4,11 +4,13 @@
 
 use async_trait::async_trait;
 
+use crate::compare::Comparison;
 use crate::plan::{
-    AcceptRequest, AcquireRequest, Cohort, ForceReleaseRequest, HeartbeatRequest,
-    MarkStatusRequest, PlanDefinition, PlanGraph, PlanId, PlanLineSummary, PlanStatus,
-    PlannerError, ReviseRequest, SelectOutcome, SyncOutcome, SyncRequest,
+    AcceptRequest, AcquireRequest, Cohort, ComparePlansRequest, ForceReleaseRequest, ForkRequest,
+    HeartbeatRequest, MarkStatusRequest, PlanDefinition, PlanGraph, PlanId, PlanLineSummary,
+    PlanStatus, PlannerError, ReviseRequest, SelectOutcome, SyncOutcome, SyncRequest,
 };
+use crate::project::ProjectRoot;
 use crate::revise::RevisionDiff;
 
 /// Lock-aware planner.
@@ -60,7 +62,9 @@ pub trait Planner: Send + Sync {
     /// [`PlannerError::LockExpired`] if the lock already lapsed.
     async fn heartbeat(&self, req: HeartbeatRequest) -> Result<(), PlannerError>;
 
-    /// Cheap read-only snapshot. Safe to poll on a timer.
+    /// Cheap read-only snapshot. Safe to poll on a timer. For a named
+    /// variant it also reports the line name, variant, whether it is
+    /// selected, and `definition_drift` (see [`PlanStatus::definition_drift`]).
     async fn status(&self, plan_id: &PlanId) -> Result<PlanStatus, PlannerError>;
 
     /// Return the stored definition for `plan_id` — the [`PlanGraph`]
@@ -146,4 +150,40 @@ pub trait Planner: Send + Sync {
         archived: bool,
         force: bool,
     ) -> Result<(), PlannerError>;
+
+    /// Fork the named variant `req.plan_id`: copy its head graph, apply
+    /// `req.edits` in order ([`crate::edits::apply_edits`]) and register the
+    /// result as the new draft (not selected) variant `req.variant` of the
+    /// same line, exactly as a [`Planner::sync_plan`] that creates it.
+    ///
+    /// With a project root for the plan's project (the request's, else the
+    /// planner's own), the new variant's plan file is written first (never
+    /// replacing an existing file) and the variant is synced from it (source
+    /// path and file content hash); otherwise it is registered inline. A
+    /// request root of another project is `INVALID_PATH`. An unnamed plan is
+    /// `INVALID_PATH: fork requires a named plan`; an existing variant is
+    /// `INVALID_PATH: variant '<v>' of '<name>' already exists`. If the sync
+    /// fails after the file was written, the file is left in place.
+    async fn fork_plan(&self, req: ForkRequest) -> Result<SyncOutcome, PlannerError>;
+
+    /// Compare plans on the scorecard ([`crate::compare::compare`]): either
+    /// `plan_ids` (two or more plans, in the given order; an unnamed plan is
+    /// labelled by its id) or every non-archived variant of the line `plan`
+    /// (sorted by variant). Giving both or neither is `INVALID_GRAPH`; an
+    /// unknown plan or line is `PLAN_NOT_FOUND`. Read-only.
+    async fn compare_plans(&self, req: ComparePlansRequest) -> Result<Comparison, PlannerError>;
+
+    /// Write the head graph of `plan_id` under `root` and return the file's
+    /// root-relative path: to `path` when given (it must be of the form
+    /// `.cpm-planner/plans/<name>/<variant>.json`), else to the named
+    /// variant's own file `<name>/<variant>.json`, which requires `root` to
+    /// be the variant's project. An unnamed plan requires `path`. An
+    /// existing file is replaced. The written file is NOT synced: the
+    /// caller syncs it if it wants the variant to track it.
+    async fn export_plan(
+        &self,
+        plan_id: &PlanId,
+        root: &ProjectRoot,
+        path: Option<&str>,
+    ) -> Result<String, PlannerError>;
 }

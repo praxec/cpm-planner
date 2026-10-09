@@ -35,15 +35,16 @@ use std::time::Duration;
 
 use crate::audit::{AuditEvent, AuditSink, NullAuditSink};
 use crate::plan::{
-    AcceptRequest, AcquireRequest, BlockedDeliverable, CallerId, Cohort, CohortRow, Deliverable,
-    DeliverableStatus, FINISH_ID, FileMode, ForceReleaseRequest, HeartbeatRequest, LockInfo,
-    MAX_DELIVERABLES, MarkStatusRequest, OwnedFile, PlanDefinition, PlanGraph, PlanId,
-    PlanLineSummary, PlanStatus, PlannerError, ReviseRequest, START_ID, ScheduleRow, SelectOutcome,
-    SyncOutcome, SyncRequest,
+    AcceptRequest, AcquireRequest, BlockedDeliverable, CallerId, Cohort, CohortRow,
+    ComparePlansRequest, Deliverable, DeliverableStatus, FINISH_ID, FileMode, ForceReleaseRequest,
+    ForkRequest, HeartbeatRequest, LockInfo, MAX_DELIVERABLES, MarkStatusRequest, OwnedFile,
+    PlanDefinition, PlanGraph, PlanId, PlanLineSummary, PlanStatus, PlannerError, ReviseRequest,
+    START_ID, ScheduleRow, SelectOutcome, SyncOutcome, SyncRequest,
 };
 use crate::plan_store::SqlitePlanStore;
-use crate::portfolio::{Archived, Revised, Selected, Synced};
+use crate::portfolio::{Archived, Revised, Selected, Synced, VariantInfo};
 use crate::ports::Planner;
+use crate::project::ProjectRoot;
 use crate::revise::RevisionDiff;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -128,6 +129,9 @@ pub struct BasicCpmPlanner {
     ttl: Duration,
     max_ttl: Duration,
     clock: ClockFn,
+    /// The project whose plan files this planner may read and write (drift
+    /// detection, fork). `None`: file features degrade to inline/unknown.
+    project_root: Option<ProjectRoot>,
 }
 
 impl BasicCpmPlanner {
@@ -204,7 +208,33 @@ impl BasicCpmPlanner {
             ttl,
             max_ttl: DEFAULT_MAX_TTL,
             clock,
+            project_root: None,
         }
+    }
+
+    /// Give the planner a project root. [`Planner::status`] then reports
+    /// `definition_drift` for that project's file-backed variants, and
+    /// [`Planner::fork_plan`] writes the new variant's plan file there when
+    /// the request names no root of its own.
+    pub fn with_project_root(mut self, root: ProjectRoot) -> Self {
+        self.project_root = Some(root);
+        self
+    }
+
+    /// Drift of a variant's plan file against its last sync: `Some(file hash
+    /// != stored content hash)` when the variant has a source path, the
+    /// planner's root is the variant's project and the file is readable;
+    /// `None` (unknown) otherwise.
+    fn definition_drift(&self, info: &VariantInfo) -> Option<bool> {
+        let root = self.project_root.as_ref()?;
+        if root.project_key() != info.project {
+            return None;
+        }
+        let rel = info.source_path.as_deref()?;
+        let stored = info.content_hash.as_deref()?;
+        let file = root.resolve_plan_file(rel).ok()?;
+        let hash = root.file_hash(&file).ok()?;
+        Some(hash != stored)
     }
 
     fn now(&self) -> DateTime<Utc> {
@@ -623,6 +653,40 @@ fn archive_events(
     events
 }
 
+/// The [`SyncOutcome`] of a committed sync and its audit trail.
+fn sync_outcome(
+    synced: Synced,
+    project: &str,
+    name: String,
+    variant: String,
+    now: DateTime<Utc>,
+) -> (SyncOutcome, Vec<AuditEvent>) {
+    let outcome = |plan_id, revision, created, changed, diff| SyncOutcome {
+        plan_id,
+        name: name.clone(),
+        variant: variant.clone(),
+        revision,
+        created,
+        changed,
+        diff,
+    };
+    match synced {
+        Synced::Created { plan_id, selected } => {
+            let out = outcome(plan_id, 1, true, true, None);
+            let event = make_portfolio_created_event(&out, project, selected);
+            (out, vec![event])
+        }
+        Synced::Unchanged { plan_id, revision } => {
+            (outcome(plan_id, revision, false, false, None), Vec::new())
+        }
+        Synced::Revised { plan_id, revised } => {
+            let events = revision_events(&plan_id, &revised, now);
+            let out = outcome(plan_id, revised.revision, false, true, Some(revised.diff));
+            (out, events)
+        }
+    }
+}
+
 /// Longest `project` key accepted by `sync_plan` (a path-derived key, not a
 /// slug).
 const MAX_PROJECT_LEN: usize = 512;
@@ -926,32 +990,148 @@ impl Planner for BasicCpmPlanner {
         let synced = self
             .store
             .write_tx(|tx| crate::portfolio::sync(tx, req, &graph_hash, now, initial_plan))?;
-        let outcome = |plan_id, revision, created, changed, diff| SyncOutcome {
-            plan_id,
-            name: name.clone(),
-            variant: variant.clone(),
-            revision,
-            created,
-            changed,
-            diff,
-        };
-        let (outcome, events) = match synced {
-            Synced::Created { plan_id, selected } => {
-                let out = outcome(plan_id, 1, true, true, None);
-                let event = make_portfolio_created_event(&out, &project, selected);
-                (out, vec![event])
-            }
-            Synced::Unchanged { plan_id, revision } => {
-                (outcome(plan_id, revision, false, false, None), Vec::new())
-            }
-            Synced::Revised { plan_id, revised } => {
-                let events = revision_events(&plan_id, &revised, now);
-                let out = outcome(plan_id, revised.revision, false, true, Some(revised.diff));
-                (out, events)
-            }
-        };
+        let (outcome, events) = sync_outcome(synced, &project, name, variant, now);
         self.flush_audit(events).await;
         Ok(outcome)
+    }
+
+    async fn fork_plan(&self, req: ForkRequest) -> Result<SyncOutcome, PlannerError> {
+        let ForkRequest {
+            plan_id,
+            variant,
+            edits,
+            project_root,
+        } = req;
+        crate::project::validate_slug("variant", &variant)?;
+        let (head, info, exists) = self.store.read_tx(|tx| {
+            let (_, head) = crate::portfolio::revision_graph(tx, &plan_id, None)?;
+            let info = crate::portfolio::variant_info(tx, &plan_id)?.ok_or_else(|| {
+                PlannerError::InvalidPath {
+                    reason: "fork requires a named plan".to_string(),
+                }
+            })?;
+            let exists = crate::portfolio::has_variant(tx, &info.project, &info.name, &variant)?;
+            Ok((head, info, exists))
+        })?;
+        // Checked again inside the creating transaction; failing here first
+        // avoids writing a plan file for a fork that cannot be registered.
+        if exists {
+            return Err(crate::portfolio::variant_exists(&variant, &info.name));
+        }
+        let graph = crate::edits::apply_edits(&head, &edits)?;
+        let root = match project_root {
+            Some(root) if root.project_key() != info.project => {
+                return Err(PlannerError::InvalidPath {
+                    reason: format!(
+                        "project root '{}' is not the project '{}' of plan {}",
+                        root.project_key(),
+                        info.project,
+                        plan_id.0
+                    ),
+                });
+            }
+            Some(root) => Some(root),
+            None => self
+                .project_root
+                .clone()
+                .filter(|root| root.project_key() == info.project),
+        };
+        let mut sync_req = SyncRequest::new(
+            info.project.clone(),
+            info.name.clone(),
+            variant.clone(),
+            graph,
+        );
+        if let Some(root) = &root {
+            let file = root.plan_file(&info.name, &variant)?;
+            let hash = root.write_new_graph(&file, &sync_req.graph)?;
+            sync_req = sync_req
+                .with_source_path(file.rel_path)
+                .with_content_hash(hash);
+        }
+        let graph_hash = hash_graph(&sync_req.graph);
+        let now = self.now();
+        let synced = self.store.write_tx(|tx| {
+            crate::portfolio::sync_new(tx, sync_req, &graph_hash, now, initial_plan)
+        })?;
+        let (outcome, events) = sync_outcome(synced, &info.project, info.name, variant, now);
+        self.flush_audit(events).await;
+        Ok(outcome)
+    }
+
+    async fn compare_plans(
+        &self,
+        req: ComparePlansRequest,
+    ) -> Result<crate::compare::Comparison, PlannerError> {
+        let ComparePlansRequest {
+            plan_ids,
+            plan,
+            request,
+        } = req;
+        let inputs = self.store.read_tx(|tx| {
+            let targets: Vec<(PlanId, Option<String>)> = match (plan_ids, plan) {
+                (Some(ids), None) => ids.into_iter().map(|id| (id, None)).collect(),
+                (None, Some((project, name))) => {
+                    crate::portfolio::live_variants(tx, &project, &name)?
+                        .into_iter()
+                        .map(|(variant, id)| (id, Some(variant)))
+                        .collect()
+                }
+                _ => {
+                    return Err(PlannerError::InvalidGraph {
+                        reason: "compare takes exactly one of plan_ids or plan".to_string(),
+                    });
+                }
+            };
+            targets
+                .into_iter()
+                .map(|(id, label)| {
+                    let (_, graph) = crate::portfolio::revision_graph(tx, &id, None)?;
+                    let label = match label {
+                        Some(variant) => variant,
+                        None => crate::portfolio::variant_info(tx, &id)?
+                            .map_or_else(|| id.0.clone(), |info| info.variant),
+                    };
+                    Ok((id, label, graph))
+                })
+                .collect::<Result<Vec<_>, PlannerError>>()
+        })?;
+        crate::compare::compare(&inputs, &request)
+    }
+
+    async fn export_plan(
+        &self,
+        plan_id: &PlanId,
+        root: &ProjectRoot,
+        path: Option<&str>,
+    ) -> Result<String, PlannerError> {
+        let (graph, info) = self.store.read_tx(|tx| {
+            let (_, graph) = crate::portfolio::revision_graph(tx, plan_id, None)?;
+            Ok((graph, crate::portfolio::variant_info(tx, plan_id)?))
+        })?;
+        let file = match (path, info) {
+            (Some(path), _) => root.resolve_plan_file(path)?,
+            (None, Some(info)) if info.project == root.project_key() => {
+                root.plan_file(&info.name, &info.variant)?
+            }
+            (None, Some(info)) => {
+                return Err(PlannerError::InvalidPath {
+                    reason: format!(
+                        "plan {} belongs to project '{}', not '{}'; give a path",
+                        plan_id.0,
+                        info.project,
+                        root.project_key()
+                    ),
+                });
+            }
+            (None, None) => {
+                return Err(PlannerError::InvalidPath {
+                    reason: format!("plan {} is unnamed; export requires a path", plan_id.0),
+                });
+            }
+        };
+        root.write_graph(&file, &graph)?;
+        Ok(file.rel_path)
     }
 
     async fn list_plans(
@@ -1545,7 +1725,7 @@ impl Planner for BasicCpmPlanner {
     }
 
     async fn status(&self, plan_id: &PlanId) -> Result<PlanStatus, PlannerError> {
-        self.store.read_plan(plan_id, |state| {
+        let (mut status, info) = self.store.read_plan_and_variant(plan_id, |state| {
             // Preserve insertion order from the original graph for stable UI.
             let deliverables: Vec<(String, DeliverableStatus, u32, u32, u32)> = state
                 .graph
@@ -1609,8 +1789,20 @@ impl Planner for BasicCpmPlanner {
                 critical_path: state.cached_result.critical_path.clone(),
                 critical_path_hours: state.cached_result.critical_path_duration,
                 locks_held: state.locks.values().cloned().collect(),
+                name: None,
+                variant: None,
+                selected: None,
+                definition_drift: None,
             }
-        })
+        })?;
+        if let Some(info) = info {
+            // File I/O outside the read snapshot.
+            status.definition_drift = self.definition_drift(&info);
+            status.name = Some(info.name);
+            status.variant = Some(info.variant);
+            status.selected = Some(info.selected);
+        }
+        Ok(status)
     }
 
     async fn accept(&self, req: AcceptRequest) -> Result<(), PlannerError> {
