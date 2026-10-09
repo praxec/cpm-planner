@@ -1371,6 +1371,37 @@ fn graph_b_after(prereq: Prerequisite) -> PlanGraph {
 }
 
 #[tokio::test]
+async fn object_prerequisite_keeps_dependent_pending_until_prerequisite_completes() {
+    let planner = BasicCpmPlanner::new();
+    let plan_id = planner
+        .submit_plan(graph_b_after(edge("a", Some("api schema"), None)))
+        .await
+        .unwrap();
+    assert_eq!(
+        status_of(&planner, &plan_id, "b").await,
+        DeliverableStatus::Pending
+    );
+}
+
+#[tokio::test]
+async fn duplicate_id_edges_hash_independent_of_order() {
+    let planner = BasicCpmPlanner::new();
+    let build = |edges: Vec<Prerequisite>| {
+        let mut g = graph_b_after(edges[0].clone());
+        g.deliverables[1].prerequisites = edges;
+        g
+    };
+    let x = edge("a", Some("x"), None);
+    let y = edge("a", Some("y"), None);
+    let forward = planner
+        .submit_plan(build(vec![x.clone(), y.clone()]))
+        .await
+        .unwrap();
+    let reversed = planner.submit_plan(build(vec![y, x])).await.unwrap();
+    assert_eq!(forward, reversed);
+}
+
+#[tokio::test]
 async fn object_prerequisite_parses_and_schedules() {
     let planner = BasicCpmPlanner::new();
     let plan_id = planner

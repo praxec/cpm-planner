@@ -40,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Plan identity hashes now normalise prerequisites to edge objects, so re-submitting a graph stored by an earlier version creates a new plan rather than deduplicating to the old one.
 - `critical_path` now includes the synthetic endpoints.
 - Completing a deliverable without a lease now requires its prerequisites to be complete and is audited.
 - `plan.acquire_cohort` no longer returns the `LAPSE_LIMIT` error; lapse-limited deliverables appear in `blocked[]` with code `LAPSE_LIMIT` and the response sets `needs_operator: true` (drivers matching on the error must read `blocked`).

@@ -252,7 +252,9 @@ fn hash_graph(graph: &PlanGraph) -> String {
                     })
                 })
                 .collect();
-            prereqs.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+            // Full-key order (serialised form) so duplicate-id edges hash
+            // independently of submission order.
+            prereqs.sort_by_cached_key(ToString::to_string);
             let mut files: Vec<String> = d
                 .owned_files
                 .iter()

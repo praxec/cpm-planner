@@ -470,6 +470,19 @@ async fn plan_get_round_trips_mixed_prerequisite_forms() {
     );
 }
 
+#[tokio::test]
+async fn submit_rejects_unknown_prerequisite_field() {
+    let server = server();
+    let graph = json!({ "deliverables": [
+        { "id": "a", "owned_files": ["a.rs"], "prerequisites": [] },
+        { "id": "b", "owned_files": ["b.rs"], "prerequisites": [{ "id": "a", "lag_hour": 2 }] }
+    ]});
+    let result = server
+        .dispatch_call(call_args(TOOL_SUBMIT, json!({ "graph": graph })))
+        .await;
+    assert!(result.is_err());
+}
+
 // ── Error mapping: INVALID_GRAPH on cycles ──────────────────────────────────
 
 #[tokio::test]

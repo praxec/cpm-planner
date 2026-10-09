@@ -114,7 +114,7 @@ pub enum PrerequisiteKind {
 
 /// A prerequisite edge. Wire: a bare id string, or an object.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 pub enum Prerequisite {
     Id(String),
     Edge {
