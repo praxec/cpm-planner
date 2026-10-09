@@ -5,7 +5,7 @@ use crate::drag::{diameter, drag};
 use crate::estimator::EffortEstimator;
 use crate::lint::{LintReport, Severity};
 use crate::network_health::{CcFlag, cyclomatic_complexity};
-use crate::plan::{FINISH_ID, PlanGraph, START_ID};
+use crate::plan::{Deliverable, FINISH_ID, PlanGraph, START_ID};
 use crate::resource_schedule::ResourceSchedule;
 use crate::risk::{
     CriticalityBand, RiskBandFlag, ValidatedThresholdSet, band_flag, classify_with,
@@ -14,6 +14,7 @@ use crate::risk::{
 use crate::schedule::{effort_basis, scheduled_length};
 use crate::task::{CriticalPathResult, Task};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Scorecard {
@@ -73,7 +74,13 @@ pub fn scorecard(
         .iter()
         .map(|&m| classify_with(m, max_minutes, &thresholds))
         .collect();
-    let risk = criticality_risk(&bands);
+    // An empty plan has nothing at risk; `criticality_risk` alone would
+    // score an empty band list as maximal risk.
+    let risk = if bands.is_empty() {
+        0.0
+    } else {
+        criticality_risk(&bands)
+    };
 
     let max_drag = drag(&real)
         .into_iter()
@@ -87,11 +94,8 @@ pub fn scorecard(
         })
         .map(|r| (r.task_id, r.drag));
 
-    let num_dependencies: usize = graph
-        .deliverables
-        .iter()
-        .map(|d| d.prerequisites.len())
-        .sum();
+    // A prerequisite listed twice is one dependency.
+    let num_dependencies: usize = graph.deliverables.iter().map(distinct_prereqs).sum();
     let (cc, cc_flag) = cyclomatic_complexity(num_dependencies, graph.deliverables.len());
 
     let estimator = EffortEstimator::new();
@@ -141,7 +145,7 @@ pub fn scorecard(
         merge_bias_count: graph
             .deliverables
             .iter()
-            .filter(|d| d.prerequisites.len() >= MERGE_BIAS_PREREQS)
+            .filter(|d| distinct_prereqs(d) >= MERGE_BIAS_PREREQS)
             .count(),
         total_effort,
         parallelism: if makespan > 0.0 {
@@ -173,7 +177,20 @@ fn is_synthetic(id: &str) -> bool {
     id == START_ID || id == FINISH_ID
 }
 
+/// Number of distinct prerequisite ids of `d`.
+fn distinct_prereqs(d: &Deliverable) -> usize {
+    d.prerequisites
+        .iter()
+        .map(|p| p.id())
+        .collect::<HashSet<&str>>()
+        .len()
+}
+
 /// Hours to whole minutes for the integer risk API; negative or NaN is 0.
+///
+/// Rounds to the nearest minute, so float below 30 seconds counts as zero
+/// float (critical) and float noise from `f32` arithmetic cannot move a
+/// deliverable between bands.
 fn to_minutes(hours: f32) -> u64 {
     (f64::from(hours) * 60.0).round().max(0.0) as u64
 }

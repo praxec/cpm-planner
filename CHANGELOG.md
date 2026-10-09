@@ -45,8 +45,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Duplicate prerequisite ids no longer leave a deliverable unscheduled.
 - Plans stored by older versions are recomputed automatically when the store
   opens.
+- `CpmAlgorithm::calculate` resets earliest start/finish on re-run (stale values when called twice on the same tasks).
+- `plan.schedule`, `plan.simulate` and the `resource_schedule` / `monte_carlo` library calls validate the graph exactly as `plan.submit` does, so a reserved or duplicate id or a cycle is `INVALID_GRAPH` instead of a hang or a wrong schedule; `CpmAlgorithm::calculate` now terminates on duplicate task ids (every task is reported unscheduled).
+- `plan.lint` reports an invalid three-point estimate as `INVALID_VALUE`, with the same message as `plan.submit`, and no longer reports `NO_ARTIFACT` for milestones.
+- Monte Carlo samples an estimate only when neither `duration_hours` nor `estimated_effort_hours` is set, matching the scheduled-length precedence.
+- `plan.simulate` rejects unknown fields inside `schedule` and `monte_carlo`.
 
 ### Changed
+
+- A plan may have at most 5000 deliverables (`INVALID_GRAPH: plan has <n> deliverables; maximum is 5000`); `plan.lint` reports a larger graph as one `TOO_MANY_DELIVERABLES` error.
+- Every hour value (effort, duration, lag and estimate points) must be finite and between 0 and 1000000 (`... must be a finite number between 0 and 1000000`).
+- Monte Carlo rejects runs where `iterations × (deliverables + prerequisite edges)` exceeds 200000000 (`INVALID_GRAPH: monte carlo budget exceeded ...`).
+- `plan.schedule` / `plan.simulate` reject an out-of-range `project_buffer_pct` or `iterations` as invalid params before doing any work.
+- The CPM kernel, lint, leveling and Monte Carlo no longer do quadratic string-set work or recursion: a 5000-deliverable chain is handled in well under a second.
+- Library: `cpm_planner::schedule::compute_cpm` is public.
+- The scorecard's merge bias and cyclomatic complexity count distinct prerequisite ids; an empty plan scores criticality risk 0.
 
 - `plan.acquire_cohort` and `ready` order by longest remaining tail (smallest latest start), then float, then id (#19).
 - A lockless `plan.mark_status` to `ready` or `in_progress` now requires the deliverable's prerequisites to be complete (`PREREQUISITES_INCOMPLETE`), so dependency order can't be bypassed.

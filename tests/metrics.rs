@@ -1,12 +1,13 @@
 //! Tests for the plan scorecard library.
 
-use cpm_planner::CpmAlgorithm;
 use cpm_planner::lint::{LintFinding, LintReport, Severity};
 use cpm_planner::metrics::{Scorecard, scorecard};
-use cpm_planner::plan::{FINISH_ID, PlanGraph, START_ID};
-use cpm_planner::task::{CriticalPathResult, Task};
+use cpm_planner::plan::PlanGraph;
+use cpm_planner::resource_schedule::{ScheduleRequest, resource_schedule};
+use cpm_planner::schedule::compute_cpm;
+use cpm_planner::task::CriticalPathResult;
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::BTreeMap;
 
 fn dv(id: &str, prereqs: &[&str], extra: serde_json::Value) -> serde_json::Value {
     let mut v = json!({"id": id, "owned_files": [], "prerequisites": prereqs});
@@ -24,43 +25,9 @@ fn graph(v: Vec<serde_json::Value>) -> PlanGraph {
     serde_json::from_value(json!({ "deliverables": v })).expect("valid graph")
 }
 
-/// CPM over the graph with synthetic endpoints, mirroring the planner.
+/// CPM over the graph exactly as the planner computes it.
 fn cpm(g: &PlanGraph) -> CriticalPathResult {
-    let referenced: HashSet<String> = g
-        .deliverables
-        .iter()
-        .flat_map(|d| d.prerequisites.iter().map(|p| p.id().to_string()))
-        .collect();
-    let mut tasks: Vec<Task> = g
-        .deliverables
-        .iter()
-        .map(|d| Task {
-            id: d.id.clone(),
-            name: d.id.clone(),
-            effort_hours: d.duration_hours.or(d.estimated_effort_hours).unwrap_or(0.0),
-            dependencies: d.prerequisites.iter().map(|p| p.id().to_string()).collect(),
-            ..Task::default()
-        })
-        .collect();
-    for t in tasks.iter_mut().filter(|t| t.dependencies.is_empty()) {
-        t.dependencies.push(START_ID.to_string());
-    }
-    let sinks: Vec<String> = g
-        .deliverables
-        .iter()
-        .filter(|d| !referenced.contains(&d.id))
-        .map(|d| d.id.clone())
-        .collect();
-    tasks.push(Task {
-        id: START_ID.to_string(),
-        ..Task::default()
-    });
-    tasks.push(Task {
-        id: FINISH_ID.to_string(),
-        dependencies: sinks,
-        ..Task::default()
-    });
-    CpmAlgorithm::calculate(&mut tasks)
+    compute_cpm(g).expect("valid graph")
 }
 
 fn clean() -> LintReport {
@@ -86,8 +53,71 @@ fn finding(severity: Severity) -> LintFinding {
 
 #[test]
 fn scorecard_excludes_synthetic_endpoints_from_counts() {
-    let g = graph(vec![hours("a", &[], 1.0), hours("b", &["a"], 1.0)]);
-    assert_eq!(card(&g).deliverables, g.deliverables.len());
+    // a -> b is critical; c has 1h float. The zero-float endpoints would add
+    // 2 to critical_count if they were counted.
+    let g = graph(vec![
+        hours("a", &[], 1.0),
+        hours("b", &["a"], 1.0),
+        hours("c", &[], 1.0),
+    ]);
+    let s = card(&g);
+    assert_eq!(
+        (s.deliverables, s.critical_count, s.total_float),
+        (3, 2, 1.0)
+    );
+}
+
+#[test]
+fn scorecard_with_schedule_reports_resource_makespan_and_peak_load() {
+    let owned = |id: &str| {
+        dv(
+            id,
+            &[],
+            json!({"estimated_effort_hours": 2.0, "metadata": {"owner": "dev"}}),
+        )
+    };
+    let g = graph(vec![owned("a"), owned("b")]);
+    let leveled = resource_schedule(
+        &g,
+        &ScheduleRequest {
+            capacities: BTreeMap::from([("dev".to_string(), 1)]),
+            resource_key: "owner".to_string(),
+            project_buffer_pct: 0.0,
+        },
+    )
+    .expect("schedule");
+    let s = scorecard(&g, &cpm(&g), Some(&leveled), &clean());
+    assert_eq!((s.resource_makespan, s.peak_load), (Some(4.0), Some(1.0)));
+}
+
+#[test]
+fn empty_graph_has_zero_criticality_risk() {
+    let g = graph(vec![]);
+    let s = card(&g);
+    assert_eq!(
+        (s.criticality_risk, s.risk_band.as_str()),
+        (0.0, "over_decompressed")
+    );
+}
+
+#[test]
+fn merge_bias_counts_distinct_prerequisites() {
+    let g = graph(vec![
+        hours("a", &[], 1.0),
+        hours("b", &[], 1.0),
+        hours("m", &["a", "a", "b"], 1.0),
+    ]);
+    assert_eq!(card(&g).merge_bias_count, 0);
+}
+
+#[test]
+fn cyclomatic_complexity_counts_distinct_prerequisites() {
+    let once = graph(vec![hours("a", &[], 1.0), hours("b", &["a"], 1.0)]);
+    let twice = graph(vec![hours("a", &[], 1.0), hours("b", &["a", "a"], 1.0)]);
+    assert_eq!(
+        card(&twice).cyclomatic_complexity,
+        card(&once).cyclomatic_complexity
+    );
 }
 
 #[test]

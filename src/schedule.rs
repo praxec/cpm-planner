@@ -1,6 +1,10 @@
 //! Shared CPM computation: turns a validated [`PlanGraph`] into a
-//! [`CriticalPathResult`]. Used both when a plan is submitted and when the
-//! store recomputes results cached by an older kernel version.
+//! [`CriticalPathResult`]. Used when a plan is submitted, when the store
+//! recomputes results cached by an older kernel version, and by the
+//! read-only analysis tools.
+//!
+//! Only [`compute_cpm`] is public; the row builders and length helpers are
+//! crate-internal.
 
 use crate::algorithm::CpmAlgorithm;
 use crate::estimator::EffortEstimator;
@@ -8,16 +12,25 @@ use crate::plan::{
     Deliverable, FINISH_ID, MilestoneRow, PlanGraph, PlannerError, START_ID, ScheduleRow,
 };
 use crate::task::{CriticalPathResult, Task, TaskKind};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-/// Run the CPM kernel over `graph`. A default-config estimator fills in
-/// effort for deliverables that omit `estimated_effort_hours`.
+/// Run the CPM kernel over `graph`, exactly as `plan.submit` does.
 ///
-/// Graphs are expected to have passed cycle validation already; if the kernel
-/// still leaves tasks unscheduled the two cycle detectors disagree, which is
-/// a correctness bug rather than bad input, so it surfaces as
-/// [`PlannerError::InvalidGraph`] instead of a confidently-wrong result.
-pub(crate) fn compute_cpm(graph: &PlanGraph) -> Result<CriticalPathResult, PlannerError> {
+/// Each deliverable's scheduled length is `duration_hours`, else
+/// `estimated_effort_hours`, else `estimate.likely`, else `0` for a
+/// milestone, else a default-config estimator's kind-aware effort. The
+/// synthetic `__start__` / `__finish__` tasks are added, so the result's
+/// `tasks` and `critical_path` include them.
+///
+/// `graph` should already be valid (as `plan.submit` would accept it). If
+/// the kernel still leaves tasks unscheduled (a cycle or duplicate id
+/// slipped through), the result surfaces as [`PlannerError::InvalidGraph`]
+/// instead of a confidently-wrong schedule.
+///
+/// # Errors
+///
+/// [`PlannerError::InvalidGraph`] when any task could not be scheduled.
+pub fn compute_cpm(graph: &PlanGraph) -> Result<CriticalPathResult, PlannerError> {
     let estimator = EffortEstimator::new();
     let mut tasks: Vec<Task> = graph
         .deliverables
@@ -155,8 +168,7 @@ pub(crate) fn deliverable_to_task(d: &Deliverable, estimator: &EffortEstimator) 
 
     let scheduled_hours = scheduled_length(d, estimator);
     // A repeated prerequisite id takes its largest lag, independent of order.
-    let mut lag_by_dependency: std::collections::HashMap<String, f32> =
-        std::collections::HashMap::new();
+    let mut lag_by_dependency: HashMap<String, f32> = HashMap::new();
     for p in d.prerequisites.iter().filter(|p| p.lag_hours() > 0.0) {
         let lag = lag_by_dependency.entry(p.id().to_string()).or_insert(0.0);
         *lag = lag.max(p.lag_hours());
@@ -179,7 +191,8 @@ pub(crate) fn deliverable_to_task(d: &Deliverable, estimator: &EffortEstimator) 
 /// then `__finish__`. The synthetic endpoints are flagged. Shared by
 /// `plan.status` and `plan.simulate` so both report identical rows.
 pub(crate) fn schedule_rows(graph: &PlanGraph, cpm: &CriticalPathResult) -> Vec<ScheduleRow> {
-    let task_of = |id: &str| cpm.tasks.iter().find(|t| t.id == id);
+    let by_id = task_index(cpm);
+    let task_of = |id: &str| by_id.get(id).copied();
     let row_of = |t: &Task, synthetic: bool| ScheduleRow {
         id: t.id.clone(),
         es: t.earliest_start,
@@ -210,12 +223,13 @@ pub(crate) fn milestone_rows(
     cpm: &CriticalPathResult,
     is_complete: impl Fn(&str) -> bool,
 ) -> Vec<MilestoneRow> {
+    let by_id = task_index(cpm);
     graph
         .deliverables
         .iter()
         .filter(|d| d.is_milestone())
         .filter_map(|d| {
-            let task = cpm.tasks.iter().find(|t| t.id == d.id)?;
+            let task = *by_id.get(d.id.as_str())?;
             Some(MilestoneRow {
                 id: d.id.clone(),
                 critical_path: CpmAlgorithm::trace_path_to(&cpm.tasks, &d.id),
@@ -224,4 +238,9 @@ pub(crate) fn milestone_rows(
             })
         })
         .collect()
+}
+
+/// Id -> task lookup over a CPM result, built once per row listing.
+fn task_index(cpm: &CriticalPathResult) -> HashMap<&str, &Task> {
+    cpm.tasks.iter().map(|t| (t.id.as_str(), t)).collect()
 }
