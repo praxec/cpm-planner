@@ -568,6 +568,43 @@ async fn acquire_cohort_prefers_lowest_float() {
     assert_eq!(ids, vec!["A"]);
 }
 
+/// Graph where `a` is a 1h deliverable carrying a 10h chain, while `b` is a
+/// 5h leaf behind a completed 7h gate. `a` has the smaller latest start
+/// (1h vs 7h) even though `b` has the smaller float (0 vs 1), so only the
+/// latest-start-first policy leases `a` first.
+async fn submit_long_tail_vs_short_leaf() -> (BasicCpmPlanner, PlanId) {
+    let planner = BasicCpmPlanner::new();
+    let graph = PlanGraph {
+        deliverables: vec![
+            deliverable("gate", &["src/gate.rs"], &[], Some(7.0)),
+            deliverable("b", &["src/b.rs"], &["gate"], Some(5.0)),
+            deliverable("a", &["src/a.rs"], &[], Some(1.0)),
+            deliverable("a_tail", &["src/a_tail.rs"], &["a"], Some(10.0)),
+        ],
+        max_chained_dispatch: None,
+    };
+    let plan_id = planner.submit_plan(graph).await.unwrap();
+    planner.accept(accept(&plan_id, "gate")).await.unwrap();
+    (planner, plan_id)
+}
+
+#[tokio::test]
+async fn acquire_prefers_longest_remaining_tail() {
+    let (planner, plan_id) = submit_long_tail_vs_short_leaf().await;
+    let cohort = planner
+        .acquire_cohort(AcquireRequest::new(plan_id, caller("w1"), 1))
+        .await
+        .unwrap();
+    assert_eq!(cohort.rows[0].deliverable.id, "a");
+}
+
+#[tokio::test]
+async fn ready_order_matches_longest_remaining_tail() {
+    let (planner, plan_id) = submit_long_tail_vs_short_leaf().await;
+    let status = planner.status(&plan_id).await.unwrap();
+    assert_eq!(status.ready, vec!["a", "b"]);
+}
+
 #[tokio::test]
 async fn submit_rejects_negative_effort() {
     let planner = BasicCpmPlanner::new();

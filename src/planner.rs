@@ -692,13 +692,14 @@ fn make_counters_reset_event(
 // Priority ordering for cohort selection
 // ---------------------------------------------------------------------------
 
-/// Sort key for the ready-set priority pass: least total float first
-/// (critical work leads), then earliest start, then id for determinism.
+/// Sort key for the ready-set priority pass: smallest latest start first
+/// (longest remaining tail leads), then least total float, then id for
+/// determinism.
 fn priority_key(
     deliverable_id: &str,
     sched_by_id: &HashMap<&str, (f32, f32)>,
 ) -> (i64, i64, String) {
-    let (float, es) = match sched_by_id.get(deliverable_id) {
+    let (latest_start, float) = match sched_by_id.get(deliverable_id) {
         Some(&v) => v,
         None => unreachable!(
             "deliverable '{deliverable_id}' is in the ready set but absent from the cached \
@@ -706,7 +707,11 @@ fn priority_key(
         ),
     };
     let scale = |h: f32| (h * 1000.0).round() as i64;
-    (scale(float), scale(es), deliverable_id.to_string())
+    (
+        scale(latest_start),
+        scale(float),
+        deliverable_id.to_string(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -862,12 +867,12 @@ impl Planner for BasicCpmPlanner {
                 })
                 .collect();
 
-            // 3. Build the (float, ES) lookup table.
+            // 3. Build the (latest_start, float) lookup table.
             let sched_by_id: HashMap<&str, (f32, f32)> = state
                 .cached_result
                 .tasks
                 .iter()
-                .map(|t| (t.id.as_str(), (t.float, t.earliest_start)))
+                .map(|t| (t.id.as_str(), (t.latest_start, t.float)))
                 .collect();
 
             // 4. Build the ready set (in scope, non-manual, Ready, unlocked,
@@ -1326,7 +1331,7 @@ impl Planner for BasicCpmPlanner {
                 .cached_result
                 .tasks
                 .iter()
-                .map(|t| (t.id.as_str(), (t.float, t.earliest_start)))
+                .map(|t| (t.id.as_str(), (t.latest_start, t.float)))
                 .collect();
             ready_rows.sort_by_key(|r| priority_key(&r.id, &sched_by_id));
             let ready: Vec<String> = ready_rows.iter().map(|r| r.id.clone()).collect();
@@ -1592,19 +1597,28 @@ mod tests {
     }
 
     fn sched<'a>(entries: &[(&'a str, f32, f32)]) -> HashMap<&'a str, (f32, f32)> {
-        entries.iter().map(|&(id, f, e)| (id, (f, e))).collect()
+        entries
+            .iter()
+            .map(|&(id, latest_start, float)| (id, (latest_start, float)))
+            .collect()
     }
 
     #[test]
-    fn priority_key_orders_lower_float_first() {
-        let s = sched(&[("A", 0.0, 5.0), ("B", 2.0, 0.0)]);
-        assert!(priority_key("A", &s) < priority_key("B", &s));
+    fn priority_key_orders_lower_latest_start_first() {
+        let s = sched(&[("A", 5.0, 0.0), ("B", 0.0, 9.0)]);
+        assert!(priority_key("B", &s) < priority_key("A", &s));
     }
 
     #[test]
-    fn priority_key_breaks_float_ties_by_es() {
+    fn priority_key_breaks_latest_start_ties_by_float() {
         let s = sched(&[("X", 1.0, 3.0), ("Y", 1.0, 1.0)]);
         assert!(priority_key("Y", &s) < priority_key("X", &s));
+    }
+
+    #[test]
+    fn priority_key_breaks_float_ties_by_id() {
+        let s = sched(&[("X", 1.0, 1.0), ("Y", 1.0, 1.0)]);
+        assert!(priority_key("X", &s) < priority_key("Y", &s));
     }
 
     #[test]
