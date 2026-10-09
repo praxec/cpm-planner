@@ -5,6 +5,7 @@
 
 # Junior delivery worker: per-run task contracts and machine-local install manifests.
 /tasks/
+/.delivery/
 .junior-manifest.json
 
 # superpowers subagent-driven-development scratch workspaces.
