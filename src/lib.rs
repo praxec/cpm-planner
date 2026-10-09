@@ -41,6 +41,7 @@
 pub mod algorithm;
 pub mod audit;
 pub mod drag;
+pub mod edits;
 pub mod estimator;
 mod graph;
 pub mod lint;
