@@ -43,6 +43,7 @@ pub mod audit;
 pub mod drag;
 pub mod estimator;
 mod graph;
+pub mod lint;
 mod locks;
 pub mod network_health;
 pub mod plan;
