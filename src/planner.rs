@@ -299,7 +299,7 @@ fn hash_graph(graph: &PlanGraph) -> String {
 
 /// Reject graphs that fail any structural invariant. Returns
 /// [`PlannerError::InvalidGraph`] with a precise `reason` on first failure.
-fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
+pub(crate) fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
     for d in &graph.deliverables {
         if d.id == START_ID || d.id == FINISH_ID {
             return Err(PlannerError::InvalidGraph {

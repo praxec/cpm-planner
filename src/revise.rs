@@ -19,6 +19,8 @@
 //! - removed deliverables are dropped; one holding a live lock is refused with
 //!   `LOCK_HELD` unless `force`, in which case its lock is released and its id
 //!   listed in `released_locks`;
+//! - counters (attempts, failures, lapses) are kept for every surviving
+//!   deliverable, including re-derived ones;
 //! - `InProgress` (leased) deliverables keep their lease unless removed.
 //!   `Failed` deliverables are outside the reopen rule: they stay `Failed`
 //!   (re-derivation applies only to `Complete`/`Ready`/`Pending`).
@@ -31,9 +33,10 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::graph::prerequisite_ids;
-use crate::locks::{PlanState, add_file_claims};
+use crate::locks::{FileClaim, PlanState, add_file_claims};
 use crate::plan::{Deliverable, DeliverableStatus, PlanGraph, PlannerError, PrerequisiteKind};
-use crate::planner::canonical_deliverable;
+use crate::planner::{canonical_deliverable, validate_graph};
+use chrono::{DateTime, Utc};
 
 /// What a revision changed. Every vector is sorted.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -72,14 +75,22 @@ fn prereq_set(d: &Deliverable) -> BTreeSet<&str> {
 /// Derive the runtime state of `new` from `old`, carrying progress over per
 /// the module rules. Pure: nothing is persisted and no audit is emitted.
 ///
-/// Errors: `LOCK_HELD` when a removed deliverable holds a live lock and
-/// `force` is false; any error from the CPM recomputation on `new`.
+/// The new graph is validated first (`validate_graph`: duplicate ids, unknown
+/// prerequisites, ...), so a bad graph is `INVALID_GRAPH`, never carried over.
+/// A lock with `expires_at < now` is not live: it never blocks removal, is not
+/// kept, and its deliverable is re-derived from its prerequisites.
+///
+/// Errors: `LOCK_HELD` when a removed deliverable holds a live lock, or two
+/// surviving leases would claim conflicting files, and `force` is false; any error from the CPM recomputation on `new`.
 pub(crate) fn plan_revision(
     old: &PlanState,
     new: &PlanGraph,
     force: bool,
+    now: DateTime<Utc>,
 ) -> Result<(PlanState, RevisionDiff), PlannerError> {
+    validate_graph(new)?;
     let cached_result = crate::schedule::compute_cpm(new)?;
+    let live = |id: &str| old.locks.get(id).filter(|l| l.expires_at >= now);
 
     let old_by_id: HashMap<&str, &Deliverable> = old
         .graph
@@ -114,7 +125,7 @@ pub(crate) fn plan_revision(
 
     // Removal of a leased deliverable: refuse, or release when forced.
     for id in &diff.removed {
-        if let Some(lock) = old.locks.get(id) {
+        if let Some(lock) = live(id) {
             if !force {
                 return Err(PlannerError::LockHeld {
                     plan_id: lock.plan_id.0.clone(),
@@ -160,7 +171,7 @@ pub(crate) fn plan_revision(
     // the walk: their status is not part of the reopen rule).
     let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
     for d in &new.deliverables {
-        for p in prerequisite_ids(d) {
+        for p in prereq_set(d) {
             dependents.entry(p).or_default().push(d.id.as_str());
         }
     }
@@ -176,6 +187,13 @@ pub(crate) fn plan_revision(
         }
     }
     diff.reopened = rederive.iter().cloned().collect();
+    // Survivors whose lease expired are re-derived too, but are not "reopened".
+    let expired: HashSet<&str> = old
+        .locks
+        .keys()
+        .map(String::as_str)
+        .filter(|id| new_by_id.contains_key(id) && live(id).is_none())
+        .collect();
 
     // Final statuses in prerequisite order (Kahn); re-derived and new
     // deliverables take Ready/Pending from their prerequisites.
@@ -204,13 +222,19 @@ pub(crate) fn plan_revision(
             }
         };
         let status = match old.statuses.get(id) {
-            Some(s) if old_by_id.contains_key(id) && !rederive.contains(id) => s.clone(),
+            Some(s)
+                if old_by_id.contains_key(id)
+                    && !rederive.contains(id)
+                    && !expired.contains(id) =>
+            {
+                s.clone()
+            }
             _ => derive(),
         };
         statuses.insert(id.to_string(), status);
         for dep in dependents.get(id).into_iter().flatten() {
             if let Some(n) = remaining.get_mut(dep) {
-                *n = n.saturating_sub(1);
+                *n -= 1;
                 if *n == 0 {
                     ready.push(dep);
                 }
@@ -241,18 +265,53 @@ pub(crate) fn plan_revision(
     state.locks = old
         .locks
         .iter()
-        .filter(|(k, _)| survives(k))
+        .filter(|(k, l)| survives(k) && l.expires_at >= now)
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    let mut held: Vec<&String> = state.locks.keys().collect();
-    held.sort();
-    for id in held {
-        add_file_claims(
-            &mut state.file_claims,
-            id,
-            &new_by_id[id.as_str()].owned_files,
-        );
+    // Rebuild claims from the NEW definitions in graph order; the earlier
+    // claimant wins a conflict.
+    for d in &new.deliverables {
+        let Some(lock) = state.locks.get(&d.id) else {
+            continue;
+        };
+        let clash = d.owned_files.iter().find_map(|f| {
+            state
+                .file_claims
+                .get(f.path())
+                .filter(|c| c.conflicts_with(f.mode()))
+        });
+        let Some(claim) = clash else {
+            add_file_claims(&mut state.file_claims, &d.id, &d.owned_files);
+            continue;
+        };
+        if !force {
+            let holder_id = match claim {
+                FileClaim::Exclusive(h) => h.clone(),
+                FileClaim::Append(set) => set.iter().next().cloned().unwrap_or_default(),
+            };
+            let holder = state
+                .locks
+                .get(&holder_id)
+                .map_or(holder_id, |l| l.caller_id.0.clone());
+            return Err(PlannerError::LockHeld {
+                plan_id: lock.plan_id.0.clone(),
+                deliverable_id: d.id.clone(),
+                holder,
+            });
+        }
+        state.locks.remove(&d.id);
+        diff.released_locks.push(d.id.clone());
+        let ok = prereq_set(d)
+            .iter()
+            .all(|p| state.statuses.get(*p) == Some(&DeliverableStatus::Complete));
+        let status = if ok {
+            DeliverableStatus::Ready
+        } else {
+            DeliverableStatus::Pending
+        };
+        state.statuses.insert(d.id.clone(), status);
     }
+    diff.released_locks.sort();
     Ok((state, diff))
 }
 
@@ -322,7 +381,7 @@ mod tests {
     }
 
     fn revise(old: &PlanState, g: PlanGraph) -> (PlanState, RevisionDiff) {
-        plan_revision(old, &g, false).expect("revision succeeds")
+        plan_revision(old, &g, false, Utc::now()).expect("revision succeeds")
     }
 
     use DeliverableStatus::{Complete, InProgress, Pending, Ready};
@@ -400,23 +459,28 @@ mod tests {
 
     #[test]
     fn removing_leased_deliverable_requires_force() {
-        let err = plan_revision(&leased(), &graph(vec![dl("b", &[], 1.0)]), false)
-            .err()
-            .expect("lock held");
+        let err = plan_revision(
+            &leased(),
+            &graph(vec![dl("b", &[], 1.0)]),
+            false,
+            Utc::now(),
+        )
+        .err()
+        .expect("lock held");
         assert!(matches!(err, PlannerError::LockHeld { .. }));
     }
 
     #[test]
     fn forced_removal_releases_lock() {
-        let (_, diff) =
-            plan_revision(&leased(), &graph(vec![dl("b", &[], 1.0)]), true).expect("forced");
+        let (_, diff) = plan_revision(&leased(), &graph(vec![dl("b", &[], 1.0)]), true, Utc::now())
+            .expect("forced");
         assert_eq!(diff.released_locks, vec!["a".to_string()]);
     }
 
     #[test]
     fn forced_removal_drops_lock_from_state() {
-        let (new, _) =
-            plan_revision(&leased(), &graph(vec![dl("b", &[], 1.0)]), true).expect("forced");
+        let (new, _) = plan_revision(&leased(), &graph(vec![dl("b", &[], 1.0)]), true, Utc::now())
+            .expect("forced");
         assert!(new.locks.is_empty());
     }
 
@@ -642,5 +706,157 @@ mod tests {
             ]),
         );
         assert_eq!(diff.added, vec!["m".to_string(), "z".to_string()]);
+    }
+
+    #[test]
+    fn duplicate_id_edges_revise_in_linear_time() {
+        let chain = || {
+            let mut ds = vec![dl("n0", &[], 1.0)];
+            for i in 1..200 {
+                let prev = format!("n{}", i - 1);
+                ds.push(iface(dl(&format!("n{i}"), &[&prev], 1.0), &prev));
+            }
+            graph(ds)
+        };
+        let old = state(chain(), &[("n0", Ready)]);
+        let start = std::time::Instant::now();
+        let ok = plan_revision(&old, &chain(), false, Utc::now()).is_ok();
+        assert!(ok && start.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    fn claiming(mut d: Deliverable, path: &str) -> Deliverable {
+        d.owned_files = vec![OwnedFile::Path(PathBuf::from(path))];
+        d
+    }
+
+    fn two_leases() -> (PlanState, PlanGraph) {
+        let mut old = state(
+            graph(vec![claiming(dl("x", &[], 1.0), "f.rs"), dl("y", &[], 1.0)]),
+            &[("x", InProgress), ("y", InProgress)],
+        );
+        old.locks.insert("x".into(), lock("x"));
+        old.locks.insert("y".into(), lock("y"));
+        let g = graph(vec![
+            claiming(dl("x", &[], 1.0), "f.rs"),
+            claiming(dl("y", &["x"], 1.0), "f.rs"),
+        ]);
+        (old, g)
+    }
+
+    #[test]
+    fn conflicting_claims_between_surviving_leases_are_refused() {
+        let (old, g) = two_leases();
+        let err = plan_revision(&old, &g, false, Utc::now())
+            .err()
+            .expect("conflict");
+        assert!(matches!(err, PlannerError::LockHeld { .. }));
+    }
+
+    #[test]
+    fn forced_revision_releases_conflicting_lease() {
+        let (old, g) = two_leases();
+        let (new, diff) = plan_revision(&old, &g, true, Utc::now()).expect("forced");
+        assert!(diff.released_locks == vec!["y".to_string()] && new.statuses["y"] == Pending);
+    }
+
+    #[test]
+    fn forced_revision_keeps_earlier_claimant_claim() {
+        let (old, g) = two_leases();
+        let (new, _) = plan_revision(&old, &g, true, Utc::now()).expect("forced");
+        assert_eq!(
+            new.file_claims.get(&PathBuf::from("f.rs")),
+            Some(&FileClaim::Exclusive("x".into()))
+        );
+    }
+
+    #[test]
+    fn revision_with_unknown_prerequisite_is_invalid_graph() {
+        let old = state(graph(vec![dl("a", &[], 1.0)]), &[("a", Ready)]);
+        let err = plan_revision(
+            &old,
+            &graph(vec![dl("a", &["ghost"], 1.0)]),
+            false,
+            Utc::now(),
+        )
+        .err()
+        .expect("invalid");
+        assert!(matches!(err, PlannerError::InvalidGraph { .. }));
+    }
+
+    fn expired_leased() -> PlanState {
+        let mut old = leased();
+        let l = old.locks.get_mut("a").expect("lock");
+        l.expires_at = Utc::now() - chrono::Duration::hours(1);
+        old
+    }
+
+    #[test]
+    fn expired_lease_does_not_block_removal() {
+        let res = plan_revision(
+            &expired_leased(),
+            &graph(vec![dl("b", &[], 1.0)]),
+            false,
+            Utc::now(),
+        );
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn expired_lease_is_not_kept_and_is_rederived() {
+        let (new, _) = revise(
+            &expired_leased(),
+            graph(vec![dl("a", &[], 1.0), dl("b", &[], 1.0)]),
+        );
+        assert!(new.locks.is_empty() && new.statuses["a"] == Ready);
+    }
+
+    fn chain_abc(c_pre: &[&str], b_effort: f32, b_pre: &[&str]) -> PlanGraph {
+        graph(vec![
+            dl("a", &[], 1.0),
+            dl("x", &[], 1.0),
+            dl("b", b_pre, b_effort),
+            dl("c", c_pre, 1.0),
+        ])
+    }
+
+    #[test]
+    fn reopen_walk_stops_at_in_progress() {
+        let mut old = state(
+            chain_abc(&["b"], 1.0, &["a"]),
+            &[
+                ("a", Complete),
+                ("x", Ready),
+                ("b", InProgress),
+                ("c", Pending),
+            ],
+        );
+        old.locks.insert("b".into(), lock("b"));
+        let (new, _) = revise(&old, chain_abc(&["b", "x"], 2.0, &["a"]));
+        assert_eq!(new.statuses["b"], InProgress);
+    }
+
+    #[test]
+    fn reopen_walk_stops_at_failed() {
+        let failed = DeliverableStatus::Failed { reason: "x".into() };
+        let old = state(
+            chain_abc(&["b"], 1.0, &["a"]),
+            &[
+                ("a", Complete),
+                ("x", Ready),
+                ("b", Complete),
+                ("c", failed.clone()),
+            ],
+        );
+        let (new, _) = revise(&old, chain_abc(&["b"], 1.0, &["a", "x"]));
+        assert_eq!(new.statuses["c"], failed);
+    }
+
+    #[test]
+    fn old_only_contract_flag_reopens_interface_consumer() {
+        let (old, _) = contract_pair(true, false);
+        let mut p2 = dl("p", &[], 1.0);
+        p2.metadata = json!({ "contract": false });
+        let (new, _) = revise(&old, graph(vec![p2, iface(dl("c", &[], 1.0), "p")]));
+        assert_eq!(new.statuses["c"], Ready);
     }
 }
