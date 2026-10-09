@@ -9,7 +9,6 @@
 //! reproduces the output exactly. Synthetic `__start__` / `__finish__` tasks
 //! take part in scheduling but never appear in the output.
 
-use crate::algorithm::CpmAlgorithm;
 use crate::estimator::EffortEstimator;
 use crate::plan::{FINISH_ID, PlanGraph, PlannerError};
 use crate::schedule::{compute_cpm, deliverable_to_task};
@@ -18,6 +17,7 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, Pert};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Maximum iterations per run.
 pub const MAX_ITERATIONS: u32 = 50_000;
@@ -84,6 +84,10 @@ pub struct MonteCarloSummary {
 }
 
 /// Run a seeded Monte Carlo simulation of `graph`.
+///
+/// Output is reproducible for a given seed on a given platform and toolchain;
+/// bit-identical results across targets are not guaranteed because float
+/// transcendental functions can differ.
 pub fn monte_carlo(
     graph: &PlanGraph,
     req: &MonteCarloRequest,
@@ -125,6 +129,7 @@ pub fn monte_carlo(
         .ok_or_else(|| PlannerError::InvalidGraph {
             reason: "internal error: missing finish endpoint".to_string(),
         })?;
+    let mut kernel = Kernel::new(&tasks)?;
     let mut rng = ChaCha8Rng::seed_from_u64(req.seed);
     let mut makespans = Vec::with_capacity(n);
     let mut lengths: Vec<Vec<f32>> = vec![Vec::with_capacity(n); sampled.len()];
@@ -133,13 +138,13 @@ pub fn monte_carlo(
     for _ in 0..n {
         for (k, (i, dist)) in sampled.iter().enumerate() {
             let v = dist.sample(&mut rng);
-            tasks[*i].effort_hours = v;
+            kernel.len[*i] = v;
             lengths[k].push(v);
         }
-        CpmAlgorithm::forward_backward(&mut tasks);
-        makespans.push(tasks[finish_idx].earliest_finish);
+        kernel.run();
+        makespans.push(kernel.ef[finish_idx]);
         for (i, runs) in critical_runs.iter_mut().enumerate() {
-            if tasks[i].float < CRITICAL_EPSILON {
+            if kernel.float[i] < CRITICAL_EPSILON {
                 *runs += 1;
             }
         }
@@ -187,6 +192,107 @@ pub fn monte_carlo(
     })
 }
 
+/// Index-based CPM kernel built once per run: topological order plus
+/// predecessor / successor lists, with reusable per-iteration buffers.
+struct Kernel {
+    order: Vec<usize>,
+    preds: Vec<Vec<(usize, f32)>>,
+    succs: Vec<Vec<(usize, f32)>>,
+    len: Vec<f32>,
+    es: Vec<f32>,
+    ef: Vec<f32>,
+    ls: Vec<f32>,
+    float: Vec<f32>,
+}
+
+impl Kernel {
+    /// Errors if the task graph has a dependency cycle or unknown id.
+    fn new(tasks: &[Task]) -> Result<Self, PlannerError> {
+        let n = tasks.len();
+        let index: HashMap<&str, usize> = tasks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.id.as_str(), i))
+            .collect();
+        let mut preds: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n];
+        let mut succs: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n];
+        for (i, t) in tasks.iter().enumerate() {
+            let mut seen: Vec<usize> = Vec::new();
+            for dep in &t.dependencies {
+                let p = *index
+                    .get(dep.as_str())
+                    .ok_or_else(|| PlannerError::InvalidGraph {
+                        reason: format!("unknown prerequisite '{dep}'"),
+                    })?;
+                if seen.contains(&p) {
+                    continue;
+                }
+                seen.push(p);
+                let lag = t.lag_by_dependency.get(dep).copied().unwrap_or(0.0);
+                preds[i].push((p, lag));
+                succs[p].push((i, lag));
+            }
+        }
+        let mut indeg: Vec<usize> = preds.iter().map(Vec::len).collect();
+        let mut order: Vec<usize> = (0..n).filter(|&i| indeg[i] == 0).collect();
+        let mut head = 0;
+        while head < order.len() {
+            let u = order[head];
+            head += 1;
+            for &(v, _) in &succs[u] {
+                indeg[v] -= 1;
+                if indeg[v] == 0 {
+                    order.push(v);
+                }
+            }
+        }
+        if order.len() != n {
+            return Err(PlannerError::InvalidGraph {
+                reason: "dependency cycle in Monte Carlo kernel".to_string(),
+            });
+        }
+        Ok(Self {
+            order,
+            preds,
+            succs,
+            len: tasks.iter().map(|t| t.effort_hours).collect(),
+            es: vec![0.0; n],
+            ef: vec![0.0; n],
+            ls: vec![0.0; n],
+            float: vec![0.0; n],
+        })
+    }
+
+    /// Forward and backward sweep over `self.len`; fills ES/EF/LS/float and
+    /// returns the makespan (largest earliest finish). No allocation.
+    fn run(&mut self) -> f32 {
+        let mut makespan = 0.0_f32;
+        for &i in &self.order {
+            let mut es = 0.0_f32;
+            for &(p, lag) in &self.preds[i] {
+                es = es.max(self.ef[p] + lag);
+            }
+            self.es[i] = es;
+            self.ef[i] = es + self.len[i];
+            makespan = makespan.max(self.ef[i]);
+        }
+        for &i in self.order.iter().rev() {
+            let mut lf = makespan;
+            let mut first = true;
+            for &(s, lag) in &self.succs[i] {
+                let v = self.ls[s] - lag;
+                if first || v < lf {
+                    lf = v;
+                    first = false;
+                }
+            }
+            self.ls[i] = lf - self.len[i];
+            self.float[i] = self.ls[i] - self.es[i];
+        }
+        makespan
+    }
+}
+
 /// Nearest-rank percentile of an ascending, non-empty slice.
 fn nearest_rank(sorted: &[f32], q: f64) -> f32 {
     let rank = (q * sorted.len() as f64).ceil() as usize;
@@ -209,4 +315,90 @@ fn pearson(x: &[f32], y: &[f32]) -> f32 {
         return 0.0;
     }
     (sxy / (sxx * syy).sqrt()) as f32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::algorithm::CpmAlgorithm;
+    use rand::RngExt;
+
+    fn random_tasks(rng: &mut ChaCha8Rng) -> Vec<Task> {
+        let n = rng.random_range(5..=40usize);
+        (0..n)
+            .map(|i| {
+                let mut t = Task {
+                    id: format!("t{i}"),
+                    effort_hours: if rng.random_range(0..6) == 0 {
+                        0.0
+                    } else {
+                        rng.random_range(1.0..20.0f32)
+                    },
+                    ..Task::default()
+                };
+                for j in 0..i {
+                    if rng.random_range(0..5) == 0 {
+                        t.dependencies.push(format!("t{j}"));
+                        if rng.random_range(0..3) == 0 {
+                            t.lag_by_dependency
+                                .insert(format!("t{j}"), rng.random_range(0.5..5.0f32));
+                        }
+                    }
+                }
+                t
+            })
+            .collect()
+    }
+
+    #[test]
+    fn index_kernel_matches_calculate_on_random_graphs() {
+        let mut rng = ChaCha8Rng::seed_from_u64(99);
+        let mut mismatches: Vec<String> = Vec::new();
+        for g in 0..20 {
+            let mut tasks = random_tasks(&mut rng);
+            let mut kernel = Kernel::new(&tasks).unwrap();
+            let makespan = kernel.run();
+            let result = CpmAlgorithm::calculate(&mut tasks);
+            if (makespan - result.critical_path_duration).abs() > 1e-3 {
+                mismatches.push(format!("graph {g}: makespan"));
+            }
+            for (i, t) in tasks.iter().enumerate() {
+                if (kernel.float[i] - t.float).abs() > 1e-3 {
+                    mismatches.push(format!("graph {g}: float of {}", t.id));
+                }
+            }
+        }
+        assert_eq!(mismatches, Vec::<String>::new());
+    }
+
+    #[test]
+    #[ignore = "timing probe: cargo test --release -- --ignored --nocapture"]
+    fn timing_1000_deliverables_2000_iterations() {
+        let mut rng = ChaCha8Rng::seed_from_u64(5);
+        let deliverables: Vec<serde_json::Value> = (0..1000)
+            .map(|i| {
+                let prereqs: Vec<String> = (0..i)
+                    .rev()
+                    .take(30)
+                    .filter(|_| rng.random_range(0..10) == 0)
+                    .map(|j| format!("d{j}"))
+                    .collect();
+                serde_json::json!({"id": format!("d{i}"), "owned_files": [],
+                    "prerequisites": prereqs,
+                    "estimate": {"optimistic": 1.0, "likely": 3.0, "pessimistic": 9.0}})
+            })
+            .collect();
+        let graph: PlanGraph =
+            serde_json::from_value(serde_json::json!({ "deliverables": deliverables })).unwrap();
+        let start = std::time::Instant::now();
+        monte_carlo(
+            &graph,
+            &MonteCarloRequest {
+                iterations: 2000,
+                seed: 1,
+            },
+        )
+        .unwrap();
+        println!("TIMING 1000x2000: {:?}", start.elapsed());
+    }
 }

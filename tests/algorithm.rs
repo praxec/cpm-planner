@@ -283,3 +283,12 @@ fn backward_pass_subtracts_lag() {
     let a = result.tasks.iter().find(|t| t.id == "a").expect("a");
     assert!((a.latest_finish - 6.0).abs() < 0.001);
 }
+
+#[test]
+fn calculate_twice_after_shortening_is_correct() {
+    let mut tasks = vec![make_task("A", 5.0, vec![]), make_task("B", 2.0, vec!["A"])];
+    CpmAlgorithm::calculate(&mut tasks);
+    tasks[0].effort_hours = 1.0;
+    CpmAlgorithm::calculate(&mut tasks);
+    assert_eq!(tasks[1].earliest_start, 1.0);
+}

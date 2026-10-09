@@ -80,31 +80,6 @@ impl CpmAlgorithm {
         Self::build_result(tasks, batches, bottlenecks, unscheduled)
     }
 
-    /// Lightweight per-iteration kernel: forward pass, backward pass and float
-    /// only (no batches or bottlenecks). Leaves ES/EF/LS/LF/float set on every
-    /// task and returns the makespan (the largest earliest-finish). Tasks the
-    /// forward pass could not schedule (a cycle) are left out of the makespan.
-    pub fn forward_backward(tasks: &mut [Task]) -> f32 {
-        if tasks.is_empty() {
-            return 0.0;
-        }
-        // The forward pass only ever raises earliest start, so stale values from
-        // a previous call on the same tasks must be cleared first.
-        for t in tasks.iter_mut() {
-            t.earliest_start = 0.0;
-            t.earliest_finish = 0.0;
-        }
-        let (successors, predecessors) = Self::build_dependency_graphs(tasks);
-        let unscheduled = Self::forward_pass(tasks, &predecessors);
-        Self::backward_pass(tasks, &successors);
-        Self::calculate_float(tasks);
-        tasks
-            .iter()
-            .filter(|t| !unscheduled.contains(&t.id))
-            .map(|t| t.earliest_finish)
-            .fold(0.0, f32::max)
-    }
-
     /// Build forward (successors) and reverse (predecessors) dependency graphs
     fn build_dependency_graphs(
         tasks: &[Task],
@@ -150,6 +125,11 @@ impl CpmAlgorithm {
         tasks: &mut [Task],
         _predecessors: &HashMap<String, Vec<String>>,
     ) -> Vec<String> {
+        // Passes only ever raise ES, so clear stale values from earlier runs.
+        for task in tasks.iter_mut() {
+            task.earliest_start = 0.0;
+            task.earliest_finish = 0.0;
+        }
         let task_count = tasks.len();
         let task_map: HashMap<String, usize> = tasks
             .iter()
