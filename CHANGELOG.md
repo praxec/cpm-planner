@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `plan.get` returns the submitted plan graph for a `plan_id`.
 - Versioned SQLite schema (`PRAGMA user_version` = 2) with a `cpm_version`
   column; databases newer than the running binary are rejected.
+- `ttl_seconds` on `plan.acquire_cohort` and `plan.heartbeat`, clamped to `CPM_MAX_TTL_SECS` (default 8h) (#13).
 
 ### Fixed
 

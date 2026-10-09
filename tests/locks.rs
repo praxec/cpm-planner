@@ -12,7 +12,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use cpm_planner::audit::MemoryAuditSink;
 use cpm_planner::plan::{
     AcceptRequest, AcquireRequest, CallerId, Deliverable, DeliverableStatus, ForceReleaseRequest,
-    MarkStatusRequest, PlanGraph, PlannerError,
+    HeartbeatRequest, MarkStatusRequest, PlanGraph, PlannerError,
 };
 use cpm_planner::ports::Planner;
 use cpm_planner::{BasicCpmPlanner, MAX_ATTEMPTS, MAX_LAPSES};
@@ -103,6 +103,137 @@ async fn ttl_expiry_test() {
         .expect("plan.lock.expired emitted");
     assert_eq!(expiry.payload["deliverable_id"], "a");
     assert_eq!(expiry.payload["last_caller_id"], "c1");
+}
+
+#[tokio::test]
+async fn acquire_with_ttl_sets_lock_expiry() {
+    let audit = Arc::new(MemoryAuditSink::new());
+    let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let clock = TestClock::new(t0);
+    let clock_arc = clock.clone();
+    let planner = BasicCpmPlanner::with_parts(
+        audit,
+        Duration::from_secs(5 * 60),
+        Arc::new(move || clock_arc.read()),
+    );
+    let graph = PlanGraph {
+        deliverables: vec![deliverable("a", &["src/a.rs"], &[], Some(1.0))],
+        max_chained_dispatch: None,
+    };
+    let plan_id = planner.submit_plan(graph).await.unwrap();
+    let cohort = planner
+        .acquire_cohort(
+            AcquireRequest::new(plan_id, caller("c1"), 1)
+                .with_ttl(Duration::from_secs(2 * 60 * 60)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        cohort.rows[0].lock.expires_at,
+        t0 + chrono::Duration::hours(2)
+    );
+}
+
+#[tokio::test]
+async fn acquire_ttl_above_max_is_clamped() {
+    let audit = Arc::new(MemoryAuditSink::new());
+    let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let clock = TestClock::new(t0);
+    let clock_arc = clock.clone();
+    let planner = BasicCpmPlanner::with_parts(
+        audit,
+        Duration::from_secs(5 * 60),
+        Arc::new(move || clock_arc.read()),
+    )
+    .with_max_ttl(Duration::from_secs(60 * 60));
+    let graph = PlanGraph {
+        deliverables: vec![deliverable("a", &["src/a.rs"], &[], Some(1.0))],
+        max_chained_dispatch: None,
+    };
+    let plan_id = planner.submit_plan(graph).await.unwrap();
+    let cohort = planner
+        .acquire_cohort(
+            AcquireRequest::new(plan_id, caller("c1"), 1)
+                .with_ttl(Duration::from_secs(5 * 60 * 60)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        cohort.rows[0].lock.expires_at,
+        t0 + chrono::Duration::hours(1)
+    );
+}
+
+#[tokio::test]
+async fn heartbeat_with_ttl_extends_to_requested_duration() {
+    let audit = Arc::new(MemoryAuditSink::new());
+    let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let clock = TestClock::new(t0);
+    let clock_arc = clock.clone();
+    let planner = BasicCpmPlanner::with_parts(
+        audit,
+        Duration::from_secs(5 * 60),
+        Arc::new(move || clock_arc.read()),
+    );
+    let graph = PlanGraph {
+        deliverables: vec![deliverable("a", &["src/a.rs"], &[], Some(1.0))],
+        max_chained_dispatch: None,
+    };
+    let plan_id = planner.submit_plan(graph).await.unwrap();
+    planner
+        .acquire_cohort(AcquireRequest::new(plan_id.clone(), caller("c1"), 1))
+        .await
+        .unwrap();
+    planner
+        .heartbeat(
+            HeartbeatRequest::new(plan_id.clone(), "a", caller("c1"))
+                .with_ttl(Duration::from_secs(3 * 60 * 60)),
+        )
+        .await
+        .unwrap();
+    let lock = planner
+        .status(&plan_id)
+        .await
+        .unwrap()
+        .locks_held
+        .into_iter()
+        .find(|l| l.deliverable_id == "a")
+        .expect("lock held");
+    assert_eq!(lock.expires_at, t0 + chrono::Duration::hours(3));
+}
+
+#[tokio::test]
+async fn lease_with_long_ttl_survives_past_default_ttl() {
+    let audit = Arc::new(MemoryAuditSink::new());
+    let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let clock = TestClock::new(t0);
+    let clock_arc = clock.clone();
+    let planner = BasicCpmPlanner::with_parts(
+        audit,
+        Duration::from_secs(5 * 60),
+        Arc::new(move || clock_arc.read()),
+    );
+    let graph = PlanGraph {
+        deliverables: vec![deliverable("a", &["src/a.rs"], &[], Some(1.0))],
+        max_chained_dispatch: None,
+    };
+    let plan_id = planner.submit_plan(graph).await.unwrap();
+    planner
+        .acquire_cohort(
+            AcquireRequest::new(plan_id.clone(), caller("c1"), 1)
+                .with_ttl(Duration::from_secs(60 * 60)),
+        )
+        .await
+        .unwrap();
+    clock.set(t0 + chrono::Duration::minutes(30));
+    let second = planner
+        .acquire_cohort(AcquireRequest::new(plan_id, caller("c2"), 1))
+        .await
+        .unwrap();
+    assert!(
+        second.rows.is_empty(),
+        "long-TTL lease must not be reaped after the default 5-minute TTL"
+    );
 }
 
 /// Defect fix: a lease lost to the ENVIRONMENT (driver killed externally,

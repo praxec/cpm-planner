@@ -638,3 +638,47 @@ async fn plan_acquire_cohort_rejects_empty_ids() {
         .expect_err("empty ids must be rejected");
     assert_eq!(err.message, "ids must be non-empty when provided");
 }
+
+#[tokio::test]
+async fn plan_acquire_cohort_rejects_zero_ttl() {
+    let server = server();
+    let plan_id = submit_plan(&server).await;
+    let err = server
+        .dispatch_call(call_args(
+            TOOL_ACQUIRE_COHORT,
+            json!({"plan_id": plan_id, "caller_id": "w", "max_count": 1, "ttl_seconds": 0}),
+        ))
+        .await
+        .expect_err("ttl_seconds 0 must be rejected");
+    assert!(
+        err.message.contains("ttl_seconds"),
+        "zero ttl must be an invalid-params error naming ttl_seconds; got: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn plan_heartbeat_accepts_ttl_seconds() {
+    let server = server();
+    let plan_id = submit_plan(&server).await;
+    let _ = server
+        .dispatch_call(call_args(
+            TOOL_ACQUIRE_COHORT,
+            json!({"plan_id": plan_id, "caller_id": "orchestrator-001", "max_count": 4}),
+        ))
+        .await
+        .expect("acquire ok");
+    let resp = server
+        .dispatch_call(call_args(
+            TOOL_HEARTBEAT,
+            json!({
+                "plan_id": plan_id,
+                "deliverable_id": "d1",
+                "caller_id": "orchestrator-001",
+                "ttl_seconds": 3600
+            }),
+        ))
+        .await
+        .expect("plan.heartbeat accepts ttl_seconds");
+    assert_eq!(resp["ok"].as_bool(), Some(true));
+}

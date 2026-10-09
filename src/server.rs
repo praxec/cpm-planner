@@ -44,6 +44,7 @@
 
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::plan::{
     AcceptRequest, AcquireRequest, CallerId, Cohort, DeliverableStatus, ForceReleaseRequest,
@@ -113,6 +114,8 @@ struct AcquireCohortArgs {
     ids: Option<Vec<String>>,
     #[serde(default)]
     filter: Option<AcquireFilter>,
+    #[serde(default)]
+    ttl_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,6 +142,8 @@ struct HeartbeatArgs {
     plan_id: String,
     deliverable_id: String,
     caller_id: String,
+    #[serde(default)]
+    ttl_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -266,6 +271,7 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                     "caller_id": { "type": "string" },
                     "max_count": { "type": "integer", "minimum": 1 },
                     "ids":       { "type": "array", "items": { "type": "string" } },
+                    "ttl_seconds": { "type": "integer", "minimum": 1 },
                     "filter":    {
                         "type": "object",
                         "properties": { "metadata": { "type": "object" } },
@@ -285,7 +291,8 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                 "properties": {
                     "plan_id":        { "type": "string" },
                     "deliverable_id": { "type": "string" },
-                    "caller_id":      { "type": "string" }
+                    "caller_id":      { "type": "string" },
+                    "ttl_seconds":    { "type": "integer", "minimum": 1 }
                 },
                 "required": ["plan_id", "deliverable_id", "caller_id"]
             })),
@@ -516,6 +523,9 @@ impl PlanServer {
         if let Some(filter) = parsed.filter.and_then(|f| f.metadata) {
             request = request.with_metadata_filter(filter);
         }
+        if let Some(ttl) = ttl_from_seconds(parsed.ttl_seconds)? {
+            request = request.with_ttl(ttl);
+        }
         let cohort: Cohort = self
             .planner
             .acquire_cohort(request)
@@ -537,12 +547,16 @@ impl PlanServer {
 
     async fn handle_heartbeat(&self, args: Value) -> Result<Value, McpError> {
         let parsed: HeartbeatArgs = parse_args(args)?;
+        let mut request = HeartbeatRequest::new(
+            PlanId(parsed.plan_id),
+            parsed.deliverable_id,
+            CallerId(parsed.caller_id),
+        );
+        if let Some(ttl) = ttl_from_seconds(parsed.ttl_seconds)? {
+            request = request.with_ttl(ttl);
+        }
         self.planner
-            .heartbeat(HeartbeatRequest::new(
-                PlanId(parsed.plan_id),
-                parsed.deliverable_id,
-                CallerId(parsed.caller_id),
-            ))
+            .heartbeat(request)
             .await
             .map_err(planner_error_to_mcp)?;
         to_value(&OkResponse::new())
@@ -685,6 +699,22 @@ fn parse_args<T: serde::de::DeserializeOwned>(args: Value) -> Result<T, McpError
         .map_err(|e| McpError::invalid_params(format!("invalid arguments: {e}"), None))
 }
 
+/// Convert an optional wire `ttl_seconds` into a lease TTL.
+///
+/// `None` means "use the planner default". `Some(0)` is rejected here, at
+/// the server layer, as invalid params; positive values pass through and
+/// the planner clamps them to its configured maximum.
+fn ttl_from_seconds(secs: Option<u64>) -> Result<Option<Duration>, McpError> {
+    match secs {
+        None => Ok(None),
+        Some(0) => Err(McpError::invalid_params(
+            "ttl_seconds must be >= 1 when provided",
+            None,
+        )),
+        Some(s) => Ok(Some(Duration::from_secs(s))),
+    }
+}
+
 /// Serialise a response into a JSON `Value`, mapping serde failures to
 /// `internal_error`. Each response type is a small struct or a wire type
 /// that already derives `Serialize`; this fallible boundary exists so the
@@ -720,6 +750,10 @@ Tools (eight total, all `plan.<verb>`):
   plan.get             — return the submitted PlanGraph (deliverables, estimates, files, metadata) for a plan_id
   plan.force_release   — operator escape hatch; emits audit event with `reason`; optional reset_counters:true also clears lapse/failure counters and revives a circuit-broken deliverable
   plan.accept          — a manager/owner marks a deliverable Complete without a lease (audited; evidence required; override_lock to take over a live lease)
+
+Leases default to 5 minutes. Pass ttl_seconds (≤ server max, default 8h)
+on acquire/heartbeat for long-running work, and heartbeat at least every
+ttl/3.
 
 Errors carry stable prefixes: LOCK_HELD, LOCK_NOT_HELD, LOCK_EXPIRED,
 OVERLAP_DETECTED, MISSING_PREREQUISITE, PLAN_NOT_FOUND,

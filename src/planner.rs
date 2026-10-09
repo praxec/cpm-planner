@@ -53,6 +53,12 @@ use crate::locks::PlanState;
 /// open-source default called out in SPEC §33 PA3.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(5 * 60);
 
+/// Default ceiling for a per-call lease TTL (`ttl_seconds`). Eight hours
+/// is generous enough for long-running work while still bounding a
+/// forgotten lease; override with `CPM_MAX_TTL_SECS` on the server or
+/// [`BasicCpmPlanner::with_max_ttl`] as a library.
+pub const DEFAULT_MAX_TTL: Duration = Duration::from_secs(8 * 60 * 60);
+
 /// Circuit-breaker: maximum number of times a deliverable may be
 /// EXPLICITLY marked failed (via [`Planner::mark_status`] with
 /// `status = Failed`) before the next [`Planner::acquire_cohort`]
@@ -113,6 +119,7 @@ pub struct BasicCpmPlanner {
     store: SqlitePlanStore,
     audit: Arc<dyn AuditSink>,
     ttl: Duration,
+    max_ttl: Duration,
     clock: ClockFn,
 }
 
@@ -133,6 +140,13 @@ impl BasicCpmPlanner {
     /// Override the lock TTL. Useful for short-lived integration tests.
     pub fn with_ttl(mut self, ttl: Duration) -> Self {
         self.ttl = ttl;
+        self
+    }
+
+    /// Override the maximum lease TTL a caller may request via
+    /// `ttl_seconds`. Requested values above this are clamped down to it.
+    pub fn with_max_ttl(mut self, max_ttl: Duration) -> Self {
+        self.max_ttl = max_ttl;
         self
     }
 
@@ -169,12 +183,19 @@ impl BasicCpmPlanner {
             store,
             audit,
             ttl,
+            max_ttl: DEFAULT_MAX_TTL,
             clock,
         }
     }
 
     fn now(&self) -> DateTime<Utc> {
         (self.clock)()
+    }
+
+    /// Effective lease TTL for one call: the caller-requested value (or
+    /// the planner default) clamped to the configured maximum.
+    fn effective_ttl(&self, requested: Option<Duration>) -> Duration {
+        requested.unwrap_or(self.ttl).min(self.max_ttl)
     }
 
     /// Flush buffered audit events. Called after the mutex is dropped so a
@@ -615,10 +636,11 @@ impl Planner for BasicCpmPlanner {
             max_count,
             ids,
             metadata_filter,
+            ttl,
         } = req;
         let now = self.now();
         let expires_at = now
-            + chrono::Duration::from_std(self.ttl)
+            + chrono::Duration::from_std(self.effective_ttl(ttl))
                 .expect("INVARIANT: planner TTL fits in chrono::Duration");
 
         // Whole acquire body runs inside one immediate sqlite transaction —
@@ -1002,12 +1024,13 @@ impl Planner for BasicCpmPlanner {
             plan_id,
             deliverable_id,
             caller_id,
+            ttl,
         } = req;
         let deliverable_id = deliverable_id.as_str();
         let caller_id = &caller_id;
         let now = self.now();
         let expires_at = now
-            + chrono::Duration::from_std(self.ttl)
+            + chrono::Duration::from_std(self.effective_ttl(ttl))
                 .expect("INVARIANT: planner TTL fits in chrono::Duration");
 
         self.store.mutate_plan(&plan_id, |state| {

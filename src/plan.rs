@@ -35,6 +35,7 @@
 //!   Implementations MUST emit an audit event carrying the supplied `reason`.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -182,6 +183,9 @@ pub struct AcquireRequest {
     /// When set, only deliverables whose `metadata` has every `(key, value)`
     /// pair (JSON equality) are considered. Non-matches are silently skipped.
     pub metadata_filter: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Requested lease TTL for this call. `None` uses the planner
+    /// default; the planner clamps the value to its configured maximum.
+    pub ttl: Option<Duration>,
 }
 
 impl AcquireRequest {
@@ -192,6 +196,7 @@ impl AcquireRequest {
             max_count,
             ids: None,
             metadata_filter: None,
+            ttl: None,
         }
     }
 
@@ -207,6 +212,14 @@ impl AcquireRequest {
         filter: serde_json::Map<String, serde_json::Value>,
     ) -> Self {
         self.metadata_filter = Some(filter);
+        self
+    }
+
+    /// Request a lease TTL for this acquire. `None` (the default) uses
+    /// the planner default TTL; the planner clamps the value to its
+    /// configured maximum.
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = Some(ttl);
         self
     }
 }
@@ -242,6 +255,9 @@ pub struct HeartbeatRequest {
     pub plan_id: PlanId,
     pub deliverable_id: String,
     pub caller_id: CallerId,
+    /// Requested lease TTL for this heartbeat. `None` uses the planner
+    /// default; the planner clamps the value to its configured maximum.
+    pub ttl: Option<Duration>,
 }
 
 impl HeartbeatRequest {
@@ -250,7 +266,16 @@ impl HeartbeatRequest {
             plan_id,
             deliverable_id: deliverable_id.into(),
             caller_id,
+            ttl: None,
         }
+    }
+
+    /// Request a lease TTL for this heartbeat. `None` (the default)
+    /// uses the planner default TTL; the planner clamps the value to
+    /// its configured maximum.
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = Some(ttl);
+        self
     }
 }
 

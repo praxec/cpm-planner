@@ -48,8 +48,8 @@ any other MCP server:
 | Tool | Does |
 |------|------|
 | `plan.submit` | Submit a task graph; returns a plan id (idempotent on the graph + caller). |
-| `plan.acquire_cohort` | Atomically acquire up to N ready deliverables with mutually disjoint file sets. |
-| `plan.heartbeat` | Refresh the TTL on a held lock. |
+| `plan.acquire_cohort` | Atomically acquire up to N ready deliverables with mutually disjoint file sets; optional `ttl_seconds` sets the lease TTL (clamped to the server maximum). |
+| `plan.heartbeat` | Refresh the TTL on a held lock; optional `ttl_seconds` sets the new TTL (clamped to the server maximum). |
 | `plan.mark_status` | Mark a deliverable complete/failed; releases its lock. |
 | `plan.status` | Read-only snapshot of the plan and its locks. |
 | `plan.get` | Return the stored plan graph for a plan_id (read back what was submitted). |
@@ -104,6 +104,15 @@ curl -fsSL https://raw.githubusercontent.com/praxec/packs/main/setup.sh | bash
 
 See the [pack registry](https://github.com/praxec/packs) for this tool's provider coordinates
 (container image / release binary) and which packs depend on it.
+
+## Environment variables
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `CPM_PLANNER_DB` | OS data dir (`~/.local/share/praxec/cpm-planner.db`) | SQLite path for durable, cross-process planner state; `:memory:` gives ephemeral state. |
+| `CPM_MAX_TTL_SECS` | `28800` (8h) | Server-side ceiling for `ttl_seconds` on `plan.acquire_cohort` and `plan.heartbeat`; larger requested values are clamped. Must be a positive integer — any other value aborts startup. |
+
+Leases default to 5 minutes. For long-running work pass `ttl_seconds` (≤ the server maximum) on acquire/heartbeat, and heartbeat at least every `ttl/3`.
 
 ## License
 
