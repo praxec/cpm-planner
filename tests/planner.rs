@@ -550,7 +550,7 @@ async fn status_ready_excludes_locked_deliverables() {
 }
 
 #[tokio::test]
-async fn acquire_cohort_prefers_lowest_float() {
+async fn acquire_cohort_prefers_critical_deliverable() {
     let (planner, plan_id) = submit_diamond_with_spare().await;
     let cohort = planner
         .acquire_cohort(AcquireRequest::new(
@@ -595,7 +595,10 @@ async fn acquire_prefers_longest_remaining_tail() {
         .acquire_cohort(AcquireRequest::new(plan_id, caller("w1"), 1))
         .await
         .unwrap();
-    assert_eq!(cohort.rows[0].deliverable.id, "a");
+    assert_eq!(
+        (cohort.rows.len(), cohort.rows[0].deliverable.id.as_str()),
+        (1, "a")
+    );
 }
 
 #[tokio::test]
