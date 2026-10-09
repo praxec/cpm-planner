@@ -14,7 +14,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Version of the CPM kernel's output semantics. Bump whenever a change
 /// alters any field of [`CriticalPathResult`] for the same input, so stored
-/// plans are recomputed on open (see `plan_store`).
+/// plans are recomputed on open (see `plan_store`). Bump also when
+/// `EffortEstimator` defaults change, since stored plans are recomputed with
+/// the current estimator.
 pub const CPM_VERSION: i64 = 1;
 
 const TIGHT_EPS: f32 = 1e-3;
@@ -434,8 +436,9 @@ impl CpmAlgorithm {
 
     /// Trace one longest chain backwards from the task with the maximum
     /// earliest finish, following predecessors whose EF equals the
-    /// successor's ES. Sink ties resolve to the later earliest start, then the smallest id; predecessor ties resolve to the smallest id. Bounded by the task
-    /// count so malformed (cyclic) input cannot loop.
+    /// successor's ES. Sink ties resolve to the later earliest start, then the
+    /// smallest id; predecessor ties resolve to the smallest id. Bounded by the
+    /// task count so malformed (cyclic) input cannot loop.
     fn trace_critical_path(tasks: &[Task]) -> Vec<String> {
         let by_id: HashMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
         let Some(sink) = tasks.iter().max_by(|a, b| {

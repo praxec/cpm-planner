@@ -478,3 +478,14 @@ async fn acquire_cohort_prefers_lowest_float() {
         .collect();
     assert_eq!(ids, vec!["A"]);
 }
+
+#[tokio::test]
+async fn submit_rejects_negative_effort() {
+    let planner = BasicCpmPlanner::new();
+    let graph = PlanGraph {
+        deliverables: vec![deliverable("a", &["src/a.rs"], &[], Some(-1.0))],
+        max_chained_dispatch: None,
+    };
+    let err = planner.submit_plan(graph).await.unwrap_err();
+    assert!(err.to_string().starts_with("INVALID_GRAPH"), "got: {err}");
+}

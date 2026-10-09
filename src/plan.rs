@@ -129,9 +129,8 @@ pub struct Deliverable {
     pub prerequisites: Vec<String>,
 
     /// Estimated wall-clock effort, used by critical-path math in
-    /// [`PlanStatus::critical_path`]. `None` means the implementation
-    /// should treat the duration as one unit when computing the longest
-    /// chain.
+    /// [`PlanStatus::critical_path`]. `None` means the planner derives an
+    /// estimate with `EffortEstimator`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_effort_hours: Option<f32>,
 
@@ -330,7 +329,10 @@ pub struct PlanStatus {
     #[serde(default)]
     pub schedule: Vec<ScheduleRow>,
     /// Deliverables with status `Ready` and no live lock, sorted by
-    /// `(float, es, id)` ascending.
+    /// `(float, es, id)` ascending. Same ordering as
+    /// [`crate::ports::Planner::acquire_cohort`] (shared `priority_key`);
+    /// membership is a superset: acquire may still skip deliverables at the
+    /// failure or lapse cap or whose files overlap a held lock.
     #[serde(default)]
     pub ready: Vec<String>,
 }

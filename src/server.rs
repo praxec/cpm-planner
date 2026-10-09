@@ -276,7 +276,9 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
             Cow::Borrowed(TOOL_STATUS),
             Cow::Borrowed(
                 "Read-only snapshot: per-deliverable [id, status, attempt_count, \
-                 failure_count, lapse_count] rows, critical path, held locks.",
+                 failure_count, lapse_count] rows, critical_path (one real chain), \
+                 critical_ids, per-deliverable schedule (es/ef/ls/lf/float, hours), \
+                 the ready set in cohort priority order, and held locks.",
             ),
             schema_object(json!({
                 "type": "object",

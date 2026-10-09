@@ -8,7 +8,7 @@
 //! # Atomicity & persistence
 //!
 //! All state lives in a [`SqlitePlanStore`]. Every mutating method runs
-//! its entire body — load [`PlanState`], apply the existing in-memory
+//! its entire body — load `PlanState`, apply the existing in-memory
 //! scheduling logic, write back — inside ONE `BEGIN IMMEDIATE` SQLite
 //! transaction. That is what makes "acquire N disjoint deliverables
 //! together" a single observable step, and because the write lock is
@@ -65,7 +65,7 @@ pub const DEFAULT_TTL: Duration = Duration::from_secs(5 * 60);
 /// This is the retry budget for the DURABLE, cross-process deliverable lease
 /// (distinct from `execution_policy`'s in-process async retry): the decision to
 /// keep leasing vs. circuit-break is expressed through that crate's
-/// [`RetryDecision`] ([`lease_retry_decision`]), and a broken deliverable is
+/// [`RetryDecision`] (`lease_retry_decision`), and a broken deliverable is
 /// classified [`FailureClass::Permanent`].
 pub const MAX_ATTEMPTS: u32 = 3;
 
@@ -95,8 +95,8 @@ fn lease_retry_decision(failure_count: u32) -> RetryDecision {
 /// Legacy flat fallback for missing effort estimates.
 ///
 /// As of CMP-016 the planner no longer uses this: when a deliverable omits
-/// `estimated_effort_hours`, [`deliverable_to_task`] asks an
-/// [`EffortEstimator`] for a kind-aware estimate instead of substituting a
+/// `estimated_effort_hours`, `crate::schedule::deliverable_to_task` asks an
+/// [`crate::estimator::EffortEstimator`] for a kind-aware estimate instead of substituting a
 /// flat one hour. The constant is retained as a documented reference value
 /// for callers that want the historical default.
 pub const DEFAULT_EFFORT_HOURS: f32 = 1.0;
@@ -257,6 +257,20 @@ fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
         if !seen_ids.insert(d.id.as_str()) {
             return Err(PlannerError::InvalidGraph {
                 reason: format!("duplicate deliverable id '{}'", d.id),
+            });
+        }
+    }
+
+    // Effort estimates, when present, must be finite and non-negative.
+    for d in &graph.deliverables {
+        if let Some(h) = d.estimated_effort_hours
+            && (h < 0.0 || !h.is_finite())
+        {
+            return Err(PlannerError::InvalidGraph {
+                reason: format!(
+                    "deliverable '{}' has invalid estimated_effort_hours {h}; must be a finite number >= 0",
+                    d.id
+                ),
             });
         }
     }
@@ -856,7 +870,9 @@ impl Planner for BasicCpmPlanner {
                         && !state.locks.contains_key(&r.id)
                 })
                 .collect();
-            // Same ordering as `acquire_cohort`, so the two can never disagree.
+            // Same ordering as acquire_cohort (shared priority_key). Membership is a
+            // superset: acquire may still skip deliverables at the failure or lapse
+            // cap or whose files overlap a held lock.
             let sched_by_id: HashMap<&str, (f32, f32)> = state
                 .cached_result
                 .tasks

@@ -23,7 +23,7 @@
 ## Review Focus
 
 1. **Plans persisted before this change** — opening the store must repair their `cached_result` (Task 3 test writes a stale row then reopens).
-2. **Ties** — two sinks with equal max EF, or two tight predecessors: output must be deterministic (smallest id wins) — Task 1 test.
+2. **Ties** — two sinks with equal max EF, or two tight predecessors: output must be deterministic (sink: later earliest start, then smallest id; predecessor: smallest id) — Task 1 test.
 3. **Duplicate prerequisite ids** (`["A","A"]`) — must schedule, not silently drop the task into `unscheduled` — Task 1 test.
 4. **Zero-effort deliverables** (milestone-like, effort 0) on the path — the backward trace must not loop or stop early — Task 1 test.
 5. **Ready set with live locks** — locked Ready deliverables must not appear in `ready` — Task 2 test.
