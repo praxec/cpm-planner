@@ -159,6 +159,22 @@ pub(crate) fn release_file_claims(
     }
 }
 
+/// The single re-derivation rule: `Ready` if every prerequisite of `d` is
+/// `Complete` in `statuses`, else `Pending`. Used by the in-memory reaper, the
+/// startup reaper in the store, and plan revision.
+pub(crate) fn rederive_status(
+    d: &crate::plan::Deliverable,
+    statuses: &HashMap<String, DeliverableStatus>,
+) -> DeliverableStatus {
+    if crate::graph::prerequisite_ids(d)
+        .all(|p| statuses.get(p) == Some(&DeliverableStatus::Complete))
+    {
+        DeliverableStatus::Ready
+    } else {
+        DeliverableStatus::Pending
+    }
+}
+
 impl PlanState {
     pub(crate) fn new(
         graph: PlanGraph,
@@ -231,20 +247,14 @@ impl PlanState {
                 *self.lapse_counts.entry(id.clone()).or_insert(0) += 1;
                 // Re-derive rather than assume Ready: after a revision the
                 // lease can sit above a prerequisite that is no longer Complete.
-                let prereqs_complete = self
+                let status = self
                     .graph
                     .deliverables
                     .iter()
                     .find(|d| d.id == id)
-                    .is_none_or(|d| {
-                        crate::graph::prerequisite_ids(d)
-                            .all(|p| self.statuses.get(p) == Some(&DeliverableStatus::Complete))
+                    .map_or(DeliverableStatus::Ready, |d| {
+                        rederive_status(d, &self.statuses)
                     });
-                let status = if prereqs_complete {
-                    DeliverableStatus::Ready
-                } else {
-                    DeliverableStatus::Pending
-                };
                 self.statuses.insert(id, status);
                 reaped.push(info);
             }

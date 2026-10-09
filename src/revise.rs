@@ -33,7 +33,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::graph::prerequisite_ids;
-use crate::locks::{FileClaim, PlanState, add_file_claims};
+use crate::locks::{FileClaim, PlanState, add_file_claims, rederive_status, release_file_claims};
 use crate::plan::{Deliverable, DeliverableStatus, PlanGraph, PlannerError, PrerequisiteKind};
 use crate::planner::{canonical_deliverable, validate_graph};
 use chrono::{DateTime, Utc};
@@ -80,14 +80,31 @@ fn prereq_set(d: &Deliverable) -> BTreeSet<&str> {
 /// A lock with `expires_at < now` is not live: it never blocks removal, is not
 /// kept, and its deliverable is re-derived from its prerequisites.
 ///
+/// Precondition: the caller has already reaped expired locks (so lapse
+/// accounting and the `lock expired` audit happened). Debug builds assert it;
+/// release builds defend by ignoring the expired lock and counting one lapse
+/// for a surviving deliverable that loses its lease here.
+///
+/// Surviving leases are re-claimed in graph order. If two now claim
+/// conflicting files: without `force` the revision is refused with
+/// `LOCK_HELD`; with `force` the lease of the deliverable whose `owned_files`
+/// changed in this revision is released (listed in `released_locks`, status
+/// re-derived), falling back to the later one in graph order when neither or
+/// both changed.
+///
 /// Errors: `LOCK_HELD` when a removed deliverable holds a live lock, or two
-/// surviving leases would claim conflicting files, and `force` is false; any error from the CPM recomputation on `new`.
+/// surviving leases would claim conflicting files, and `force` is false; any
+/// error from the CPM recomputation on `new`.
 pub(crate) fn plan_revision(
     old: &PlanState,
     new: &PlanGraph,
     force: bool,
     now: DateTime<Utc>,
 ) -> Result<(PlanState, RevisionDiff), PlannerError> {
+    debug_assert!(
+        old.locks.values().all(|l| l.expires_at >= now),
+        "plan_revision requires expired locks to be reaped first"
+    );
     validate_graph(new)?;
     let cached_result = crate::schedule::compute_cpm(new)?;
     let live = |id: &str| old.locks.get(id).filter(|l| l.expires_at >= now);
@@ -262,54 +279,70 @@ pub(crate) fn plan_revision(
         .filter(|(k, _)| survives(k))
         .map(|(k, v)| (k.clone(), *v))
         .collect();
+    for (id, l) in &old.locks {
+        if l.expires_at < now && survives(id) {
+            *state.lapse_counts.entry(id.clone()).or_insert(0) += 1;
+        }
+    }
     state.locks = old
         .locks
         .iter()
         .filter(|(k, l)| survives(k) && l.expires_at >= now)
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    // Rebuild claims from the NEW definitions in graph order; the earlier
-    // claimant wins a conflict.
+    // Rebuild claims from the NEW definitions in graph order.
+    let files_changed = |id: &str| {
+        old_by_id.get(id).is_some_and(|o| {
+            canonical_deliverable(o)["owned_files"]
+                != canonical_deliverable(new_by_id[id])["owned_files"]
+        })
+    };
     for d in &new.deliverables {
-        let Some(lock) = state.locks.get(&d.id) else {
+        if !state.locks.contains_key(&d.id) {
             continue;
-        };
-        let clash = d.owned_files.iter().find_map(|f| {
-            state
-                .file_claims
-                .get(f.path())
-                .filter(|c| c.conflicts_with(f.mode()))
-        });
-        let Some(claim) = clash else {
-            add_file_claims(&mut state.file_claims, &d.id, &d.owned_files);
-            continue;
-        };
-        if !force {
+        }
+        loop {
+            let clash = d.owned_files.iter().find_map(|f| {
+                state
+                    .file_claims
+                    .get(f.path())
+                    .filter(|c| c.conflicts_with(f.mode()))
+            });
+            let Some(claim) = clash else {
+                add_file_claims(&mut state.file_claims, &d.id, &d.owned_files);
+                break;
+            };
             let holder_id = match claim {
                 FileClaim::Exclusive(h) => h.clone(),
                 FileClaim::Append(set) => set.iter().next().cloned().unwrap_or_default(),
             };
-            let holder = state
-                .locks
-                .get(&holder_id)
-                .map_or(holder_id, |l| l.caller_id.0.clone());
-            return Err(PlannerError::LockHeld {
-                plan_id: lock.plan_id.0.clone(),
-                deliverable_id: d.id.clone(),
-                holder,
-            });
+            if !force {
+                let holder = state
+                    .locks
+                    .get(&holder_id)
+                    .map_or_else(|| holder_id.clone(), |l| l.caller_id.0.clone());
+                return Err(PlannerError::LockHeld {
+                    plan_id: state.locks[&d.id].plan_id.0.clone(),
+                    deliverable_id: d.id.clone(),
+                    holder,
+                });
+            }
+            let release_holder = files_changed(&holder_id) && !files_changed(&d.id);
+            let victim = if release_holder {
+                holder_id
+            } else {
+                d.id.clone()
+            };
+            let vd = new_by_id[victim.as_str()];
+            state.locks.remove(&victim);
+            release_file_claims(&mut state.file_claims, &victim, &vd.owned_files);
+            diff.released_locks.push(victim.clone());
+            let status = rederive_status(vd, &state.statuses);
+            state.statuses.insert(victim, status);
+            if !release_holder {
+                break;
+            }
         }
-        state.locks.remove(&d.id);
-        diff.released_locks.push(d.id.clone());
-        let ok = prereq_set(d)
-            .iter()
-            .all(|p| state.statuses.get(*p) == Some(&DeliverableStatus::Complete));
-        let status = if ok {
-            DeliverableStatus::Ready
-        } else {
-            DeliverableStatus::Pending
-        };
-        state.statuses.insert(d.id.clone(), status);
     }
     diff.released_locks.sort();
     Ok((state, diff))
@@ -783,17 +816,18 @@ mod tests {
         assert!(matches!(err, PlannerError::InvalidGraph { .. }));
     }
 
-    fn expired_leased() -> PlanState {
+    fn reaped_expired() -> PlanState {
         let mut old = leased();
         let l = old.locks.get_mut("a").expect("lock");
         l.expires_at = Utc::now() - chrono::Duration::hours(1);
+        old.reap_expired(Utc::now());
         old
     }
 
     #[test]
     fn expired_lease_does_not_block_removal() {
         let res = plan_revision(
-            &expired_leased(),
+            &reaped_expired(),
             &graph(vec![dl("b", &[], 1.0)]),
             false,
             Utc::now(),
@@ -804,10 +838,52 @@ mod tests {
     #[test]
     fn expired_lease_is_not_kept_and_is_rederived() {
         let (new, _) = revise(
-            &expired_leased(),
+            &reaped_expired(),
             graph(vec![dl("a", &[], 1.0), dl("b", &[], 1.0)]),
         );
         assert!(new.locks.is_empty() && new.statuses["a"] == Ready);
+    }
+
+    #[test]
+    fn expired_lease_is_counted_as_lapse_when_reaped_first() {
+        let (new, _) = revise(
+            &reaped_expired(),
+            graph(vec![dl("a", &[], 1.0), dl("b", &[], 1.0)]),
+        );
+        assert_eq!(new.lapse_count("a"), 1);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "reaped first")]
+    fn plan_revision_requires_reaped_locks() {
+        let mut old = leased();
+        let l = old.locks.get_mut("a").expect("lock");
+        l.expires_at = Utc::now() - chrono::Duration::hours(1);
+        let _ = plan_revision(&old, &graph(vec![dl("b", &[], 1.0)]), false, Utc::now());
+    }
+
+    #[test]
+    fn forced_conflict_releases_the_deliverable_whose_files_changed() {
+        let mut old = state(
+            graph(vec![
+                claiming(dl("x", &[], 1.0), "a.rs"),
+                claiming(dl("y", &[], 1.0), "f.rs"),
+            ]),
+            &[("x", InProgress), ("y", InProgress)],
+        );
+        old.locks.insert("x".into(), lock("x"));
+        old.locks.insert("y".into(), lock("y"));
+        let g = graph(vec![
+            claiming(dl("x", &[], 1.0), "f.rs"),
+            claiming(dl("y", &["x"], 1.0), "f.rs"),
+        ]);
+        let (new, diff) = plan_revision(&old, &g, true, Utc::now()).expect("forced");
+        assert!(
+            diff.released_locks == vec!["x".to_string()]
+                && new.file_claims.get(&PathBuf::from("f.rs"))
+                    == Some(&FileClaim::Exclusive("y".into()))
+        );
     }
 
     fn chain_abc(c_pre: &[&str], b_effort: f32, b_pre: &[&str]) -> PlanGraph {

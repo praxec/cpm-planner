@@ -142,7 +142,8 @@ impl SqlitePlanStore {
     }
 
     /// Reap every lock whose TTL lapsed before `now`: the deliverable
-    /// goes back to `ready`, its `lapse_count` is incremented (the lease
+    /// is re-derived (`ready` if every prerequisite is complete, else
+    /// `pending`), its `lapse_count` is incremented (the lease
     /// was lost ENVIRONMENTALLY — no terminal mark was ever recorded —
     /// so it feeds the lapse bound, never the failure circuit-breaker),
     /// and the lock row is deleted. Also resets any orphaned
@@ -157,31 +158,80 @@ impl SqlitePlanStore {
             .map_err(|_| anyhow!("planner store mutex poisoned"))?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let ready = serde_json::to_string(&DeliverableStatus::Ready)?;
         let in_progress = serde_json::to_string(&DeliverableStatus::InProgress)?;
         let now_us = now.timestamp_micros();
 
-        tx.execute(
-            "UPDATE deliverable_statuses SET status = ?1, lapse_count = lapse_count + 1
-             WHERE (plan_id, deliverable_id) IN
-                   (SELECT plan_id, deliverable_id FROM locks WHERE expires_at_us < ?2)",
-            params![ready, now_us],
-        )?;
+        // Targets: deliverables with an expired lock, plus orphaned
+        // in_progress ones with no lock at all (cannot be legitimately held
+        // by anyone). Losing the lease without a terminal mark is an
+        // environmental loss, so each counts as a lapse.
+        let expired: Vec<(String, String)> = {
+            let mut stmt =
+                tx.prepare("SELECT plan_id, deliverable_id FROM locks WHERE expires_at_us < ?1")?;
+            stmt.query_map(params![now_us], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<_, _>>()?
+        };
+        let orphans: Vec<(String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT plan_id, deliverable_id FROM deliverable_statuses
+                 WHERE status = ?1
+                   AND (plan_id, deliverable_id) NOT IN
+                       (SELECT plan_id, deliverable_id FROM locks)",
+            )?;
+            stmt.query_map(params![in_progress], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<_, _>>()?
+        };
+
+        // Re-derive (Ready if every prerequisite is Complete, else Pending)
+        // with the same rule as the in-memory reaper.
+        type PlanSnapshot = Option<(PlanGraph, HashMap<String, DeliverableStatus>)>;
+        let mut plans: HashMap<String, PlanSnapshot> = HashMap::new();
+        for (plan_id, deliverable_id) in expired.iter().chain(orphans.iter()) {
+            if !plans.contains_key(plan_id) {
+                let graph: Option<PlanGraph> = tx
+                    .query_row(
+                        "SELECT graph FROM plans WHERE plan_id = ?1",
+                        params![plan_id],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .and_then(|g| serde_json::from_str(&g).ok());
+                let mut statuses = HashMap::new();
+                let mut stmt = tx.prepare(
+                    "SELECT deliverable_id, status FROM deliverable_statuses WHERE plan_id = ?1",
+                )?;
+                for row in stmt.query_map(params![plan_id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })? {
+                    let (id, st) = row?;
+                    if let Ok(st) = serde_json::from_str(&st) {
+                        statuses.insert(id, st);
+                    }
+                }
+                plans.insert(plan_id.clone(), graph.map(|g| (g, statuses)));
+            }
+            // An undecodable stored graph cannot be consulted: fall back to Ready.
+            let status = plans
+                .get(plan_id)
+                .and_then(Option::as_ref)
+                .and_then(|(g, st)| {
+                    g.deliverables
+                        .iter()
+                        .find(|d| &d.id == deliverable_id)
+                        .map(|d| crate::locks::rederive_status(d, st))
+                })
+                .unwrap_or(DeliverableStatus::Ready);
+            tx.execute(
+                "UPDATE deliverable_statuses SET status = ?1, lapse_count = lapse_count + 1
+                 WHERE plan_id = ?2 AND deliverable_id = ?3",
+                params![serde_json::to_string(&status)?, plan_id, deliverable_id],
+            )?;
+        }
         let reaped = tx.execute(
             "DELETE FROM locks WHERE expires_at_us < ?1",
             params![now_us],
         )?;
-
-        // Orphaned in_progress with no lock at all: cannot be legitimately
-        // held by anyone, so it goes back to the pool. Losing the lock row
-        // without a terminal mark is an environmental loss — count the lapse.
-        let orphaned = tx.execute(
-            "UPDATE deliverable_statuses SET status = ?1, lapse_count = lapse_count + 1
-             WHERE status = ?2
-               AND (plan_id, deliverable_id) NOT IN
-                   (SELECT plan_id, deliverable_id FROM locks)",
-            params![ready, in_progress],
-        )?;
+        let orphaned = orphans.len();
 
         tx.commit()?;
         if reaped > 0 || orphaned > 0 {
