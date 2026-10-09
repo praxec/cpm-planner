@@ -198,9 +198,10 @@ pub(crate) fn record_reported(
 /// Copy the actuals of `ids` from plan `from` to plan `to` (a selection
 /// carrying their `Complete` status). Merged into an existing row of `to`:
 /// leased hours add up, evidence is `from`'s then `to`'s (only the newest
-/// [`crate::plan::MAX_EVIDENCE_ENTRIES`] kept, oldest dropped first), and `to`'s
-/// percent and actual hours win where set. Ids without a row in `from` are
-/// skipped.
+/// [`crate::plan::MAX_EVIDENCE_ENTRIES`] kept, oldest dropped first), and
+/// `from`'s percent and actual hours win where set (`from` is the carried,
+/// `Complete` deliverable, so its reports are authoritative). Ids without a
+/// row in `from` are skipped.
 pub(crate) fn carry_actuals(
     conn: &Connection,
     from: &PlanId,
@@ -234,8 +235,8 @@ pub(crate) fn carry_actuals(
             params![
                 to.0,
                 id,
-                new.earned_pct.or(old.earned_pct),
-                new.actual_hours.or(old.actual_hours).map(f64::from),
+                old.earned_pct.or(new.earned_pct),
+                old.actual_hours.or(new.actual_hours).map(f64::from),
                 f64::from(old.leased_hours) + f64::from(new.leased_hours),
                 evidence,
                 at.timestamp_micros()
@@ -546,6 +547,40 @@ mod tests {
             .collect();
         let got = store.read_tx(|tx| load_actuals(tx, &new)).unwrap();
         assert_eq!(got["a"].evidence, expected);
+    }
+
+    #[test]
+    fn select_carry_prefers_source_reported_actuals() {
+        let (store, old) = store_with_plan();
+        let new = store
+            .submit_or_get("h2", || {
+                let graph = PlanGraph {
+                    deliverables: vec![],
+                    max_chained_dispatch: None,
+                };
+                Ok((
+                    PlanId("q".into()),
+                    PlanState::new(graph, HashMap::new(), Default::default()),
+                ))
+            })
+            .unwrap();
+        let report = |pct: u8, hours: f32| ReportedActuals {
+            earned_pct: Some(pct),
+            actual_hours: Some(hours),
+            evidence: None,
+        };
+        store
+            .write_tx(|tx| {
+                record_reported(tx, &old, "a", &report(80, 5.0), at(1))?;
+                record_reported(tx, &new, "a", &report(10, 1.0), at(2))?;
+                carry_actuals(tx, &old, &new, &["a".to_string()], at(3))
+            })
+            .unwrap();
+        let got = store.read_tx(|tx| load_actuals(tx, &new)).unwrap();
+        assert_eq!(
+            (got["a"].earned_pct, got["a"].actual_hours),
+            (Some(80), Some(5.0))
+        );
     }
 
     #[test]
