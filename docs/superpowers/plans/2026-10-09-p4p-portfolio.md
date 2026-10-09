@@ -14,7 +14,7 @@
 
 - Plan directory: `<repo root>/.cpm-planner/plans/<name>/<variant>.json`. Repo root = `CPM_PROJECT_ROOT` if set, else the nearest ancestor of the server's cwd containing `.cpm-planner/` or `.git`. `name` and `variant` match `^[a-z0-9][a-z0-9._-]{0,63}$`.
 - Path safety: every path argument is relative to the repo root, canonicalized, and must resolve inside `<root>/.cpm-planner/plans/`; `..`, absolute paths, and symlinks escaping the root are rejected with `INVALID_PATH:`. Writes never follow symlinks.
-- When the server cannot read the project (no root found), `plan.sync` accepts the graph inline (`graph` + `path` used only for naming); file-reading features report `definition_drift: null` (unknown), never an error.
+- When the server cannot read the project (no root found), file-reading features report `definition_drift: null` (unknown), never an error; an inline `plan.sync` graph requires `name` (Task 7).
 - Many variants may be designed; exactly one variant per plan line is selected. Execution tools (`acquire_cohort`, `heartbeat`, `mark_status`, `accept`, later `baseline`) on a non-selected variant's `plan_id` → `VARIANT_NOT_SELECTED: plan <plan_id> is variant '<v>' of '<name>'; selected is '<s>'`. Read/analysis tools work on any variant.
 - Legacy and unnamed plans (`plan.submit` without `name`) behave exactly as today and are never subject to `VARIANT_NOT_SELECTED`.
 - `plan.submit` dedup is scoped: named submissions dedup within (project, name, variant) only; unnamed keep the global graph-hash dedup.
