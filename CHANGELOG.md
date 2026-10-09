@@ -46,6 +46,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `duration_hours` (calendar time) per deliverable and `lag_hours` per prerequisite edge drive the schedule; effort stays the cost basis (#27).
 - `milestone: true` deliverables; `plan.status` reports per-milestone critical path and hours (#22).
 - `owned_files` entries may be `{path, mode: "append"}`; append claims may be co-leased and are reported in the cohort's `shared_paths` (#28).
+- `plan.baseline` freezes a plan's CPM schedule and budgets (effort × `metadata.cost_rate`) as a numbered earned-value baseline, with an optional working-time `calendar`; re-baselining requires a `reason`, keeps actuals and is audited as `plan.ev.baselined` (#16).
+- `plan.ev` reports PV, EV, AC, SV, CV, SPI, CPI, EAC, ETC, VAC and TCPI against the latest baseline as of any instant; undefined ratios are `null` with a reason in `undefined`, never NaN (#16).
+- `plan.snapshot` appends an EV snapshot and returns its summary with a JSON or Markdown (date, PV, EV, AC, SPI, CPI, EAC) export of the newest 100 snapshots; `SPI_BELOW_0_9` / `CPI_BELOW_0_9` alerts fire when the metric is below 0.9 on the two latest snapshots (#16).
+- Stable `NOT_BASELINED` error prefix for `plan.ev` and `plan.snapshot` on a plan without a baseline.
+- Library: `BasicCpmPlanner::baseline`, `earned_value` and `snapshot`; `earned_value::{BaselineRequest, BaselineOutcome, SnapshotRequest, SnapshotOutcome, SnapshotSummary, SnapshotFormat, trend_alerts, render_snapshots_markdown}`; `PlannerError::NotBaselined`.
 
 ### Fixed
 
