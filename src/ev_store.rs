@@ -197,7 +197,8 @@ pub(crate) fn record_reported(
 
 /// Copy the actuals of `ids` from plan `from` to plan `to` (a selection
 /// carrying their `Complete` status). Merged into an existing row of `to`:
-/// leased hours add up, evidence is `from`'s then `to`'s, and `to`'s
+/// leased hours add up, evidence is `from`'s then `to`'s (only the newest
+/// [`crate::plan::MAX_EVIDENCE_ENTRIES`] kept, oldest dropped first), and `to`'s
 /// percent and actual hours win where set. Ids without a row in `from` are
 /// skipped.
 pub(crate) fn carry_actuals(
@@ -219,6 +220,11 @@ pub(crate) fn carry_actuals(
         let new = target.remove(id).unwrap_or_default();
         let mut evidence = old.evidence.clone();
         evidence.extend(new.evidence);
+        // Keep the newest entries only, so a merged row never exceeds the cap.
+        let excess = evidence
+            .len()
+            .saturating_sub(crate::plan::MAX_EVIDENCE_ENTRIES);
+        evidence.drain(..excess);
         let evidence = serde_json::to_string(&evidence).map_err(backend)?;
         conn.execute(
             "INSERT OR REPLACE INTO ev_actuals
@@ -502,6 +508,44 @@ mod tests {
             .unwrap();
         let got = store.read_tx(|tx| load_actuals(tx, &plan_id)).unwrap();
         assert_eq!(got["a"].leased_hours, 1.0);
+    }
+
+    #[test]
+    fn select_merge_keeps_newest_100_evidence_entries() {
+        let (store, old) = store_with_plan();
+        let new = store
+            .submit_or_get("h2", || {
+                let graph = PlanGraph {
+                    deliverables: vec![],
+                    max_chained_dispatch: None,
+                };
+                Ok((
+                    PlanId("q".into()),
+                    PlanState::new(graph, HashMap::new(), Default::default()),
+                ))
+            })
+            .unwrap();
+        let note = |e: String| ReportedActuals {
+            evidence: Some(e),
+            ..Default::default()
+        };
+        store
+            .write_tx(|tx| {
+                for i in 0..70 {
+                    record_reported(tx, &old, "a", &note(format!("o{i}")), at(1))?;
+                }
+                for i in 0..40 {
+                    record_reported(tx, &new, "a", &note(format!("n{i}")), at(2))?;
+                }
+                carry_actuals(tx, &old, &new, &["a".to_string()], at(3))
+            })
+            .unwrap();
+        let expected: Vec<String> = (10..70)
+            .map(|i| format!("o{i}"))
+            .chain((0..40).map(|i| format!("n{i}")))
+            .collect();
+        let got = store.read_tx(|tx| load_actuals(tx, &new)).unwrap();
+        assert_eq!(got["a"].evidence, expected);
     }
 
     #[test]
