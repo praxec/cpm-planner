@@ -17,11 +17,13 @@
 #   --base-url URL       Release base URL (default: https://github.com/praxec/cpm-planner/releases)
 #   --print-target       Print the resolved target triple and exit (no network)
 #   --dry-run            Print resolved URLs and exit (no install)
+#   --add-to-path        Append the install dir to PATH in your shell rc file (opt-in)
 #   -h, --help           Show this help
 #
 # Environment overrides (mirrors, air-gapped hosts, and tests):
 #   PRAXEC_REPO PRAXEC_BIN PRAXEC_VERSION PRAXEC_INSTALL_DIR PRAXEC_BASE_URL
 #   PRAXEC_OS PRAXEC_ARCH PRAXEC_MAX_BYTES
+#   PRAXEC_ALLOW_INSECURE=1   allow non-https base URLs (tests/local mirrors only)
 #
 # This installer only ever writes the binary into --install-dir. Application
 # state and configuration live elsewhere (see the README) and are never touched.
@@ -33,11 +35,13 @@ DEFAULT_BIN="cpm-planner"
 REPO="${PRAXEC_REPO:-$DEFAULT_REPO}"
 BIN="${PRAXEC_BIN:-$DEFAULT_BIN}"
 VERSION="${PRAXEC_VERSION:-latest}"
-INSTALL_DIR="${PRAXEC_INSTALL_DIR:-${HOME:-/tmp}/.local/bin}"
+INSTALL_DIR="${PRAXEC_INSTALL_DIR:-}"
 BASE_URL="${PRAXEC_BASE_URL:-https://github.com/$REPO/releases}"
 MAX_BYTES="${PRAXEC_MAX_BYTES:-134217728}"
 PRINT_TARGET=0
 DRY_RUN=0
+ADD_TO_PATH=0
+ALLOW_INSECURE="${PRAXEC_ALLOW_INSECURE:-0}"
 
 say() { printf 'install: %s\n' "$*" >&2; }
 die() { printf 'install: error: %s\n' "$*" >&2; exit 1; }
@@ -45,7 +49,7 @@ die() { printf 'install: error: %s\n' "$*" >&2; exit 1; }
 usage() {
   cat <<'USAGE'
 usage: install.sh [--version TAG] [--install-dir DIR] [--base-url URL]
-                  [--print-target] [--dry-run]
+                  [--print-target] [--dry-run] [--add-to-path]
 USAGE
 }
 
@@ -59,10 +63,20 @@ while [ "$#" -gt 0 ]; do
     --base-url=*) BASE_URL="${1#*=}"; shift;;
     --print-target) PRINT_TARGET=1; shift;;
     --dry-run) DRY_RUN=1; shift;;
+    --add-to-path) ADD_TO_PATH=1; shift;;
     -h|--help) usage; exit 0;;
     *) die "unknown argument: $1";;
   esac
 done
+
+if [ -z "$INSTALL_DIR" ]; then
+  [ -n "${HOME:-}" ] || die "HOME is not set; pass --install-dir DIR"
+  INSTALL_DIR="$HOME/.local/bin"
+fi
+case "$BASE_URL" in
+  https://*) ;;
+  *) [ "$ALLOW_INSECURE" = "1" ] || die "refusing non-https base URL '$BASE_URL' (set PRAXEC_ALLOW_INSECURE=1 to override for local testing)";;
+esac
 
 detect_os() {
   if [ -n "${PRAXEC_OS:-}" ]; then printf '%s' "$PRAXEC_OS"; return 0; fi
@@ -116,13 +130,26 @@ ARCH=$(detect_arch)
 TARGET=$(target_triple "$OS" "$ARCH")
 EXT=$(asset_ext "$OS")
 ASSET="${BIN}-${TARGET}.${EXT}"
-if [ "$VERSION" = "latest" ]; then
-  RELEASE_URL="${BASE_URL}/latest/download"
+
+# curl hardening: https only (and TLS >= 1.2) unless explicitly overridden for local testing.
+if [ "$ALLOW_INSECURE" = "1" ]; then
+  CURL_SEC=""
 else
-  RELEASE_URL="${BASE_URL}/download/${VERSION}"
+  CURL_SEC="--proto =https --tlsv1.2"
 fi
-DOWNLOAD_URL="${RELEASE_URL}/${ASSET}"
-CHECKSUM_URL="${RELEASE_URL}/checksums.sha256"
+
+set_urls() {
+  RELEASE_URL="${BASE_URL}/download/${VERSION}"
+  DOWNLOAD_URL="${RELEASE_URL}/${ASSET}"
+  CHECKSUM_URL="${RELEASE_URL}/checksums.sha256"
+}
+if [ "$VERSION" = "latest" ] && [ "$DRY_RUN" -eq 1 ]; then
+  RELEASE_URL="${BASE_URL}/latest/download"
+  DOWNLOAD_URL="${RELEASE_URL}/${ASSET}"
+  CHECKSUM_URL="${RELEASE_URL}/checksums.sha256"
+else
+  [ "$VERSION" = "latest" ] || set_urls
+fi
 
 if [ "$PRINT_TARGET" -eq 1 ]; then
   printf '%s\n' "$TARGET"
@@ -140,13 +167,31 @@ command -v curl >/dev/null 2>&1 || die "curl is required to download release ass
 command -v tar >/dev/null 2>&1 || die "tar is required to extract release assets"
 
 work="$(mktemp -d "${TMPDIR:-/tmp}/cpm-planner.install.XXXXXX")"
-cleanup() { rm -rf "$work"; }
-trap cleanup EXIT HUP INT TERM
+tmpdest=""
+cleanup() {
+  rm -rf "$work"
+  [ -z "$tmpdest" ] || rm -f "$tmpdest"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+
+# Resolve "latest" to a concrete tag once, so the archive and checksums come from the same release.
+if [ "$VERSION" = "latest" ]; then
+  # shellcheck disable=SC2086
+  _final=$(curl -fsSLI $CURL_SEC --max-time 60 -o /dev/null -w '%{url_effective}' "${BASE_URL}/latest") \
+    || die "could not resolve the latest release from ${BASE_URL}/latest"
+  VERSION="${_final##*/}"
+  case "$VERSION" in v[0-9]*) ;; *) die "could not determine latest release tag from '$_final'";; esac
+  say "resolved latest release: $VERSION"
+  set_urls
+fi
 
 bounded_download() {
   _url="$1"; _dest="$2"
   say "downloading $_url"
-  curl -fsSL --retry 3 --retry-delay 1 --max-time 180 --max-filesize "$MAX_BYTES" -o "$_dest" "$_url" \
+  # shellcheck disable=SC2086
+  curl -fsSL $CURL_SEC --retry 3 --retry-delay 1 --max-time 180 --max-filesize "$MAX_BYTES" -o "$_dest" "$_url" \
     || die "download failed: $_url"
   _size=$(wc -c < "$_dest" | tr -d ' ')
   [ "$_size" -gt 0 ] || die "downloaded asset is empty: $_url"
@@ -196,4 +241,30 @@ tmpdest="$INSTALL_DIR/.$BIN.tmp.$$"
 cp "$src" "$tmpdest"
 chmod 0755 "$tmpdest"
 mv -f "$tmpdest" "$dest"
+tmpdest=""
 say "installed $BIN $VERSION -> $dest"
+say "restart your MCP client to load the new version"
+
+case ":${PATH:-}:" in
+  *":$INSTALL_DIR:"*) ;;
+  *)
+    _line="export PATH=\"$INSTALL_DIR:\$PATH\""
+    if [ "$ADD_TO_PATH" -eq 1 ]; then
+      case "${SHELL:-}" in
+        */zsh) _rc="${ZDOTDIR:-$HOME}/.zshrc";;
+        */bash) if [ "$OS" = "darwin" ]; then _rc="$HOME/.bash_profile"; else _rc="$HOME/.bashrc"; fi;;
+        *) _rc="$HOME/.profile";;
+      esac
+      if [ -f "$_rc" ] && grep -qxF "$_line" "$_rc"; then
+        say "$INSTALL_DIR already configured in $_rc"
+      else
+        printf '\n# added by cpm-planner install.sh\n%s\n' "$_line" >> "$_rc"
+        say "added to $_rc: $_line (open a new shell to use it)"
+      fi
+    else
+      say "$INSTALL_DIR is not on your PATH. Add it with:"
+      say "  $_line"
+      say "or re-run with --add-to-path. GUI MCP clients do not inherit your shell PATH, so use the absolute path $dest in their configs."
+    fi
+    ;;
+esac

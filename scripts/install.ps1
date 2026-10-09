@@ -11,9 +11,10 @@
 #   -BaseUrl URL        Release base URL (default: https://github.com/praxec/cpm-planner/releases)
 #   -PrintTarget        Print the resolved target triple and exit (no network)
 #   -DryRun             Print resolved URLs and exit (no install)
+#   -AddToPath          Add the install dir to your user PATH (opt-in)
 #
 # Environment overrides: PRAXEC_REPO PRAXEC_BIN PRAXEC_VERSION PRAXEC_INSTALL_DIR
-#                        PRAXEC_BASE_URL PRAXEC_OS PRAXEC_ARCH PRAXEC_MAX_BYTES
+#                        PRAXEC_BASE_URL PRAXEC_ALLOW_INSECURE=1 (allow non-https; testing only) PRAXEC_OS PRAXEC_ARCH PRAXEC_MAX_BYTES
 #
 # Writes only the binary into -InstallDir; application state and configuration
 # live elsewhere (see the README) and are never touched.
@@ -23,7 +24,8 @@ param(
   [string]$InstallDir = $env:PRAXEC_INSTALL_DIR,
   [string]$BaseUrl = $env:PRAXEC_BASE_URL,
   [switch]$PrintTarget,
-  [switch]$DryRun
+  [switch]$DryRun,
+  [switch]$AddToPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -39,8 +41,19 @@ $InstallDir = if ($InstallDir) { $InstallDir } else { Join-Path $LocalPrograms "
 $BaseUrl = if ($BaseUrl) { $BaseUrl } else { "https://github.com/$Repo/releases" }
 $MaxBytes = if ($env:PRAXEC_MAX_BYTES) { [int64]$env:PRAXEC_MAX_BYTES } else { 134217728 }
 
+# Windows PowerShell 5.1 may default to TLS 1.0/1.1; make sure TLS 1.2 is enabled.
+if ($PSVersionTable.PSVersion.Major -lt 6) {
+  [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+}
+# Invoke-WebRequest's progress bar makes downloads dramatically slower on 5.1.
+$ProgressPreference = 'SilentlyContinue'
+
 function Write-Say([string]$Message) { Write-Host "install: $Message" }
 function Write-Die([string]$Message) { Write-Error "install: error: $Message"; exit 1 }
+
+if (($BaseUrl -notlike 'https://*') -and ($env:PRAXEC_ALLOW_INSECURE -ne '1')) {
+  Write-Die "refusing non-https base URL '$BaseUrl' (set PRAXEC_ALLOW_INSECURE=1 to override for local testing)"
+}
 
 function Get-HostOs {
   if ($env:PRAXEC_OS) { return $env:PRAXEC_OS }
@@ -73,9 +86,30 @@ $OS = Get-HostOs
 $ARCH = Get-HostArch
 $Target = Get-TargetTriple $OS $ARCH
 $Asset = "${Bin}-${Target}.zip"
-$ReleaseUrl = if ($Version -eq 'latest') { "$BaseUrl/latest/download" } else { "$BaseUrl/download/$Version" }
-$DownloadUrl = "$ReleaseUrl/$Asset"
-$ChecksumUrl = "$ReleaseUrl/checksums.sha256"
+function Set-Urls {
+  $script:ReleaseUrl = if ($Version -eq 'latest') { "$BaseUrl/latest/download" } else { "$BaseUrl/download/$Version" }
+  $script:DownloadUrl = "$ReleaseUrl/$Asset"
+  $script:ChecksumUrl = "$ReleaseUrl/checksums.sha256"
+}
+Set-Urls
+
+# Resolve "latest" to a concrete tag so the archive and checksums come from the same release.
+function Resolve-LatestTag {
+  $location = $null
+  try {
+    Invoke-WebRequest -Uri "$BaseUrl/latest" -Method Head -MaximumRedirection 0 -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop | Out-Null
+  } catch {
+    $resp = $_.Exception.Response
+    if ($resp) {
+      $location = $resp.Headers.Location
+      if (-not $location) { $location = $resp.Headers['Location'] }
+    }
+  }
+  if (-not $location) { Write-Die "could not resolve the latest release from $BaseUrl/latest" }
+  $tag = ([string]$location).TrimEnd('/').Split('/')[-1]
+  if ($tag -notmatch '^v\d') { Write-Die "could not determine latest release tag from '$location'" }
+  return $tag
+}
 
 if ($PrintTarget) { Write-Output $Target; exit 0 }
 if ($DryRun) {
@@ -85,9 +119,15 @@ if ($DryRun) {
   exit 0
 }
 
+$tmpDest = $null
 $work = Join-Path ([System.IO.Path]::GetTempPath()) ("${Bin}.install." + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $work | Out-Null
 try {
+  if ($Version -eq 'latest') {
+    $Version = Resolve-LatestTag
+    Write-Say "resolved latest release: $Version"
+    Set-Urls
+  }
   $archivePath = Join-Path $work $Asset
   $checksumPath = Join-Path $work 'checksums.sha256'
 
@@ -135,14 +175,33 @@ try {
 
   New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
   $dest = Join-Path $InstallDir "${Bin}.exe"
+  $old = "$dest.old"
+  # Remove leftovers from a previous upgrade (a running exe cannot be deleted, so it was renamed).
+  Get-ChildItem -Path $InstallDir -Filter "${Bin}.exe.old" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
   $tmpDest = Join-Path $InstallDir ".${Bin}.tmp.$PID.exe"
   Copy-Item -Force -Path $src.FullName -Destination $tmpDest
   if (Test-Path $dest) {
-    [System.IO.File]::Replace($tmpDest, $dest, $null)
-  } else {
-    Move-Item -Force -Path $tmpDest -Destination $dest
+    # Windows lets a running exe be renamed but not overwritten: move it aside first.
+    Move-Item -Force -Path $dest -Destination $old
   }
+  Move-Item -Force -Path $tmpDest -Destination $dest
+  $tmpDest = $null
   Write-Say "installed $Bin $Version -> $dest"
+  Write-Say "restart your MCP client to load the new version"
+
+  $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+  $onPath = ($userPath -split ';') -contains $InstallDir -or (($env:Path -split ';') -contains $InstallDir)
+  if (-not $onPath) {
+    if ($AddToPath) {
+      [Environment]::SetEnvironmentVariable('Path', "$InstallDir;" + $userPath, 'User')
+      Write-Say "added $InstallDir to your user PATH (open a new terminal to use it)"
+    } else {
+      Write-Say "$InstallDir is not on your PATH. Add it with:"
+      Write-Say "  [Environment]::SetEnvironmentVariable('Path', `"$InstallDir;`" + [Environment]::GetEnvironmentVariable('Path','User'), 'User')"
+      Write-Say "or re-run with -AddToPath. GUI MCP clients do not inherit your shell PATH, so use the absolute path $dest in their configs."
+    }
+  }
 } finally {
+  if ($tmpDest) { Remove-Item -Force -Path $tmpDest -ErrorAction SilentlyContinue }
   Remove-Item -Recurse -Force -Path $work -ErrorAction SilentlyContinue
 }

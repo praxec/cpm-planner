@@ -8,11 +8,11 @@ import { spawn } from 'node:child_process';
 
 const bin = process.argv[2];
 if (!bin) {
-  console.error('usage: mcp-smoke.mjs <path-to-mcp-binary>');
+  console.error('usage: mcp-smoke.mjs <path-to-mcp-binary> [args...]');
   process.exit(2);
 }
 
-const child = spawn(bin, [], { stdio: ['pipe', 'pipe', 'pipe'] });
+const child = spawn(bin, process.argv.slice(3), { stdio: ['pipe', 'pipe', 'pipe'] });
 const pending = new Map();
 let buffer = '';
 let stderrText = '';

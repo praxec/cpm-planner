@@ -31,7 +31,8 @@ function run(cmd, args, opts = {}) {
     encoding: 'utf8',
     timeout: 60000,
     cwd: opts.cwd ?? ROOT,
-    env: { ...process.env, ...(opts.env ?? {}) },
+    // Fixtures are served over file://, so allow insecure by default; tests of the https rule override it.
+    env: { ...process.env, PRAXEC_ALLOW_INSECURE: '1', ...(opts.env ?? {}) },
   });
   return { status: res.status, stdout: res.stdout ?? '', stderr: res.stderr ?? '' };
 }
@@ -216,6 +217,78 @@ test('cpm-planner/install.sh resolves native arm64 when macOS runs under Rosetta
     env: { PATH: `${fakeBin}:${process.env.PATH}`, PRAXEC_OS: '', PRAXEC_ARCH: '' },
   });
   assert.equal(r.stdout.trim(), 'aarch64-apple-darwin');
+});
+
+test('cpm-planner/install.sh refuses a non-https base URL unless explicitly overridden', (t) => {
+  const dest = tempDir(t);
+  const r = run('sh', [scriptPath('cpm-planner', 'install.sh'), '--base-url', 'http://example.invalid/releases', '--version', TAG, '--install-dir', dest], {
+    env: { PRAXEC_OS: 'linux', PRAXEC_ARCH: 'x86_64', PRAXEC_ALLOW_INSECURE: '' },
+  });
+  assert.match(r.stderr, /non-https/);
+  assert.notEqual(r.status, 0);
+});
+
+test('cpm-planner/install.sh fails when HOME is unset and no install dir is given', () => {
+  const r = run('sh', [scriptPath('cpm-planner', 'install.sh'), '--dry-run', '--base-url', 'https://example.invalid/releases'], {
+    env: { PRAXEC_OS: 'linux', PRAXEC_ARCH: 'x86_64', HOME: '' },
+  });
+  assert.match(r.stderr, /HOME is not set/);
+  assert.notEqual(r.status, 0);
+});
+
+test('cpm-planner/install.sh leaves no temp files behind after an upgrade', (t) => {
+  const fixture = makeReleaseFixture('cpm-planner', [
+    { target: 'x86_64-unknown-linux-gnu', payload: 'NEW\n' },
+  ]);
+  t.after(() => fs.rmSync(fixture.root, { recursive: true, force: true }));
+  const dest = tempDir(t);
+  fs.writeFileSync(path.join(dest, 'cpm-planner'), 'OLD\n', { mode: 0o755 });
+  run('sh', [scriptPath('cpm-planner', 'install.sh'), ...installArgs(fixture, dest)], {
+    env: { PRAXEC_OS: 'linux', PRAXEC_ARCH: 'x86_64' },
+  });
+  assert.deepEqual(fs.readdirSync(dest), ['cpm-planner']);
+});
+
+test('cpm-planner/install.sh prints the exact PATH line when the install dir is not on PATH', (t) => {
+  const fixture = makeReleaseFixture('cpm-planner', [
+    { target: 'x86_64-unknown-linux-gnu', payload: 'X\n' },
+  ]);
+  t.after(() => fs.rmSync(fixture.root, { recursive: true, force: true }));
+  const dest = tempDir(t);
+  const r = run('sh', [scriptPath('cpm-planner', 'install.sh'), ...installArgs(fixture, dest)], {
+    env: { PRAXEC_OS: 'linux', PRAXEC_ARCH: 'x86_64' },
+  });
+  assert.ok(r.stderr.includes(`export PATH="${dest}:$PATH"`), r.stderr);
+});
+
+test('cpm-planner/install.sh --add-to-path appends to the shell rc once', (t) => {
+  const fixture = makeReleaseFixture('cpm-planner', [
+    { target: 'x86_64-unknown-linux-gnu', payload: 'X\n' },
+  ]);
+  t.after(() => fs.rmSync(fixture.root, { recursive: true, force: true }));
+  const dest = tempDir(t);
+  const home = tempDir(t);
+  const env = { PRAXEC_OS: 'linux', PRAXEC_ARCH: 'x86_64', HOME: home, SHELL: '/bin/bash' };
+  for (let i = 0; i < 2; i++) {
+    run('sh', [scriptPath('cpm-planner', 'install.sh'), ...installArgs(fixture, dest), '--add-to-path'], { env });
+  }
+  const rc = fs.readFileSync(path.join(home, '.bashrc'), 'utf8');
+  assert.equal(rc.split(`export PATH="${dest}:$PATH"`).length - 1, 1);
+});
+
+const PWSH = spawnSync('pwsh', ['-NoProfile', '-Command', '1']).status === 0;
+test('cpm-planner/install.ps1 resolves the native windows/x86_64 target', { skip: !PWSH }, () => {
+  const r = run('pwsh', ['-NoProfile', '-File', scriptPath('cpm-planner', 'install.ps1'), '-PrintTarget'], {
+    env: { PRAXEC_OS: 'windows', PRAXEC_ARCH: 'x86_64' },
+  });
+  assert.equal(r.stdout.trim(), 'x86_64-pc-windows-msvc');
+});
+
+test('cpm-planner/install.ps1 refuses a non-https base URL unless overridden', { skip: !PWSH }, () => {
+  const r = run('pwsh', ['-NoProfile', '-File', scriptPath('cpm-planner', 'install.ps1'), '-DryRun'], {
+    env: { PRAXEC_OS: 'windows', PRAXEC_ARCH: 'x86_64', PRAXEC_BASE_URL: 'http://example.invalid/r', PRAXEC_ALLOW_INSECURE: '' },
+  });
+  assert.notEqual(r.status, 0);
 });
 
 // ---------------------------------------------------------------------------
