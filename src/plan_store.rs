@@ -4,7 +4,8 @@
 //! plans (graph + cached CPM result), per-deliverable statuses, held
 //! cohort locks, the submit-dedup map, and (schema v3) the portfolio tables
 //! — named plan lines, variants and revisions, queried by
-//! `crate::portfolio`. Every planner operation loads
+//! `crate::portfolio` — and (schema v4) the earned-value tables, accessed
+//! through `crate::ev_store`. Every planner operation loads
 //! the relevant [`PlanState`] from SQLite, runs the in-memory scheduling
 //! logic, and writes the result back — all inside ONE
 //! `BEGIN IMMEDIATE` transaction.
@@ -410,9 +411,10 @@ impl SqlitePlanStore {
 /// last one applied. Each step must be idempotent against databases created
 /// before versioning existed (user_version 0 but tables present).
 const MIGRATIONS: &[fn(&Connection) -> anyhow::Result<()>] = &[
-    migrate_v1_base_schema, // tables + counter columns (pre-versioning layout)
-    migrate_v2_cpm_version, // plans.cpm_version
-    migrate_v3_portfolio,   // plan_lines, variants, revisions
+    migrate_v1_base_schema,  // tables + counter columns (pre-versioning layout)
+    migrate_v2_cpm_version,  // plans.cpm_version
+    migrate_v3_portfolio,    // plan_lines, variants, revisions
+    migrate_v4_earned_value, // baselines, ev_actuals, ev_snapshots
 ];
 
 /// Runs the whole ladder plus the stale sweep in one immediate transaction,
@@ -529,6 +531,45 @@ fn migrate_v3_portfolio(conn: &Connection) -> anyhow::Result<()> {
          );",
     )
     .context("creating portfolio tables")
+}
+
+/// Earned-value tables (see [`crate::ev_store`]): numbered frozen
+/// baselines, per-deliverable actuals (reported percent, actual hours,
+/// accumulated lease hours, evidence list) and EV snapshots. Rows of a
+/// deliverable later removed from the graph are kept: its baselined budget
+/// and actual cost still count.
+fn migrate_v4_earned_value(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS baselines (
+             plan_id       TEXT NOT NULL REFERENCES plans(plan_id) ON DELETE CASCADE,
+             number        INTEGER NOT NULL,
+             start_us      INTEGER NOT NULL,
+             calendar      TEXT,
+             rows          TEXT NOT NULL,
+             bac           REAL NOT NULL,
+             reason        TEXT,
+             created_at_us INTEGER NOT NULL,
+             PRIMARY KEY (plan_id, number)
+         );
+         CREATE TABLE IF NOT EXISTS ev_actuals (
+             plan_id        TEXT NOT NULL REFERENCES plans(plan_id) ON DELETE CASCADE,
+             deliverable_id TEXT NOT NULL,
+             earned_pct     INTEGER,
+             actual_hours   REAL,
+             leased_hours   REAL NOT NULL DEFAULT 0,
+             evidence       TEXT NOT NULL DEFAULT '[]',
+             updated_at_us  INTEGER,
+             PRIMARY KEY (plan_id, deliverable_id)
+         );
+         CREATE TABLE IF NOT EXISTS ev_snapshots (
+             plan_id     TEXT NOT NULL REFERENCES plans(plan_id) ON DELETE CASCADE,
+             taken_at_us INTEGER NOT NULL,
+             as_of_us    INTEGER NOT NULL,
+             summary     TEXT NOT NULL,
+             PRIMARY KEY (plan_id, taken_at_us)
+         );",
+    )
+    .context("creating earned-value tables")
 }
 
 /// Recompute `cached_result` for every plan stored by an older CPM kernel.
@@ -1028,6 +1069,52 @@ mod tests {
                 let _ = std::fs::remove_file(PathBuf::from(p));
             }
         }
+    }
+
+    /// A v4 database stripped back to the v3 layout (earned-value tables
+    /// dropped, `user_version` 3) holding one plan.
+    fn v3_database(tag: &str) -> TempDbFile {
+        let db = TempDbFile::new(tag);
+        let store = SqlitePlanStore::open(&db.path).unwrap();
+        store
+            .submit_or_get("hash-1", || {
+                Ok((PlanId("plan_v3".into()), plan_state_with_one_ready()))
+            })
+            .unwrap();
+        drop(store);
+        let conn = Connection::open(&db.path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE baselines; DROP TABLE ev_actuals; DROP TABLE ev_snapshots;
+             PRAGMA user_version = 3;",
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn migrating_v3_to_v4_keeps_plans() {
+        let db = v3_database("v3-keeps");
+        let store = SqlitePlanStore::open(&db.path).unwrap();
+        let status = store
+            .read_plan(&PlanId("plan_v3".into()), |s| s.statuses.get("d1").cloned())
+            .unwrap();
+        assert_eq!(status, Some(DeliverableStatus::Ready));
+    }
+
+    #[test]
+    fn migrating_v3_to_v4_creates_the_earned_value_tables() {
+        let db = v3_database("v3-tables");
+        drop(SqlitePlanStore::open(&db.path).unwrap());
+        let conn = Connection::open(&db.path).unwrap();
+        let tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
+                 AND name IN ('baselines', 'ev_actuals', 'ev_snapshots')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 3);
     }
 
     /// Migration safety: a database created BEFORE the circuit-breaker

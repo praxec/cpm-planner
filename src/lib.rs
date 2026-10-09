@@ -48,6 +48,7 @@ pub mod drag;
 pub mod earned_value;
 pub mod edits;
 pub mod estimator;
+pub(crate) mod ev_store;
 mod graph;
 pub mod lint;
 mod locks;
