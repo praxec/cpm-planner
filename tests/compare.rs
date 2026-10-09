@@ -167,6 +167,19 @@ fn first_variant_has_an_empty_diff() {
 }
 
 #[test]
+fn compare_diff_leaves_runtime_fields_empty() {
+    let base = graph(&[("a", &[], 5.0), ("b", &["a"], 5.0)]);
+    let other = graph(&[("a", &[], 9.0)]);
+    let c = compare(
+        &[input("base", base), input("other", other)],
+        &CompareRequest::default(),
+    )
+    .expect("compare");
+    let d = &by_id(&c, "other").diff_vs_first;
+    assert!(d.reopened.is_empty() && d.released_locks.is_empty());
+}
+
+#[test]
 fn compare_requires_two_variants() {
     let err = compare(&[input("only", parallel())], &CompareRequest::default()).expect_err("err");
     assert!(

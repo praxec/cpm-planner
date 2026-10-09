@@ -6,6 +6,7 @@ use crate::monte_carlo::{MonteCarloRequest, monte_carlo};
 use crate::plan::{PlanGraph, PlanId, PlannerError};
 use crate::planner::canonical_deliverable;
 use crate::resource_schedule::{ScheduleRequest, resource_schedule};
+use crate::revise::RevisionDiff;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -58,21 +59,16 @@ pub struct CompareRequest {
     pub weights: CompareWeights,
 }
 
-/// Structural difference of one variant against the first.
-// TODO(P4P merge): reconcile with `revise::RevisionDiff`.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct StructuralDiff {
-    pub added: Vec<String>,
-    pub removed: Vec<String>,
-    pub changed: Vec<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VariantComparison {
     pub plan_id: PlanId,
     pub variant: String,
     pub scorecard: Scorecard,
-    pub diff_vs_first: StructuralDiff,
+    /// Structural difference against the first input variant: `added`,
+    /// `removed` and `changed` (canonical definition differs) deliverable ids.
+    /// A comparison carries no runtime state, so `reopened` and
+    /// `released_locks` are always empty.
+    pub diff_vs_first: RevisionDiff,
     pub pareto_optimal: bool,
     pub score: f32,
     pub rank: u32,
@@ -110,7 +106,7 @@ fn dominates(a: &[f32; 5], b: &[f32; 5]) -> bool {
     a.iter().zip(b).all(|(x, y)| x <= y) && a.iter().zip(b).any(|(x, y)| x < y)
 }
 
-fn diff(first: &PlanGraph, other: &PlanGraph) -> StructuralDiff {
+fn diff(first: &PlanGraph, other: &PlanGraph) -> RevisionDiff {
     let canon = |g: &PlanGraph| -> BTreeMap<String, serde_json::Value> {
         g.deliverables
             .iter()
@@ -118,7 +114,7 @@ fn diff(first: &PlanGraph, other: &PlanGraph) -> StructuralDiff {
             .collect()
     };
     let (a, b) = (canon(first), canon(other));
-    StructuralDiff {
+    RevisionDiff {
         added: b.keys().filter(|k| !a.contains_key(*k)).cloned().collect(),
         removed: a.keys().filter(|k| !b.contains_key(*k)).cloned().collect(),
         changed: a
@@ -126,6 +122,8 @@ fn diff(first: &PlanGraph, other: &PlanGraph) -> StructuralDiff {
             .filter(|(k, v)| b.get(*k).is_some_and(|o| o != *v))
             .map(|(k, _)| k.clone())
             .collect(),
+        reopened: Vec::new(),
+        released_locks: Vec::new(),
     }
 }
 
