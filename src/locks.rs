@@ -308,6 +308,7 @@ mod tests {
             estimate: None,
             metadata: serde_json::json!({}),
             milestone: false,
+            earning_rule: None,
         };
         let graph = PlanGraph {
             deliverables: vec![dl("a", &[]), dl("b", &["a"])],

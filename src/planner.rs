@@ -442,7 +442,7 @@ pub(crate) fn canonical_deliverable(d: &Deliverable) -> serde_json::Value {
         .map(|f| json!({ "path": f.path().to_string_lossy(), "mode": f.mode() }))
         .collect();
     files.sort_by_cached_key(ToString::to_string);
-    json!({
+    let mut canonical = json!({
         "id": d.id,
         "owned_files": files,
         "prerequisites": prereqs,
@@ -451,7 +451,13 @@ pub(crate) fn canonical_deliverable(d: &Deliverable) -> serde_json::Value {
         "estimate": d.estimate,
         "metadata": d.metadata,
         "milestone": d.milestone,
-    })
+    });
+    // Only when set, so graphs without an earning rule keep the hash they
+    // had before the field existed (dedup and inline sync stay stable).
+    if let Some(rule) = d.earning_rule {
+        canonical["earning_rule"] = json!(rule);
+    }
+    canonical
 }
 
 /// Deterministic content hash of a [`PlanGraph`]. Same logical graph -> same
@@ -2140,7 +2146,14 @@ mod tests {
             duration_hours: None,
             estimate: None,
             milestone: false,
+            earning_rule: None,
         }
+    }
+
+    #[test]
+    fn canonical_form_omits_an_absent_earning_rule() {
+        let d = deliverable("D1", Some(1.0), json!({}));
+        assert!(canonical_deliverable(&d).get("earning_rule").is_none());
     }
 
     #[test]

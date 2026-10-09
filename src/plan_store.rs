@@ -849,6 +849,7 @@ mod tests {
                 duration_hours: None,
                 estimate: None,
                 milestone: false,
+                earning_rule: None,
             }],
             max_chained_dispatch: None,
         };

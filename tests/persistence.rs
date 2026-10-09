@@ -102,6 +102,7 @@ fn deliverable(id: &str, files: &[&str], prereqs: &[&str]) -> Deliverable {
         duration_hours: None,
         estimate: None,
         milestone: false,
+        earning_rule: None,
     }
 }
 

@@ -13,6 +13,7 @@
 //! budget or AC.
 
 use crate::estimator::EffortEstimator;
+pub use crate::plan::EarningRule;
 use crate::plan::{Deliverable, DeliverableStatus, FINISH_ID, PlanGraph, PlannerError, START_ID};
 use crate::schedule::{compute_cpm, effort_basis};
 use crate::task::CriticalPathResult;
@@ -53,19 +54,6 @@ impl Default for Calendar {
             utc_offset_minutes: 0,
         }
     }
-}
-
-/// How partial progress on a deliverable converts to earned percent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EarningRule {
-    /// 100% only when Complete.
-    #[default]
-    ZeroHundred,
-    /// 50% once started (or any percent reported), 100% when Complete.
-    FiftyFifty,
-    /// The reported percent, 100% when Complete.
-    Weighted,
 }
 
 /// One frozen baseline row.
@@ -564,6 +552,7 @@ mod tests {
             estimate: None,
             metadata: serde_json::Value::Null,
             milestone: false,
+            earning_rule: None,
         }
     }
 

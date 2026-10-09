@@ -26,6 +26,7 @@ fn deliverable(id: &str, files: &[&str], prereqs: &[&str], effort: Option<f32>) 
         duration_hours: None,
         estimate: None,
         milestone: false,
+        earning_rule: None,
     }
 }
 
@@ -2123,4 +2124,19 @@ async fn submit_rejects_more_than_5000_deliverables() {
         err.to_string(),
         "INVALID_GRAPH: plan has 5001 deliverables; maximum is 5000"
     );
+}
+
+#[tokio::test]
+async fn earning_rule_changes_plan_identity() {
+    let planner = BasicCpmPlanner::new();
+    let plain = deliverable("a", &["src/a.rs"], &[], Some(1.0));
+    let mut weighted = plain.clone();
+    weighted.earning_rule = Some(cpm_planner::plan::EarningRule::Weighted);
+    let graph = |d: Deliverable| PlanGraph {
+        deliverables: vec![d],
+        max_chained_dispatch: None,
+    };
+    let id1 = planner.submit_plan(graph(plain)).await.unwrap();
+    let id2 = planner.submit_plan(graph(weighted)).await.unwrap();
+    assert_ne!(id1, id2);
 }

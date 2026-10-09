@@ -455,6 +455,7 @@ fn graph_schema() -> Value {
                             "pessimistic": { "type": "number", "minimum": 0, "maximum": 1000000 }
                         }, "required": ["optimistic", "likely", "pessimistic"], "additionalProperties": false },
                         "milestone":              { "type": "boolean", "description": "Acceptance point; reported in plan.status milestones with its own critical path." },
+                        "earning_rule":           { "type": "string", "enum": ["zero_hundred", "fifty_fifty", "weighted"], "description": "How earned value credits partial progress: zero_hundred (default; 100% only when complete), fifty_fifty (50% once in progress or any earned_pct is reported), weighted (the reported earned_pct). Part of the plan's identity." },
                         "metadata":              {}
                     },
                     "required": ["id", "owned_files", "prerequisites"]
@@ -1721,6 +1722,7 @@ Tools (nineteen total, all `plan.<verb>`):
   plan.submit          — submit a PlanGraph, get a plan_id (idempotent on identical graphs)
                         a prerequisite is an id string or {id, consumes?, kind?: artifact|interface, lag_hours?}; a deliverable's duration_hours (calendar time; when absent the default is the effort estimate, explicit or estimator-derived) and lag_hours (minimum wait after a prerequisite finishes) drive the schedule
                         a milestone (milestone: true) is zero-length unless you give it an estimate or duration; it is still an ordinary deliverable someone must complete (accept or mark Complete), and it is not leased if metadata.kind=manual
+                        an optional earning_rule (zero_hundred default: 100% only when complete; fifty_fifty: 50% once in progress or any earned_pct is reported; weighted: the reported earned_pct) sets how earned value credits progress; it is part of the plan's identity
                         an optional estimate {optimistic, likely, pessimistic} (0 <= optimistic <= likely <= pessimistic) is a three-point effort estimate; scheduled length precedence is duration_hours > estimated_effort_hours > estimate.likely > 0 for a milestone > estimator default, and Monte Carlo samples the estimate only when neither duration_hours nor estimated_effort_hours is set
                         limits: at most 5000 deliverables; every hour value (effort, duration, lag, estimate) must be finite and between 0 and 1000000 (INVALID_GRAPH)
   plan.acquire_cohort  — atomically acquire ready deliverables with no conflicting file claims (an owned_files entry may be {path, mode: "append"}: append claims on one path may be co-leased and are listed in the response's shared_paths; exclusive claims never overlap anything at once; plan.submit accepts a shared file only when the claimants are ordered by prerequisites, or all claims are append)

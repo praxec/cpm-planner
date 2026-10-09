@@ -370,6 +370,7 @@ mod tests {
             estimate: None,
             metadata: json!({}),
             milestone: false,
+            earning_rule: None,
         }
     }
 

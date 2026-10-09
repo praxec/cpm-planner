@@ -271,6 +271,20 @@ pub struct Estimate {
     pub pessimistic: f32,
 }
 
+/// How partial progress on a deliverable converts to earned percent for
+/// earned value ([`Deliverable::earning_rule`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EarningRule {
+    /// 100% only when Complete.
+    #[default]
+    ZeroHundred,
+    /// 50% once started (or any percent reported), 100% when Complete.
+    FiftyFifty,
+    /// The reported percent, 100% when Complete.
+    Weighted,
+}
+
 /// A single unit of work scheduled by the Planner.
 ///
 /// `owned_files` is the load-bearing field for concurrent dispatch: the
@@ -329,6 +343,11 @@ pub struct Deliverable {
     /// with `metadata.milestone == true` is treated the same way.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub milestone: bool,
+
+    /// How earned value credits partial progress. `None` means
+    /// [`EarningRule::ZeroHundred`]. Part of the plan's identity (hashed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub earning_rule: Option<EarningRule>,
 }
 
 impl Deliverable {
@@ -1214,6 +1233,7 @@ mod tests {
                 duration_hours: None,
                 estimate: None,
                 milestone: false,
+                earning_rule: None,
             }],
             max_chained_dispatch: Some(8),
         };
@@ -1276,6 +1296,7 @@ mod tests {
                         duration_hours: None,
                         estimate: None,
                         milestone: false,
+                        earning_rule: None,
                     },
                     lock: LockInfo {
                         plan_id: plan_id.clone(),
@@ -1295,6 +1316,7 @@ mod tests {
                         duration_hours: None,
                         estimate: None,
                         milestone: false,
+                        earning_rule: None,
                     },
                     lock: LockInfo {
                         plan_id: plan_id.clone(),
