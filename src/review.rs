@@ -40,14 +40,18 @@
 //!
 //! The missing-dependency score adds [`MENTION_WEIGHT`] when either
 //! deliverable's `metadata.description` contains the other's id as a token
-//! (whitespace-separated, outer punctuation trimmed), [`SHARED_DIR_WEIGHT`]
-//! when they own files sharing a path prefix (one file's parent directory
-//! equals, or is an ancestor of, the other's, compared component-wise so
-//! `src/ap` is not a prefix of `src/api`; top-level files have no
-//! directory), and [`SHARED_OWNER_WEIGHT`]
-//! when their `metadata.owner` strings are equal. Directory and owner groups
-//! larger than [`MAX_SIGNAL_GROUP`] carry no signal (and are not expanded
-//! into pairs), which also bounds the pair count.
+//! (whitespace-separated, outer punctuation trimmed); [`SHARED_DIR_WEIGHT`]
+//! when they own files in the same directory, or [`NESTED_DIR_WEIGHT`] when
+//! one file's directory is a proper ancestor of the other's (compared
+//! component-wise, so `src/ap` is not a prefix of `src/api`; top-level
+//! files and directories deeper than [`MAX_DIR_DEPTH`] components carry no
+//! signal); and [`SHARED_OWNER_WEIGHT`] when their `metadata.owner` strings
+//! are equal. An owner or same-directory group of more than
+//! [`MAX_SIGNAL_GROUP`] deliverables carries no signal, nor does an ancestor
+//! directory whose subtree (its own entries plus all descendant
+//! directories') has more than [`MAX_SIGNAL_GROUP`] entries. Directory and
+//! owner pairs are each generated in sorted order and stop at
+//! [`MAX_CANDIDATE_PAIRS`], so the work is bounded on any graph.
 //!
 //! The selected lists are interleaved round-robin in the table's order
 //! (crash, false dependency, interface split, split, missing dependency)
@@ -113,7 +117,7 @@
 //! answers, and never contains NaN or infinity.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -162,6 +166,15 @@ pub const MISSING_DEPENDENCY_TOP_K: usize = 16;
 pub const MENTION_WEIGHT: u32 = 3;
 /// Missing-dependency score for owning files in the same directory.
 pub const SHARED_DIR_WEIGHT: u32 = 2;
+/// Missing-dependency score for owning files where one's directory is a
+/// proper ancestor of the other's.
+pub const NESTED_DIR_WEIGHT: u32 = 1;
+/// Most directory-signal (and, separately, owner-signal) pairs generated
+/// before scoring.
+pub const MAX_CANDIDATE_PAIRS: usize = 10_000;
+/// Directories deeper than this many components carry no signal (bounds
+/// the ancestor walk).
+pub const MAX_DIR_DEPTH: usize = 32;
 /// Missing-dependency score for the same `metadata.owner`.
 pub const SHARED_OWNER_WEIGHT: u32 = 1;
 /// Directory / owner groups larger than this carry no pair signal.
@@ -732,9 +745,7 @@ impl Context<'_> {
             .enumerate()
             .map(|(i, d)| (d.id.as_str(), i))
             .collect();
-        let pair = |a: usize, b: usize| {
-            if ds[a].id <= ds[b].id { (a, b) } else { (b, a) }
-        };
+        let pair = |a: usize, b: usize| ordered_pair(ds, a, b);
 
         let mut mentions: BTreeSet<(usize, usize)> = BTreeSet::new();
         for (i, d) in ds.iter().enumerate() {
@@ -751,44 +762,35 @@ impl Context<'_> {
             }
         }
 
-        let group_pairs = |groups: BTreeMap<String, BTreeSet<usize>>| {
-            let mut pairs = BTreeSet::new();
-            for members in groups.values().filter(|m| m.len() <= MAX_SIGNAL_GROUP) {
-                let members: Vec<usize> = members.iter().copied().collect();
-                for (k, &a) in members.iter().enumerate() {
-                    for &b in &members[k + 1..] {
-                        pairs.insert(pair(a, b));
-                    }
-                }
-            }
-            pairs
-        };
-        let mut owners: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
-        let mut dirs: BTreeMap<PathBuf, BTreeSet<usize>> = BTreeMap::new();
+        let mut owners: BTreeMap<&str, BTreeSet<usize>> = BTreeMap::new();
         for (i, d) in ds.iter().enumerate() {
             if let Some(owner) = d.metadata.get("owner").and_then(Value::as_str) {
-                owners.entry(owner.to_string()).or_default().insert(i);
+                owners.entry(owner).or_default().insert(i);
             }
-            for f in &d.owned_files {
-                if let Some(dir) = f.path().parent()
-                    && dir.parent().is_some()
-                {
-                    dirs.entry(dir.to_path_buf()).or_default().insert(i);
+        }
+        let mut owner_pairs: BTreeSet<(usize, usize)> = BTreeSet::new();
+        'owners: for members in owners.values().filter(|m| m.len() <= MAX_SIGNAL_GROUP) {
+            let members: Vec<usize> = members.iter().copied().collect();
+            for (k, &a) in members.iter().enumerate() {
+                for &b in &members[k + 1..] {
+                    if owner_pairs.len() >= MAX_CANDIDATE_PAIRS {
+                        break 'owners;
+                    }
+                    owner_pairs.insert(pair(a, b));
                 }
             }
         }
-        let owner_pairs = group_pairs(owners);
-        let dir_pairs = prefix_pairs(&dirs, pair);
+        let dir_pairs = directory_pairs(ds);
 
         let mut scores: BTreeMap<(usize, usize), u32> = BTreeMap::new();
-        for (pairs, weight) in [
-            (&mentions, MENTION_WEIGHT),
-            (&dir_pairs, SHARED_DIR_WEIGHT),
-            (&owner_pairs, SHARED_OWNER_WEIGHT),
-        ] {
-            for p in pairs {
-                *scores.entry(*p).or_default() += weight;
-            }
+        for p in &mentions {
+            *scores.entry(*p).or_default() += MENTION_WEIGHT;
+        }
+        for (p, weight) in &dir_pairs {
+            *scores.entry(*p).or_default() += weight;
+        }
+        for p in &owner_pairs {
+            *scores.entry(*p).or_default() += SHARED_OWNER_WEIGHT;
         }
         if scores.is_empty() {
             return Vec::new();
@@ -815,8 +817,12 @@ impl Context<'_> {
                 if mentions.contains(&key) {
                     signals.push("a description mentions the other");
                 }
-                if dir_pairs.contains(&key) {
-                    signals.push("they own files in the same directory");
+                match dir_pairs.get(&key) {
+                    Some(&SHARED_DIR_WEIGHT) => {
+                        signals.push("they own files in the same directory");
+                    }
+                    Some(_) => signals.push("they own files in nested directories"),
+                    None => {}
                 }
                 if owner_pairs.contains(&key) {
                     signals.push("they share metadata.owner");
@@ -1177,23 +1183,73 @@ fn round_hours(hours: f32) -> f32 {
     ((f64::from(hours) * HOURS_SCALE).round() / HOURS_SCALE) as f32
 }
 
-/// Pairs of deliverables owning files in the same directory or in a
-/// directory and one of its descendants (compared component-wise). Groups
-/// larger than [`MAX_SIGNAL_GROUP`] are skipped.
-fn prefix_pairs(
-    dirs: &BTreeMap<PathBuf, BTreeSet<usize>>,
-    pair: impl Fn(usize, usize) -> (usize, usize),
-) -> BTreeSet<(usize, usize)> {
-    let mut pairs = BTreeSet::new();
-    for (dir, members) in dirs.iter().filter(|(_, m)| m.len() <= MAX_SIGNAL_GROUP) {
+/// `(a, b)` with the smaller id first.
+fn ordered_pair(ds: &[Deliverable], a: usize, b: usize) -> (usize, usize) {
+    if ds[a].id <= ds[b].id { (a, b) } else { (b, a) }
+}
+
+/// Directory-signal pairs and their weight: [`SHARED_DIR_WEIGHT`] for files
+/// in the same directory, [`NESTED_DIR_WEIGHT`] when one file's directory
+/// is a proper ancestor of the other's (component-wise; the larger weight
+/// wins when both hold).
+///
+/// Bounds, all deterministic: directories deeper than [`MAX_DIR_DEPTH`]
+/// components and top-level files carry no signal; a same-directory group
+/// of more than [`MAX_SIGNAL_GROUP`] deliverables is skipped, and so is an
+/// ancestor whose subtree (its own entries plus every descendant
+/// directory's) has more than [`MAX_SIGNAL_GROUP`] entries. Directories are
+/// visited in sorted order (members in index order, nearest ancestor first)
+/// and generation stops at [`MAX_CANDIDATE_PAIRS`] pairs.
+pub(crate) fn directory_pairs(ds: &[Deliverable]) -> BTreeMap<(usize, usize), u32> {
+    let mut dirs: BTreeMap<&Path, BTreeSet<usize>> = BTreeMap::new();
+    for (i, d) in ds.iter().enumerate() {
+        for f in &d.owned_files {
+            if let Some(dir) = f.path().parent()
+                && dir.parent().is_some()
+                && dir.components().nth(MAX_DIR_DEPTH).is_none()
+            {
+                dirs.entry(dir).or_default().insert(i);
+            }
+        }
+    }
+    let mut subtree: HashMap<&Path, usize> = HashMap::new();
+    for (dir, members) in &dirs {
         for ancestor in dir.ancestors().filter(|a| a.parent().is_some()) {
-            let Some(others) = dirs.get(ancestor).filter(|m| m.len() <= MAX_SIGNAL_GROUP) else {
+            *subtree.entry(ancestor).or_default() += members.len();
+        }
+    }
+
+    let mut pairs: BTreeMap<(usize, usize), u32> = BTreeMap::new();
+    let mut add = |a: usize, b: usize, weight: u32| {
+        if pairs.len() >= MAX_CANDIDATE_PAIRS {
+            return false;
+        }
+        let w = pairs.entry(ordered_pair(ds, a, b)).or_default();
+        *w = (*w).max(weight);
+        true
+    };
+    for (dir, members) in &dirs {
+        if members.len() <= MAX_SIGNAL_GROUP {
+            let list: Vec<usize> = members.iter().copied().collect();
+            for (k, &a) in list.iter().enumerate() {
+                for &b in &list[k + 1..] {
+                    if !add(a, b, SHARED_DIR_WEIGHT) {
+                        return pairs;
+                    }
+                }
+            }
+        }
+        for ancestor in dir.ancestors().skip(1).filter(|a| a.parent().is_some()) {
+            if subtree.get(ancestor).is_none_or(|n| *n > MAX_SIGNAL_GROUP) {
+                continue;
+            }
+            let Some(others) = dirs.get(ancestor) else {
                 continue;
             };
             for &a in members {
-                for &b in others {
-                    if a != b {
-                        pairs.insert(pair(a, b));
+                for &b in others.iter().filter(|b| **b != a) {
+                    if !add(a, b, NESTED_DIR_WEIGHT) {
+                        return pairs;
                     }
                 }
             }
@@ -1260,5 +1316,48 @@ fn write_canonical(value: &Value, out: &mut String) {
             out.push(']');
         }
         scalar => out.push_str(&scalar.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plan::OwnedFile;
+    use std::path::PathBuf;
+
+    fn owning(id: String, path: String) -> Deliverable {
+        Deliverable {
+            id,
+            owned_files: vec![OwnedFile::Path(PathBuf::from(path))],
+            prerequisites: Vec::new(),
+            estimated_effort_hours: Some(1.0),
+            duration_hours: None,
+            estimate: None,
+            metadata: Value::Null,
+            milestone: false,
+        }
+    }
+
+    #[test]
+    fn deep_directory_chain_keeps_pair_count_bounded() {
+        // Deliverable i owns a file i + 1 directories deep, one chain.
+        let mut dir = String::new();
+        let ds: Vec<Deliverable> = (0..5000)
+            .map(|i| {
+                dir.push_str("d/");
+                owning(format!("x{i:04}"), format!("{dir}f.rs"))
+            })
+            .collect();
+        assert!(directory_pairs(&ds).len() <= MAX_CANDIDATE_PAIRS);
+    }
+
+    #[test]
+    fn wide_directory_tree_stops_at_the_pair_cap() {
+        // 1000 sibling directories of 20 deliverables each: 190k
+        // same-directory pairs uncapped.
+        let ds: Vec<Deliverable> = (0..20_000)
+            .map(|i| owning(format!("x{i:05}"), format!("src/m{:03}/f{i}.rs", i / 20)))
+            .collect();
+        assert_eq!(directory_pairs(&ds).len(), MAX_CANDIDATE_PAIRS);
     }
 }

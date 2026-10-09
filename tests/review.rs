@@ -1016,3 +1016,49 @@ async fn add_capacity_proposal_shortens_duration_not_effort() {
         }])
     );
 }
+
+// ---------------------------------------------------------------- fix round 2
+
+#[tokio::test]
+async fn same_directory_signal_outranks_ancestor_signal() {
+    // m and n share src/x (same directory); a's src is an ancestor of
+    // both. By id alone (a, m) would sort first; by score (m, n) does.
+    let judge = FakeJudge::new();
+    run(
+        &graph(vec![
+            owning("a", "src/a.rs"),
+            owning("m", "src/x/m.rs"),
+            owning("n", "src/x/n.rs"),
+        ]),
+        &judge,
+    )
+    .await;
+    let first = judge
+        .kinds_sent()
+        .into_iter()
+        .find(|(k, _)| k == "missing_dependency");
+    assert_eq!(
+        first,
+        Some((
+            "missing_dependency".to_string(),
+            vec!["m".into(), "n".into()]
+        ))
+    );
+}
+
+#[tokio::test]
+async fn ancestor_with_a_large_subtree_carries_no_signal() {
+    // src holds hub's file plus 33 deliverables below it: subtree 34 > 32.
+    let mut v = vec![owning("hub", "src/hub.rs")];
+    for i in 0..33 {
+        v.push(owning(&format!("leaf{i:02}"), &format!("src/m{i:02}/f.rs")));
+    }
+    let judge = FakeJudge::new();
+    run(&graph(v), &judge).await;
+    assert!(
+        !judge
+            .kinds_sent()
+            .iter()
+            .any(|(k, ids)| k == "missing_dependency" && ids.contains(&"hub".to_string()))
+    );
+}
