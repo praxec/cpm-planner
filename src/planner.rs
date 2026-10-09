@@ -36,8 +36,9 @@ use std::time::Duration;
 use crate::audit::{AuditEvent, AuditSink, NullAuditSink};
 use crate::plan::{
     AcceptRequest, AcquireRequest, BlockedDeliverable, CallerId, Cohort, CohortRow, Deliverable,
-    DeliverableStatus, ForceReleaseRequest, HeartbeatRequest, LockInfo, MarkStatusRequest,
-    PlanDefinition, PlanGraph, PlanId, PlanStatus, PlannerError, ScheduleRow,
+    DeliverableStatus, FINISH_ID, ForceReleaseRequest, HeartbeatRequest, LockInfo,
+    MarkStatusRequest, PlanDefinition, PlanGraph, PlanId, PlanStatus, PlannerError, START_ID,
+    ScheduleRow,
 };
 use crate::plan_store::SqlitePlanStore;
 use crate::ports::Planner;
@@ -277,6 +278,14 @@ fn hash_graph(graph: &PlanGraph) -> String {
 /// Reject graphs that fail any structural invariant. Returns
 /// [`PlannerError::InvalidGraph`] with a precise `reason` on first failure.
 fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
+    for d in &graph.deliverables {
+        if d.id == START_ID || d.id == FINISH_ID {
+            return Err(PlannerError::InvalidGraph {
+                reason: format!("deliverable id '{}' is reserved", d.id),
+            });
+        }
+    }
+
     // Duplicate ids.
     let mut seen_ids: HashSet<&str> = HashSet::new();
     for d in &graph.deliverables {
@@ -464,12 +473,17 @@ fn incomplete_prerequisites(state: &PlanState, deliverable_id: &str) -> Vec<Stri
 /// Mark a deliverable `Complete`: release any lock (and its file index,
 /// emitting a released event), set the status, and promote dependents whose
 /// prerequisites are now all complete. Shared by `mark_status` and `accept`.
+///
+/// Returns true when this completion made every deliverable `Complete`
+/// (the false -> true flip of `plan_complete`), so the caller can emit
+/// `plan.completed` exactly once.
 fn complete_deliverable(
     state: &mut PlanState,
     deliverable_id: &str,
     audit_buf: &mut Vec<AuditEvent>,
     release_reason: &str,
-) {
+) -> bool {
+    let was_complete = all_complete(state);
     if let Some(lock) = state.locks.remove(deliverable_id) {
         // Callers verified the deliverable exists; a held lock implies the
         // graph entry exists.
@@ -519,6 +533,23 @@ fn complete_deliverable(
             state.statuses.insert(dep_id, DeliverableStatus::Ready);
         }
     }
+    !was_complete && all_complete(state)
+}
+
+/// True when every deliverable in the plan is `Complete`.
+fn all_complete(state: &PlanState) -> bool {
+    state
+        .graph
+        .deliverables
+        .iter()
+        .all(|d| matches!(state.statuses.get(&d.id), Some(DeliverableStatus::Complete)))
+}
+
+fn make_plan_completed_event(plan_id: &PlanId, deliverable_count: usize) -> AuditEvent {
+    AuditEvent::new("plan.completed").with_payload(json!({
+        "plan_id": plan_id.as_str(),
+        "deliverable_count": deliverable_count,
+    }))
 }
 
 fn make_accepted_event(
@@ -1054,7 +1085,12 @@ impl Planner for BasicCpmPlanner {
             }
 
             if is_complete {
-                complete_deliverable(state, deliverable_id, &mut audit_buf, "completed");
+                if complete_deliverable(state, deliverable_id, &mut audit_buf, "completed") {
+                    audit_buf.push(make_plan_completed_event(
+                        &plan_id,
+                        state.graph.deliverables.len(),
+                    ));
+                }
             } else {
                 state
                     .statuses
@@ -1159,21 +1195,27 @@ impl Planner for BasicCpmPlanner {
                 .collect();
 
             let task_of = |id: &str| state.cached_result.tasks.iter().find(|t| t.id == id);
-            let schedule: Vec<ScheduleRow> = state
-                .graph
-                .deliverables
-                .iter()
-                .filter_map(|d| task_of(&d.id))
-                .map(|t| ScheduleRow {
-                    id: t.id.clone(),
-                    es: t.earliest_start,
-                    ef: t.earliest_finish,
-                    ls: t.latest_start,
-                    lf: t.latest_finish,
-                    float: t.float,
-                    critical: t.is_critical,
-                })
-                .collect();
+            let row_of = |t: &crate::task::Task, synthetic: bool| ScheduleRow {
+                id: t.id.clone(),
+                es: t.earliest_start,
+                ef: t.earliest_finish,
+                ls: t.latest_start,
+                lf: t.latest_finish,
+                float: t.float,
+                critical: t.is_critical,
+                synthetic,
+            };
+            let mut schedule: Vec<ScheduleRow> = Vec::new();
+            schedule.extend(task_of(START_ID).map(|t| row_of(t, true)));
+            schedule.extend(
+                state
+                    .graph
+                    .deliverables
+                    .iter()
+                    .filter_map(|d| task_of(&d.id))
+                    .map(|t| row_of(t, false)),
+            );
+            schedule.extend(task_of(FINISH_ID).map(|t| row_of(t, true)));
             let mut ready_rows: Vec<&ScheduleRow> = schedule
                 .iter()
                 .filter(|r| {
@@ -1195,7 +1237,14 @@ impl Planner for BasicCpmPlanner {
 
             PlanStatus {
                 plan_id: plan_id.clone(),
-                critical_ids: state.cached_result.critical_ids.clone(),
+                critical_ids: state
+                    .cached_result
+                    .critical_ids
+                    .iter()
+                    .filter(|id| id.as_str() != START_ID && id.as_str() != FINISH_ID)
+                    .cloned()
+                    .collect(),
+                plan_complete: all_complete(state),
                 schedule,
                 ready,
                 deliverables,
@@ -1262,12 +1311,18 @@ impl Planner for BasicCpmPlanner {
                 });
             }
 
-            complete_deliverable(state, deliverable_id, &mut audit_buf, "accepted");
+            let plan_done = complete_deliverable(state, deliverable_id, &mut audit_buf, "accepted");
             audit_buf.push(make_accepted_event(
                 &req,
                 overrode.as_deref(),
                 &previous_status,
             ));
+            if plan_done {
+                audit_buf.push(make_plan_completed_event(
+                    &plan_id,
+                    state.graph.deliverables.len(),
+                ));
+            }
             Ok(())
         })?;
 

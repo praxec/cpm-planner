@@ -144,7 +144,12 @@ async fn plan_and_statuses_survive_reopen() {
     assert!(status.locks_held.is_empty());
     assert_eq!(
         status.critical_path,
-        vec!["d1".to_string(), "d2".to_string()]
+        vec![
+            "__start__".to_string(),
+            "d1".to_string(),
+            "d2".to_string(),
+            "__finish__".to_string()
+        ]
     );
 }
 
@@ -743,7 +748,10 @@ async fn reopening_store_repairs_stale_cached_critical_path() {
     }
     let planner = open_planner(&db.path);
     let status = planner.status(&plan_id).await.unwrap();
-    assert_eq!(status.critical_path, vec!["P0a", "P0b"]);
+    assert_eq!(
+        status.critical_path,
+        vec!["__start__", "P0a", "P0b", "__finish__"]
+    );
 }
 
 #[test]
@@ -818,7 +826,10 @@ async fn pre_versioning_database_is_upgraded_and_repaired() {
         .unwrap();
     }
     let status = open_planner(&db.path).status(&plan_id).await.unwrap();
-    assert_eq!(status.critical_path, vec!["P0a", "P0b"]);
+    assert_eq!(
+        status.critical_path,
+        vec!["__start__", "P0a", "P0b", "__finish__"]
+    );
 }
 
 #[test]
@@ -830,4 +841,20 @@ fn newer_schema_version_is_rejected() {
         .pragma_update(None, "user_version", 99)
         .unwrap();
     assert!(SqlitePlanStore::open(&db.path).is_err());
+}
+
+#[tokio::test]
+async fn stored_p2_plan_gains_endpoints_after_reopen() {
+    let db = TempDb::new();
+    let plan_id = submit_parallel_chains(&db.path).await;
+    {
+        let conn = rusqlite::Connection::open(&db.path).unwrap();
+        conn.execute("UPDATE plans SET cpm_version = 1", [])
+            .unwrap();
+    }
+    let status = open_planner(&db.path).status(&plan_id).await.unwrap();
+    assert_eq!(
+        status.critical_path.first().map(String::as_str),
+        Some("__start__")
+    );
 }

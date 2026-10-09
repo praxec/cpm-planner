@@ -509,15 +509,16 @@ pub struct PlanStatus {
     ///   terminal mark); pressure against the lapse bound
     ///   ([`crate::planner::MAX_LAPSES`]), never the failure breaker.
     pub deliverables: Vec<(String, DeliverableStatus, u32, u32, u32)>,
-    /// Ids on the longest dependency chain, in execution order. Empty
-    /// when the plan has no deliverables.
+    /// Ids on the longest dependency chain, in execution order. Always
+    /// begins with `__start__` and ends with `__finish__` (synthetic
+    /// endpoints; an empty plan is just those two).
     pub critical_path: Vec<String>,
     /// Project length in hours: the maximum earliest finish, equal to the
     /// effort summed along `critical_path`.
     pub critical_path_hours: f32,
     /// Every lock currently active across the plan.
     pub locks_held: Vec<LockInfo>,
-    /// Every zero-float deliverable, sorted by `(es, id)`.
+    /// Every zero-float deliverable (synthetic endpoints excluded), sorted by `(es, id)`.
     #[serde(default)]
     pub critical_ids: Vec<String>,
     /// Per-deliverable CPM schedule, in graph insertion order.
@@ -531,7 +532,16 @@ pub struct PlanStatus {
     /// held lock.
     #[serde(default)]
     pub ready: Vec<String>,
+    /// True when every deliverable is `Complete` (vacuously true for an
+    /// empty plan).
+    #[serde(default)]
+    pub plan_complete: bool,
 }
+
+/// Reserved id of the synthetic zero-effort source node in every plan's CPM.
+pub const START_ID: &str = "__start__";
+/// Reserved id of the synthetic zero-effort sink node in every plan's CPM.
+pub const FINISH_ID: &str = "__finish__";
 
 /// The stored definition of a plan: the [`PlanGraph`] exactly as submitted,
 /// returned by [`crate::ports::Planner::get_plan`].
@@ -551,6 +561,9 @@ pub struct ScheduleRow {
     pub lf: f32,
     pub float: f32,
     pub critical: bool,
+    /// True for the synthetic [`START_ID`] / [`FINISH_ID`] endpoint rows.
+    #[serde(default)]
+    pub synthetic: bool,
 }
 
 /// Errors returned by [`crate::ports::Planner`] methods.

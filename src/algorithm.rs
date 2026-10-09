@@ -17,7 +17,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 /// plans are recomputed on open (see `plan_store`). Bump also when
 /// `EffortEstimator` defaults change, since stored plans are recomputed with
 /// the current estimator.
-pub const CPM_VERSION: i64 = 1;
+///
+/// - v2: synthetic `__start__`/`__finish__` endpoints
+pub const CPM_VERSION: i64 = 2;
 
 const TIGHT_EPS: f32 = 1e-3;
 
