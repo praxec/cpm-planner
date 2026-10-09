@@ -44,6 +44,7 @@ pub mod drag;
 pub mod estimator;
 mod graph;
 mod locks;
+pub mod monte_carlo;
 pub mod network_health;
 pub mod plan;
 pub mod plan_store;
