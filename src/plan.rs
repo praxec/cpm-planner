@@ -731,8 +731,9 @@ pub struct PlanStatus {
     #[serde(default)]
     pub schedule: Vec<ScheduleRow>,
     /// Deliverables with status `Ready` and no live lock, sorted by
-    /// `(float, es, id)` ascending. Same ordering as
-    /// [`crate::ports::Planner::acquire_cohort`] (shared `priority_key`);
+    /// `(latest_start, float, id)` ascending (smallest latest start first,
+    /// i.e. longest remaining tail; same order as
+    /// [`crate::ports::Planner::acquire_cohort`] via the shared `priority_key`);
     /// membership is a superset: acquire may still skip deliverables at the
     /// failure or lapse cap, manual deliverables, or whose files overlap a
     /// held lock.
