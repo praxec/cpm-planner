@@ -36,6 +36,13 @@ fn find<'a>(graph: &'a PlanGraph, id: &str) -> &'a Deliverable {
         .expect("deliverable present")
 }
 
+fn invalid_reason(err: PlannerError) -> String {
+    match err {
+        PlannerError::InvalidGraph { reason } => reason,
+        other => panic!("expected InvalidGraph, got {other:?}"),
+    }
+}
+
 #[test]
 fn remove_edge_removes_prerequisite() {
     let out = apply_edits(
@@ -176,5 +183,147 @@ fn edits_producing_cycle_are_rejected() {
             consumes: None,
         }],
     );
-    assert!(matches!(result, Err(PlannerError::InvalidGraph { .. })));
+    let PlannerError::InvalidGraph { reason } = result.expect_err("cycle rejected") else {
+        panic!("expected InvalidGraph");
+    };
+    assert!(reason.contains("cycle"));
+}
+
+#[test]
+fn remove_missing_edge_is_rejected() {
+    let g = PlanGraph {
+        deliverables: vec![deliverable("a", &[]), deliverable("b", &[])],
+        max_chained_dispatch: None,
+    };
+    let err = apply_edits(
+        &g,
+        &[GraphEdit::RemoveEdge {
+            from: "a".into(),
+            to: "b".into(),
+        }],
+    )
+    .expect_err("missing edge rejected");
+    assert_eq!(invalid_reason(err), "edit 0: no edge 'a' -> 'b'");
+}
+
+#[test]
+fn add_duplicate_edge_is_rejected() {
+    let err = apply_edits(
+        &graph(),
+        &[GraphEdit::AddEdge {
+            from: "a".into(),
+            to: "b".into(),
+            consumes: None,
+        }],
+    )
+    .expect_err("duplicate edge rejected");
+    assert_eq!(
+        invalid_reason(err),
+        "edit 0: edge 'a' -> 'b' already exists"
+    );
+}
+
+#[test]
+fn remove_deliverable_with_dependents_is_rejected() {
+    let g = PlanGraph {
+        deliverables: vec![
+            deliverable("a", &[]),
+            deliverable("c", &["a"]),
+            deliverable("b", &["a"]),
+        ],
+        max_chained_dispatch: None,
+    };
+    let err = apply_edits(&g, &[GraphEdit::RemoveDeliverable { id: "a".into() }])
+        .expect_err("dependent deliverable rejected");
+    assert_eq!(
+        invalid_reason(err),
+        "edit 0: 'a' is a prerequisite of [b, c]; remove those edges first"
+    );
+}
+
+#[test]
+fn add_duplicate_deliverable_is_rejected() {
+    let err = apply_edits(
+        &graph(),
+        &[GraphEdit::AddDeliverable {
+            deliverable: deliverable("a", &[]),
+        }],
+    )
+    .expect_err("duplicate deliverable rejected");
+    assert_eq!(
+        invalid_reason(err),
+        "edit 0: deliverable 'a' already exists"
+    );
+}
+
+#[test]
+fn set_metadata_on_non_object_is_rejected() {
+    let mut g = graph();
+    g.deliverables[0].metadata = json!("text");
+    let err = apply_edits(
+        &g,
+        &[GraphEdit::SetMetadata {
+            id: "a".into(),
+            key: "owner".into(),
+            value: json!("platform"),
+        }],
+    )
+    .expect_err("non-object metadata rejected");
+    assert_eq!(
+        invalid_reason(err),
+        "edit 0: metadata of 'a' is not an object"
+    );
+}
+
+#[test]
+fn set_duration_none_clears_duration() {
+    let mut g = graph();
+    g.deliverables[0].duration_hours = Some(5.0);
+    let out = apply_edits(
+        &g,
+        &[GraphEdit::SetDuration {
+            id: "a".into(),
+            hours: None,
+        }],
+    )
+    .expect("valid edit");
+    assert_eq!(find(&out, "a").duration_hours, None);
+}
+
+#[test]
+fn set_estimate_none_clears_estimate() {
+    let mut g = graph();
+    g.deliverables[0].estimate = Some(Estimate {
+        optimistic: 1.0,
+        likely: 2.0,
+        pessimistic: 3.0,
+    });
+    let out = apply_edits(
+        &g,
+        &[GraphEdit::SetEstimate {
+            id: "a".into(),
+            estimate: None,
+        }],
+    )
+    .expect("valid edit");
+    assert_eq!(find(&out, "a").estimate, None);
+}
+
+#[test]
+fn graph_edit_rejects_unknown_fields_on_the_wire() {
+    let parsed = serde_json::from_str::<GraphEdit>(
+        r#"{"op":"set_effort","id":"a","hours":1.0,"extra":true}"#,
+    );
+    assert!(parsed.is_err());
+}
+
+#[test]
+fn graph_edit_op_tag_round_trips() {
+    let edit = GraphEdit::SetEffort {
+        id: "a".into(),
+        hours: 2.5,
+    };
+    let wire = serde_json::to_string(&edit).expect("serializes");
+    let back: GraphEdit = serde_json::from_str(&wire).expect("deserializes");
+    assert_eq!(back, edit);
 }

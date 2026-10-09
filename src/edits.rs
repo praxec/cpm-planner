@@ -50,23 +50,6 @@ pub enum GraphEdit {
     AddDeliverable { deliverable: Deliverable },
 }
 
-// `GraphEdit` derives `PartialEq` (per the task interface). `PlanGraph`'s
-// `Deliverable` does not, and `plan.rs` is outside this task's edit scope,
-// so provide the missing structural equality here rather than weakening the
-// requested `GraphEdit` derive.
-impl PartialEq for Deliverable {
-    fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
-            && self.owned_files == other.owned_files
-            && self.prerequisites == other.prerequisites
-            && self.estimated_effort_hours == other.estimated_effort_hours
-            && self.duration_hours == other.duration_hours
-            && self.estimate == other.estimate
-            && self.metadata == other.metadata
-            && self.milestone == other.milestone
-    }
-}
-
 /// Apply `edits` in order to a clone of `graph`, then validate the result
 /// with the same rules as `plan.submit`.
 ///
@@ -106,7 +89,13 @@ fn apply_one(graph: &mut PlanGraph, index: usize, edit: &GraphEdit) -> Result<()
                 return Err(unknown_id(index, from));
             }
             let target = find_mut(graph, to).expect("checked present above");
+            let before = target.prerequisites.len();
             target.prerequisites.retain(|p| p.id() != from);
+            if target.prerequisites.len() == before {
+                return Err(PlannerError::InvalidGraph {
+                    reason: format!("edit {index}: no edge '{from}' -> '{to}'"),
+                });
+            }
         }
         GraphEdit::AddEdge { from, to, consumes } => {
             if !contains_id(graph, to) {
@@ -125,6 +114,11 @@ fn apply_one(graph: &mut PlanGraph, index: usize, edit: &GraphEdit) -> Result<()
                 None => Prerequisite::Id(from.clone()),
             };
             let target = find_mut(graph, to).expect("checked present above");
+            if target.prerequisites.iter().any(|p| p.id() == from) {
+                return Err(PlannerError::InvalidGraph {
+                    reason: format!("edit {index}: edge '{from}' -> '{to}' already exists"),
+                });
+            }
             target.prerequisites.push(edge);
         }
         GraphEdit::SetEffort { id, hours } => {
@@ -141,7 +135,12 @@ fn apply_one(graph: &mut PlanGraph, index: usize, edit: &GraphEdit) -> Result<()
         }
         GraphEdit::SetMetadata { id, key, value } => {
             let target = find_mut(graph, id).ok_or_else(|| unknown_id(index, id))?;
-            if !target.metadata.is_object() {
+            if !target.metadata.is_null() && !target.metadata.is_object() {
+                return Err(PlannerError::InvalidGraph {
+                    reason: format!("edit {index}: metadata of '{id}' is not an object"),
+                });
+            }
+            if target.metadata.is_null() {
                 target.metadata = serde_json::json!({});
             }
             target
@@ -154,9 +153,32 @@ fn apply_one(graph: &mut PlanGraph, index: usize, edit: &GraphEdit) -> Result<()
             if !contains_id(graph, id) {
                 return Err(unknown_id(index, id));
             }
+            let mut dependents: Vec<&str> = graph
+                .deliverables
+                .iter()
+                .filter(|d| d.id != *id && d.prerequisites.iter().any(|p| p.id() == id))
+                .map(|d| d.id.as_str())
+                .collect();
+            if !dependents.is_empty() {
+                dependents.sort_unstable();
+                return Err(PlannerError::InvalidGraph {
+                    reason: format!(
+                        "edit {index}: '{id}' is a prerequisite of [{}]; remove those edges first",
+                        dependents.join(", ")
+                    ),
+                });
+            }
             graph.deliverables.retain(|d| d.id != *id);
         }
         GraphEdit::AddDeliverable { deliverable } => {
+            if contains_id(graph, &deliverable.id) {
+                return Err(PlannerError::InvalidGraph {
+                    reason: format!(
+                        "edit {index}: deliverable '{}' already exists",
+                        deliverable.id
+                    ),
+                });
+            }
             for prereq in &deliverable.prerequisites {
                 if !contains_id(graph, prereq.id()) {
                     return Err(unknown_id(index, prereq.id()));
