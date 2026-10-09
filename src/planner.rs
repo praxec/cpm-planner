@@ -229,9 +229,10 @@ impl Default for BasicCpmPlanner {
 // Graph validation + hashing
 // ---------------------------------------------------------------------------
 
-/// Canonical JSON form of one deliverable: prerequisites and owned files
-/// sorted so declaration order never matters. Shared by `hash_graph` and
-/// plan revision's "did the definition change" test.
+/// Canonical, order-independent JSON form of one deliverable: prerequisites
+/// and owned files sorted so declaration order never matters. Shared by
+/// [`hash_graph`], plan revision's "did the definition change" test, and
+/// variant comparison diffs.
 pub(crate) fn canonical_deliverable(d: &Deliverable) -> serde_json::Value {
     let mut prereqs: Vec<serde_json::Value> = d
         .prerequisites
