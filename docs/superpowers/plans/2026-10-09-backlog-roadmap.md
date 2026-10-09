@@ -198,6 +198,8 @@ Research facts (2026-10-09):
 
 ## P7a — MCP install instructions (parallel, any time)
 
+**PR #11 (decided 2026-10-09):** land #29 → #30 → P2 first, then rebase PR #11 (`codex/prebuilt-installers`) onto `dev` as the base of P7a: drop its `src/` clippy workarounds (superseded by P0) and its full-file `src/ports.rs` rewrite, pin its workflows to `dtolnay/rust-toolchain@1.99.0`, fix the failing `test (macos-latest)` job, sync `server.json`/version, then merge.
+
 **Files:** `README.md` (new "Install as an MCP server" section), `server.json` (version sync + CI check), optionally `scripts/install.sh`/`install.ps1` salvaged from `origin/codex/prebuilt-installers`.
 
 - [ ] Per-client snippets: Claude Code (`claude mcp add cpm-planner -- cpm-planner`, with `-e CPM_PLANNER_DB=…`, `--scope user|project`), Claude Desktop (`claude_desktop_config.json`), Cursor (`.cursor/mcp.json`), VS Code (`.vscode/mcp.json`), Codex (`~/.codex/config.toml` `[mcp_servers.cpm-planner]`), Docker (`docker run -i --rm -v …:/data ghcr.io/praxec/cpm-planner`), praxec.
@@ -207,6 +209,8 @@ Research facts (2026-10-09):
 - [ ] PR → dev.
 
 ## P7b — `deliverable-cpm` skill + docs refresh (last)
+
+**PR #25 (decided 2026-10-09):** held open, not merged as-is (it teaches the scratch-`graph.json` workflow and the #18 caveat). P7b rewrites it on that branch per the steps below, then merges.
 
 **Files:** `skills/deliverable-cpm/SKILL.md` (from `origin/skill/deliverable-cpm` b40f267), README, CHANGELOG, `instructions()`.
 
