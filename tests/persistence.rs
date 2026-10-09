@@ -96,6 +96,7 @@ fn deliverable(id: &str, files: &[&str], prereqs: &[&str]) -> Deliverable {
         prerequisites: prereqs.iter().map(|s| (*s).into()).collect(),
         estimated_effort_hours: Some(1.0),
         metadata: serde_json::Value::Null,
+        milestone: false,
     }
 }
 

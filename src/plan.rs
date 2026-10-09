@@ -210,6 +210,25 @@ pub struct Deliverable {
     /// this field.
     #[serde(default)]
     pub metadata: serde_json::Value,
+
+    /// True for a milestone: a zero-effort marker whose schedule and
+    /// critical path `plan.status` reports in `milestones`. A deliverable
+    /// with `metadata.milestone == true` is treated the same way.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub milestone: bool,
+}
+
+impl Deliverable {
+    /// Whether this deliverable is a milestone, via the `milestone` field or
+    /// the legacy `metadata.milestone == true` convention.
+    pub fn is_milestone(&self) -> bool {
+        self.milestone
+            || self
+                .metadata
+                .get("milestone")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+    }
 }
 
 /// Lifecycle state of a single [`Deliverable`].
@@ -606,6 +625,21 @@ pub struct PlanStatus {
     /// empty plan).
     #[serde(default)]
     pub plan_complete: bool,
+    /// One row per milestone deliverable, in graph order.
+    #[serde(default)]
+    pub milestones: Vec<MilestoneRow>,
+}
+
+/// A milestone's schedule summary, reported by [`PlanStatus::milestones`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MilestoneRow {
+    pub id: String,
+    /// Longest chain from `__start__` to this milestone (ends at `id`).
+    pub critical_path: Vec<String>,
+    /// The milestone's earliest finish, in hours from plan start.
+    pub hours: f32,
+    /// True once the milestone deliverable is `Complete`.
+    pub complete: bool,
 }
 
 /// Reserved id of the synthetic zero-effort source node in every plan's CPM.
@@ -774,6 +808,7 @@ mod tests {
                 prerequisites: vec!["d0".into()],
                 estimated_effort_hours: Some(1.5),
                 metadata: serde_json::json!({"description": "smoke test"}),
+                milestone: false,
             }],
             max_chained_dispatch: Some(8),
         };
@@ -832,6 +867,7 @@ mod tests {
                         prerequisites: vec![],
                         estimated_effort_hours: Some(1.0),
                         metadata: serde_json::Value::Null,
+                        milestone: false,
                     },
                     lock: LockInfo {
                         plan_id: plan_id.clone(),
@@ -848,6 +884,7 @@ mod tests {
                         prerequisites: vec![],
                         estimated_effort_hours: Some(2.0),
                         metadata: serde_json::Value::Null,
+                        milestone: false,
                     },
                     lock: LockInfo {
                         plan_id: plan_id.clone(),

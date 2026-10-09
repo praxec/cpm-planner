@@ -21,6 +21,7 @@ fn deliverable(id: &str, files: &[&str], prereqs: &[&str], effort: Option<f32>) 
         prerequisites: prereqs.iter().map(|s| (*s).into()).collect(),
         estimated_effort_hours: effort,
         metadata: serde_json::Value::Null,
+        milestone: false,
     }
 }
 
@@ -1427,4 +1428,72 @@ async fn negative_lag_is_rejected() {
         .await
         .unwrap_err();
     assert!(err.to_string().starts_with("INVALID_GRAPH"), "got: {err}");
+}
+
+fn milestone(id: &str, prereqs: &[&str]) -> Deliverable {
+    let mut d = deliverable(id, &[], prereqs, Some(0.0));
+    d.milestone = true;
+    d
+}
+
+fn milestone_graph() -> Vec<Deliverable> {
+    vec![
+        deliverable("a", &["src/a.rs"], &[], Some(1.0)),
+        deliverable("x", &["src/x.rs"], &[], Some(3.0)),
+        milestone("m", &["a", "x"]),
+        deliverable("c", &["src/c.rs"], &["m"], Some(5.0)),
+    ]
+}
+
+#[tokio::test]
+async fn milestone_row_reports_longest_chain_to_milestone() {
+    let planner = BasicCpmPlanner::new();
+    let plan_id = submit(&planner, milestone_graph()).await;
+    let status = planner.status(&plan_id).await.unwrap();
+    assert_eq!(status.milestones[0].critical_path, ["__start__", "x", "m"]);
+}
+
+#[tokio::test]
+async fn milestone_hours_is_milestone_earliest_finish() {
+    let planner = BasicCpmPlanner::new();
+    let plan_id = submit(&planner, milestone_graph()).await;
+    let status = planner.status(&plan_id).await.unwrap();
+    assert_eq!(status.milestones[0].hours, 3.0);
+}
+
+#[tokio::test]
+async fn metadata_milestone_flag_is_honoured() {
+    let planner = BasicCpmPlanner::new();
+    let graph = vec![with_meta(
+        deliverable("m", &["src/m.rs"], &[], Some(0.0)),
+        serde_json::json!({"milestone": true}),
+    )];
+    let plan_id = submit(&planner, graph).await;
+    let status = planner.status(&plan_id).await.unwrap();
+    assert_eq!(status.milestones[0].id, "m");
+}
+
+#[tokio::test]
+async fn milestone_flag_changes_plan_identity() {
+    let planner = BasicCpmPlanner::new();
+    let plain = PlanGraph {
+        deliverables: vec![deliverable("m", &["src/m.rs"], &[], Some(0.0))],
+        max_chained_dispatch: None,
+    };
+    let mut flagged = plain.clone();
+    flagged.deliverables[0].milestone = true;
+    let a = planner.submit_plan(plain).await.unwrap();
+    let b = planner.submit_plan(flagged).await.unwrap();
+    assert_ne!(a, b);
+}
+
+#[tokio::test]
+async fn milestone_complete_reflects_status() {
+    let planner = BasicCpmPlanner::new();
+    let plan_id = submit(&planner, milestone_graph()).await;
+    for id in ["a", "x", "m"] {
+        complete(&planner, &plan_id, id).await;
+    }
+    let status = planner.status(&plan_id).await.unwrap();
+    assert!(status.milestones[0].complete);
 }

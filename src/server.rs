@@ -343,7 +343,7 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                  failure_count, lapse_count] rows, critical_path (one real chain, always from __start__ to __finish__), \
                  critical_ids, per-deliverable schedule (es/ef/ls/lf/float, hours; \
                  synthetic __start__/__finish__ rows have synthetic=true), \
-                 the ready set in cohort priority order, plan_complete, and held locks.",
+                 the ready set in cohort priority order, plan_complete, milestones (per milestone: id, critical_path from __start__, hours, complete), and held locks.",
             ),
             schema_object(json!({
                 "type": "object",
@@ -771,7 +771,7 @@ Tools (eight total, all `plan.<verb>`):
   plan.acquire_cohort  — atomically acquire ready, file-disjoint deliverables
   plan.heartbeat       — refresh a held lock's TTL
   plan.mark_status     — set a deliverable's status (Complete/Failed releases the lock); lockless Complete requires complete prerequisites (PREREQUISITES_INCOMPLETE) and is audited
-  plan.status          — read-only snapshot ([id, status, attempt_count, failure_count, lapse_count] rows, critical_path (one real chain, always __start__ to __finish__), critical_ids, per-deliverable schedule (es/ef/ls/lf/float, hours; synthetic __start__/__finish__ endpoint rows have synthetic=true), the ready set ordered by float, plan_complete, held locks). __start__ and __finish__ are reserved deliverable ids (INVALID_GRAPH)
+  plan.status          — read-only snapshot ([id, status, attempt_count, failure_count, lapse_count] rows, critical_path (one real chain, always __start__ to __finish__), critical_ids, per-deliverable schedule (es/ef/ls/lf/float, hours; synthetic __start__/__finish__ endpoint rows have synthetic=true), the ready set ordered by float, plan_complete, milestones (one row per `milestone: true` deliverable, or metadata.milestone == true: id, critical_path from __start__ to it, hours = its earliest finish, complete), held locks). __start__ and __finish__ are reserved deliverable ids (INVALID_GRAPH)
   plan.get             — return the submitted PlanGraph (deliverables, estimates, files, metadata) for a plan_id
   plan.force_release   — operator escape hatch; emits audit event with `reason`; optional reset_counters:true also clears lapse/failure counters and revives a circuit-broken deliverable
   plan.accept          — a manager/owner marks a deliverable Complete without a lease (audited; evidence required; override_lock to take over a live lease)

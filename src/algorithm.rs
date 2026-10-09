@@ -442,7 +442,6 @@ impl CpmAlgorithm {
     /// smallest id; predecessor ties resolve to the smallest id. Bounded by the
     /// task count so malformed (cyclic) input cannot loop.
     fn trace_critical_path(tasks: &[Task]) -> Vec<String> {
-        let by_id: HashMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
         let Some(sink) = tasks.iter().max_by(|a, b| {
             a.earliest_finish
                 .partial_cmp(&b.earliest_finish)
@@ -456,6 +455,22 @@ impl CpmAlgorithm {
         }) else {
             return Vec::new();
         };
+        Self::trace_back(tasks, sink)
+    }
+
+    /// Trace the longest chain ending at the task `end_id` (same tie rules as
+    /// [`Self::trace_critical_path`]), restricted to that task's ancestors.
+    /// Empty when `end_id` is unknown.
+    pub(crate) fn trace_path_to(tasks: &[Task], end_id: &str) -> Vec<String> {
+        tasks
+            .iter()
+            .find(|t| t.id == end_id)
+            .map_or_else(Vec::new, |end| Self::trace_back(tasks, end))
+    }
+
+    /// Walk backwards from `sink` along tight edges, smallest id on ties.
+    fn trace_back(tasks: &[Task], sink: &Task) -> Vec<String> {
+        let by_id: HashMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
         let mut path = vec![sink.id.clone()];
         let mut current = sink;
         let mut seen: HashSet<&str> = HashSet::from([sink.id.as_str()]);

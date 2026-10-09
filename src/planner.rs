@@ -37,8 +37,8 @@ use crate::audit::{AuditEvent, AuditSink, NullAuditSink};
 use crate::plan::{
     AcceptRequest, AcquireRequest, BlockedDeliverable, CallerId, Cohort, CohortRow, Deliverable,
     DeliverableStatus, FINISH_ID, ForceReleaseRequest, HeartbeatRequest, LockInfo,
-    MarkStatusRequest, PlanDefinition, PlanGraph, PlanId, PlanStatus, PlannerError, START_ID,
-    ScheduleRow,
+    MarkStatusRequest, MilestoneRow, PlanDefinition, PlanGraph, PlanId, PlanStatus, PlannerError,
+    START_ID, ScheduleRow,
 };
 use crate::plan_store::SqlitePlanStore;
 use crate::ports::Planner;
@@ -48,6 +48,7 @@ use execution_policy::classify::{FailureClass, RetryDecision};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+use crate::algorithm::CpmAlgorithm;
 use crate::locks::PlanState;
 
 /// Default TTL applied to newly acquired locks. Five minutes is the
@@ -264,6 +265,7 @@ fn hash_graph(graph: &PlanGraph) -> String {
                 "prerequisites": prereqs,
                 "estimated_effort_hours": d.estimated_effort_hours,
                 "metadata": d.metadata,
+                "milestone": d.milestone,
             })
         })
         .collect();
@@ -1255,8 +1257,31 @@ impl Planner for BasicCpmPlanner {
             ready_rows.sort_by_key(|r| priority_key(&r.id, &sched_by_id));
             let ready: Vec<String> = ready_rows.iter().map(|r| r.id.clone()).collect();
 
+            let milestones: Vec<MilestoneRow> = state
+                .graph
+                .deliverables
+                .iter()
+                .filter(|d| d.is_milestone())
+                .filter_map(|d| {
+                    let task = task_of(&d.id)?;
+                    Some(MilestoneRow {
+                        id: d.id.clone(),
+                        critical_path: CpmAlgorithm::trace_path_to(
+                            &state.cached_result.tasks,
+                            &d.id,
+                        ),
+                        hours: task.earliest_finish,
+                        complete: matches!(
+                            state.statuses.get(&d.id),
+                            Some(DeliverableStatus::Complete)
+                        ),
+                    })
+                })
+                .collect();
+
             PlanStatus {
                 plan_id: plan_id.clone(),
+                milestones,
                 critical_ids: state
                     .cached_result
                     .critical_ids
@@ -1453,6 +1478,7 @@ mod tests {
             prerequisites: Vec::new(),
             estimated_effort_hours: effort,
             metadata,
+            milestone: false,
         }
     }
 
