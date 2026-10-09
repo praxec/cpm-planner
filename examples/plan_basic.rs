@@ -22,7 +22,6 @@
 //! - Locks are atomically acquired with the cohort and released by
 //!   `mark_status(Complete)`.
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -59,10 +58,12 @@ fn deliverable(
 ) -> Deliverable {
     Deliverable {
         id: id.to_string(),
-        owned_files: owned_files.iter().map(PathBuf::from).collect(),
-        prerequisites: prerequisites.iter().map(|s| s.to_string()).collect(),
+        owned_files: owned_files.iter().map(|f| (*f).into()).collect(),
+        prerequisites: prerequisites.iter().map(|s| (*s).into()).collect(),
         estimated_effort_hours: Some(estimated_effort_hours),
         metadata: serde_json::Value::Null,
+        duration_hours: None,
+        milestone: false,
     }
 }
 

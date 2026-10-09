@@ -20,11 +20,25 @@ use cpm_planner::{BasicCpmPlanner, MAX_ATTEMPTS, MAX_LAPSES};
 fn deliverable(id: &str, files: &[&str], prereqs: &[&str], effort: Option<f32>) -> Deliverable {
     Deliverable {
         id: id.to_string(),
-        owned_files: files.iter().map(PathBuf::from).collect(),
-        prerequisites: prereqs.iter().map(|s| s.to_string()).collect(),
+        owned_files: files
+            .iter()
+            .map(|f| cpm_planner::plan::OwnedFile::from(*f))
+            .collect(),
+        prerequisites: prereqs.iter().map(|s| (*s).into()).collect(),
         estimated_effort_hours: effort,
         metadata: serde_json::Value::Null,
+        duration_hours: None,
+        milestone: false,
     }
+}
+
+fn appending(id: &str, path: &str) -> Deliverable {
+    let mut d = deliverable(id, &[], &[], Some(1.0));
+    d.owned_files = vec![cpm_planner::plan::OwnedFile::Claim {
+        path: PathBuf::from(path),
+        mode: Some(cpm_planner::plan::FileMode::Append),
+    }];
+    d
 }
 
 fn caller(id: &str) -> CallerId {
@@ -824,7 +838,7 @@ async fn concurrent_acquire_race_test() {
                 let d = &row.deliverable;
                 all_ids.push(d.id.clone());
                 for f in &d.owned_files {
-                    all_files.push(f.clone());
+                    all_files.push(f.path().to_path_buf());
                 }
                 // F5 INTERFACE_GAP-001: row pairing is type-enforced;
                 // this assertion still documents the operator-facing
@@ -1104,4 +1118,83 @@ async fn reset_counters_event_is_attributed_to_operator() {
         .find(|e| e.event_type == "plan.deliverable.counters_reset")
         .expect("counters_reset event");
     assert_eq!(evt.actor.as_deref(), Some("operator"));
+}
+
+#[tokio::test]
+async fn append_claims_on_same_path_are_coleased() {
+    let planner = BasicCpmPlanner::new();
+    let plan_id = planner
+        .submit_plan(PlanGraph {
+            deliverables: vec![appending("a", "REGISTRY.md"), appending("b", "REGISTRY.md")],
+            max_chained_dispatch: None,
+        })
+        .await
+        .unwrap();
+    let cohort = planner
+        .acquire_cohort(AcquireRequest::new(plan_id, caller("c1"), 2))
+        .await
+        .unwrap();
+    assert_eq!(cohort.rows.len(), 2);
+}
+
+#[tokio::test]
+async fn cohort_reports_shared_append_paths() {
+    let planner = BasicCpmPlanner::new();
+    let plan_id = planner
+        .submit_plan(PlanGraph {
+            deliverables: vec![appending("a", "REGISTRY.md"), appending("b", "REGISTRY.md")],
+            max_chained_dispatch: None,
+        })
+        .await
+        .unwrap();
+    let cohort = planner
+        .acquire_cohort(AcquireRequest::new(plan_id, caller("c1"), 2))
+        .await
+        .unwrap();
+    assert_eq!(cohort.shared_paths, vec![PathBuf::from("REGISTRY.md")]);
+}
+
+#[tokio::test]
+async fn unordered_exclusive_and_append_claims_are_rejected_at_submit() {
+    let planner = BasicCpmPlanner::new();
+    let exclusive = deliverable("c", &["REGISTRY.md"], &[], Some(1.0));
+    let err = planner
+        .submit_plan(PlanGraph {
+            deliverables: vec![
+                appending("a", "REGISTRY.md"),
+                appending("b", "REGISTRY.md"),
+                exclusive,
+            ],
+            max_chained_dispatch: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PlannerError::InvalidGraph { .. }), "{err:?}");
+}
+
+#[tokio::test]
+async fn releasing_one_append_holder_keeps_the_other_claim() {
+    let planner = BasicCpmPlanner::new();
+    let plan_id = planner
+        .submit_plan(PlanGraph {
+            deliverables: vec![appending("a", "REGISTRY.md"), appending("b", "REGISTRY.md")],
+            max_chained_dispatch: None,
+        })
+        .await
+        .unwrap();
+    planner
+        .acquire_cohort(AcquireRequest::new(plan_id.clone(), caller("c1"), 2))
+        .await
+        .unwrap();
+    planner
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
+            "a",
+            caller("c1"),
+            DeliverableStatus::Complete,
+        ))
+        .await
+        .unwrap();
+    let status = planner.status(&plan_id).await.unwrap();
+    assert_eq!(status.locks_held.len(), 1);
 }

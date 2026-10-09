@@ -14,10 +14,10 @@
 //! Lifecycle methods drain pending events into a `Vec<AuditEvent>` while
 //! holding the mutex, then flush after dropping it.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 
-use crate::plan::{DeliverableStatus, LockInfo, PlanGraph};
+use crate::plan::{DeliverableStatus, FileMode, LockInfo, OwnedFile, PlanGraph};
 use chrono::{DateTime, Utc};
 
 use crate::task::CriticalPathResult;
@@ -64,15 +64,99 @@ pub(crate) struct PlanState {
     /// `InProgress` iff this map contains it.
     pub(crate) locks: HashMap<String, LockInfo>,
 
-    /// Inverse index: which deliverable currently owns each locked file.
-    /// Maintained in lock-step with `locks` so overlap checks during
-    /// `acquire_cohort` are O(candidate.owned_files.len()).
-    pub(crate) file_to_deliverable: HashMap<PathBuf, String>,
+    /// Inverse index: who currently claims each locked file (one exclusive
+    /// holder, or a set of append holders). Maintained in lock-step with
+    /// `locks` so overlap checks during `acquire_cohort` are
+    /// O(candidate.owned_files.len()).
+    pub(crate) file_claims: HashMap<PathBuf, FileClaim>,
 
     /// CPM result computed at submit time. The critical-path ordering
     /// drives priority in `acquire_cohort`; the duration is surfaced via
     /// `status`.
     pub(crate) cached_result: CriticalPathResult,
+}
+
+/// Who holds a locked path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FileClaim {
+    Exclusive(String),
+    Append(BTreeSet<String>),
+}
+
+/// Two claims on one path conflict unless both are append.
+pub(crate) fn modes_conflict(requested: FileMode, held: FileMode) -> bool {
+    !(requested == FileMode::Append && held == FileMode::Append)
+}
+
+impl FileClaim {
+    /// Whether a request for this path in `requested` mode conflicts with
+    /// this held claim.
+    pub(crate) fn conflicts_with(&self, requested: FileMode) -> bool {
+        let held = match self {
+            FileClaim::Exclusive(_) => FileMode::Exclusive,
+            FileClaim::Append(_) => FileMode::Append,
+        };
+        modes_conflict(requested, held)
+    }
+}
+
+/// Record `deliverable_id`'s claims in the index.
+pub(crate) fn add_file_claims(
+    claims: &mut HashMap<PathBuf, FileClaim>,
+    deliverable_id: &str,
+    files: &[OwnedFile],
+) {
+    for f in files {
+        match f.mode() {
+            FileMode::Exclusive => {
+                debug_assert!(
+                    !matches!(claims.get(f.path()), Some(FileClaim::Append(_))),
+                    "exclusive claim by {deliverable_id} on a path held by append claims"
+                );
+                claims.insert(
+                    f.path().to_path_buf(),
+                    FileClaim::Exclusive(deliverable_id.to_string()),
+                );
+            }
+            FileMode::Append => match claims.entry(f.path().to_path_buf()) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    debug_assert!(
+                        matches!(e.get(), FileClaim::Append(_)),
+                        "append claim by {deliverable_id} on a path held exclusively"
+                    );
+                    if let FileClaim::Append(set) = e.get_mut() {
+                        set.insert(deliverable_id.to_string());
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(FileClaim::Append(BTreeSet::from([
+                        deliverable_id.to_string()
+                    ])));
+                }
+            },
+        }
+    }
+}
+
+/// Drop only `deliverable_id`'s claims; an emptied append set removes the path.
+pub(crate) fn release_file_claims(
+    claims: &mut HashMap<PathBuf, FileClaim>,
+    deliverable_id: &str,
+    files: &[OwnedFile],
+) {
+    for f in files {
+        let drop_path = match claims.get_mut(f.path()) {
+            Some(FileClaim::Exclusive(owner)) => owner == deliverable_id,
+            Some(FileClaim::Append(set)) => {
+                set.remove(deliverable_id);
+                set.is_empty()
+            }
+            None => false,
+        };
+        if drop_path {
+            claims.remove(f.path());
+        }
+    }
 }
 
 impl PlanState {
@@ -88,7 +172,7 @@ impl PlanState {
             failure_counts: HashMap::new(),
             lapse_counts: HashMap::new(),
             locks: HashMap::new(),
-            file_to_deliverable: HashMap::new(),
+            file_claims: HashMap::new(),
             cached_result,
         }
     }
@@ -142,9 +226,7 @@ impl PlanState {
             if let Some(info) = self.locks.remove(&id) {
                 // Drop this deliverable's owned_files from the inverse index.
                 if let Some(deliverable) = self.graph.deliverables.iter().find(|d| d.id == id) {
-                    for f in &deliverable.owned_files {
-                        self.file_to_deliverable.remove(f);
-                    }
+                    release_file_claims(&mut self.file_claims, &id, &deliverable.owned_files);
                 }
                 *self.lapse_counts.entry(id.clone()).or_insert(0) += 1;
                 self.statuses.insert(id, DeliverableStatus::Ready);
@@ -152,5 +234,36 @@ impl PlanState {
             }
         }
         reaped
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn releasing_one_append_holder_keeps_the_other_claim() {
+        let files = vec![OwnedFile::Claim {
+            path: PathBuf::from("R.md"),
+            mode: Some(FileMode::Append),
+        }];
+        let mut claims = HashMap::new();
+        add_file_claims(&mut claims, "a", &files);
+        add_file_claims(&mut claims, "b", &files);
+        release_file_claims(&mut claims, "a", &files);
+        assert_eq!(
+            claims.get(&PathBuf::from("R.md")),
+            Some(&FileClaim::Append(BTreeSet::from(["b".to_string()])))
+        );
+    }
+
+    #[test]
+    fn file_claim_conflicts_unless_both_sides_append() {
+        let ex = FileClaim::Exclusive("a".into());
+        let ap = FileClaim::Append(BTreeSet::from(["a".to_string()]));
+        assert!(ex.conflicts_with(FileMode::Exclusive));
+        assert!(ex.conflicts_with(FileMode::Append));
+        assert!(ap.conflicts_with(FileMode::Exclusive));
+        assert!(!ap.conflicts_with(FileMode::Append));
     }
 }

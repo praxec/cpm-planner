@@ -17,7 +17,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 /// plans are recomputed on open (see `plan_store`). Bump also when
 /// `EffortEstimator` defaults change, since stored plans are recomputed with
 /// the current estimator.
-pub const CPM_VERSION: i64 = 1;
+///
+/// - v2: synthetic `__start__`/`__finish__` endpoints
+/// - v3: calendar `duration_hours` and per-edge `lag_hours`
+pub const CPM_VERSION: i64 = 3;
 
 const TIGHT_EPS: f32 = 1e-3;
 
@@ -112,8 +115,8 @@ impl CpmAlgorithm {
 
     /// Forward pass: Calculate earliest start (ES) and earliest finish (EF)
     ///
-    /// ES = max(EF of all predecessors), or 0 if no predecessors
-    /// EF = ES + effort
+    /// ES = max(EF of each predecessor + edge lag), or 0 if no predecessors
+    /// EF = ES + scheduled length (`duration_hours` when set, else effort)
     ///
     /// Returns the ids of any tasks that could not be scheduled because
     /// they (or their predecessors) sit on a dependency cycle. An empty
@@ -176,9 +179,14 @@ impl CpmAlgorithm {
             // Find successors by scanning all tasks
             for task in tasks.iter_mut() {
                 if task.dependencies.contains(&current_id) {
-                    // Update ES if this predecessor has later EF
-                    if current_ef > task.earliest_start {
-                        task.earliest_start = current_ef;
+                    // Update ES if this predecessor (plus edge lag) is later
+                    let lag = task
+                        .lag_by_dependency
+                        .get(&current_id)
+                        .copied()
+                        .unwrap_or(0.0);
+                    if current_ef + lag > task.earliest_start {
+                        task.earliest_start = current_ef + lag;
                         task.earliest_finish = task.earliest_start + task.effort_hours;
                     }
 
@@ -225,8 +233,9 @@ impl CpmAlgorithm {
 
     /// Backward pass: Calculate latest start (LS) and latest finish (LF)
     ///
-    /// LF = min(LS of all successors), or `project_end` if no successors
-    /// LS = LF - effort
+    /// LF = min(LS of each successor - edge lag), or `project_end` if no
+    /// successors
+    /// LS = LF - scheduled length
     ///
     /// Returns the ids of any tasks whose `latest_finish` never relaxed off
     /// the `f32::MAX` sentinel. In a well-formed graph this is empty; a
@@ -279,7 +288,20 @@ impl CpmAlgorithm {
                 {
                     let min_succ_ls = succ_ids
                         .iter()
-                        .filter_map(|sid| task_map.get(sid).map(|&idx| tasks[idx].latest_start))
+                        .filter_map(|sid| {
+                            task_map.get(sid).map(|&idx| {
+                                let lag = tasks[idx]
+                                    .lag_by_dependency
+                                    .get(&task_id)
+                                    .copied()
+                                    .unwrap_or(0.0);
+                                if tasks[idx].latest_start < f32::MAX {
+                                    tasks[idx].latest_start - lag
+                                } else {
+                                    f32::MAX
+                                }
+                            })
+                        })
                         .filter(|&ls| ls < f32::MAX)
                         .fold(f32::MAX, f32::min);
 
@@ -440,7 +462,6 @@ impl CpmAlgorithm {
     /// smallest id; predecessor ties resolve to the smallest id. Bounded by the
     /// task count so malformed (cyclic) input cannot loop.
     fn trace_critical_path(tasks: &[Task]) -> Vec<String> {
-        let by_id: HashMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
         let Some(sink) = tasks.iter().max_by(|a, b| {
             a.earliest_finish
                 .partial_cmp(&b.earliest_finish)
@@ -454,6 +475,23 @@ impl CpmAlgorithm {
         }) else {
             return Vec::new();
         };
+        Self::trace_back(tasks, sink)
+    }
+
+    /// Trace the longest chain ending at the task `end_id` (same tie rules as
+    /// [`Self::trace_critical_path`]), restricted to that task's ancestors.
+    /// Empty when `end_id` is unknown.
+    pub(crate) fn trace_path_to(tasks: &[Task], end_id: &str) -> Vec<String> {
+        tasks
+            .iter()
+            .find(|t| t.id == end_id)
+            .map_or_else(Vec::new, |end| Self::trace_back(tasks, end))
+    }
+
+    /// Walk backwards from `sink` along tight edges (EF + lag == ES),
+    /// smallest id on ties. Lengths are scheduled lengths, not effort.
+    fn trace_back(tasks: &[Task], sink: &Task) -> Vec<String> {
+        let by_id: HashMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
         let mut path = vec![sink.id.clone()];
         let mut current = sink;
         let mut seen: HashSet<&str> = HashSet::from([sink.id.as_str()]);
@@ -462,7 +500,10 @@ impl CpmAlgorithm {
                 .dependencies
                 .iter()
                 .filter_map(|d| by_id.get(d.as_str()).copied())
-                .filter(|p| (p.earliest_finish - current.earliest_start).abs() < TIGHT_EPS)
+                .filter(|p| {
+                    let lag = current.lag_by_dependency.get(&p.id).copied().unwrap_or(0.0);
+                    (p.earliest_finish + lag - current.earliest_start).abs() < TIGHT_EPS
+                })
                 .filter(|p| !seen.contains(p.id.as_str()))
                 .min_by(|a, b| a.id.cmp(&b.id));
             let Some(pred) = next else { break };

@@ -29,15 +29,16 @@
 //! A slow sink therefore never holds up concurrent acquirers.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::audit::{AuditEvent, AuditSink, NullAuditSink};
 use crate::plan::{
     AcceptRequest, AcquireRequest, BlockedDeliverable, CallerId, Cohort, CohortRow, Deliverable,
-    DeliverableStatus, ForceReleaseRequest, HeartbeatRequest, LockInfo, MarkStatusRequest,
-    PlanDefinition, PlanGraph, PlanId, PlanStatus, PlannerError, ScheduleRow,
+    DeliverableStatus, FINISH_ID, FileMode, ForceReleaseRequest, HeartbeatRequest, LockInfo,
+    MarkStatusRequest, MilestoneRow, OwnedFile, PlanDefinition, PlanGraph, PlanId, PlanStatus,
+    PlannerError, START_ID, ScheduleRow,
 };
 use crate::plan_store::SqlitePlanStore;
 use crate::ports::Planner;
@@ -47,7 +48,8 @@ use execution_policy::classify::{FailureClass, RetryDecision};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::locks::PlanState;
+use crate::algorithm::CpmAlgorithm;
+use crate::locks::{FileClaim, PlanState, add_file_claims, modes_conflict, release_file_claims};
 
 /// Default TTL applied to newly acquired locks. Five minutes is the
 /// open-source default called out in SPEC §33 PA3.
@@ -238,20 +240,35 @@ fn hash_graph(graph: &PlanGraph) -> String {
         .deliverables
         .iter()
         .map(|d| {
-            let mut prereqs = d.prerequisites.clone();
-            prereqs.sort();
-            let mut files: Vec<String> = d
+            let mut prereqs: Vec<serde_json::Value> = d
+                .prerequisites
+                .iter()
+                .map(|p| {
+                    json!({
+                        "id": p.id(),
+                        "consumes": p.consumes(),
+                        "kind": p.kind(),
+                        "lag_hours": p.lag_hours() + 0.0,
+                    })
+                })
+                .collect();
+            // Full-key order (serialised form) so duplicate-id edges hash
+            // independently of submission order.
+            prereqs.sort_by_cached_key(ToString::to_string);
+            let mut files: Vec<serde_json::Value> = d
                 .owned_files
                 .iter()
-                .map(|p| p.to_string_lossy().into_owned())
+                .map(|f| json!({ "path": f.path().to_string_lossy(), "mode": f.mode() }))
                 .collect();
-            files.sort();
+            files.sort_by_cached_key(ToString::to_string);
             json!({
                 "id": d.id,
                 "owned_files": files,
                 "prerequisites": prereqs,
                 "estimated_effort_hours": d.estimated_effort_hours,
+                "duration_hours": d.duration_hours,
                 "metadata": d.metadata,
+                "milestone": d.milestone,
             })
         })
         .collect();
@@ -277,6 +294,14 @@ fn hash_graph(graph: &PlanGraph) -> String {
 /// Reject graphs that fail any structural invariant. Returns
 /// [`PlannerError::InvalidGraph`] with a precise `reason` on first failure.
 fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
+    for d in &graph.deliverables {
+        if d.id == START_ID || d.id == FINISH_ID {
+            return Err(PlannerError::InvalidGraph {
+                reason: format!("deliverable id '{}' is reserved", d.id),
+            });
+        }
+    }
+
     // Duplicate ids.
     let mut seen_ids: HashSet<&str> = HashSet::new();
     for d in &graph.deliverables {
@@ -301,11 +326,37 @@ fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
         }
     }
 
+    // Calendar durations, when present, must be finite and non-negative.
+    for d in &graph.deliverables {
+        if let Some(h) = d.duration_hours
+            && (h < 0.0 || !h.is_finite())
+        {
+            return Err(PlannerError::InvalidGraph {
+                reason: format!(
+                    "deliverable '{}' has invalid duration_hours {h}; must be a finite number >= 0",
+                    d.id
+                ),
+            });
+        }
+    }
+
     // Prerequisite references resolve.
     let id_set: HashSet<&str> = graph.deliverables.iter().map(|d| d.id.as_str()).collect();
     for d in &graph.deliverables {
         for p in &d.prerequisites {
-            if !id_set.contains(p.as_str()) {
+            let lag = p.lag_hours();
+            if !lag.is_finite() || lag < 0.0 {
+                return Err(PlannerError::InvalidGraph {
+                    reason: format!(
+                        "prerequisite '{}' of deliverable '{}' has invalid lag_hours {lag}; must be a finite number >= 0",
+                        p.id(),
+                        d.id
+                    ),
+                });
+            }
+        }
+        for p in crate::graph::prerequisite_ids(d) {
+            if !id_set.contains(p) {
                 return Err(PlannerError::InvalidGraph {
                     reason: format!(
                         "prerequisite '{p}' for deliverable '{}' does not exist",
@@ -316,19 +367,39 @@ fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
         }
     }
 
-    // Disjoint owned_files at graph level.
-    let mut file_owner: HashMap<&PathBuf, &str> = HashMap::new();
+    // Shared files: any pair of claimants where at least one claim is
+    // exclusive must be ordered by prerequisites, so one can never run
+    // while the other holds the file. Append/append needs no ordering.
+    let mut reach: Option<HashMap<String, HashSet<String>>> = None;
+    let mut claimants: HashMap<&Path, Vec<(&str, FileMode)>> = HashMap::new();
+    let mut path_order: Vec<&Path> = Vec::new();
     for d in &graph.deliverables {
         for f in &d.owned_files {
-            if let Some(other) = file_owner.insert(f, d.id.as_str()) {
-                return Err(PlannerError::InvalidGraph {
-                    reason: format!(
-                        "file '{}' is owned by both '{}' and '{}'",
-                        f.display(),
-                        other,
-                        d.id
-                    ),
-                });
+            let entry = claimants.entry(f.path()).or_insert_with(|| {
+                path_order.push(f.path());
+                Vec::new()
+            });
+            entry.push((d.id.as_str(), f.mode()));
+        }
+    }
+    for path in path_order {
+        let list = &claimants[path];
+        for (i, &(x, xm)) in list.iter().enumerate() {
+            for &(y, ym) in &list[i + 1..] {
+                if x == y || (xm == FileMode::Append && ym == FileMode::Append) {
+                    continue;
+                }
+                let reach = reach.get_or_insert_with(|| crate::graph::reachability(graph));
+                let ordered = reach.get(x).is_some_and(|r| r.contains(y))
+                    || reach.get(y).is_some_and(|r| r.contains(x));
+                if !ordered {
+                    return Err(PlannerError::InvalidGraph {
+                        reason: format!(
+                            "file '{}' is claimed by '{x}' and '{y}', which are not ordered by prerequisites (one could run while the other holds it)",
+                            path.display(),
+                        ),
+                    });
+                }
             }
         }
     }
@@ -341,9 +412,9 @@ fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
         succs.entry(d.id.as_str()).or_default();
     }
     for d in &graph.deliverables {
-        for p in &d.prerequisites {
+        for p in crate::graph::prerequisite_ids(d) {
             *indeg.entry(d.id.as_str()).or_insert(0) += 1;
-            succs.entry(p.as_str()).or_default().push(d.id.as_str());
+            succs.entry(p).or_default().push(d.id.as_str());
         }
     }
     let mut queue: Vec<&str> = indeg
@@ -391,7 +462,7 @@ fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
 // Audit helpers
 // ---------------------------------------------------------------------------
 
-fn make_acquired_event(lock: &LockInfo, owned_files: &[PathBuf]) -> AuditEvent {
+fn make_acquired_event(lock: &LockInfo, owned_files: &[OwnedFile]) -> AuditEvent {
     AuditEvent::new("plan.lock.acquired")
         .with_actor(lock.caller_id.as_str())
         .with_payload(json!({
@@ -452,10 +523,9 @@ fn incomplete_prerequisites(state: &PlanState, deliverable_id: &str) -> Vec<Stri
         .iter()
         .find(|d| d.id == deliverable_id)
         .map(|d| {
-            d.prerequisites
-                .iter()
+            crate::graph::prerequisite_ids(d)
                 .filter(|p| !matches!(state.statuses.get(*p), Some(DeliverableStatus::Complete)))
-                .cloned()
+                .map(str::to_string)
                 .collect()
         })
         .unwrap_or_default()
@@ -464,16 +534,21 @@ fn incomplete_prerequisites(state: &PlanState, deliverable_id: &str) -> Vec<Stri
 /// Mark a deliverable `Complete`: release any lock (and its file index,
 /// emitting a released event), set the status, and promote dependents whose
 /// prerequisites are now all complete. Shared by `mark_status` and `accept`.
+///
+/// Returns true when this completion made every deliverable `Complete`
+/// (the false -> true flip of `plan_complete`), so the caller can emit
+/// `plan.completed` exactly once.
 fn complete_deliverable(
     state: &mut PlanState,
     deliverable_id: &str,
     audit_buf: &mut Vec<AuditEvent>,
     release_reason: &str,
-) {
+) -> bool {
+    let was_complete = all_complete(state);
     if let Some(lock) = state.locks.remove(deliverable_id) {
         // Callers verified the deliverable exists; a held lock implies the
         // graph entry exists.
-        let owned_files: Vec<PathBuf> = match state
+        let owned_files: Vec<OwnedFile> = match state
             .graph
             .deliverables
             .iter()
@@ -485,9 +560,7 @@ fn complete_deliverable(
                  invariant broken"
             ),
         };
-        for f in &owned_files {
-            state.file_to_deliverable.remove(f);
-        }
+        release_file_claims(&mut state.file_claims, deliverable_id, &owned_files);
         audit_buf.push(make_released_event(&lock, release_reason));
     }
 
@@ -499,7 +572,7 @@ fn complete_deliverable(
         .graph
         .deliverables
         .iter()
-        .filter(|d| d.prerequisites.iter().any(|p| p == deliverable_id))
+        .filter(|d| crate::graph::prerequisite_ids(d).any(|p| p == deliverable_id))
         .map(|d| d.id.clone())
         .collect();
     for dep_id in dependents {
@@ -507,9 +580,7 @@ fn complete_deliverable(
             Some(d) => d,
             None => unreachable!("dependent id {dep_id} present in graph but not findable"),
         };
-        let all_done = dep
-            .prerequisites
-            .iter()
+        let all_done = crate::graph::prerequisite_ids(dep)
             .all(|p| matches!(state.statuses.get(p), Some(DeliverableStatus::Complete)));
         let currently_pending = matches!(
             state.statuses.get(&dep_id),
@@ -519,6 +590,23 @@ fn complete_deliverable(
             state.statuses.insert(dep_id, DeliverableStatus::Ready);
         }
     }
+    !was_complete && all_complete(state)
+}
+
+/// True when every deliverable in the plan is `Complete`.
+fn all_complete(state: &PlanState) -> bool {
+    state
+        .graph
+        .deliverables
+        .iter()
+        .all(|d| matches!(state.statuses.get(&d.id), Some(DeliverableStatus::Complete)))
+}
+
+fn make_plan_completed_event(plan_id: &PlanId, deliverable_count: usize) -> AuditEvent {
+    AuditEvent::new("plan.completed").with_payload(json!({
+        "plan_id": plan_id.as_str(),
+        "deliverable_count": deliverable_count,
+    }))
 }
 
 fn make_accepted_event(
@@ -844,7 +932,7 @@ impl Planner for BasicCpmPlanner {
             // 5. Greedy fill with file-disjointness check. Requested ids that
             //    are skipped are reported as FILE_CONFLICT / MAX_COUNT.
             let mut selected: Vec<Deliverable> = Vec::new();
-            let mut selected_files: HashSet<PathBuf> = HashSet::new();
+            let mut selected_files: HashMap<PathBuf, FileMode> = HashMap::new();
             for candidate in ready {
                 if selected.len() == max_count {
                     if ids.is_none() {
@@ -858,7 +946,13 @@ impl Planner for BasicCpmPlanner {
                     continue;
                 }
                 let conflict = candidate.owned_files.iter().any(|f| {
-                    selected_files.contains(f) || state.file_to_deliverable.contains_key(f)
+                    selected_files
+                        .get(f.path())
+                        .is_some_and(|m| modes_conflict(f.mode(), *m))
+                        || state
+                            .file_claims
+                            .get(f.path())
+                            .is_some_and(|c| c.conflicts_with(f.mode()))
                 });
                 if conflict {
                     if ids.is_some() {
@@ -872,7 +966,13 @@ impl Planner for BasicCpmPlanner {
                     continue;
                 }
                 for f in &candidate.owned_files {
-                    selected_files.insert(f.clone());
+                    // Exclusive wins if a path is somehow listed twice.
+                    let e = selected_files
+                        .entry(f.path().to_path_buf())
+                        .or_insert(f.mode());
+                    if f.mode() == FileMode::Exclusive {
+                        *e = FileMode::Exclusive;
+                    }
                 }
                 selected.push(candidate.clone());
             }
@@ -901,9 +1001,7 @@ impl Planner for BasicCpmPlanner {
                 // deliverable actually handed to a driver counts as an
                 // attempt (a file-conflict skip above does not).
                 *state.attempt_counts.entry(d.id.clone()).or_insert(0) += 1;
-                for f in &d.owned_files {
-                    state.file_to_deliverable.insert(f.clone(), d.id.clone());
-                }
+                add_file_claims(&mut state.file_claims, &d.id, &d.owned_files);
                 state.locks.insert(d.id.clone(), lock.clone());
                 audit_buf.push(make_acquired_event(&lock, &d.owned_files));
                 rows.push(CohortRow {
@@ -912,10 +1010,26 @@ impl Planner for BasicCpmPlanner {
                 });
             }
 
+            // Append paths in this cohort that two or more deliverables hold
+            // (claims were just recorded, so the set includes cohort members).
+            let mut shared_paths: Vec<PathBuf> = rows
+                .iter()
+                .flat_map(|r| r.deliverable.owned_files.iter())
+                .filter(|f| f.mode() == FileMode::Append)
+                .filter(|f| {
+                    matches!(state.file_claims.get(f.path()),
+                        Some(FileClaim::Append(set)) if set.len() >= 2)
+                })
+                .map(|f| f.path().to_path_buf())
+                .collect();
+            shared_paths.sort();
+            shared_paths.dedup();
+
             Ok(Cohort {
                 plan_id: plan_id.clone(),
                 rows,
                 blocked,
+                shared_paths,
             })
         })?;
 
@@ -1002,6 +1116,21 @@ impl Planner for BasicCpmPlanner {
                     &previous_status,
                 ));
             } else if !is_complete && !state.locks.contains_key(deliverable_id) {
+                // Putting a deliverable back to work without a lease must
+                // not bypass dependency order.
+                if matches!(
+                    status,
+                    DeliverableStatus::Ready | DeliverableStatus::InProgress
+                ) {
+                    let missing = incomplete_prerequisites(state, deliverable_id);
+                    if !missing.is_empty() {
+                        return Err(PlannerError::PrerequisitesIncomplete {
+                            plan_id: plan_id.0.clone(),
+                            deliverable_id: deliverable_id.to_string(),
+                            missing,
+                        });
+                    }
+                }
                 audit_buf.push(make_marked_without_lease_event(
                     &plan_id,
                     deliverable_id,
@@ -1017,7 +1146,7 @@ impl Planner for BasicCpmPlanner {
             {
                 // Deliverable existence was verified at the top of
                 // `mark_status`; `.find()` is guaranteed to succeed.
-                let owned_files: Vec<PathBuf> = match state
+                let owned_files: Vec<OwnedFile> = match state
                     .graph
                     .deliverables
                     .iter()
@@ -1029,9 +1158,7 @@ impl Planner for BasicCpmPlanner {
                          graph — invariant broken"
                     ),
                 };
-                for f in &owned_files {
-                    state.file_to_deliverable.remove(f);
-                }
+                release_file_claims(&mut state.file_claims, deliverable_id, &owned_files);
                 audit_buf.push(make_released_event(&lock, "failed"));
             }
 
@@ -1054,7 +1181,12 @@ impl Planner for BasicCpmPlanner {
             }
 
             if is_complete {
-                complete_deliverable(state, deliverable_id, &mut audit_buf, "completed");
+                if complete_deliverable(state, deliverable_id, &mut audit_buf, "completed") {
+                    audit_buf.push(make_plan_completed_event(
+                        &plan_id,
+                        state.graph.deliverables.len(),
+                    ));
+                }
             } else {
                 state
                     .statuses
@@ -1159,21 +1291,27 @@ impl Planner for BasicCpmPlanner {
                 .collect();
 
             let task_of = |id: &str| state.cached_result.tasks.iter().find(|t| t.id == id);
-            let schedule: Vec<ScheduleRow> = state
-                .graph
-                .deliverables
-                .iter()
-                .filter_map(|d| task_of(&d.id))
-                .map(|t| ScheduleRow {
-                    id: t.id.clone(),
-                    es: t.earliest_start,
-                    ef: t.earliest_finish,
-                    ls: t.latest_start,
-                    lf: t.latest_finish,
-                    float: t.float,
-                    critical: t.is_critical,
-                })
-                .collect();
+            let row_of = |t: &crate::task::Task, synthetic: bool| ScheduleRow {
+                id: t.id.clone(),
+                es: t.earliest_start,
+                ef: t.earliest_finish,
+                ls: t.latest_start,
+                lf: t.latest_finish,
+                float: t.float,
+                critical: t.is_critical,
+                synthetic,
+            };
+            let mut schedule: Vec<ScheduleRow> = Vec::new();
+            schedule.extend(task_of(START_ID).map(|t| row_of(t, true)));
+            schedule.extend(
+                state
+                    .graph
+                    .deliverables
+                    .iter()
+                    .filter_map(|d| task_of(&d.id))
+                    .map(|t| row_of(t, false)),
+            );
+            schedule.extend(task_of(FINISH_ID).map(|t| row_of(t, true)));
             let mut ready_rows: Vec<&ScheduleRow> = schedule
                 .iter()
                 .filter(|r| {
@@ -1193,9 +1331,39 @@ impl Planner for BasicCpmPlanner {
             ready_rows.sort_by_key(|r| priority_key(&r.id, &sched_by_id));
             let ready: Vec<String> = ready_rows.iter().map(|r| r.id.clone()).collect();
 
+            let milestones: Vec<MilestoneRow> = state
+                .graph
+                .deliverables
+                .iter()
+                .filter(|d| d.is_milestone())
+                .filter_map(|d| {
+                    let task = task_of(&d.id)?;
+                    Some(MilestoneRow {
+                        id: d.id.clone(),
+                        critical_path: CpmAlgorithm::trace_path_to(
+                            &state.cached_result.tasks,
+                            &d.id,
+                        ),
+                        hours: task.earliest_finish,
+                        complete: matches!(
+                            state.statuses.get(&d.id),
+                            Some(DeliverableStatus::Complete)
+                        ),
+                    })
+                })
+                .collect();
+
             PlanStatus {
                 plan_id: plan_id.clone(),
-                critical_ids: state.cached_result.critical_ids.clone(),
+                milestones,
+                critical_ids: state
+                    .cached_result
+                    .critical_ids
+                    .iter()
+                    .filter(|id| id.as_str() != START_ID && id.as_str() != FINISH_ID)
+                    .cloned()
+                    .collect(),
+                plan_complete: all_complete(state),
                 schedule,
                 ready,
                 deliverables,
@@ -1262,12 +1430,18 @@ impl Planner for BasicCpmPlanner {
                 });
             }
 
-            complete_deliverable(state, deliverable_id, &mut audit_buf, "accepted");
+            let plan_done = complete_deliverable(state, deliverable_id, &mut audit_buf, "accepted");
             audit_buf.push(make_accepted_event(
                 &req,
                 overrode.as_deref(),
                 &previous_status,
             ));
+            if plan_done {
+                audit_buf.push(make_plan_completed_event(
+                    &plan_id,
+                    state.graph.deliverables.len(),
+                ));
+            }
             Ok(())
         })?;
 
@@ -1301,7 +1475,7 @@ impl Planner for BasicCpmPlanner {
             if let Some(lock) = state.locks.remove(deliverable_id) {
                 // Deliverable existence was verified above; the held lock
                 // implies the graph entry exists.
-                let owned_files: Vec<PathBuf> = match state
+                let owned_files: Vec<OwnedFile> = match state
                     .graph
                     .deliverables
                     .iter()
@@ -1312,9 +1486,7 @@ impl Planner for BasicCpmPlanner {
                         "deliverable {deliverable_id} present in locks but missing from graph"
                     ),
                 };
-                for f in &owned_files {
-                    state.file_to_deliverable.remove(f);
-                }
+                release_file_claims(&mut state.file_claims, deliverable_id, &owned_files);
                 state
                     .statuses
                     .insert(deliverable_id.to_string(), DeliverableStatus::Ready);
@@ -1335,7 +1507,7 @@ impl Planner for BasicCpmPlanner {
                         .iter()
                         .find(|d| d.id == deliverable_id)
                         .is_some_and(|d| {
-                            d.prerequisites.iter().all(|p| {
+                            crate::graph::prerequisite_ids(d).all(|p| {
                                 matches!(state.statuses.get(p), Some(DeliverableStatus::Complete))
                             })
                         });
@@ -1378,6 +1550,8 @@ mod tests {
             prerequisites: Vec::new(),
             estimated_effort_hours: effort,
             metadata,
+            duration_hours: None,
+            milestone: false,
         }
     }
 

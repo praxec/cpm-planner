@@ -3,25 +3,34 @@
 //! Covers the trait surface from outside the crate; for lock-lifecycle
 //! and TTL behaviour see `tests/locks.rs`.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use cpm_planner::BasicCpmPlanner;
 use cpm_planner::audit::MemoryAuditSink;
 use cpm_planner::plan::{
     AcceptRequest, AcquireRequest, CallerId, Deliverable, DeliverableStatus, ForceReleaseRequest,
-    HeartbeatRequest, MarkStatusRequest, PlanGraph, PlanId, PlannerError,
+    HeartbeatRequest, MarkStatusRequest, PlanGraph, PlanId, PlannerError, Prerequisite,
 };
 use cpm_planner::ports::Planner;
 
 fn deliverable(id: &str, files: &[&str], prereqs: &[&str], effort: Option<f32>) -> Deliverable {
     Deliverable {
         id: id.to_string(),
-        owned_files: files.iter().map(PathBuf::from).collect(),
-        prerequisites: prereqs.iter().map(|s| s.to_string()).collect(),
+        owned_files: files
+            .iter()
+            .map(|f| cpm_planner::plan::OwnedFile::from(*f))
+            .collect(),
+        prerequisites: prereqs.iter().map(|s| (*s).into()).collect(),
         estimated_effort_hours: effort,
         metadata: serde_json::Value::Null,
+        duration_hours: None,
+        milestone: false,
     }
+}
+
+fn with_duration(mut d: Deliverable, hours: f32) -> Deliverable {
+    d.duration_hours = Some(hours);
+    d
 }
 
 fn caller(id: &str) -> CallerId {
@@ -423,7 +432,10 @@ async fn status_reflects_cached_critical_path() {
     };
     let plan_id = planner.submit_plan(graph).await.unwrap();
     let status = planner.status(&plan_id).await.unwrap();
-    assert_eq!(status.critical_path, vec!["a", "b", "c"]);
+    assert_eq!(
+        status.critical_path,
+        vec!["__start__", "a", "b", "c", "__finish__"]
+    );
     assert!((status.critical_path_hours - 6.0).abs() < 0.001);
     assert!(status.locks_held.is_empty());
 }
@@ -512,7 +524,7 @@ async fn status_schedule_marks_critical_rows() {
         .filter(|r| r.critical)
         .map(|r| r.id.as_str())
         .collect();
-    assert_eq!(critical, vec!["A", "C", "D"]);
+    assert_eq!(critical, vec!["__start__", "A", "C", "D", "__finish__"]);
 }
 
 #[tokio::test]
@@ -1139,4 +1151,740 @@ fn legacy_cohort_payload_without_blocked_deserializes() {
     }))
     .unwrap();
     assert!(cohort.blocked.is_empty());
+}
+
+// ---------------------------------------------------------------------
+// Synthetic __start__ / __finish__ endpoints
+// ---------------------------------------------------------------------
+
+async fn submit(planner: &BasicCpmPlanner, deliverables: Vec<Deliverable>) -> PlanId {
+    planner
+        .submit_plan(PlanGraph {
+            deliverables,
+            max_chained_dispatch: None,
+        })
+        .await
+        .unwrap()
+}
+
+async fn complete(planner: &BasicCpmPlanner, plan_id: &PlanId, id: &str) {
+    planner
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
+            id,
+            caller("c1"),
+            DeliverableStatus::Complete,
+        ))
+        .await
+        .unwrap();
+}
+
+fn ab_chain() -> Vec<Deliverable> {
+    vec![
+        deliverable("a", &["src/a.rs"], &[], Some(1.0)),
+        deliverable("b", &["src/b.rs"], &["a"], Some(2.0)),
+    ]
+}
+
+#[tokio::test]
+async fn critical_path_starts_and_ends_at_synthetic_endpoints() {
+    let planner = BasicCpmPlanner::new();
+    let plan_id = submit(&planner, ab_chain()).await;
+    let status = planner.status(&plan_id).await.unwrap();
+    assert_eq!(
+        status.critical_path,
+        vec!["__start__", "a", "b", "__finish__"]
+    );
+}
+
+#[tokio::test]
+async fn schedule_lists_endpoints_as_synthetic_rows() {
+    let planner = BasicCpmPlanner::new();
+    let plan_id = submit(&planner, ab_chain()).await;
+    let status = planner.status(&plan_id).await.unwrap();
+    let ids: Vec<(&str, bool)> = status
+        .schedule
+        .iter()
+        .map(|r| (r.id.as_str(), r.synthetic))
+        .collect();
+    assert_eq!(
+        ids,
+        vec![
+            ("__start__", true),
+            ("a", false),
+            ("b", false),
+            ("__finish__", true)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn finish_depends_on_every_sink() {
+    let planner = BasicCpmPlanner::new();
+    let plan_id = submit(
+        &planner,
+        vec![
+            deliverable("a", &["src/a.rs"], &[], Some(1.0)),
+            deliverable("b", &["src/b.rs"], &[], Some(3.0)),
+        ],
+    )
+    .await;
+    let status = planner.status(&plan_id).await.unwrap();
+    let finish_row = status
+        .schedule
+        .iter()
+        .find(|r| r.id == "__finish__")
+        .unwrap();
+    assert!((finish_row.es - 3.0).abs() < 1e-3);
+}
+
+#[tokio::test]
+async fn endpoints_are_never_ready_or_leased() {
+    let planner = BasicCpmPlanner::new();
+    let plan_id = submit(&planner, ab_chain()).await;
+    let status = planner.status(&plan_id).await.unwrap();
+    assert_eq!(status.ready, vec!["a"]);
+}
+
+#[tokio::test]
+async fn endpoints_are_absent_from_deliverable_rows() {
+    let planner = BasicCpmPlanner::new();
+    let plan_id = submit(&planner, ab_chain()).await;
+    let status = planner.status(&plan_id).await.unwrap();
+    assert_eq!(status.deliverables.len(), 2);
+}
+
+#[tokio::test]
+async fn submit_rejects_reserved_finish_id() {
+    let planner = BasicCpmPlanner::new();
+    let err = planner
+        .submit_plan(PlanGraph {
+            deliverables: vec![deliverable("__finish__", &["src/a.rs"], &[], Some(1.0))],
+            max_chained_dispatch: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(err.to_string().starts_with("INVALID_GRAPH"));
+}
+
+#[tokio::test]
+async fn submit_rejects_reserved_start_id() {
+    let planner = BasicCpmPlanner::new();
+    let err = planner
+        .submit_plan(PlanGraph {
+            deliverables: vec![deliverable("__start__", &["src/a.rs"], &[], Some(1.0))],
+            max_chained_dispatch: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("deliverable id '__start__' is reserved")
+    );
+}
+
+#[tokio::test]
+async fn plan_complete_after_every_deliverable_completes() {
+    let planner = BasicCpmPlanner::new();
+    let plan_id = submit(&planner, ab_chain()).await;
+    complete(&planner, &plan_id, "a").await;
+    complete(&planner, &plan_id, "b").await;
+    let status = planner.status(&plan_id).await.unwrap();
+    assert!(status.plan_complete);
+}
+
+#[tokio::test]
+async fn plan_complete_is_false_while_work_remains() {
+    let planner = BasicCpmPlanner::new();
+    let plan_id = submit(&planner, ab_chain()).await;
+    complete(&planner, &plan_id, "a").await;
+    let status = planner.status(&plan_id).await.unwrap();
+    assert!(!status.plan_complete);
+}
+
+#[tokio::test]
+async fn completing_last_deliverable_emits_plan_completed_once() {
+    let audit = Arc::new(MemoryAuditSink::new());
+    let planner = BasicCpmPlanner::with_audit(audit.clone());
+    let plan_id = submit(&planner, ab_chain()).await;
+    complete(&planner, &plan_id, "a").await;
+    complete(&planner, &plan_id, "b").await;
+    complete(&planner, &plan_id, "b").await;
+    let events = audit.snapshot();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.event_type == "plan.completed")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn accepting_last_deliverable_emits_plan_completed() {
+    let audit = Arc::new(MemoryAuditSink::new());
+    let planner = BasicCpmPlanner::with_audit(audit.clone());
+    let plan_id = submit(
+        &planner,
+        vec![deliverable("a", &["src/a.rs"], &[], Some(1.0))],
+    )
+    .await;
+    planner
+        .accept(AcceptRequest::new(plan_id.clone(), "a", "op", "done"))
+        .await
+        .unwrap();
+    assert_eq!(
+        audit
+            .event_types()
+            .iter()
+            .filter(|t| *t == "plan.completed")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn plan_completed_is_not_emitted_while_work_remains() {
+    let audit = Arc::new(MemoryAuditSink::new());
+    let planner = BasicCpmPlanner::with_audit(audit.clone());
+    let plan_id = submit(&planner, ab_chain()).await;
+    complete(&planner, &plan_id, "a").await;
+    assert!(!audit.event_types().contains(&"plan.completed".to_string()));
+}
+
+#[tokio::test]
+async fn empty_graph_has_start_to_finish_critical_path() {
+    let planner = BasicCpmPlanner::new();
+    let plan_id = submit(&planner, vec![]).await;
+    let status = planner.status(&plan_id).await.unwrap();
+    assert_eq!(status.critical_path, vec!["__start__", "__finish__"]);
+}
+
+fn edge(id: &str, consumes: Option<&str>, lag: Option<f32>) -> Prerequisite {
+    Prerequisite::Edge {
+        id: id.to_string(),
+        consumes: consumes.map(str::to_string),
+        kind: None,
+        lag_hours: lag,
+    }
+}
+
+fn graph_b_after(prereq: Prerequisite) -> PlanGraph {
+    let mut b = deliverable("b", &["src/b.rs"], &[], Some(1.0));
+    b.prerequisites = vec![prereq];
+    PlanGraph {
+        deliverables: vec![deliverable("a", &["src/a.rs"], &[], Some(1.0)), b],
+        max_chained_dispatch: None,
+    }
+}
+
+#[tokio::test]
+async fn object_prerequisite_keeps_dependent_pending_until_prerequisite_completes() {
+    let planner = BasicCpmPlanner::new();
+    let plan_id = planner
+        .submit_plan(graph_b_after(edge("a", Some("api schema"), None)))
+        .await
+        .unwrap();
+    assert_eq!(
+        status_of(&planner, &plan_id, "b").await,
+        DeliverableStatus::Pending
+    );
+}
+
+#[tokio::test]
+async fn duplicate_id_edges_hash_independent_of_order() {
+    let planner = BasicCpmPlanner::new();
+    let build = |edges: Vec<Prerequisite>| {
+        let mut g = graph_b_after(edges[0].clone());
+        g.deliverables[1].prerequisites = edges;
+        g
+    };
+    let x = edge("a", Some("x"), None);
+    let y = edge("a", Some("y"), None);
+    let forward = planner
+        .submit_plan(build(vec![x.clone(), y.clone()]))
+        .await
+        .unwrap();
+    let reversed = planner.submit_plan(build(vec![y, x])).await.unwrap();
+    assert_eq!(forward, reversed);
+}
+
+#[tokio::test]
+async fn object_prerequisite_parses_and_schedules() {
+    let planner = BasicCpmPlanner::new();
+    let plan_id = planner
+        .submit_plan(graph_b_after(edge("a", Some("api schema"), None)))
+        .await
+        .unwrap();
+    planner
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
+            "a",
+            caller("owner"),
+            DeliverableStatus::Complete,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        status_of(&planner, &plan_id, "b").await,
+        DeliverableStatus::Ready
+    );
+}
+
+#[tokio::test]
+async fn string_and_object_prerequisite_hash_identically() {
+    let planner = BasicCpmPlanner::new();
+    let bare = planner
+        .submit_plan(graph_b_after(Prerequisite::from("a")))
+        .await
+        .unwrap();
+    let object = planner
+        .submit_plan(graph_b_after(edge("a", None, None)))
+        .await
+        .unwrap();
+    assert_eq!(bare, object);
+}
+
+#[tokio::test]
+async fn consumes_difference_changes_plan_identity() {
+    let planner = BasicCpmPlanner::new();
+    let bare = planner
+        .submit_plan(graph_b_after(Prerequisite::from("a")))
+        .await
+        .unwrap();
+    let consuming = planner
+        .submit_plan(graph_b_after(edge("a", Some("api schema"), None)))
+        .await
+        .unwrap();
+    assert_ne!(bare, consuming);
+}
+
+#[tokio::test]
+async fn negative_lag_is_rejected() {
+    let planner = BasicCpmPlanner::new();
+    let err = planner
+        .submit_plan(graph_b_after(edge("a", None, Some(-1.0))))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().starts_with("INVALID_GRAPH"), "got: {err}");
+}
+
+fn milestone(id: &str, prereqs: &[&str]) -> Deliverable {
+    let mut d = deliverable(id, &[], prereqs, Some(0.0));
+    d.milestone = true;
+    d
+}
+
+fn milestone_graph() -> Vec<Deliverable> {
+    vec![
+        deliverable("a", &["src/a.rs"], &[], Some(1.0)),
+        deliverable("x", &["src/x.rs"], &[], Some(3.0)),
+        milestone("m", &["a", "x"]),
+        deliverable("c", &["src/c.rs"], &["m"], Some(5.0)),
+    ]
+}
+
+#[tokio::test]
+async fn milestone_row_reports_longest_chain_to_milestone() {
+    let planner = BasicCpmPlanner::new();
+    let plan_id = submit(&planner, milestone_graph()).await;
+    let status = planner.status(&plan_id).await.unwrap();
+    assert_eq!(status.milestones[0].critical_path, ["__start__", "x", "m"]);
+}
+
+#[tokio::test]
+async fn milestone_hours_is_milestone_earliest_finish() {
+    let planner = BasicCpmPlanner::new();
+    let plan_id = submit(&planner, milestone_graph()).await;
+    let status = planner.status(&plan_id).await.unwrap();
+    assert_eq!(status.milestones[0].hours, 3.0);
+}
+
+#[tokio::test]
+async fn metadata_milestone_flag_is_honoured() {
+    let planner = BasicCpmPlanner::new();
+    let graph = vec![with_meta(
+        deliverable("m", &["src/m.rs"], &[], Some(0.0)),
+        serde_json::json!({"milestone": true}),
+    )];
+    let plan_id = submit(&planner, graph).await;
+    let status = planner.status(&plan_id).await.unwrap();
+    assert!(status.milestones.len() == 1 && status.milestones[0].id == "m");
+}
+
+#[tokio::test]
+async fn milestone_flag_changes_plan_identity() {
+    let planner = BasicCpmPlanner::new();
+    let plain = PlanGraph {
+        deliverables: vec![deliverable("m", &["src/m.rs"], &[], Some(0.0))],
+        max_chained_dispatch: None,
+    };
+    let mut flagged = plain.clone();
+    flagged.deliverables[0].milestone = true;
+    let a = planner.submit_plan(plain).await.unwrap();
+    let b = planner.submit_plan(flagged).await.unwrap();
+    assert_ne!(a, b);
+}
+
+#[tokio::test]
+async fn milestone_complete_reflects_status() {
+    let planner = BasicCpmPlanner::new();
+    let plan_id = submit(&planner, milestone_graph()).await;
+    for id in ["a", "x", "m"] {
+        complete(&planner, &plan_id, id).await;
+    }
+    let status = planner.status(&plan_id).await.unwrap();
+    assert!(status.milestones[0].complete);
+}
+
+#[tokio::test]
+async fn milestone_incomplete_before_completion() {
+    let planner = BasicCpmPlanner::new();
+    let plan_id = submit(&planner, milestone_graph()).await;
+    complete(&planner, &plan_id, "a").await;
+    let status = planner.status(&plan_id).await.unwrap();
+    assert!(!status.milestones[0].complete);
+}
+
+#[tokio::test]
+async fn downstream_milestone_path_excludes_unrelated_branch() {
+    let planner = BasicCpmPlanner::new();
+    let plan_id = submit(
+        &planner,
+        vec![
+            deliverable("a", &["src/a.rs"], &[], Some(1.0)),
+            milestone("m1", &["a"]),
+            deliverable("c", &["src/c.rs"], &[], Some(2.0)),
+            milestone("m2", &["c"]),
+        ],
+    )
+    .await;
+    let status = planner.status(&plan_id).await.unwrap();
+    let m2 = status.milestones.iter().find(|m| m.id == "m2").unwrap();
+    assert_eq!(m2.critical_path, ["__start__", "c", "m2"]);
+}
+
+#[tokio::test]
+async fn milestone_without_estimate_is_zero_length() {
+    let planner = BasicCpmPlanner::new();
+    let mut m = deliverable("m", &[], &["a"], None);
+    m.milestone = true;
+    let plan_id = submit(
+        &planner,
+        vec![deliverable("a", &["src/a.rs"], &[], Some(2.0)), m],
+    )
+    .await;
+    let status = planner.status(&plan_id).await.unwrap();
+    let row = status.schedule.iter().find(|r| r.id == "m").unwrap();
+    assert_eq!(row.ef, 2.0);
+}
+
+#[tokio::test]
+async fn duration_hours_overrides_effort_for_schedule() {
+    let planner = BasicCpmPlanner::new();
+    let graph = PlanGraph {
+        deliverables: vec![with_duration(
+            deliverable("d", &["src/d.rs"], &[], Some(8.0)),
+            2.0,
+        )],
+        max_chained_dispatch: None,
+    };
+    let plan_id = planner.submit_plan(graph).await.unwrap();
+    let status = planner.status(&plan_id).await.unwrap();
+    let finish = status
+        .schedule
+        .iter()
+        .find(|r| r.id == "__finish__")
+        .unwrap();
+    assert!((finish.es - 2.0).abs() < 1e-3);
+}
+
+#[tokio::test]
+async fn duration_change_changes_plan_identity() {
+    let planner = BasicCpmPlanner::new();
+    let base = deliverable("d", &["src/d.rs"], &[], Some(8.0));
+    let g1 = PlanGraph {
+        deliverables: vec![with_duration(base.clone(), 2.0)],
+        max_chained_dispatch: None,
+    };
+    let g2 = PlanGraph {
+        deliverables: vec![with_duration(base, 3.0)],
+        max_chained_dispatch: None,
+    };
+    let id1 = planner.submit_plan(g1).await.unwrap();
+    let id2 = planner.submit_plan(g2).await.unwrap();
+    assert_ne!(id1, id2);
+}
+
+#[tokio::test]
+async fn submit_rejects_negative_duration() {
+    let planner = BasicCpmPlanner::new();
+    let graph = PlanGraph {
+        deliverables: vec![with_duration(
+            deliverable("d", &["src/d.rs"], &[], Some(1.0)),
+            -1.0,
+        )],
+        max_chained_dispatch: None,
+    };
+    let err = planner.submit_plan(graph).await.unwrap_err();
+    assert!(matches!(err, PlannerError::InvalidGraph { .. }));
+}
+
+#[tokio::test]
+async fn path_and_object_file_forms_hash_identically() {
+    let planner = BasicCpmPlanner::new();
+    let plain = deliverable("a", &["x"], &[], Some(1.0));
+    let mut object = deliverable("a", &[], &[], Some(1.0));
+    object.owned_files = vec![serde_json::from_value(serde_json::json!({ "path": "x" })).unwrap()];
+    let first = planner
+        .submit_plan(PlanGraph {
+            deliverables: vec![plain],
+            max_chained_dispatch: None,
+        })
+        .await
+        .unwrap();
+    let second = planner
+        .submit_plan(PlanGraph {
+            deliverables: vec![object],
+            max_chained_dispatch: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(first, second);
+}
+
+async fn b_start_with_edges(edges: Vec<Prerequisite>) -> f32 {
+    let planner = BasicCpmPlanner::new();
+    let mut b = deliverable("b", &["src/b.rs"], &[], Some(1.0));
+    b.prerequisites = edges;
+    let graph = PlanGraph {
+        deliverables: vec![deliverable("a", &["src/a.rs"], &[], Some(2.0)), b],
+        max_chained_dispatch: None,
+    };
+    let plan_id = planner.submit_plan(graph).await.unwrap();
+    let status = planner.status(&plan_id).await.unwrap();
+    status.schedule.iter().find(|r| r.id == "b").unwrap().es
+}
+
+#[tokio::test]
+async fn duplicate_prerequisite_ids_use_the_largest_lag() {
+    let es = b_start_with_edges(vec![edge("a", None, Some(4.0)), edge("a", None, Some(1.0))]).await;
+    assert!((es - 6.0).abs() < 1e-3);
+}
+
+#[tokio::test]
+async fn prerequisite_lag_hours_flows_into_schedule() {
+    let es = b_start_with_edges(vec![edge("a", None, Some(3.0))]).await;
+    assert!((es - 5.0).abs() < 1e-3);
+}
+
+fn overlap_reason(result: Result<PlanId, PlannerError>) -> String {
+    match result.unwrap_err() {
+        PlannerError::InvalidGraph { reason } => reason,
+        other => panic!("expected InvalidGraph, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn ordered_deliverables_may_share_an_exclusive_file() {
+    let planner = BasicCpmPlanner::new();
+    let graph = PlanGraph {
+        deliverables: vec![
+            deliverable("a", &["src/x.rs"], &[], Some(1.0)),
+            deliverable("b", &["src/x.rs"], &["a"], Some(1.0)),
+        ],
+        max_chained_dispatch: None,
+    };
+    assert!(planner.submit_plan(graph).await.is_ok());
+}
+
+#[tokio::test]
+async fn transitively_ordered_deliverables_may_share_a_file() {
+    let planner = BasicCpmPlanner::new();
+    let graph = PlanGraph {
+        deliverables: vec![
+            deliverable("a", &["src/x.rs"], &[], Some(1.0)),
+            deliverable("m", &["src/m.rs"], &["a"], Some(1.0)),
+            deliverable("b", &["src/x.rs"], &["m"], Some(1.0)),
+        ],
+        max_chained_dispatch: None,
+    };
+    assert!(planner.submit_plan(graph).await.is_ok());
+}
+
+#[tokio::test]
+async fn unordered_deliverables_sharing_an_exclusive_file_are_rejected() {
+    let planner = BasicCpmPlanner::new();
+    let graph = PlanGraph {
+        deliverables: vec![
+            deliverable("a", &["src/x.rs"], &[], Some(1.0)),
+            deliverable("b", &["src/x.rs"], &[], Some(1.0)),
+        ],
+        max_chained_dispatch: None,
+    };
+    let reason = overlap_reason(planner.submit_plan(graph).await);
+    assert_eq!(
+        reason,
+        "file 'src/x.rs' is claimed by 'a' and 'b', which are not ordered by prerequisites (one could run while the other holds it)"
+    );
+}
+
+#[tokio::test]
+async fn unordered_append_and_exclusive_claims_are_rejected() {
+    let planner = BasicCpmPlanner::new();
+    let mut a = deliverable("a", &[], &[], Some(1.0));
+    a.owned_files = vec![cpm_planner::plan::OwnedFile::Claim {
+        path: "REGISTRY.md".into(),
+        mode: Some(cpm_planner::plan::FileMode::Append),
+    }];
+    let graph = PlanGraph {
+        deliverables: vec![a, deliverable("b", &["REGISTRY.md"], &[], Some(1.0))],
+        max_chained_dispatch: None,
+    };
+    let reason = overlap_reason(planner.submit_plan(graph).await);
+    assert!(reason.contains("'a' and 'b'"), "got: {reason}");
+}
+
+#[tokio::test]
+async fn ordering_must_hold_between_every_claiming_pair() {
+    // a -> b ordered, but c shares the file and is unordered with both.
+    let planner = BasicCpmPlanner::new();
+    let graph = PlanGraph {
+        deliverables: vec![
+            deliverable("a", &["src/x.rs"], &[], Some(1.0)),
+            deliverable("b", &["src/x.rs"], &["a"], Some(1.0)),
+            deliverable("c", &["src/x.rs"], &[], Some(1.0)),
+        ],
+        max_chained_dispatch: None,
+    };
+    let reason = overlap_reason(planner.submit_plan(graph).await);
+    assert!(reason.contains("'c'"), "got: {reason}");
+}
+
+#[tokio::test]
+async fn ordered_sharers_are_leased_one_after_the_other() {
+    let planner = BasicCpmPlanner::new();
+    let graph = PlanGraph {
+        deliverables: vec![
+            deliverable("a", &["src/x.rs"], &[], Some(1.0)),
+            deliverable("b", &["src/x.rs"], &["a"], Some(1.0)),
+        ],
+        max_chained_dispatch: None,
+    };
+    let plan_id = planner.submit_plan(graph).await.unwrap();
+    let first = planner
+        .acquire_cohort(AcquireRequest::new(plan_id.clone(), caller("w"), 5))
+        .await
+        .unwrap();
+    assert_eq!(cohort_ids(&first), vec!["a".to_string()]);
+    planner
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
+            "a",
+            caller("w"),
+            DeliverableStatus::Complete,
+        ))
+        .await
+        .unwrap();
+    let second = planner
+        .acquire_cohort(AcquireRequest::new(plan_id, caller("w"), 5))
+        .await
+        .unwrap();
+    assert_eq!(cohort_ids(&second), vec!["b".to_string()]);
+}
+
+async fn submit_ordered_sharers() -> (BasicCpmPlanner, PlanId) {
+    let planner = BasicCpmPlanner::new();
+    let graph = PlanGraph {
+        deliverables: vec![
+            deliverable("a", &["src/x.rs"], &[], Some(1.0)),
+            deliverable("b", &["src/x.rs"], &["a"], Some(1.0)),
+        ],
+        max_chained_dispatch: None,
+    };
+    let plan_id = planner.submit_plan(graph).await.unwrap();
+    (planner, plan_id)
+}
+
+#[tokio::test]
+async fn lockless_ready_mark_with_incomplete_prerequisites_is_rejected() {
+    let (planner, plan_id) = submit_ordered_sharers().await;
+    planner
+        .acquire_cohort(AcquireRequest::new(plan_id.clone(), caller("w"), 1))
+        .await
+        .unwrap();
+    let err = planner
+        .mark_status(MarkStatusRequest::new(
+            plan_id,
+            "b",
+            caller("other"),
+            DeliverableStatus::Ready,
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().starts_with("PREREQUISITES_INCOMPLETE"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn lockless_in_progress_mark_with_incomplete_prerequisites_is_rejected() {
+    let (planner, plan_id) = submit_ordered_sharers().await;
+    let err = planner
+        .mark_status(MarkStatusRequest::new(
+            plan_id,
+            "b",
+            caller("other"),
+            DeliverableStatus::InProgress,
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().starts_with("PREREQUISITES_INCOMPLETE"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn lockless_ready_mark_after_prerequisites_complete_is_allowed() {
+    let (planner, plan_id) = submit_ordered_sharers().await;
+    planner
+        .acquire_cohort(AcquireRequest::new(plan_id.clone(), caller("w"), 1))
+        .await
+        .unwrap();
+    planner
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
+            "a",
+            caller("w"),
+            DeliverableStatus::Complete,
+        ))
+        .await
+        .unwrap();
+    let result = planner
+        .mark_status(MarkStatusRequest::new(
+            plan_id,
+            "b",
+            caller("other"),
+            DeliverableStatus::Ready,
+        ))
+        .await;
+    assert!(result.is_ok(), "got: {result:?}");
+}
+
+#[tokio::test]
+async fn ordered_sharer_is_not_leased_while_predecessor_holds_the_file() {
+    let (planner, plan_id) = submit_ordered_sharers().await;
+    planner
+        .acquire_cohort(AcquireRequest::new(plan_id.clone(), caller("w"), 1))
+        .await
+        .unwrap();
+    let mut req = AcquireRequest::new(plan_id, caller("w2"), 1);
+    req.ids = Some(vec!["b".to_string()]);
+    let cohort = planner.acquire_cohort(req).await.unwrap();
+    assert_eq!(
+        codes(&cohort),
+        vec![("b".to_string(), "NOT_READY".to_string())]
+    );
 }

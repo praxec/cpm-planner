@@ -18,8 +18,9 @@ use crate::plan::{
 ///   [`PlanId`] instead of creating a duplicate.
 /// - [`Planner::acquire_cohort`] returns up to `max_count` deliverables that
 ///   are simultaneously: (a) all prerequisites complete, (b) file sets
-///   mutually disjoint within the returned cohort, (c) file sets disjoint from
-///   every currently held lock. The implementation MUST lock the returned
+///   free of conflicting claims within the returned cohort, (c) free of
+///   conflicting claims against every currently held lock (exclusive
+///   conflicts with anything; append/append may share). The implementation MUST lock the returned
 ///   deliverables atomically.
 /// - [`Planner::mark_status`] with [`DeliverableStatus::Complete`] or
 ///   [`DeliverableStatus::Failed`] releases the lock. If the supplied
@@ -36,8 +37,9 @@ pub trait Planner: Send + Sync {
     async fn submit_plan(&self, graph: PlanGraph) -> Result<PlanId, PlannerError>;
 
     /// Acquire up to `max_count` deliverables that are ready to run *and* have
-    /// mutually disjoint `owned_files` (within the cohort and against all
-    /// currently held locks). The returned [`Cohort`] carries one
+    /// no conflicting `owned_files` claims (within the cohort and against all
+    /// currently held locks; exclusive conflicts with anything, append/append
+    /// may share). The returned [`Cohort`] carries one
     /// [`crate::plan::LockInfo`] per acquired deliverable, in the same order.
     async fn acquire_cohort(&self, req: AcquireRequest) -> Result<Cohort, PlannerError>;
 

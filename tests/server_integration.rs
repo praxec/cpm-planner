@@ -441,6 +441,88 @@ async fn plan_get_unknown_plan_is_an_error() {
     assert!(err.message.contains("PLAN_NOT_FOUND"));
 }
 
+#[tokio::test]
+async fn plan_get_round_trips_mixed_prerequisite_forms() {
+    let server = server();
+    let deliverables = json!([
+        { "id": "a", "owned_files": ["a.rs"], "prerequisites": [] },
+        { "id": "c", "owned_files": ["c.rs"], "prerequisites": [] },
+        { "id": "d", "owned_files": ["d.rs"],
+          "prerequisites": ["a", { "id": "c", "kind": "interface" }] }
+    ]);
+    let submitted = server
+        .dispatch_call(call_args(
+            TOOL_SUBMIT,
+            json!({ "graph": { "deliverables": deliverables } }),
+        ))
+        .await
+        .unwrap();
+    let got = server
+        .dispatch_call(call_args(
+            "plan.get",
+            json!({ "plan_id": submitted["plan_id"] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        got["graph"]["deliverables"][2]["prerequisites"],
+        deliverables[2]["prerequisites"]
+    );
+}
+
+#[tokio::test]
+async fn plan_get_round_trips_mixed_file_forms() {
+    let server = server();
+    let files = json!([
+        "a.rs",
+        { "path": "b.rs", "mode": "append" },
+        { "path": "c.rs" },
+        { "path": "d.rs", "mode": "exclusive" }
+    ]);
+    let submitted = server
+        .dispatch_call(call_args(
+            TOOL_SUBMIT,
+            json!({ "graph": { "deliverables": [
+                { "id": "a", "owned_files": files, "prerequisites": [] }
+            ] } }),
+        ))
+        .await
+        .unwrap();
+    let got = server
+        .dispatch_call(call_args(
+            "plan.get",
+            json!({ "plan_id": submitted["plan_id"] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(got["graph"]["deliverables"][0]["owned_files"], files);
+}
+
+#[tokio::test]
+async fn submit_rejects_unknown_prerequisite_field() {
+    let server = server();
+    let graph = json!({ "deliverables": [
+        { "id": "a", "owned_files": ["a.rs"], "prerequisites": [] },
+        { "id": "b", "owned_files": ["b.rs"], "prerequisites": [{ "id": "a", "lag_hour": 2 }] }
+    ]});
+    let result = server
+        .dispatch_call(call_args(TOOL_SUBMIT, json!({ "graph": graph })))
+        .await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn submit_rejects_unknown_owned_file_field() {
+    let server = server();
+    let graph = json!({ "deliverables": [
+        { "id": "a", "owned_files": [{ "path": "x", "mod": "append" }], "prerequisites": [] }
+    ]});
+    let result = server
+        .dispatch_call(call_args(TOOL_SUBMIT, json!({ "graph": graph })))
+        .await;
+    assert!(result.is_err());
+}
+
 // ── Error mapping: INVALID_GRAPH on cycles ──────────────────────────────────
 
 #[tokio::test]

@@ -21,9 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Versioned SQLite schema (`PRAGMA user_version` = 2) with a `cpm_version`
   column; databases newer than the running binary are rejected.
 - `ttl_seconds` on `plan.acquire_cohort` and `plan.heartbeat`, clamped to `CPM_MAX_TTL_SECS` (default 8h) (#13).
+- Synthetic `__start__`/`__finish__` endpoints in every plan's CPM: `critical_path` always runs start → finish; `schedule` rows carry `synthetic`; `plan.status` reports `plan_complete`; `plan.completed` audit event. `__start__`/`__finish__` are reserved ids.
+- Prerequisites may be objects `{id, consumes?, kind?: artifact|interface, lag_hours?}` (#21).
+- `duration_hours` (calendar time) per deliverable and `lag_hours` per prerequisite edge drive the schedule; effort stays the cost basis (#27).
+- `milestone: true` deliverables; `plan.status` reports per-milestone critical path and hours (#22).
+- `owned_files` entries may be `{path, mode: "append"}`; append claims may be co-leased and are reported in the cohort's `shared_paths` (#28).
 
 ### Fixed
 
+- `plan.submit` accepts a file owned by deliverables ordered by prerequisites; only unordered exclusive overlaps are rejected (#12).
 - One lapse-limited deliverable no longer fails `plan.acquire_cohort` for the whole plan; it is reported in the new `blocked` list (#17).
 - `plan.status` `critical_path` is now one real prerequisite chain (each id is a
   prerequisite of the next) and `critical_path_hours` is the project length
@@ -37,8 +43,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A lockless `plan.mark_status` to `ready` or `in_progress` now requires the deliverable's prerequisites to be complete (`PREREQUISITES_INCOMPLETE`), so dependency order can't be bypassed.
+- Plan identity hashes changed (prerequisites, owned_files, duration_hours and milestone are normalised into the hash): re-submitting any graph stored by an earlier version creates a new plan.
+- `critical_path` now includes the synthetic endpoints.
 - Completing a deliverable without a lease now requires its prerequisites to be complete and is audited.
 - `plan.acquire_cohort` no longer returns the `LAPSE_LIMIT` error; lapse-limited deliverables appear in `blocked[]` with code `LAPSE_LIMIT` and the response sets `needs_operator: true` (drivers matching on the error must read `blocked`).
+- Library: `Deliverable.prerequisites` is `Vec<Prerequisite>`.
+- Library: `Deliverable` gains public `duration_hours` and `milestone`; `Task` gains `lag_by_dependency` and its `effort_hours` means scheduled length; `PlanStatus` gains `plan_complete` and `milestones`; `ScheduleRow` gains `synthetic`; new public types `Prerequisite`, `PrerequisiteKind`, `OwnedFile`, `FileMode`, `MilestoneRow` and consts `START_ID`, `FINISH_ID`.
+- A milestone is zero-length unless you give it an estimate or `duration_hours`; it is still an ordinary deliverable someone must complete (or accept).
+- Library: `Deliverable.owned_files` is `Vec<OwnedFile>`; `Cohort` gains `shared_paths`.
 - Library: `Planner` gains required method `accept`; `Cohort` gains public field `blocked`; `PlannerError` gains `PrerequisitesIncomplete` (breaks exhaustive matches); new `DEFAULT_MAX_TTL` / `BasicCpmPlanner::with_max_ttl`.
 - Library: `Planner` methods `acquire_cohort`, `mark_status`, `heartbeat`,
   `force_release` take request structs (`AcquireRequest`, `MarkStatusRequest`,

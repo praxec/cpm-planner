@@ -11,7 +11,7 @@
 //!
 //! `TransactionBehavior::Immediate` takes the database write lock at
 //! `BEGIN`, so the whole read-modify-write of an `acquire_cohort` (ready
-//! check + within-cohort file disjointness + disjoint-from-held-locks +
+//! check + within-cohort file-claim conflicts + conflicts with held locks +
 //! lock insert + status flip to `in_progress`) is serialised across
 //! processes. Two concurrent acquirers — even in different OS processes —
 //! can never both observe the same "ready and unlocked" deliverable, so
@@ -401,6 +401,14 @@ fn recompute_stale_results(conn: &Connection) -> anyhow::Result<()> {
                 continue;
             }
         };
+        if graph
+            .deliverables
+            .iter()
+            .any(|d| d.id == crate::plan::START_ID || d.id == crate::plan::FINISH_ID)
+        {
+            tracing::warn!(%plan_id, "stored graph uses a reserved endpoint id; leaving cached result as is");
+            continue;
+        }
         match crate::schedule::compute_cpm(&graph) {
             Ok(result) => {
                 conn.execute(
@@ -546,12 +554,10 @@ fn load_plan_state(
     }
 
     // Rebuild the inverse file index from held locks + graph ownership.
-    let mut file_to_deliverable: HashMap<PathBuf, String> = HashMap::new();
+    let mut file_claims: HashMap<PathBuf, crate::locks::FileClaim> = HashMap::new();
     for deliverable_id in locks.keys() {
         if let Some(d) = graph.deliverables.iter().find(|d| &d.id == deliverable_id) {
-            for f in &d.owned_files {
-                file_to_deliverable.insert(f.clone(), deliverable_id.clone());
-            }
+            crate::locks::add_file_claims(&mut file_claims, deliverable_id, &d.owned_files);
         }
     }
 
@@ -562,7 +568,7 @@ fn load_plan_state(
         failure_counts,
         lapse_counts,
         locks,
-        file_to_deliverable,
+        file_claims,
         cached_result,
     }))
 }
@@ -636,10 +642,12 @@ mod tests {
         let graph = PlanGraph {
             deliverables: vec![Deliverable {
                 id: "d1".to_string(),
-                owned_files: vec![PathBuf::from("src/a.rs")],
+                owned_files: vec!["src/a.rs".into()],
                 prerequisites: vec![],
                 estimated_effort_hours: Some(1.0),
                 metadata: serde_json::Value::Null,
+                duration_hours: None,
+                milestone: false,
             }],
             max_chained_dispatch: None,
         };
@@ -703,8 +711,8 @@ mod tests {
                 assert_eq!(lock.caller_id, CallerId("c1".to_string()));
                 // Inverse file index rebuilt from locks + graph.
                 assert_eq!(
-                    state.file_to_deliverable.get(&PathBuf::from("src/a.rs")),
-                    Some(&"d1".to_string())
+                    state.file_claims.get(&PathBuf::from("src/a.rs")),
+                    Some(&crate::locks::FileClaim::Exclusive("d1".to_string()))
                 );
             })
             .unwrap();

@@ -1,0 +1,203 @@
+{
+  "deliverables": [
+    {
+      "id": "P0",
+      "owned_files": [
+        ".cpm-planner/work/P0"
+      ],
+      "prerequisites": [],
+      "estimated_effort_hours": 1.0,
+      "metadata": {
+        "description": "Pin Rust 1.99.0",
+        "size": "S",
+        "owner": "junior",
+        "issues": [],
+        "artifact": "merged PR into dev",
+        "pr": "#29"
+      }
+    },
+    {
+      "id": "P1",
+      "owned_files": [
+        ".cpm-planner/work/P1"
+      ],
+      "prerequisites": [
+        "P0"
+      ],
+      "estimated_effort_hours": 1.5,
+      "metadata": {
+        "description": "CPM correctness + schedule + plan.get",
+        "size": "S-M",
+        "owner": "subagent",
+        "issues": [
+          "#18",
+          "#15"
+        ],
+        "artifact": "merged PR into dev",
+        "pr": "#30"
+      }
+    },
+    {
+      "id": "P2",
+      "owned_files": [
+        ".cpm-planner/work/P2"
+      ],
+      "prerequisites": [
+        "P0"
+      ],
+      "estimated_effort_hours": 2.0,
+      "metadata": {
+        "description": "Lease ergonomics",
+        "size": "M",
+        "owner": "subagent",
+        "issues": [
+          "#17",
+          "#14",
+          "#24",
+          "#13"
+        ],
+        "artifact": "merged PR into dev",
+        "pr": "#31"
+      }
+    },
+    {
+      "id": "P3",
+      "owned_files": [
+        ".cpm-planner/work/P3"
+      ],
+      "prerequisites": [
+        "P1",
+        "P2"
+      ],
+      "estimated_effort_hours": 4.0,
+      "metadata": {
+        "description": "Graph schema batch + synthetic endpoints",
+        "size": "L",
+        "owner": "subagent",
+        "issues": [
+          "#21",
+          "#22",
+          "#27",
+          "#28",
+          "#12"
+        ],
+        "artifact": "merged PR into dev"
+      }
+    },
+    {
+      "id": "P4",
+      "owned_files": [
+        ".cpm-planner/work/P4"
+      ],
+      "prerequisites": [
+        "P3"
+      ],
+      "estimated_effort_hours": 4.0,
+      "metadata": {
+        "description": "Analysis tools + scorecard + Monte Carlo",
+        "size": "L",
+        "owner": "subagent",
+        "issues": [
+          "#20",
+          "#19",
+          "#23"
+        ],
+        "artifact": "merged PR into dev"
+      }
+    },
+    {
+      "id": "P4P",
+      "owned_files": [
+        ".cpm-planner/work/P4P"
+      ],
+      "prerequisites": [
+        "P4"
+      ],
+      "estimated_effort_hours": 4.0,
+      "metadata": {
+        "description": "Plan-as-code portfolio",
+        "size": "L",
+        "owner": "subagent",
+        "issues": [
+          "#23"
+        ],
+        "artifact": "merged PR into dev"
+      }
+    },
+    {
+      "id": "P5",
+      "owned_files": [
+        ".cpm-planner/work/P5"
+      ],
+      "prerequisites": [
+        "P4P"
+      ],
+      "estimated_effort_hours": 4.0,
+      "metadata": {
+        "description": "Earned value",
+        "size": "L",
+        "owner": "subagent",
+        "issues": [
+          "#16"
+        ],
+        "artifact": "merged PR into dev"
+      }
+    },
+    {
+      "id": "P6",
+      "owned_files": [
+        ".cpm-planner/work/P6"
+      ],
+      "prerequisites": [
+        "P4P"
+      ],
+      "estimated_effort_hours": 4.0,
+      "metadata": {
+        "description": "OpenRouter integration: rig + Jev",
+        "size": "L",
+        "owner": "subagent",
+        "issues": [
+          "#26"
+        ],
+        "artifact": "merged PR into dev"
+      }
+    },
+    {
+      "id": "P7a",
+      "owned_files": [
+        ".cpm-planner/work/P7a"
+      ],
+      "prerequisites": [
+        "P2"
+      ],
+      "estimated_effort_hours": 1.0,
+      "metadata": {
+        "description": "MCP install instructions (rebase PR #11)",
+        "size": "S",
+        "owner": "junior",
+        "issues": [],
+        "artifact": "merged PR into dev"
+      }
+    },
+    {
+      "id": "P7b",
+      "owned_files": [
+        ".cpm-planner/work/P7b"
+      ],
+      "prerequisites": [
+        "P5",
+        "P6",
+        "P7a"
+      ],
+      "estimated_effort_hours": 2.0,
+      "metadata": {
+        "description": "deliverable-cpm skill + 0.1.0 release (PR #25)",
+        "size": "M",
+        "owner": "subagent",
+        "issues": [],
+        "artifact": "merged PR into dev"
+      }
+    }
+  ],
+  "max_chained_dispatch": null
+}
