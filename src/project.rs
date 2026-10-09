@@ -337,6 +337,21 @@ impl ProjectRoot {
     /// relative to the final directory handle, fstat'd to be a regular file,
     /// and read from that same handle.
     pub fn read_graph(&self, f: &PlanFileRef) -> Result<(PlanGraph, String), PlannerError> {
+        let bytes = self.read_bytes(f)?;
+        let graph = serde_json::from_slice(&bytes).map_err(|e| PlannerError::InvalidGraph {
+            reason: format!("{}: {e}", f.rel_path),
+        })?;
+        Ok((graph, hash_hex(&bytes)))
+    }
+
+    /// The sha256 hex of a plan file's bytes (the hash [`Self::read_graph`]
+    /// and [`Self::write_graph`] return), without parsing it. Read with the
+    /// same no-follow, regular-file-only rules as [`Self::read_graph`].
+    pub fn file_hash(&self, f: &PlanFileRef) -> Result<String, PlannerError> {
+        Ok(hash_hex(&self.read_bytes(f)?))
+    }
+
+    fn read_bytes(&self, f: &PlanFileRef) -> Result<Vec<u8>, PlannerError> {
         validate_slug("name", &f.name)?;
         validate_slug("variant", &f.variant)?;
         let dir = self
@@ -367,10 +382,7 @@ impl ProjectRoot {
         }
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).map_err(backend)?;
-        let graph = serde_json::from_slice(&bytes).map_err(|e| PlannerError::InvalidGraph {
-            reason: format!("{}: {e}", f.rel_path),
-        })?;
-        Ok((graph, hash_hex(&bytes)))
+        Ok(bytes)
     }
 
     /// Atomically write pretty JSON plus a trailing newline; returns the
@@ -378,6 +390,22 @@ impl ProjectRoot {
     /// operation is relative to the final directory handle, so a parent
     /// swapped for a symlink mid-call cannot redirect the write.
     pub fn write_graph(&self, f: &PlanFileRef, g: &PlanGraph) -> Result<String, PlannerError> {
+        self.write_graph_inner(f, g, true)
+    }
+
+    /// [`Self::write_graph`] that never replaces an existing file: the new
+    /// file is linked into place atomically, and an existing one (written
+    /// concurrently included) is `INVALID_PATH: <rel_path> already exists`.
+    pub fn write_new_graph(&self, f: &PlanFileRef, g: &PlanGraph) -> Result<String, PlannerError> {
+        self.write_graph_inner(f, g, false)
+    }
+
+    fn write_graph_inner(
+        &self,
+        f: &PlanFileRef,
+        g: &PlanGraph,
+        replace: bool,
+    ) -> Result<String, PlannerError> {
         validate_slug("name", &f.name)?;
         validate_slug("variant", &f.variant)?;
         let mut bytes = serde_json::to_vec_pretty(g).map_err(backend)?;
@@ -405,10 +433,20 @@ impl ProjectRoot {
             file.write_all(&bytes)?;
             file.sync_all()?;
             drop(file);
-            dir.rename(&tmp, &dir, &target)
+            if replace {
+                dir.rename(&tmp, &dir, &target)
+            } else {
+                // link(2) fails with EEXIST instead of replacing.
+                let linked = dir.hard_link(&tmp, &dir, &target);
+                let _ = dir.remove_file(&tmp);
+                linked
+            }
         })();
         if let Err(e) = result {
             let _ = dir.remove_file(&tmp);
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                return Err(invalid(format!("{} already exists", f.rel_path)));
+            }
             return Err(backend(e));
         }
         sync_dir(&dir)?;

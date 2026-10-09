@@ -548,3 +548,48 @@ fn read_rejects_fifo_without_hanging() {
         Err(_) => panic!("read_graph blocked on a FIFO instead of rejecting it"),
     }
 }
+
+#[test]
+fn write_new_graph_creates_missing_file() {
+    let (_d, r) = root_with_git("write-new");
+    let f = r.plan_file("web", "main").unwrap();
+    let hash = r.write_new_graph(&f, &graph()).unwrap();
+    assert_eq!(r.read_graph(&f).unwrap().1, hash);
+}
+
+#[test]
+fn write_new_graph_refuses_existing_file() {
+    let (_d, r) = root_with_git("write-new-exists");
+    let f = r.plan_file("web", "main").unwrap();
+    r.write_graph(&f, &graph()).unwrap();
+    assert!(is_invalid_path(r.write_new_graph(&f, &graph())));
+}
+
+#[test]
+fn refused_write_new_graph_leaves_no_temp_file() {
+    let (d, r) = root_with_git("write-new-tmp");
+    let f = r.plan_file("web", "main").unwrap();
+    r.write_graph(&f, &graph()).unwrap();
+    let _ = r.write_new_graph(&f, &graph());
+    let entries = std::fs::read_dir(d.join(".cpm-planner/plans/web"))
+        .unwrap()
+        .count();
+    assert_eq!(entries, 1);
+}
+
+#[test]
+fn file_hash_matches_written_hash() {
+    let (_d, r) = root_with_git("file-hash");
+    let f = r.plan_file("web", "main").unwrap();
+    let hash = r.write_graph(&f, &graph()).unwrap();
+    assert_eq!(r.file_hash(&f).unwrap(), hash);
+}
+
+#[test]
+fn file_hash_does_not_parse_the_file() {
+    let (d, r) = root_with_git("file-hash-raw");
+    let f = r.plan_file("web", "main").unwrap();
+    r.write_graph(&f, &graph()).unwrap();
+    std::fs::write(d.join(&f.rel_path), b"not json").unwrap();
+    assert!(r.file_hash(&f).is_ok());
+}
