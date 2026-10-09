@@ -42,6 +42,7 @@ pub mod algorithm;
 pub mod audit;
 pub mod compare;
 pub mod drag;
+pub mod earned_value;
 pub mod edits;
 pub mod estimator;
 mod graph;
