@@ -118,7 +118,7 @@ impl SqlitePlanStore {
         Ok(PathBuf::from(home).join(DEFAULT_DB_RELATIVE))
     }
 
-    fn init(conn: Connection) -> anyhow::Result<Self> {
+    fn init(mut conn: Connection) -> anyhow::Result<Self> {
         // WAL + busy_timeout: concurrent processes queue on the write
         // lock instead of failing; readers never block the writer.
         // (`execute_batch` tolerates pragmas that return a row.)
@@ -130,7 +130,7 @@ impl SqlitePlanStore {
         )
         .context("applying sqlite pragmas")?;
 
-        migrate(&conn)?;
+        migrate(&mut conn)?;
 
         let store = Self {
             conn: Mutex::new(conn),
@@ -305,16 +305,29 @@ const MIGRATIONS: &[fn(&Connection) -> anyhow::Result<()>] = &[
     migrate_v2_cpm_version, // plans.cpm_version
 ];
 
-fn migrate(conn: &Connection) -> anyhow::Result<()> {
-    let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+/// Runs the whole ladder plus the stale sweep in one immediate transaction,
+/// so concurrent openers serialise instead of racing on `ALTER TABLE`.
+/// `user_version` is read only after the write lock is held.
+fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    let supported = MIGRATIONS.len() as i64;
+    if current > supported {
+        return Err(anyhow!(
+            "database schema version {current} is newer than this cpm-planner supports \
+             ({supported}); upgrade cpm-planner"
+        ));
+    }
     for (i, step) in MIGRATIONS.iter().enumerate() {
         let version = i as i64 + 1;
         if version > current {
-            step(conn).with_context(|| format!("applying schema migration v{version}"))?;
-            conn.pragma_update(None, "user_version", version)?;
+            step(&tx).with_context(|| format!("applying schema migration v{version}"))?;
+            tx.pragma_update(None, "user_version", version)?;
         }
     }
-    recompute_stale_results(conn)
+    recompute_stale_results(&tx)?;
+    tx.commit()?;
+    Ok(())
 }
 
 fn migrate_v1_base_schema(conn: &Connection) -> anyhow::Result<()> {
@@ -381,8 +394,13 @@ fn recompute_stale_results(conn: &Connection) -> anyhow::Result<()> {
         .collect::<Result<_, _>>()?
     };
     for (plan_id, graph_json) in stale {
-        let graph: PlanGraph = serde_json::from_str(&graph_json)
-            .with_context(|| format!("decoding stored graph for {plan_id}"))?;
+        let graph: PlanGraph = match serde_json::from_str(&graph_json) {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!(%plan_id, error = %e, "could not decode stored graph; leaving cached result as is");
+                continue;
+            }
+        };
         match crate::schedule::compute_cpm(&graph) {
             Ok(result) => {
                 conn.execute(

@@ -684,3 +684,63 @@ async fn newly_submitted_plan_is_stamped_with_current_cpm_version() {
         .unwrap();
     assert_eq!(v, cpm_planner::algorithm::CPM_VERSION);
 }
+
+#[tokio::test]
+async fn store_opens_when_a_stored_graph_is_undecodable() {
+    let db = TempDb::new();
+    let broken = submit_parallel_chains(&db.path).await;
+    let healthy = open_planner(&db.path)
+        .submit_plan(chain_graph())
+        .await
+        .expect("submit healthy");
+    {
+        let conn = rusqlite::Connection::open(&db.path).unwrap();
+        conn.execute(
+            "UPDATE plans SET graph = 'not json', cpm_version = 0 WHERE plan_id = ?1",
+            [&broken.0],
+        )
+        .unwrap();
+    }
+    let planner = open_planner(&db.path);
+    let status = planner.status(&healthy).await.unwrap();
+    assert_eq!(status.deliverables.len(), 2);
+}
+
+#[tokio::test]
+async fn pre_versioning_database_is_upgraded_and_repaired() {
+    let db = TempDb::new();
+    let plan_id = submit_parallel_chains(&db.path).await;
+    {
+        let conn = rusqlite::Connection::open(&db.path).unwrap();
+        let mut result: serde_json::Value = serde_json::from_str(
+            &conn
+                .query_row("SELECT cached_result FROM plans", [], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap(),
+        )
+        .unwrap();
+        result["critical_path"] = serde_json::json!(["P0a", "P1a", "P0b", "P1b"]);
+        conn.execute("UPDATE plans SET cached_result = ?1", [result.to_string()])
+            .unwrap();
+        // Strip cpm_version and reset to the unversioned layout.
+        conn.execute_batch(
+            "ALTER TABLE plans DROP COLUMN cpm_version;
+             PRAGMA user_version = 0;",
+        )
+        .unwrap();
+    }
+    let status = open_planner(&db.path).status(&plan_id).await.unwrap();
+    assert_eq!(status.critical_path, vec!["P0a", "P0b"]);
+}
+
+#[test]
+fn newer_schema_version_is_rejected() {
+    let db = TempDb::new();
+    drop(SqlitePlanStore::open(&db.path).unwrap());
+    rusqlite::Connection::open(&db.path)
+        .unwrap()
+        .pragma_update(None, "user_version", 99)
+        .unwrap();
+    assert!(SqlitePlanStore::open(&db.path).is_err());
+}
