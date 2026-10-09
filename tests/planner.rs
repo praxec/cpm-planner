@@ -904,3 +904,116 @@ async fn unfiltered_acquire_lists_no_manual_entries_in_blocked() {
         .unwrap();
     assert!(cohort.blocked.iter().all(|b| b.code != "MANUAL"));
 }
+
+#[tokio::test]
+async fn accept_by_name_matching_holder_still_requires_override() {
+    let (planner, plan_id) = submit_accept_graph().await;
+    planner
+        .acquire_cohort(AcquireRequest::new(plan_id.clone(), caller("w1"), 1))
+        .await
+        .unwrap();
+    let err = planner
+        .accept(AcceptRequest::new(plan_id.clone(), "a", "w1", "self"))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().starts_with("LOCK_HELD"), "got: {err}");
+}
+
+#[tokio::test]
+async fn accepting_complete_deliverable_emits_no_second_event() {
+    let audit = Arc::new(MemoryAuditSink::new());
+    let (planner, plan_id) =
+        submit_accept_graph_with(BasicCpmPlanner::with_audit(audit.clone())).await;
+    planner.accept(accept(&plan_id, "a")).await.unwrap();
+    planner.accept(accept(&plan_id, "a")).await.unwrap();
+    let n = audit
+        .snapshot()
+        .iter()
+        .filter(|e| e.event_type == "accepted")
+        .count();
+    assert_eq!(n, 1);
+}
+
+#[tokio::test]
+async fn accept_rescues_failed_deliverable() {
+    let (planner, plan_id) = submit_accept_graph().await;
+    planner
+        .acquire_cohort(AcquireRequest::new(plan_id.clone(), caller("w"), 1))
+        .await
+        .unwrap();
+    planner
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
+            "a",
+            caller("w"),
+            DeliverableStatus::Failed {
+                reason: "boom".to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+    planner.accept(accept(&plan_id, "a")).await.unwrap();
+    assert_eq!(
+        status_of(&planner, &plan_id, "a").await,
+        DeliverableStatus::Complete
+    );
+}
+
+#[tokio::test]
+async fn accepted_event_records_previous_status() {
+    let audit = Arc::new(MemoryAuditSink::new());
+    let (planner, plan_id) =
+        submit_accept_graph_with(BasicCpmPlanner::with_audit(audit.clone())).await;
+    planner.accept(accept(&plan_id, "a")).await.unwrap();
+    let evt = audit
+        .snapshot()
+        .into_iter()
+        .find(|e| e.event_type == "accepted")
+        .unwrap();
+    assert_eq!(evt.payload["previous_status"]["status"], "ready");
+}
+
+#[tokio::test]
+async fn accepted_event_records_overridden_lock_holder() {
+    let audit = Arc::new(MemoryAuditSink::new());
+    let (planner, plan_id) =
+        submit_accept_graph_with(BasicCpmPlanner::with_audit(audit.clone())).await;
+    planner
+        .acquire_cohort(AcquireRequest::new(plan_id.clone(), caller("w1"), 1))
+        .await
+        .unwrap();
+    planner
+        .accept(AcceptRequest::new(plan_id.clone(), "a", "w1", "x").override_lock(true))
+        .await
+        .unwrap();
+    let evt = audit
+        .snapshot()
+        .into_iter()
+        .find(|e| e.event_type == "accepted")
+        .unwrap();
+    assert_eq!(evt.payload["overrode_lock_of"], "w1");
+}
+
+#[tokio::test]
+async fn lockless_mark_complete_on_complete_deliverable_emits_no_second_event() {
+    let audit = Arc::new(MemoryAuditSink::new());
+    let (planner, plan_id) =
+        submit_accept_graph_with(BasicCpmPlanner::with_audit(audit.clone())).await;
+    for _ in 0..2 {
+        planner
+            .mark_status(MarkStatusRequest::new(
+                plan_id.clone(),
+                "a",
+                caller("w"),
+                DeliverableStatus::Complete,
+            ))
+            .await
+            .unwrap();
+    }
+    let n = audit
+        .snapshot()
+        .iter()
+        .filter(|e| e.event_type == "completed_without_lease")
+        .count();
+    assert_eq!(n, 1);
+}

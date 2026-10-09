@@ -11,7 +11,7 @@ use std::time::Duration;
 use chrono::{DateTime, TimeZone, Utc};
 use cpm_planner::audit::MemoryAuditSink;
 use cpm_planner::plan::{
-    AcquireRequest, CallerId, Deliverable, DeliverableStatus, ForceReleaseRequest,
+    AcceptRequest, AcquireRequest, CallerId, Deliverable, DeliverableStatus, ForceReleaseRequest,
     MarkStatusRequest, PlanGraph, PlannerError,
 };
 use cpm_planner::ports::Planner;
@@ -848,4 +848,30 @@ async fn force_release_audit_includes_reason() {
     assert_eq!(evt.payload["reason"], reason);
     assert_eq!(evt.payload["deliverable_id"], "a");
     assert_eq!(evt.payload["last_caller_id"], "c1");
+}
+
+#[tokio::test]
+async fn accept_ignores_expired_foreign_lease() {
+    let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let clock = TestClock::new(t0);
+    let clock_arc = clock.clone();
+    let planner = BasicCpmPlanner::with_parts(
+        Arc::new(MemoryAuditSink::new()),
+        Duration::from_secs(60),
+        Arc::new(move || clock_arc.read()),
+    );
+    let graph = PlanGraph {
+        deliverables: vec![deliverable("a", &["src/a.rs"], &[], Some(1.0))],
+        max_chained_dispatch: None,
+    };
+    let plan_id = planner.submit_plan(graph).await.unwrap();
+    planner
+        .acquire_cohort(AcquireRequest::new(plan_id.clone(), caller("w1"), 1))
+        .await
+        .unwrap();
+    clock.set(t0 + chrono::Duration::minutes(5));
+    let result = planner
+        .accept(AcceptRequest::new(plan_id, "a", "owner", "ok"))
+        .await;
+    assert!(result.is_ok(), "got: {result:?}");
 }

@@ -496,7 +496,11 @@ fn complete_deliverable(
     }
 }
 
-fn make_accepted_event(req: &AcceptRequest, overrode_lock_of: Option<&str>) -> AuditEvent {
+fn make_accepted_event(
+    req: &AcceptRequest,
+    overrode_lock_of: Option<&str>,
+    previous_status: &DeliverableStatus,
+) -> AuditEvent {
     AuditEvent::new("accepted")
         .with_actor(req.accepted_by.as_str())
         .with_payload(json!({
@@ -505,6 +509,7 @@ fn make_accepted_event(req: &AcceptRequest, overrode_lock_of: Option<&str>) -> A
             "accepted_by": req.accepted_by,
             "evidence": req.evidence,
             "overrode_lock_of": overrode_lock_of,
+            "previous_status": previous_status,
         }))
 }
 
@@ -906,6 +911,13 @@ impl Planner for BasicCpmPlanner {
             // Completing without a lease: every prerequisite must be done,
             // and the bypass is audited.
             if is_complete && !state.locks.contains_key(deliverable_id) {
+                // Already Complete: idempotent no-op, nothing to audit.
+                if matches!(
+                    state.statuses.get(deliverable_id),
+                    Some(DeliverableStatus::Complete)
+                ) {
+                    return Ok(());
+                }
                 let missing = incomplete_prerequisites(state, deliverable_id);
                 if !missing.is_empty() {
                     return Err(PlannerError::PrerequisitesIncomplete {
@@ -1111,6 +1123,7 @@ impl Planner for BasicCpmPlanner {
         let mut audit_buf: Vec<AuditEvent> = Vec::new();
         let plan_id = req.plan_id.clone();
         let deliverable_id = req.deliverable_id.as_str();
+        let now = self.now();
         self.store.mutate_plan(&plan_id, |state| {
             if !state
                 .graph
@@ -1124,11 +1137,25 @@ impl Planner for BasicCpmPlanner {
                 });
             }
 
-            // A live lease held by someone else needs an explicit override.
+            // Only LIVE leases block acceptance: reap expired ones first.
+            for lock in &state.reap_expired(now) {
+                audit_buf.push(make_expired_event(lock, now));
+            }
+
+            // Already Complete: idempotent no-op (no state change, no audit).
+            let previous_status = state
+                .statuses
+                .get(deliverable_id)
+                .cloned()
+                .unwrap_or(DeliverableStatus::Pending);
+            if matches!(previous_status, DeliverableStatus::Complete) {
+                return Ok(());
+            }
+
+            // ANY live lease needs an explicit override, whoever the
+            // acceptor claims to be.
             let mut overrode: Option<String> = None;
-            if let Some(lock) = state.locks.get(deliverable_id)
-                && lock.caller_id.as_str() != req.accepted_by
-            {
+            if let Some(lock) = state.locks.get(deliverable_id) {
                 if !req.override_lock {
                     return Err(PlannerError::LockHeld {
                         plan_id: plan_id.0.clone(),
@@ -1149,7 +1176,11 @@ impl Planner for BasicCpmPlanner {
             }
 
             complete_deliverable(state, deliverable_id, &mut audit_buf, "accepted");
-            audit_buf.push(make_accepted_event(&req, overrode.as_deref()));
+            audit_buf.push(make_accepted_event(
+                &req,
+                overrode.as_deref(),
+                &previous_status,
+            ));
             Ok(())
         })?;
 
