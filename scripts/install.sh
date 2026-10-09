@@ -259,7 +259,14 @@ case ":${PATH:-}:" in
           _rc=""
           ;;
         */zsh) _rc="${ZDOTDIR:-$HOME}/.zshrc";;
-        */bash) if [ -f "$HOME/.bash_profile" ]; then _rc="$HOME/.bash_profile"; else _rc="$HOME/.bashrc"; fi;;
+        */bash)
+          # macOS Terminal.app login shells read ~/.bash_profile and never ~/.bashrc,
+          # so on darwin always target ~/.bash_profile (created on demand). The
+          # PRAXEC_OS override above sets $OS, which makes this path testable off-macOS.
+          if [ "$OS" = "darwin" ]; then _rc="$HOME/.bash_profile"
+          elif [ -f "$HOME/.bash_profile" ]; then _rc="$HOME/.bash_profile"
+          else _rc="$HOME/.bashrc"; fi
+          ;;
         *) _rc="$HOME/.profile";;
       esac
       if [ -z "$_rc" ]; then

@@ -201,17 +201,26 @@ try {
       try {
         Move-Item -Force -Path $dest -Destination $old -ErrorAction Stop
       } catch {
-        Write-Die "a previous ${Bin}.exe.old is still in use; restart your MCP client and re-run the installer"
+        if (Test-Path $old) {
+          Write-Die "a previous ${Bin}.exe.old is still in use; restart your MCP client and re-run the installer"
+        } else {
+          Write-Die "could not replace ${dest}: $($_.Exception.Message); close any running ${Bin} and re-run"
+        }
       }
       $movedAside = $true
     }
     Move-Item -Force -Path $tmpDest -Destination $dest -ErrorAction Stop
   } catch {
     # Roll back so a failed swap never leaves the install without a binary.
+    $originalError = $_
     if ($movedAside -and -not (Test-Path $dest)) {
-      Move-Item -Force -Path $old -Destination $dest -ErrorAction SilentlyContinue
+      try {
+        Move-Item -Force -Path $old -Destination $dest -ErrorAction Stop
+      } catch {
+        Write-Warning "could not restore previous ${Bin}.exe from $old; reinstall to recover"
+      }
     }
-    throw
+    throw $originalError
   }
   $tmpDest = $null
   Write-Say "installed $Bin $Version -> $dest"

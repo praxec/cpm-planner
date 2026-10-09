@@ -303,6 +303,19 @@ test('cpm-planner/install.sh --add-to-path prefers an existing ~/.bash_profile f
   assert.ok(fs.readFileSync(path.join(home, '.bash_profile'), 'utf8').includes(`export PATH="${dest}:$PATH"`));
 });
 
+test('cpm-planner/install.sh --add-to-path uses ~/.bash_profile for bash on macOS', (t) => {
+  const fixture = makeReleaseFixture('cpm-planner', [
+    { target: 'aarch64-apple-darwin', payload: 'X\n' },
+  ]);
+  t.after(() => fs.rmSync(fixture.root, { recursive: true, force: true }));
+  const dest = tempDir(t);
+  const home = tempDir(t);
+  run('sh', [scriptPath('cpm-planner', 'install.sh'), ...installArgs(fixture, dest), '--add-to-path'], {
+    env: { PRAXEC_OS: 'darwin', PRAXEC_ARCH: 'aarch64', HOME: home, SHELL: '/bin/bash' },
+  });
+  assert.ok(fs.readFileSync(path.join(home, '.bash_profile'), 'utf8').includes(`export PATH="${dest}:$PATH"`));
+});
+
 test('cpm-planner/install.sh --add-to-path prints fish_add_path for fish and writes no rc file', (t) => {
   const { r, home, dest } = installWithShell(t, '/usr/bin/fish');
   assert.ok(r.stderr.includes(`fish_add_path ${dest}`), r.stderr);
