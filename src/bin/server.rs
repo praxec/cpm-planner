@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use cpm_planner::audit::{AuditSink, NullAuditSink};
 use cpm_planner::planner::{DEFAULT_MAX_TTL, MAX_TTL_CEILING};
+use cpm_planner::project::ProjectRoot;
 use cpm_planner::{BasicCpmPlanner, PlanServer, SqlitePlanStore};
 use tracing_subscriber::EnvFilter;
 
@@ -48,10 +49,29 @@ async fn main() -> anyhow::Result<()> {
     let store = SqlitePlanStore::open(&db_path)?;
     let max_ttl = resolve_max_ttl()?;
     tracing::info!(max_ttl_secs = max_ttl.as_secs(), "lease TTL ceiling");
-    let planner = Arc::new(BasicCpmPlanner::with_store(store, audit).with_max_ttl(max_ttl));
+
+    // Discover the repo root for plan-as-code tools: CPM_PROJECT_ROOT if
+    // set, else the nearest ancestor of cwd containing .cpm-planner/ or
+    // .git. The server stays usable without one (inline/unnamed plans);
+    // only path-based portfolio tools report INVALID_PATH.
+    let cwd = std::env::current_dir()?;
+    let project_root = ProjectRoot::discover(&cwd);
+    match &project_root {
+        Some(root) => tracing::info!(root = %root.root().display(), "project root discovered"),
+        None => tracing::info!("no project root discovered; path-based tools disabled"),
+    }
+
+    let mut planner_builder = BasicCpmPlanner::with_store(store, audit).with_max_ttl(max_ttl);
+    if let Some(root) = project_root.clone() {
+        planner_builder = planner_builder.with_project_root(root);
+    }
+    let planner = Arc::new(planner_builder);
 
     tracing::info!("starting cpm-planner stdio server");
-    let server = PlanServer::new(planner);
+    let mut server = PlanServer::new(planner);
+    if let Some(root) = project_root {
+        server = server.with_project_root(root);
+    }
     server.serve_stdio().await?;
     Ok(())
 }
