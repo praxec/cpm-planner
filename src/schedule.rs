@@ -123,7 +123,6 @@ pub(crate) fn scheduled_length(d: &Deliverable, estimator: &EffortEstimator) -> 
 /// `estimate.likely`, else `0.0` for a milestone, else the estimator's
 /// kind-aware effort. Unlike [`scheduled_length`] this ignores
 /// `duration_hours`: calendar time is not cost.
-#[allow(dead_code)] // consumed by later P4 analysis modules
 pub(crate) fn effort_basis(d: &Deliverable, estimator: &EffortEstimator) -> f32 {
     if let Some(hours) = d.estimated_effort_hours {
         return hours;
