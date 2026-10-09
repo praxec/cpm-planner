@@ -1813,3 +1813,35 @@ fn mark_status_schema_caps_evidence_length() {
         json!(2048)
     );
 }
+
+#[tokio::test]
+async fn fractional_earned_pct_is_invalid_actuals() {
+    let server = server();
+    let plan_id = server_with_d1_leased(&server).await;
+    let err = call_err(
+        &server,
+        TOOL_MARK_STATUS,
+        mark_d1(&plan_id, json!({ "earned_pct": 40.5 })),
+    )
+    .await;
+    assert_eq!(
+        err.message,
+        "INVALID_ACTUALS: earned_pct must be an integer 0..=100, got 40.5"
+    );
+}
+
+#[tokio::test]
+async fn negative_earned_pct_is_invalid_actuals() {
+    let server = server();
+    let plan_id = server_with_d1_leased(&server).await;
+    let err = call_err(
+        &server,
+        TOOL_MARK_STATUS,
+        mark_d1(&plan_id, json!({ "earned_pct": -1 })),
+    )
+    .await;
+    assert_eq!(
+        err.message,
+        "INVALID_ACTUALS: earned_pct must be an integer 0..=100, got -1"
+    );
+}

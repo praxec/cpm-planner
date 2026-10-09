@@ -142,3 +142,24 @@ async fn a_mark_without_progress_fields_creates_no_actuals_row() {
         .unwrap();
     assert!(rows.is_empty());
 }
+
+#[tokio::test]
+async fn evidence_beyond_100_entries_is_rejected() {
+    let (planner, plan_id) = leased_a().await;
+    for i in 0..100 {
+        planner
+            .mark_status(
+                mark(&plan_id, DeliverableStatus::InProgress).with_evidence(format!("e{i}")),
+            )
+            .await
+            .unwrap();
+    }
+    let err = planner
+        .mark_status(mark(&plan_id, DeliverableStatus::InProgress).with_evidence("e100"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "INVALID_ACTUALS: deliverable 'a' already has 100 evidence entries"
+    );
+}

@@ -200,8 +200,8 @@ fn create(
     now: DateTime<Utc>,
     build: impl FnOnce(PlanGraph) -> Result<(PlanId, PlanState), PlannerError>,
 ) -> Result<Synced, PlannerError> {
-    let (plan_id, state) = build(req.graph)?;
-    insert_plan(tx, &plan_id, &state, now)?;
+    let (plan_id, mut state) = build(req.graph)?;
+    insert_plan(tx, &plan_id, &mut state, now)?;
     // First variant of a line (or of a line with no selection) is selected.
     tx.execute(
         "INSERT INTO plan_lines (project, name, selected_variant) VALUES (?1, ?2, ?3)
@@ -275,7 +275,7 @@ pub(crate) fn revise(
     }
     let reaped = state.reap_expired(now);
     let was_complete = all_complete(&state);
-    let (new_state, diff) = plan_revision(&state, &graph, force, now)?;
+    let (mut new_state, diff) = plan_revision(&state, &graph, force, now)?;
     let completed =
         (!was_complete && all_complete(&new_state)).then_some(new_state.graph.deliverables.len());
     let released: Vec<LockInfo> = diff
@@ -283,7 +283,7 @@ pub(crate) fn revise(
         .iter()
         .filter_map(|id| state.locks.get(id).cloned())
         .collect();
-    replace_plan_state(tx, plan_id, &new_state)?;
+    replace_plan_state(tx, plan_id, &mut new_state)?;
 
     // An unnamed plan (no `variants` row) must be found by the global dedup
     // under the graph it now holds; named plans are never in that map. If
@@ -843,7 +843,7 @@ pub(crate) fn select(
             selected.outcome.released_locks =
                 live.iter().map(|l| l.deliverable_id.clone()).collect();
             selected.released = live;
-            save_plan_state(tx, old_id, &old)?;
+            save_plan_state(tx, old_id, &mut old)?;
             Some(old)
         }
         None => None,
@@ -857,9 +857,13 @@ pub(crate) fn select(
     if let Some(old) = &old_state {
         selected.outcome.carried = carry_progress(old, &mut new);
     }
+    // Carried deliverables bring their earned-value actuals along.
+    if let Some(old_id) = &old_plan_id {
+        crate::ev_store::carry_actuals(tx, old_id, plan_id, &selected.outcome.carried, now)?;
+    }
     selected.completed =
         (!was_complete && all_complete(&new)).then_some(new.graph.deliverables.len());
-    save_plan_state(tx, plan_id, &new)?;
+    save_plan_state(tx, plan_id, &mut new)?;
 
     tx.execute(
         "UPDATE plan_lines SET selected_variant = ?1 WHERE project = ?2 AND name = ?3",
@@ -1107,5 +1111,5 @@ fn release_selected_locks(
         release_lock(&mut state, &lock.deliverable_id, now);
     }
     out.released = live;
-    save_plan_state(tx, &plan_id, &state)
+    save_plan_state(tx, &plan_id, &mut state)
 }

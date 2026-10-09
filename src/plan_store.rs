@@ -307,8 +307,8 @@ impl SqlitePlanStore {
             return Ok(PlanId(plan_id));
         }
 
-        let (plan_id, state) = build()?;
-        insert_plan(&tx, &plan_id, &state, Utc::now())?;
+        let (plan_id, mut state) = build()?;
+        insert_plan(&tx, &plan_id, &mut state, Utc::now())?;
         tx.execute(
             "INSERT INTO submit_dedup (graph_hash, plan_id) VALUES (?1, ?2)",
             params![graph_hash, plan_id.0],
@@ -366,7 +366,7 @@ impl SqlitePlanStore {
                 plan_id: plan_id.0.clone(),
             })?;
         let out = f(&mut state)?;
-        save_plan_state(&tx, plan_id, &state)?;
+        save_plan_state(&tx, plan_id, &mut state)?;
         tx.commit().map_err(backend)?;
         Ok(out)
     }
@@ -798,7 +798,7 @@ pub(crate) fn load_plan_state(
 pub(crate) fn insert_plan(
     tx: &Transaction<'_>,
     plan_id: &PlanId,
-    state: &PlanState,
+    state: &mut PlanState,
     now: DateTime<Utc>,
 ) -> Result<(), PlannerError> {
     let graph_json = serde_json::to_string(&state.graph).map_err(backend)?;
@@ -824,7 +824,7 @@ pub(crate) fn insert_plan(
 pub(crate) fn replace_plan_state(
     tx: &Transaction<'_>,
     plan_id: &PlanId,
-    state: &PlanState,
+    state: &mut PlanState,
 ) -> Result<(), PlannerError> {
     let graph_json = serde_json::to_string(&state.graph).map_err(backend)?;
     let result_json = serde_json::to_string(&state.cached_result).map_err(backend)?;
@@ -854,7 +854,7 @@ pub(crate) fn replace_plan_state(
 pub(crate) fn save_plan_state(
     tx: &Transaction<'_>,
     plan_id: &PlanId,
-    state: &PlanState,
+    state: &mut PlanState,
 ) -> Result<(), PlannerError> {
     {
         let mut stmt = tx
@@ -905,13 +905,14 @@ pub(crate) fn save_plan_state(
         }
     }
 
-    // Lease hours ended and progress reported in this transaction (deltas,
-    // see `PlanState::leased_hours` / `reported_actuals`).
-    if let Some(at) = state.actuals_updated_at {
-        for (deliverable_id, hours) in &state.leased_hours {
+    // Lease hours ended and progress reported in this transaction. They are
+    // deltas, consumed here, so saving the same state again adds nothing.
+    let deltas = state.take_actuals_deltas();
+    if let Some(at) = deltas.at {
+        for (deliverable_id, hours) in &deltas.leased_hours {
             crate::ev_store::add_leased_hours(tx, plan_id, deliverable_id, *hours, at)?;
         }
-        for (deliverable_id, report) in &state.reported_actuals {
+        for (deliverable_id, report) in &deltas.reported {
             crate::ev_store::record_reported(tx, plan_id, deliverable_id, report, at)?;
         }
     }

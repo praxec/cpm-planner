@@ -135,7 +135,9 @@ pub(crate) fn add_leased_hours(
 }
 
 /// Apply a `mark_status` progress report: set the percent and actual hours
-/// that are given and append the evidence entry.
+/// that are given and append the evidence entry. A deliverable already at
+/// [`crate::plan::MAX_EVIDENCE_ENTRIES`] entries refuses another
+/// (`INVALID_ACTUALS`).
 pub(crate) fn record_reported(
     conn: &Connection,
     plan_id: &PlanId,
@@ -160,6 +162,14 @@ pub(crate) fn record_reported(
         None => Vec::new(),
     };
     if let Some(e) = &report.evidence {
+        if evidence.len() >= crate::plan::MAX_EVIDENCE_ENTRIES {
+            return Err(PlannerError::InvalidActuals {
+                reason: format!(
+                    "deliverable '{deliverable_id}' already has {} evidence entries",
+                    crate::plan::MAX_EVIDENCE_ENTRIES
+                ),
+            });
+        }
         evidence.push(e.clone());
     }
     let evidence = serde_json::to_string(&evidence).map_err(backend)?;
@@ -182,6 +192,51 @@ pub(crate) fn record_reported(
         ],
     )
     .map_err(backend)?;
+    Ok(())
+}
+
+/// Copy the actuals of `ids` from plan `from` to plan `to` (a selection
+/// carrying their `Complete` status). Merged into an existing row of `to`:
+/// leased hours add up, evidence is `from`'s then `to`'s, and `to`'s
+/// percent and actual hours win where set. Ids without a row in `from` are
+/// skipped.
+pub(crate) fn carry_actuals(
+    conn: &Connection,
+    from: &PlanId,
+    to: &PlanId,
+    ids: &[String],
+    at: DateTime<Utc>,
+) -> Result<(), PlannerError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let source = load_actuals(conn, from)?;
+    let mut target = load_actuals(conn, to)?;
+    for id in ids {
+        let Some(old) = source.get(id) else {
+            continue;
+        };
+        let new = target.remove(id).unwrap_or_default();
+        let mut evidence = old.evidence.clone();
+        evidence.extend(new.evidence);
+        let evidence = serde_json::to_string(&evidence).map_err(backend)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO ev_actuals
+                 (plan_id, deliverable_id, earned_pct, actual_hours, leased_hours,
+                  evidence, updated_at_us)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                to.0,
+                id,
+                new.earned_pct.or(old.earned_pct),
+                new.actual_hours.or(old.actual_hours).map(f64::from),
+                f64::from(old.leased_hours) + f64::from(new.leased_hours),
+                evidence,
+                at.timestamp_micros()
+            ],
+        )
+        .map_err(backend)?;
+    }
     Ok(())
 }
 
@@ -425,6 +480,28 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn saving_state_twice_does_not_double_count_leased_hours() {
+        let (store, plan_id) = store_with_plan();
+        store
+            .write_tx(|tx| {
+                let mut state = crate::plan_store::load_plan_state(tx, &plan_id)?.unwrap();
+                let lock = crate::plan::LockInfo {
+                    plan_id: plan_id.clone(),
+                    deliverable_id: "a".into(),
+                    caller_id: crate::plan::CallerId("w".into()),
+                    acquired_at: at(0),
+                    expires_at: at(5),
+                };
+                state.record_lease_end(&lock, at(1));
+                crate::plan_store::save_plan_state(tx, &plan_id, &mut state)?;
+                crate::plan_store::save_plan_state(tx, &plan_id, &mut state)
+            })
+            .unwrap();
+        let got = store.read_tx(|tx| load_actuals(tx, &plan_id)).unwrap();
+        assert_eq!(got["a"].leased_hours, 1.0);
     }
 
     #[test]

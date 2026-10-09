@@ -275,3 +275,55 @@ async fn forced_archive_records_the_released_lease_hours() {
         .unwrap();
     assert!(near(leased(&planner, &main, "a"), 0.6));
 }
+
+fn actuals(
+    planner: &BasicCpmPlanner,
+    plan_id: &PlanId,
+    id: &str,
+) -> Option<crate::earned_value::Actuals> {
+    planner
+        .store()
+        .read_tx(|tx| crate::ev_store::load_actuals(tx, plan_id))
+        .unwrap()
+        .remove(id)
+}
+
+#[tokio::test]
+async fn select_carries_actuals_for_carried_deliverables() {
+    let (planner, clock) = planner();
+    let (main, alt) = main_and_alt(&planner).await;
+    acquire(&planner, &main, "a").await;
+    clock.advance_minutes(30);
+    planner
+        .mark_status(
+            MarkStatusRequest::new(main.clone(), "a", worker(), DeliverableStatus::Complete)
+                .with_actual_effort_hours(2.0)
+                .with_evidence("merged"),
+        )
+        .await
+        .unwrap();
+    planner.select_variant(&alt, false).await.unwrap();
+    assert_eq!(actuals(&planner, &alt, "a"), actuals(&planner, &main, "a"));
+}
+
+#[tokio::test]
+async fn select_does_not_carry_actuals_for_uncarried_deliverables() {
+    let (planner, clock) = planner();
+    let main = planner
+        .sync_plan(SyncRequest::new("proj", "web", "main", graph(&["a"])))
+        .await
+        .unwrap()
+        .plan_id;
+    let mut changed = graph(&["a"]);
+    changed.deliverables[0].estimated_effort_hours = Some(5.0);
+    let alt = planner
+        .sync_plan(SyncRequest::new("proj", "web", "alt", changed))
+        .await
+        .unwrap()
+        .plan_id;
+    acquire(&planner, &main, "a").await;
+    clock.advance_minutes(30);
+    mark(&planner, &main, "a", DeliverableStatus::Complete).await;
+    planner.select_variant(&alt, false).await.unwrap();
+    assert_eq!(actuals(&planner, &alt, "a"), None);
+}

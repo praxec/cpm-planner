@@ -458,9 +458,13 @@ pub(crate) fn canonical_deliverable(d: &Deliverable) -> serde_json::Value {
         "metadata": d.metadata,
         "milestone": d.milestone,
     });
-    // Only when set, so graphs without an earning rule keep the hash they
-    // had before the field existed (dedup and inline sync stay stable).
-    if let Some(rule) = d.earning_rule {
+    // Only when set to a non-default rule, so graphs without one keep the
+    // hash they had before the field existed (dedup and inline sync stay
+    // stable) and an explicit `zero_hundred` hashes like an absent rule.
+    if let Some(rule) = d
+        .earning_rule
+        .filter(|r| *r != crate::plan::EarningRule::ZeroHundred)
+    {
         canonical["earning_rule"] = json!(rule);
     }
     canonical
@@ -937,16 +941,17 @@ fn make_circuit_break_event(
 }
 
 /// Validate `mark_status` progress fields (`INVALID_ACTUALS`). Takes wide
-/// types so the server can check raw wire values with the same messages.
+/// types (any JSON number) so the server can check raw wire values with the
+/// same messages: a negative, fractional or > 100 `earned_pct` is refused.
 pub(crate) fn validate_actuals(
     status: &DeliverableStatus,
-    earned_pct: Option<u64>,
+    earned_pct: Option<f64>,
     actual_effort_hours: Option<f64>,
     evidence: Option<&str>,
 ) -> Result<(), PlannerError> {
     let bad = |reason: String| Err(PlannerError::InvalidActuals { reason });
     if let Some(pct) = earned_pct {
-        if pct > 100 {
+        if !(pct.fract() == 0.0 && (0.0..=100.0).contains(&pct)) {
             return bad(format!("earned_pct must be an integer 0..=100, got {pct}"));
         }
         if !matches!(
@@ -1700,7 +1705,7 @@ impl Planner for BasicCpmPlanner {
         } = req;
         validate_actuals(
             &status,
-            earned_pct.map(u64::from),
+            earned_pct.map(f64::from),
             actual_effort_hours.map(f64::from),
             evidence.as_deref(),
         )?;
@@ -2176,6 +2181,18 @@ mod tests {
             milestone: false,
             earning_rule: None,
         }
+    }
+
+    #[test]
+    fn explicit_default_earning_rule_hashes_like_absent() {
+        let absent = deliverable("D1", Some(1.0), json!({}));
+        let mut explicit = absent.clone();
+        explicit.earning_rule = Some(crate::plan::EarningRule::ZeroHundred);
+        let graph = |d: Deliverable| PlanGraph {
+            deliverables: vec![d],
+            max_chained_dispatch: None,
+        };
+        assert_eq!(hash_graph(&graph(explicit)), hash_graph(&graph(absent)));
     }
 
     #[test]

@@ -76,8 +76,8 @@ pub(crate) struct PlanState {
     pub(crate) cached_result: CriticalPathResult,
 
     /// Lease hours ended during this transaction, keyed by deliverable id:
-    /// a DELTA (empty when loaded), added to `ev_actuals.leased_hours` by
-    /// [`crate::plan_store::save_plan_state`]. Written through
+    /// a DELTA (empty when loaded), added to `ev_actuals.leased_hours` and
+    /// consumed by [`crate::plan_store::save_plan_state`]. Written through
     /// [`PlanState::record_lease_end`]; a plan revision carries it over.
     pub(crate) leased_hours: HashMap<String, f32>,
 
@@ -90,6 +90,15 @@ pub(crate) struct PlanState {
     /// Latest time recorded in `leased_hours` or `reported_actuals`; stored
     /// as the actuals rows' `updated_at_us`.
     pub(crate) actuals_updated_at: Option<DateTime<Utc>>,
+}
+
+/// Earned-value deltas taken from a [`PlanState`] by
+/// [`PlanState::take_actuals_deltas`].
+pub(crate) struct ActualsDeltas {
+    pub(crate) leased_hours: HashMap<String, f32>,
+    pub(crate) reported: HashMap<String, crate::ev_store::ReportedActuals>,
+    /// `None` exactly when both maps are empty.
+    pub(crate) at: Option<DateTime<Utc>>,
 }
 
 /// Who holds a locked path.
@@ -215,6 +224,17 @@ impl PlanState {
             leased_hours: HashMap::new(),
             reported_actuals: HashMap::new(),
             actuals_updated_at: None,
+        }
+    }
+
+    /// Take (and clear) the earned-value deltas of this transaction: lease
+    /// hours ended, progress reported, and the time to stamp them with.
+    /// Consuming them is what keeps a second save from counting them twice.
+    pub(crate) fn take_actuals_deltas(&mut self) -> ActualsDeltas {
+        ActualsDeltas {
+            leased_hours: std::mem::take(&mut self.leased_hours),
+            reported: std::mem::take(&mut self.reported_actuals),
+            at: self.actuals_updated_at.take(),
         }
     }
 

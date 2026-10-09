@@ -345,9 +345,23 @@ pub struct Deliverable {
     pub milestone: bool,
 
     /// How earned value credits partial progress. `None` means
-    /// [`EarningRule::ZeroHundred`]. Part of the plan's identity (hashed).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// [`EarningRule::ZeroHundred`]; an explicit `zero_hundred` deserializes
+    /// as `None` and hashes like it. Part of the plan's identity (hashed).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_earning_rule"
+    )]
     pub earning_rule: Option<EarningRule>,
+}
+
+/// The default rule is normalised to `None`, so `"zero_hundred"` and an
+/// absent rule describe the same deliverable.
+fn deserialize_earning_rule<'de, D>(d: D) -> Result<Option<EarningRule>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<EarningRule>::deserialize(d)?.filter(|r| *r != EarningRule::ZeroHundred))
 }
 
 impl Deliverable {
@@ -451,7 +465,8 @@ impl AcquireRequest {
 /// `INVALID_ACTUALS`: `earned_pct` is 0..=100 and only accepted with
 /// `InProgress` (with `Complete` it is accepted and ignored),
 /// `actual_effort_hours` is finite and in `0..=`[`MAX_HOURS`], and
-/// `evidence` is at most [`MAX_EVIDENCE_CHARS`] characters.
+/// `evidence` is at most [`MAX_EVIDENCE_CHARS`] characters, with at most
+/// [`MAX_EVIDENCE_ENTRIES`] kept per deliverable.
 #[derive(Debug, Clone)]
 pub struct MarkStatusRequest {
     pub plan_id: PlanId,
@@ -1069,6 +1084,10 @@ pub const MAX_HOURS: f32 = 1_000_000.0;
 /// Longest `evidence` note `mark_status` accepts, in characters.
 pub const MAX_EVIDENCE_CHARS: usize = 2048;
 
+/// Most evidence entries one deliverable keeps; appending beyond it is
+/// `INVALID_ACTUALS`.
+pub const MAX_EVIDENCE_ENTRIES: usize = 100;
+
 /// Reserved id of the synthetic zero-effort source node in every plan's CPM.
 pub const START_ID: &str = "__start__";
 /// Reserved id of the synthetic zero-effort sink node in every plan's CPM.
@@ -1246,7 +1265,8 @@ pub enum PlannerError {
     /// `mark_status` progress fields failed validation: `earned_pct` above
     /// 100 or given with a status other than `in_progress`/`complete`,
     /// `actual_effort_hours` not finite or outside `0..=1000000`, or
-    /// `evidence` longer than [`MAX_EVIDENCE_CHARS`] characters.
+    /// `evidence` longer than [`MAX_EVIDENCE_CHARS`] characters or beyond
+    /// [`MAX_EVIDENCE_ENTRIES`] entries for the deliverable.
     #[error("INVALID_ACTUALS: {reason}")]
     InvalidActuals { reason: String },
 
@@ -1297,6 +1317,18 @@ mod tests {
         assert_eq!(d.metadata, serde_json::json!({"description": "smoke test"}));
         assert_eq!(back.max_chained_dispatch, Some(8));
         Ok(())
+    }
+
+    #[test]
+    fn explicit_default_earning_rule_deserializes_as_absent() {
+        let d: Deliverable = serde_json::from_value(serde_json::json!({
+            "id": "a",
+            "owned_files": [],
+            "prerequisites": [],
+            "earning_rule": "zero_hundred"
+        }))
+        .unwrap();
+        assert_eq!(d.earning_rule, None);
     }
 
     /// `DeliverableStatus` uses an internally-tagged enum representation
