@@ -40,6 +40,7 @@
 
 pub mod algorithm;
 pub mod audit;
+pub mod compare;
 pub mod drag;
 pub mod estimator;
 mod graph;
