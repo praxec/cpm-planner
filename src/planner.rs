@@ -370,7 +370,7 @@ fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
     // Shared files: any pair of claimants where at least one claim is
     // exclusive must be ordered by prerequisites, so one can never run
     // while the other holds the file. Append/append needs no ordering.
-    let reach = crate::graph::reachability(graph);
+    let mut reach: Option<HashMap<String, HashSet<String>>> = None;
     let mut claimants: HashMap<&Path, Vec<(&str, FileMode)>> = HashMap::new();
     let mut path_order: Vec<&Path> = Vec::new();
     for d in &graph.deliverables {
@@ -389,6 +389,7 @@ fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
                 if x == y || (xm == FileMode::Append && ym == FileMode::Append) {
                     continue;
                 }
+                let reach = reach.get_or_insert_with(|| crate::graph::reachability(graph));
                 let ordered = reach.get(x).is_some_and(|r| r.contains(y))
                     || reach.get(y).is_some_and(|r| r.contains(x));
                 if !ordered {
@@ -1115,6 +1116,21 @@ impl Planner for BasicCpmPlanner {
                     &previous_status,
                 ));
             } else if !is_complete && !state.locks.contains_key(deliverable_id) {
+                // Putting a deliverable back to work without a lease must
+                // not bypass dependency order.
+                if matches!(
+                    status,
+                    DeliverableStatus::Ready | DeliverableStatus::InProgress
+                ) {
+                    let missing = incomplete_prerequisites(state, deliverable_id);
+                    if !missing.is_empty() {
+                        return Err(PlannerError::PrerequisitesIncomplete {
+                            plan_id: plan_id.0.clone(),
+                            deliverable_id: deliverable_id.to_string(),
+                            missing,
+                        });
+                    }
+                }
                 audit_buf.push(make_marked_without_lease_event(
                     &plan_id,
                     deliverable_id,

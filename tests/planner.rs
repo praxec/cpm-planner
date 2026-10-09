@@ -1750,3 +1750,99 @@ async fn ordered_sharers_are_leased_one_after_the_other() {
         .unwrap();
     assert_eq!(cohort_ids(&second), vec!["b".to_string()]);
 }
+
+async fn submit_ordered_sharers() -> (BasicCpmPlanner, PlanId) {
+    let planner = BasicCpmPlanner::new();
+    let graph = PlanGraph {
+        deliverables: vec![
+            deliverable("a", &["src/x.rs"], &[], Some(1.0)),
+            deliverable("b", &["src/x.rs"], &["a"], Some(1.0)),
+        ],
+        max_chained_dispatch: None,
+    };
+    let plan_id = planner.submit_plan(graph).await.unwrap();
+    (planner, plan_id)
+}
+
+#[tokio::test]
+async fn lockless_ready_mark_with_incomplete_prerequisites_is_rejected() {
+    let (planner, plan_id) = submit_ordered_sharers().await;
+    planner
+        .acquire_cohort(AcquireRequest::new(plan_id.clone(), caller("w"), 1))
+        .await
+        .unwrap();
+    let err = planner
+        .mark_status(MarkStatusRequest::new(
+            plan_id,
+            "b",
+            caller("other"),
+            DeliverableStatus::Ready,
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().starts_with("PREREQUISITES_INCOMPLETE"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn lockless_in_progress_mark_with_incomplete_prerequisites_is_rejected() {
+    let (planner, plan_id) = submit_ordered_sharers().await;
+    let err = planner
+        .mark_status(MarkStatusRequest::new(
+            plan_id,
+            "b",
+            caller("other"),
+            DeliverableStatus::InProgress,
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().starts_with("PREREQUISITES_INCOMPLETE"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn lockless_ready_mark_after_prerequisites_complete_is_allowed() {
+    let (planner, plan_id) = submit_ordered_sharers().await;
+    planner
+        .acquire_cohort(AcquireRequest::new(plan_id.clone(), caller("w"), 1))
+        .await
+        .unwrap();
+    planner
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
+            "a",
+            caller("w"),
+            DeliverableStatus::Complete,
+        ))
+        .await
+        .unwrap();
+    let result = planner
+        .mark_status(MarkStatusRequest::new(
+            plan_id,
+            "b",
+            caller("other"),
+            DeliverableStatus::Ready,
+        ))
+        .await;
+    assert!(result.is_ok(), "got: {result:?}");
+}
+
+#[tokio::test]
+async fn ordered_sharer_is_not_leased_while_predecessor_holds_the_file() {
+    let (planner, plan_id) = submit_ordered_sharers().await;
+    planner
+        .acquire_cohort(AcquireRequest::new(plan_id.clone(), caller("w"), 1))
+        .await
+        .unwrap();
+    let mut req = AcquireRequest::new(plan_id, caller("w2"), 1);
+    req.ids = Some(vec!["b".to_string()]);
+    let cohort = planner.acquire_cohort(req).await.unwrap();
+    assert_eq!(
+        codes(&cohort),
+        vec![("b".to_string(), "NOT_READY".to_string())]
+    );
+}

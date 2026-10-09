@@ -324,9 +324,9 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
             Cow::Borrowed(
                 "Set a deliverable's status. Complete/Failed releases the lock; \
                  caller_id mismatch yields LOCK_NOT_HELD. Without a lock, \
-                 Complete requires all prerequisites complete \
-                 (PREREQUISITES_INCOMPLETE) and is audited; other lockless \
-                 marks are audited too, and an already-complete deliverable \
+                 Complete, Ready or InProgress requires all prerequisites \
+                 complete (PREREQUISITES_INCOMPLETE) and is audited; other \
+                 lockless marks are audited too, and an already-complete deliverable \
                  cannot be changed (LOCK_NOT_HELD).",
             ),
             schema_object(json!({
@@ -777,7 +777,7 @@ Tools (eight total, all `plan.<verb>`):
                         a prerequisite is an id string or {id, consumes?, kind?: artifact|interface, lag_hours?}; a deliverable's duration_hours (calendar time; when absent the default is the effort estimate, explicit or estimator-derived) and lag_hours (minimum wait after a prerequisite finishes) drive the schedule
   plan.acquire_cohort  — atomically acquire ready, file-disjoint deliverables (an owned_files entry may be {path, mode: "append"}: append claims on one path may be co-leased and are listed in the response's shared_paths; exclusive claims never overlap anything at once; plan.submit accepts a shared file only when the claimants are ordered by prerequisites, or all claims are append)
   plan.heartbeat       — refresh a held lock's TTL
-  plan.mark_status     — set a deliverable's status (Complete/Failed releases the lock); lockless Complete requires complete prerequisites (PREREQUISITES_INCOMPLETE) and is audited
+  plan.mark_status     — set a deliverable's status (Complete/Failed releases the lock); lockless Complete/Ready/InProgress requires complete prerequisites (PREREQUISITES_INCOMPLETE) and is audited
   plan.status          — read-only snapshot ([id, status, attempt_count, failure_count, lapse_count] rows, critical_path (one real chain, always __start__ to __finish__), critical_ids, per-deliverable schedule (es/ef/ls/lf/float, hours; synthetic __start__/__finish__ endpoint rows have synthetic=true), the ready set ordered by float, plan_complete, milestones (one row per `milestone: true` deliverable, or metadata.milestone == true: id, critical_path from __start__ to it, hours = its earliest finish, complete), held locks). __start__ and __finish__ are reserved deliverable ids (INVALID_GRAPH)
   plan.get             — return the submitted PlanGraph (deliverables, estimates, files, metadata) for a plan_id
   plan.force_release   — operator escape hatch; emits audit event with `reason`; optional reset_counters:true also clears lapse/failure counters and revives a circuit-broken deliverable

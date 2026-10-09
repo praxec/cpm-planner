@@ -43,6 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A lockless `plan.mark_status` to `ready` or `in_progress` now requires the deliverable's prerequisites to be complete (`PREREQUISITES_INCOMPLETE`), so dependency order can't be bypassed.
 - Plan identity hashes now normalise prerequisites to edge objects, so re-submitting a graph stored by an earlier version creates a new plan rather than deduplicating to the old one.
 - `critical_path` now includes the synthetic endpoints.
 - Completing a deliverable without a lease now requires its prerequisites to be complete and is audited.
