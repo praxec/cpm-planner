@@ -47,7 +47,7 @@ any other MCP server:
 
 | Tool | Does |
 |------|------|
-| `plan.submit` | Submit a task graph; returns a plan id (idempotent on the graph + caller). A prerequisite is a deliverable id string or an object `{id, consumes?, kind?: artifact\|interface, lag_hours?}`; both forms round-trip through `plan.get`. A deliverable may set `milestone: true` (an acceptance point, zero-length unless given an estimate or duration, reported in `plan.status` `milestones`). A deliverable's optional `duration_hours` (calendar time) replaces effort as its scheduled length and a prerequisite's `lag_hours` delays the dependent's start; effort stays the cost basis. |
+| `plan.submit` | Submit a task graph; returns a plan id (idempotent on the graph + caller). A prerequisite is a deliverable id string or an object `{id, consumes?, kind?: artifact\|interface, lag_hours?}`; both forms round-trip through `plan.get`. A deliverable may set `milestone: true` (an acceptance point, zero-length unless given an estimate or duration, reported in `plan.status` `milestones`). A deliverable's optional `duration_hours` (calendar time) replaces effort as its scheduled length and a prerequisite's `lag_hours` delays the dependent's start; effort stays the cost basis. An optional `estimate` `{optimistic, likely, pessimistic}` (`0 <= optimistic <= likely <= pessimistic`) is a three-point effort estimate. Scheduled-length precedence: `duration_hours` > `estimated_effort_hours` > `estimate.likely` > 0 for a milestone > the estimator default; Monte Carlo samples the estimate only when neither `duration_hours` nor `estimated_effort_hours` is set. Limits: at most 5000 deliverables, and every hour value (effort, duration, lag, estimate) finite and between 0 and 1000000 (`INVALID_GRAPH`). |
 | `plan.acquire_cohort` | Atomically acquire up to N ready deliverables with mutually disjoint file sets (an `owned_files` entry may be `{path, mode: "append"}`; append claims on one path may be co-leased and appear in `shared_paths`; a file may be owned by several deliverables only if they are ordered by prerequisites, or all claims are append); optional `ttl_seconds` sets the lease TTL (clamped to the server maximum); optional `ids` and `filter.metadata` target deliverables; `metadata.kind = "manual"` deliverables are never leased; the response lists unleased candidates in `blocked` (with `blocked_count`, `needs_operator`). |
 | `plan.heartbeat` | Refresh the TTL on a held lock; optional `ttl_seconds` sets the new TTL (clamped to the server maximum). |
 | `plan.mark_status` | Mark a deliverable complete/failed; releases its lock. Without a lock, Complete requires complete prerequisites (`PREREQUISITES_INCOMPLETE`) and every lockless mark is audited. |
@@ -55,6 +55,15 @@ any other MCP server:
 | `plan.get` | Return the stored plan graph for a plan_id (read back what was submitted). |
 | `plan.force_release` | Operator escape hatch: release a lock regardless of holder/TTL; `reset_counters: true` also clears lapse/failure counters. |
 | `plan.accept` | Manager/owner acceptance: complete a deliverable without holding its lease (audited, with evidence). |
+| `plan.lint` | Static checks without submitting: cycles (with the loop), redundant edges, edges without rationale, interface edges not targeting a contract, deliverables feeding no milestone, and unordered file overlaps (#20). |
+| `plan.schedule` | Level a graph against resource capacities (`metadata.owner` by default): makespan, per-deliverable start/finish, per-resource load, the driving chain (dependency vs resource waits), and project/feeding buffers (#19). `capacities` is required: every resource carrying work needs at least 1 unit, otherwise `INVALID_CAPACITIES:` lists the missing resources. `project_buffer_pct` is 0 to 100 (default 25). |
+| `plan.simulate` | Read-only what-if for a graph or stored plan (persists nothing): lint, critical path, schedule, milestones, optional resource schedule (`schedule`, same inputs and `INVALID_CAPACITIES:` rule as `plan.schedule`) and Monte Carlo (`monte_carlo`: `iterations` 1 to 50000, default 2000; `seed`, default `0xC0FFEE`; `iterations × (deliverables + prerequisite edges)` must not exceed 200000000), and the scorecard (#23). |
+
+`plan.lint`, `plan.schedule` and `plan.simulate` take exactly one of an inline
+`graph` or a stored `plan_id`; `plan.schedule` and `plan.simulate` reject what `plan.submit`
+rejects, and `plan.lint` reports it as findings. Monte Carlo output is reproducible for a given seed on the same platform
+and toolchain; bit-identical results across targets or compiler versions are
+not guaranteed, because float math functions can differ.
 
 ## Use as a library
 

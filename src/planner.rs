@@ -37,9 +37,9 @@ use crate::audit::{AuditEvent, AuditSink, NullAuditSink};
 use crate::plan::{
     AcceptRequest, AcquireRequest, BlockedDeliverable, CallerId, Cohort, CohortRow, Deliverable,
     DeliverableStatus, FINISH_ID, FileMode, ForceReleaseRequest, HeartbeatRequest, LockInfo,
-    MarkStatusRequest, MilestoneRow, OwnedFile, PlanDefinition, PlanGraph, PlanId, PlanLineSummary,
-    PlanStatus, PlannerError, ReviseRequest, START_ID, ScheduleRow, SelectOutcome, SyncOutcome,
-    SyncRequest,
+    MAX_DELIVERABLES, MarkStatusRequest, OwnedFile, PlanDefinition, PlanGraph, PlanId,
+    PlanLineSummary, PlanStatus, PlannerError, ReviseRequest, START_ID, ScheduleRow, SelectOutcome,
+    SyncOutcome, SyncRequest,
 };
 use crate::plan_store::SqlitePlanStore;
 use crate::portfolio::{Archived, Revised, Selected, Synced};
@@ -51,7 +51,6 @@ use execution_policy::classify::{FailureClass, RetryDecision};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::algorithm::CpmAlgorithm;
 use crate::locks::{FileClaim, PlanState, add_file_claims, modes_conflict, release_file_claims};
 
 /// Default TTL applied to newly acquired locks. Five minutes is the
@@ -143,6 +142,17 @@ impl BasicCpmPlanner {
     /// TTL. The real `Utc::now` is used as the clock.
     pub fn with_audit(audit: Arc<dyn AuditSink>) -> Self {
         Self::with_parts(audit, DEFAULT_TTL, Arc::new(Utc::now))
+    }
+
+    /// Simulate a stored plan's graph read-only: nothing is written and no
+    /// audit events are emitted. See [`crate::simulate::simulate`].
+    pub async fn simulate_plan(
+        &self,
+        plan_id: &PlanId,
+        req: &crate::simulate::SimulateRequest,
+    ) -> Result<crate::simulate::SimulationResult, PlannerError> {
+        let graph = self.get_plan(plan_id).await?.graph;
+        crate::simulate::simulate(&graph, req)
     }
 
     /// Override the lock TTL. Useful for short-lived integration tests.
@@ -304,7 +314,17 @@ pub(crate) fn hash_graph(graph: &PlanGraph) -> String {
 
 /// Reject graphs that fail any structural invariant. Returns
 /// [`PlannerError::InvalidGraph`] with a precise `reason` on first failure.
+/// Run by submit and by every analysis entry point (`resource_schedule`,
+/// `monte_carlo`, `simulate`).
 pub(crate) fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
+    if graph.deliverables.len() > MAX_DELIVERABLES {
+        return Err(PlannerError::InvalidGraph {
+            reason: format!(
+                "plan has {} deliverables; maximum is {MAX_DELIVERABLES}",
+                graph.deliverables.len()
+            ),
+        });
+    }
     for d in &graph.deliverables {
         if d.id == START_ID || d.id == FINISH_ID {
             return Err(PlannerError::InvalidGraph {
@@ -323,70 +343,17 @@ pub(crate) fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
         }
     }
 
-    // Effort estimates, when present, must be finite and non-negative.
-    for d in &graph.deliverables {
-        if let Some(h) = d.estimated_effort_hours
-            && (h < 0.0 || !h.is_finite())
-        {
-            return Err(PlannerError::InvalidGraph {
-                reason: format!(
-                    "deliverable '{}' has invalid estimated_effort_hours {h}; must be a finite number >= 0",
-                    d.id
-                ),
-            });
-        }
-    }
-
-    // Calendar durations, when present, must be finite and non-negative.
-    for d in &graph.deliverables {
-        if let Some(h) = d.duration_hours
-            && (h < 0.0 || !h.is_finite())
-        {
-            return Err(PlannerError::InvalidGraph {
-                reason: format!(
-                    "deliverable '{}' has invalid duration_hours {h}; must be a finite number >= 0",
-                    d.id
-                ),
-            });
-        }
-    }
-
-    // Three-point estimates, when present, must be finite, non-negative
-    // and ordered optimistic <= likely <= pessimistic.
-    for d in &graph.deliverables {
-        if let Some(e) = d.estimate {
-            let ordered = e.optimistic.is_finite()
-                && e.likely.is_finite()
-                && e.pessimistic.is_finite()
-                && e.optimistic >= 0.0
-                && e.optimistic <= e.likely
-                && e.likely <= e.pessimistic;
-            if !ordered {
-                return Err(PlannerError::InvalidGraph {
-                    reason: format!(
-                        "deliverable '{}' estimate must satisfy 0 <= optimistic <= likely <= pessimistic",
-                        d.id
-                    ),
-                });
-            }
-        }
+    // Effort, duration, estimate and lag hours: finite, within
+    // 0..=MAX_HOURS, and estimates ordered. Same messages as `plan.lint`.
+    if let Some(problem) = crate::graph::value_problems(graph).into_iter().next() {
+        return Err(PlannerError::InvalidGraph {
+            reason: problem.message,
+        });
     }
 
     // Prerequisite references resolve.
     let id_set: HashSet<&str> = graph.deliverables.iter().map(|d| d.id.as_str()).collect();
     for d in &graph.deliverables {
-        for p in &d.prerequisites {
-            let lag = p.lag_hours();
-            if !lag.is_finite() || lag < 0.0 {
-                return Err(PlannerError::InvalidGraph {
-                    reason: format!(
-                        "prerequisite '{}' of deliverable '{}' has invalid lag_hours {lag}; must be a finite number >= 0",
-                        p.id(),
-                        d.id
-                    ),
-                });
-            }
-        }
         for p in crate::graph::prerequisite_ids(d) {
             if !id_set.contains(p) {
                 return Err(PlannerError::InvalidGraph {
@@ -1592,28 +1559,7 @@ impl Planner for BasicCpmPlanner {
                 })
                 .collect();
 
-            let task_of = |id: &str| state.cached_result.tasks.iter().find(|t| t.id == id);
-            let row_of = |t: &crate::task::Task, synthetic: bool| ScheduleRow {
-                id: t.id.clone(),
-                es: t.earliest_start,
-                ef: t.earliest_finish,
-                ls: t.latest_start,
-                lf: t.latest_finish,
-                float: t.float,
-                critical: t.is_critical,
-                synthetic,
-            };
-            let mut schedule: Vec<ScheduleRow> = Vec::new();
-            schedule.extend(task_of(START_ID).map(|t| row_of(t, true)));
-            schedule.extend(
-                state
-                    .graph
-                    .deliverables
-                    .iter()
-                    .filter_map(|d| task_of(&d.id))
-                    .map(|t| row_of(t, false)),
-            );
-            schedule.extend(task_of(FINISH_ID).map(|t| row_of(t, true)));
+            let schedule = crate::schedule::schedule_rows(&state.graph, &state.cached_result);
             let mut ready_rows: Vec<&ScheduleRow> = schedule
                 .iter()
                 .filter(|r| {
@@ -1633,27 +1579,10 @@ impl Planner for BasicCpmPlanner {
             ready_rows.sort_by_key(|r| priority_key(&r.id, &sched_by_id));
             let ready: Vec<String> = ready_rows.iter().map(|r| r.id.clone()).collect();
 
-            let milestones: Vec<MilestoneRow> = state
-                .graph
-                .deliverables
-                .iter()
-                .filter(|d| d.is_milestone())
-                .filter_map(|d| {
-                    let task = task_of(&d.id)?;
-                    Some(MilestoneRow {
-                        id: d.id.clone(),
-                        critical_path: CpmAlgorithm::trace_path_to(
-                            &state.cached_result.tasks,
-                            &d.id,
-                        ),
-                        hours: task.earliest_finish,
-                        complete: matches!(
-                            state.statuses.get(&d.id),
-                            Some(DeliverableStatus::Complete)
-                        ),
-                    })
-                })
-                .collect();
+            let milestones =
+                crate::schedule::milestone_rows(&state.graph, &state.cached_result, |id| {
+                    matches!(state.statuses.get(id), Some(DeliverableStatus::Complete))
+                });
 
             PlanStatus {
                 plan_id: plan_id.clone(),

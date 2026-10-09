@@ -155,3 +155,51 @@ fn deterministic_graph_with_lag_and_parallel_sinks_matches_cpm() {
     let cpm = CpmAlgorithm::calculate(&mut tasks).critical_path_duration;
     assert_eq!((s.p50, s.deterministic_makespan, cpm), (9.0, 9.0, 9.0));
 }
+
+#[test]
+fn explicit_effort_suppresses_sampling() {
+    let g = graph(
+        json!([{"id": "a", "owned_files": [], "prerequisites": [], "estimated_effort_hours": 4.0,
+        "estimate": {"optimistic": 1.0, "likely": 2.0, "pessimistic": 50.0}}]),
+    );
+    let s = monte_carlo(&g, &req(50, 1)).unwrap();
+    assert_eq!((s.p95, s.sensitivity.len()), (4.0, 0));
+}
+
+#[test]
+fn summary_echoes_iterations_and_seed() {
+    let g = graph(json!([est("a", &[], 1.0, 2.0, 3.0)]));
+    let s = monte_carlo(&g, &req(37, 991)).unwrap();
+    assert_eq!((s.iterations, s.seed), (37, 991));
+}
+
+#[test]
+fn work_budget_is_enforced() {
+    // 2001 deliverables + 2000 edges = 4001 nodes+edges; × 50 000 > 200 000 000.
+    let mut v = vec![fixed("d0", &[], 1.0)];
+    for i in 1..2001 {
+        let prev = format!("d{}", i - 1);
+        v.push(fixed(&format!("d{i}"), &[prev.as_str()], 1.0));
+    }
+    let err = monte_carlo(&graph(json!(v)), &req(50_000, 1)).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "INVALID_GRAPH: monte carlo budget exceeded (50000 iterations × 4001 nodes+edges > 200000000)"
+    );
+}
+
+#[test]
+fn cyclic_graph_is_invalid_graph() {
+    let g = graph(json!([fixed("a", &["b"], 1.0), fixed("b", &["a"], 1.0)]));
+    let err = monte_carlo(&g, &req(10, 1)).unwrap_err();
+    assert!(
+        err.to_string().starts_with("INVALID_GRAPH: cycle detected"),
+        "{err}"
+    );
+}
+
+#[test]
+fn request_rejects_unknown_fields() {
+    let parsed: Result<MonteCarloRequest, _> = serde_json::from_value(json!({"iteratons": 10}));
+    assert!(parsed.is_err());
+}

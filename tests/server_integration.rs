@@ -823,3 +823,340 @@ async fn plan_acquire_cohort_without_blocked_does_not_need_operator() {
         (json!(0), json!(false))
     );
 }
+
+// ── Roundtrip: plan.lint / plan.schedule / plan.simulate ────────────────────
+
+fn lintable_graph() -> Value {
+    json!({
+        "deliverables": [
+            {
+                "id": "a",
+                "owned_files": ["src/a.rs"],
+                "prerequisites": [],
+                "estimated_effort_hours": 1.0
+            },
+            {
+                "id": "b",
+                "owned_files": ["src/b.rs"],
+                "prerequisites": [{ "id": "a", "consumes": "artifact" }],
+                "estimated_effort_hours": 2.0
+            }
+        ]
+    })
+}
+
+#[tokio::test]
+async fn plan_lint_inline_graph_roundtrip() {
+    let server = server();
+    let resp = server
+        .dispatch_call(call_args("plan.lint", json!({ "graph": lintable_graph() })))
+        .await
+        .expect("plan.lint returns Ok");
+    assert_eq!(resp["clean"], json!(true));
+}
+
+#[tokio::test]
+async fn plan_lint_stored_plan_roundtrip() {
+    let server = server();
+    let sub = server
+        .dispatch_call(call_args(TOOL_SUBMIT, json!({ "graph": lintable_graph() })))
+        .await
+        .unwrap();
+    let plan_id = sub["plan_id"].as_str().unwrap().to_string();
+    let resp = server
+        .dispatch_call(call_args("plan.lint", json!({ "plan_id": plan_id })))
+        .await
+        .expect("plan.lint by plan_id returns Ok");
+    assert_eq!(resp["clean"], json!(true));
+}
+
+#[tokio::test]
+async fn plan_lint_rejects_both_graph_and_plan_id() {
+    let server = server();
+    let err = server
+        .dispatch_call(call_args(
+            "plan.lint",
+            json!({ "graph": lintable_graph(), "plan_id": "plan_x" }),
+        ))
+        .await
+        .expect_err("both graph and plan_id must be rejected");
+    assert_eq!(err.message, "provide exactly one of graph or plan_id");
+}
+
+#[tokio::test]
+async fn plan_schedule_roundtrip() {
+    let server = server();
+    let resp = server
+        .dispatch_call(call_args(
+            "plan.schedule",
+            json!({
+                "graph": sample_graph(),
+                "capacities": { "unassigned": 1 }
+            }),
+        ))
+        .await
+        .expect("plan.schedule returns Ok");
+    assert_eq!(resp["makespan"], json!(3.0));
+}
+
+#[tokio::test]
+async fn plan_schedule_rejects_missing_capacities() {
+    let server = server();
+    let err = server
+        .dispatch_call(call_args(
+            "plan.schedule",
+            json!({
+                "graph": sample_graph(),
+                "capacities": {}
+            }),
+        ))
+        .await
+        .expect_err("missing capacities must be rejected");
+    assert!(
+        err.message.contains("INVALID_CAPACITIES"),
+        "expected INVALID_CAPACITIES; got: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn plan_simulate_roundtrip() {
+    let server = server();
+    let resp = server
+        .dispatch_call(call_args(
+            "plan.simulate",
+            json!({ "graph": sample_graph() }),
+        ))
+        .await
+        .expect("plan.simulate returns Ok");
+    assert_eq!(resp["scorecard"]["deliverables"], json!(2));
+}
+
+#[tokio::test]
+async fn plan_simulate_rejects_unknown_fields() {
+    let server = server();
+    let err = server
+        .dispatch_call(call_args(
+            "plan.simulate",
+            json!({ "graph": sample_graph(), "bogus": 1 }),
+        ))
+        .await
+        .expect_err("unknown fields must be rejected");
+    assert!(
+        err.message.contains("bogus") || err.message.contains("unknown field"),
+        "expected unknown-field rejection; got: {}",
+        err.message
+    );
+}
+
+// ── Fix wave: validation, limits and read-only guarantees ──────────────────
+
+async fn call_within(server: &PlanServer, name: &str, args: Value) -> Result<Value, String> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        server.dispatch_call(call_args(name, args)),
+    )
+    .await
+    .expect("tool call returns promptly")
+    .map_err(|e| e.message.to_string())
+}
+
+fn schedule_args(deliverables: Value) -> Value {
+    json!({
+        "graph": { "deliverables": deliverables },
+        "capacities": { "unassigned": 1 }
+    })
+}
+
+#[tokio::test]
+async fn plan_schedule_rejects_reserved_id() {
+    let args = schedule_args(json!([
+        { "id": "__start__", "owned_files": [], "prerequisites": [], "estimated_effort_hours": 1.0 }
+    ]));
+    let err = call_within(&server(), "plan.schedule", args)
+        .await
+        .unwrap_err();
+    assert!(err.contains("INVALID_GRAPH"), "{err}");
+}
+
+#[tokio::test]
+async fn plan_schedule_rejects_duplicate_id() {
+    let args = schedule_args(json!([
+        { "id": "a", "owned_files": [], "prerequisites": [], "estimated_effort_hours": 1.0 },
+        { "id": "a", "owned_files": [], "prerequisites": ["b"], "estimated_effort_hours": 1.0 },
+        { "id": "b", "owned_files": [], "prerequisites": ["a"], "estimated_effort_hours": 1.0 }
+    ]));
+    let err = call_within(&server(), "plan.schedule", args)
+        .await
+        .unwrap_err();
+    assert!(err.contains("INVALID_GRAPH"), "{err}");
+}
+
+#[tokio::test]
+async fn plan_schedule_rejects_cycle() {
+    let args = schedule_args(json!([
+        { "id": "a", "owned_files": [], "prerequisites": ["b"], "estimated_effort_hours": 1.0 },
+        { "id": "b", "owned_files": [], "prerequisites": ["a"], "estimated_effort_hours": 1.0 }
+    ]));
+    let err = call_within(&server(), "plan.schedule", args)
+        .await
+        .unwrap_err();
+    assert!(err.contains("INVALID_GRAPH: cycle detected"), "{err}");
+}
+
+#[tokio::test]
+async fn plan_simulate_rejects_nested_unknown_field() {
+    let args = json!({ "graph": sample_graph(), "monte_carlo": { "iteratons": 10 } });
+    let err = call_within(&server(), "plan.simulate", args)
+        .await
+        .unwrap_err();
+    assert!(err.contains("unknown field `iteratons`"), "{err}");
+}
+
+#[tokio::test]
+async fn plan_schedule_rejects_nested_unknown_field_in_simulate_schedule() {
+    let args = json!({
+        "graph": sample_graph(),
+        "schedule": { "capacities": { "unassigned": 1 }, "resource_keys": "owner" }
+    });
+    let err = call_within(&server(), "plan.simulate", args)
+        .await
+        .unwrap_err();
+    assert!(err.contains("unknown field `resource_keys`"), "{err}");
+}
+
+#[tokio::test]
+async fn plan_simulate_rejects_zero_iterations_as_invalid_params() {
+    let args = json!({ "graph": sample_graph(), "monte_carlo": { "iterations": 0 } });
+    let err = server()
+        .dispatch_call(call_args("plan.simulate", args))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+}
+
+#[tokio::test]
+async fn plan_schedule_rejects_buffer_pct_above_100_as_invalid_params() {
+    let mut args = schedule_args(sample_graph()["deliverables"].clone());
+    args["project_buffer_pct"] = json!(101.0);
+    let err = server()
+        .dispatch_call(call_args("plan.schedule", args))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+}
+
+#[tokio::test]
+async fn plan_simulate_rejects_buffer_pct_above_100_as_invalid_params() {
+    let args = json!({
+        "graph": sample_graph(),
+        "schedule": { "capacities": { "unassigned": 1 }, "project_buffer_pct": 150.0 }
+    });
+    let err = server()
+        .dispatch_call(call_args("plan.simulate", args))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+}
+
+#[test]
+fn tool_definitions_match_tool_names() {
+    let defs = cpm_planner::plan_tool_definitions();
+    let names: Vec<String> = defs.iter().map(|t| t.name.to_string()).collect();
+    let expected: Vec<String> = cpm_planner::PLAN_TOOL_NAMES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    assert_eq!((names, expected.len()), (expected, 11));
+}
+
+#[test]
+fn no_tool_schema_has_top_level_combinators() {
+    let defs = cpm_planner::plan_tool_definitions();
+    let offending: Vec<String> = defs
+        .iter()
+        .filter(|t| {
+            ["oneOf", "anyOf", "allOf"]
+                .iter()
+                .any(|key| t.input_schema.contains_key(*key))
+        })
+        .map(|t| t.name.to_string())
+        .collect();
+    assert_eq!(offending, Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn plan_lint_rejects_neither_graph_nor_plan_id() {
+    let err = server()
+        .dispatch_call(call_args("plan.lint", json!({})))
+        .await
+        .expect_err("neither graph nor plan_id must be rejected");
+    assert_eq!(err.message, "provide exactly one of graph or plan_id");
+}
+
+#[tokio::test]
+async fn plan_schedule_by_plan_id_roundtrip() {
+    let server = server();
+    let plan_id = submit_plan(&server).await;
+    let resp = server
+        .dispatch_call(call_args(
+            "plan.schedule",
+            json!({ "plan_id": plan_id, "capacities": { "unassigned": 1 } }),
+        ))
+        .await
+        .expect("plan.schedule by plan_id returns Ok");
+    assert_eq!(resp["makespan"], json!(3.0));
+}
+
+#[tokio::test]
+async fn plan_simulate_by_plan_id_roundtrip() {
+    let server = server();
+    let plan_id = submit_plan(&server).await;
+    let resp = server
+        .dispatch_call(call_args("plan.simulate", json!({ "plan_id": plan_id })))
+        .await
+        .expect("plan.simulate by plan_id returns Ok");
+    assert_eq!(resp["critical_path_hours"], json!(3.0));
+}
+
+#[tokio::test]
+async fn analysis_tools_are_read_only() {
+    use cpm_planner::audit::MemoryAuditSink;
+    let dir = std::env::temp_dir().join(format!(
+        "cpm-read-only-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("plans.db");
+    let audit = Arc::new(MemoryAuditSink::new());
+    let store = cpm_planner::SqlitePlanStore::open(&path).unwrap();
+    let server = PlanServer::new(Arc::new(BasicCpmPlanner::with_store(store, audit.clone())));
+    let plan_id = submit_plan(&server).await;
+    let plans = || -> i64 {
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM plans", [], |r| r.get(0))
+            .unwrap()
+    };
+    let before = (plans(), audit.snapshot().len());
+    for (tool, extra) in [
+        ("plan.lint", json!({})),
+        (
+            "plan.schedule",
+            json!({ "capacities": { "unassigned": 1 } }),
+        ),
+        (
+            "plan.simulate",
+            json!({ "schedule": { "capacities": { "unassigned": 1 } },
+                    "monte_carlo": { "iterations": 20 } }),
+        ),
+    ] {
+        let mut args = extra;
+        args["plan_id"] = json!(plan_id);
+        server.dispatch_call(call_args(tool, args)).await.unwrap();
+    }
+    let after = (plans(), audit.snapshot().len());
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(after, before);
+}

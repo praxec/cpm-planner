@@ -4,22 +4,38 @@
 
 use crate::estimator::EffortEstimator;
 use crate::plan::{Deliverable, FINISH_ID, PlanGraph, PlannerError};
+use crate::task::CriticalPathResult;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 const EPS: f32 = 1e-4;
 const UNASSIGNED: &str = "unassigned";
 
-fn default_resource_key() -> String {
+/// Default `resource_key`: deliverables name their resource in
+/// `metadata.owner`.
+pub(crate) fn default_resource_key() -> String {
     "owner".to_string()
 }
 
-fn default_buffer_pct() -> f32 {
+/// Default `project_buffer_pct`.
+pub(crate) fn default_buffer_pct() -> f32 {
     25.0
+}
+
+/// Check `project_buffer_pct` is a finite percentage in `0..=100`.
+pub(crate) fn check_buffer_pct(pct: f32) -> Result<(), String> {
+    if pct.is_finite() && (0.0..=100.0).contains(&pct) {
+        Ok(())
+    } else {
+        Err(format!(
+            "project_buffer_pct must be between 0 and 100; got {pct}"
+        ))
+    }
 }
 
 /// Input to [`resource_schedule`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScheduleRequest {
     /// Units available per resource name.
     pub capacities: BTreeMap<String, u32>,
@@ -98,28 +114,35 @@ struct Node {
 }
 
 /// Level `graph` against `req.capacities`.
+///
+/// The graph is validated exactly as `plan.submit` validates it, so a
+/// reserved or duplicate id, a cycle, an unknown prerequisite or an
+/// out-of-range hour value is [`PlannerError::InvalidGraph`].
 pub fn resource_schedule(
     graph: &PlanGraph,
     req: &ScheduleRequest,
 ) -> Result<ResourceSchedule, PlannerError> {
+    crate::planner::validate_graph(graph)?;
     let cpm = crate::schedule::compute_cpm(graph)?;
-    if !req.project_buffer_pct.is_finite()
-        || req.project_buffer_pct < 0.0
-        || req.project_buffer_pct > 100.0
-    {
-        return Err(PlannerError::InvalidGraph {
-            reason: format!(
-                "project_buffer_pct must be between 0 and 100; got {}",
-                req.project_buffer_pct
-            ),
-        });
-    }
+    resource_schedule_with_cpm(graph, req, &cpm)
+}
+
+/// [`resource_schedule`] over an already validated graph and its CPM
+/// result, so callers that already ran CPM (`simulate`) do not repeat it.
+pub(crate) fn resource_schedule_with_cpm(
+    graph: &PlanGraph,
+    req: &ScheduleRequest,
+    cpm: &CriticalPathResult,
+) -> Result<ResourceSchedule, PlannerError> {
+    check_buffer_pct(req.project_buffer_pct)
+        .map_err(|reason| PlannerError::InvalidGraph { reason })?;
     let cpm_makespan = cpm.get_task(FINISH_ID).map_or(0.0, |t| t.earliest_finish);
 
     let nodes = build_nodes(graph, &req.resource_key)?;
     check_capacities(&nodes, &req.capacities)?;
     let n = nodes.len();
-    let tail = tails(&nodes);
+    let order = topological_order(&nodes)?;
+    let tail = tails(&nodes, &order);
 
     // Allocate units only for resources that carry work, and never more than
     // the number of work-bearing deliverables on that resource: extra units
@@ -132,7 +155,12 @@ pub fn resource_schedule(
     let mut units: BTreeMap<&str, Vec<f32>> = work_per_resource
         .into_iter()
         .map(|(resource, work)| {
-            let capacity = req.capacities.get(resource).copied().unwrap_or(0) as usize;
+            let capacity = req
+                .capacities
+                .get(resource)
+                .copied()
+                .expect("INVARIANT: capacities validated before allocation")
+                as usize;
             (resource, vec![0.0; capacity.min(work)])
         })
         .collect();
@@ -217,7 +245,7 @@ pub fn resource_schedule(
     let chain_set: BTreeSet<usize> = chain.iter().map(|&(i, _)| i).collect();
     let pct = req.project_buffer_pct / 100.0;
     let project_buffer_hours = pct * chain.iter().map(|&(i, _)| nodes[i].len).sum::<f32>();
-    let feeding_buffers = feeding_buffers(&nodes, &ids, &chain_set, pct);
+    let feeding_buffers = feeding_buffers(&nodes, &ids, &order, &chain_set, pct);
 
     Ok(ResourceSchedule {
         makespan,
@@ -292,31 +320,56 @@ fn check_capacities(nodes: &[Node], caps: &BTreeMap<String, u32>) -> Result<(), 
     }
 }
 
+/// Kahn order over `preds`; errors on a cycle (unreachable once the graph
+/// is validated, but never loop on it).
+fn topological_order(nodes: &[Node]) -> Result<Vec<usize>, PlannerError> {
+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+    for (i, n) in nodes.iter().enumerate() {
+        for &(p, _) in &n.preds {
+            succs[p].push(i);
+        }
+    }
+    let mut indeg: Vec<usize> = nodes.iter().map(|n| n.preds.len()).collect();
+    let mut order: Vec<usize> = (0..nodes.len()).filter(|&i| indeg[i] == 0).collect();
+    let mut head = 0;
+    while head < order.len() {
+        let u = order[head];
+        head += 1;
+        for &v in &succs[u] {
+            indeg[v] -= 1;
+            if indeg[v] == 0 {
+                order.push(v);
+            }
+        }
+    }
+    if order.len() == nodes.len() {
+        Ok(order)
+    } else {
+        Err(PlannerError::InvalidGraph {
+            reason: "resource schedule found a prerequisite cycle".to_string(),
+        })
+    }
+}
+
 /// Longest remaining tail per node: its length plus the heaviest successor
-/// (edge lag + that successor's tail). Memoised over a DFS; acyclic by now.
-fn tails(nodes: &[Node]) -> Vec<f32> {
+/// (edge lag + that successor's tail). Filled in reverse topological order,
+/// so no recursion.
+fn tails(nodes: &[Node], order: &[usize]) -> Vec<f32> {
     let mut succs: Vec<Vec<(usize, f32)>> = vec![Vec::new(); nodes.len()];
     for (i, n) in nodes.iter().enumerate() {
         for &(p, lag) in &n.preds {
             succs[p].push((i, lag));
         }
     }
-    fn go(i: usize, nodes: &[Node], succs: &[Vec<(usize, f32)>], memo: &mut [Option<f32>]) -> f32 {
-        if let Some(v) = memo[i] {
-            return v;
-        }
+    let mut tail = vec![0.0_f32; nodes.len()];
+    for &i in order.iter().rev() {
         let best = succs[i]
             .iter()
-            .map(|&(s, lag)| lag + go(s, nodes, succs, memo))
+            .map(|&(s, lag)| lag + tail[s])
             .fold(0.0_f32, f32::max);
-        let v = nodes[i].len + best;
-        memo[i] = Some(v);
-        v
+        tail[i] = nodes[i].len + best;
     }
-    let mut memo = vec![None; nodes.len()];
-    (0..nodes.len())
-        .map(|i| go(i, nodes, &succs, &mut memo))
-        .collect()
+    tail
 }
 
 fn driving_chain(
@@ -373,51 +426,54 @@ fn driving_chain(
 fn feeding_buffers(
     nodes: &[Node],
     ids: &[&str],
+    order: &[usize],
     chain: &BTreeSet<usize>,
     pct: f32,
 ) -> Vec<FeedingBuffer> {
-    // Longest dependency chain ending at each off-chain node (nodes are not
-    // topologically ordered, so memoise).
-    fn best(
-        i: usize,
-        nodes: &[Node],
-        ids: &[&str],
-        chain: &BTreeSet<usize>,
-        memo: &mut HashMap<usize, (f32, Vec<usize>)>,
-    ) -> (f32, Vec<usize>) {
-        if let Some(v) = memo.get(&i) {
-            return v.clone();
-        }
-        let mut top: Option<(f32, Vec<usize>)> = None;
+    // Heaviest off-chain dependency chain ending at each node, filled in
+    // topological order: (summed length, best off-chain predecessor, first
+    // node of that chain). Ties go to the chain whose first id is smaller.
+    let mut sum = vec![0.0_f32; nodes.len()];
+    let mut via: Vec<Option<usize>> = vec![None; nodes.len()];
+    let mut head: Vec<usize> = (0..nodes.len()).collect();
+    for &i in order {
+        let mut top: Option<usize> = None;
         for &(p, _) in nodes[i].preds.iter().filter(|(p, _)| !chain.contains(p)) {
-            let cand = best(p, nodes, ids, chain, memo);
-            let take = match &top {
+            let take = match top {
                 None => true,
                 Some(t) => {
-                    cand.0 > t.0 + EPS
-                        || ((cand.0 - t.0).abs() <= EPS && ids[cand.1[0]] < ids[t.1[0]])
+                    sum[p] > sum[t] + EPS
+                        || ((sum[p] - sum[t]).abs() <= EPS && ids[head[p]] < ids[head[t]])
                 }
             };
             if take {
-                top = Some(cand);
+                top = Some(p);
             }
         }
-        let (sum, mut path) = top.unwrap_or((0.0, Vec::new()));
-        path.push(i);
-        let v = (sum + nodes[i].len, path);
-        memo.insert(i, v.clone());
-        v
+        sum[i] = top.map_or(0.0, |t| sum[t]) + nodes[i].len;
+        via[i] = top;
+        if let Some(t) = top {
+            head[i] = head[t];
+        }
     }
+    let path_to = |end: usize| -> Vec<usize> {
+        let mut path = vec![end];
+        let mut cur = end;
+        while let Some(p) = via[cur] {
+            path.push(p);
+            cur = p;
+        }
+        path.reverse();
+        path
+    };
 
-    let mut memo = HashMap::new();
     let mut out = Vec::new();
     for &c in chain {
         for &(p, _) in nodes[c].preds.iter().filter(|(p, _)| !chain.contains(p)) {
-            let (sum, path) = best(p, nodes, ids, chain, &mut memo);
             out.push(FeedingBuffer {
                 joins: ids[c].to_string(),
-                from_chain: path.iter().map(|&i| ids[i].to_string()).collect(),
-                buffer_hours: pct * sum,
+                from_chain: path_to(p).iter().map(|&i| ids[i].to_string()).collect(),
+                buffer_hours: pct * sum[p],
             });
         }
     }
@@ -436,7 +492,10 @@ fn loads(nodes: &[Node], caps: &BTreeMap<String, u32>, makespan: f32) -> Vec<Res
     }
     busy.into_iter()
         .map(|(resource, busy_hours)| {
-            let capacity = caps.get(resource).copied().unwrap_or(0);
+            let capacity = caps
+                .get(resource)
+                .copied()
+                .expect("INVARIANT: capacities validated before allocation");
             let available = capacity as f32 * makespan;
             ResourceLoad {
                 resource: resource.to_string(),
