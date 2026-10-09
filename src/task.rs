@@ -89,7 +89,8 @@ pub struct Task {
     /// Type of task.
     pub kind: TaskKind,
     /// Scheduled length in hours. For tasks built from a deliverable this is
-    /// its calendar `duration_hours` when set, else its effort estimate.
+    /// its calendar `duration_hours` when set, else its effort estimate;
+    /// earned value reads effort from the graph, not from here.
     pub effort_hours: f32,
     /// Task IDs this depends on (must complete before this can start).
     pub dependencies: Vec<String>,
@@ -206,11 +207,12 @@ pub struct Bottleneck {
     pub task_name: String,
     /// Number of tasks blocked by this one (directly or transitively).
     pub blocks_count: usize,
-    /// Total hours of work blocked.
+    /// Total scheduled hours of work blocked. Uses the scheduled length (`duration_hours` when set, else effort); earned value reads effort from the graph.
     pub blocked_hours: f32,
-    /// ROI: `blocked_hours / task_effort` (higher = higher priority).
+    /// ROI: `blocked_hours / effort_hours` (higher = higher priority). Both
+    /// are scheduled lengths; earned value reads effort from the graph.
     pub roi: f32,
-    /// Effort to complete this task.
+    /// Scheduled length of this task (`duration_hours` when set, else effort).
     pub effort_hours: f32,
 }
 
@@ -227,12 +229,12 @@ pub struct CriticalPathResult {
     /// Unlike `critical_path` this may contain several parallel chains.
     #[serde(default)]
     pub critical_ids: Vec<String>,
-    /// Project length: the maximum earliest finish (equals the effort summed
-    /// along `critical_path`).
+    /// Project length: the maximum earliest finish (the scheduled lengths plus
+    /// edge lags along `critical_path`).
     pub critical_path_duration: f32,
-    /// Total duration if done sequentially.
+    /// Total duration if done sequentially. Uses the scheduled length (`duration_hours` when set, else effort); earned value reads effort from the graph.
     pub total_duration_sequential: f32,
-    /// Makespan with unlimited parallelism (maximum earliest finish).
+    /// Makespan with unlimited parallelism (maximum earliest finish). Uses the scheduled length (`duration_hours` when set, else effort); earned value reads effort from the graph.
     pub optimal_duration_parallel: f32,
     /// Speedup factor (sequential / parallel).
     pub speedup_factor: f32,

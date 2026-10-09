@@ -1610,3 +1610,28 @@ async fn path_and_object_file_forms_hash_identically() {
         .unwrap();
     assert_eq!(first, second);
 }
+
+async fn b_start_with_edges(edges: Vec<Prerequisite>) -> f32 {
+    let planner = BasicCpmPlanner::new();
+    let mut b = deliverable("b", &["src/b.rs"], &[], Some(1.0));
+    b.prerequisites = edges;
+    let graph = PlanGraph {
+        deliverables: vec![deliverable("a", &["src/a.rs"], &[], Some(2.0)), b],
+        max_chained_dispatch: None,
+    };
+    let plan_id = planner.submit_plan(graph).await.unwrap();
+    let status = planner.status(&plan_id).await.unwrap();
+    status.schedule.iter().find(|r| r.id == "b").unwrap().es
+}
+
+#[tokio::test]
+async fn duplicate_prerequisite_ids_use_the_largest_lag() {
+    let es = b_start_with_edges(vec![edge("a", None, Some(4.0)), edge("a", None, Some(1.0))]).await;
+    assert!((es - 6.0).abs() < 1e-3);
+}
+
+#[tokio::test]
+async fn prerequisite_lag_hours_flows_into_schedule() {
+    let es = b_start_with_edges(vec![edge("a", None, Some(3.0))]).await;
+    assert!((es - 5.0).abs() < 1e-3);
+}

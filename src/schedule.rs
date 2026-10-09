@@ -111,12 +111,13 @@ pub(crate) fn deliverable_to_task(d: &Deliverable, estimator: &EffortEstimator) 
     // Calendar duration, when given, is the scheduled length; effort stays
     // on the deliverable as the cost basis.
     let scheduled_hours = d.duration_hours.unwrap_or(effort_hours);
-    let lag_by_dependency = d
-        .prerequisites
-        .iter()
-        .filter(|p| p.lag_hours() > 0.0)
-        .map(|p| (p.id().to_string(), p.lag_hours()))
-        .collect();
+    // A repeated prerequisite id takes its largest lag, independent of order.
+    let mut lag_by_dependency: std::collections::HashMap<String, f32> =
+        std::collections::HashMap::new();
+    for p in d.prerequisites.iter().filter(|p| p.lag_hours() > 0.0) {
+        let lag = lag_by_dependency.entry(p.id().to_string()).or_insert(0.0);
+        *lag = lag.max(p.lag_hours());
+    }
 
     Task {
         id: d.id.clone(),

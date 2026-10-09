@@ -116,7 +116,7 @@ impl CpmAlgorithm {
     /// Forward pass: Calculate earliest start (ES) and earliest finish (EF)
     ///
     /// ES = max(EF of each predecessor + edge lag), or 0 if no predecessors
-    /// EF = ES + effort
+    /// EF = ES + scheduled length (`duration_hours` when set, else effort)
     ///
     /// Returns the ids of any tasks that could not be scheduled because
     /// they (or their predecessors) sit on a dependency cycle. An empty
@@ -235,7 +235,7 @@ impl CpmAlgorithm {
     ///
     /// LF = min(LS of each successor - edge lag), or `project_end` if no
     /// successors
-    /// LS = LF - effort
+    /// LS = LF - scheduled length
     ///
     /// Returns the ids of any tasks whose `latest_finish` never relaxed off
     /// the `f32::MAX` sentinel. In a well-formed graph this is empty; a
@@ -488,7 +488,8 @@ impl CpmAlgorithm {
             .map_or_else(Vec::new, |end| Self::trace_back(tasks, end))
     }
 
-    /// Walk backwards from `sink` along tight edges, smallest id on ties.
+    /// Walk backwards from `sink` along tight edges (EF + lag == ES),
+    /// smallest id on ties. Lengths are scheduled lengths, not effort.
     fn trace_back(tasks: &[Task], sink: &Task) -> Vec<String> {
         let by_id: HashMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
         let mut path = vec![sink.id.clone()];
