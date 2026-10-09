@@ -180,7 +180,7 @@ fn unrelated_zero_float_task_is_not_chained_into_critical_path() {
         make_task("Z", 4.0, vec!["Y"]),
     ];
     let result = CpmAlgorithm::calculate(&mut tasks);
-    assert_eq!(result.critical_path, vec!["X"]);
+    assert_eq!(result.critical_path, vec!["Y", "Z"]);
 }
 
 #[test]
@@ -227,4 +227,11 @@ fn tight_predecessor_tie_picks_smallest_id() {
     ];
     let result = CpmAlgorithm::calculate(&mut tasks);
     assert_eq!(result.critical_path, vec!["B", "D"]);
+}
+
+#[test]
+fn zero_effort_final_milestone_ends_the_critical_path() {
+    let mut tasks = vec![make_task("A", 3.0, vec![]), make_task("M", 0.0, vec!["A"])];
+    let result = CpmAlgorithm::calculate(&mut tasks);
+    assert_eq!(result.critical_path, vec!["A", "M"]);
 }

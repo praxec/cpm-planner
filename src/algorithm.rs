@@ -4,7 +4,8 @@
 //! 1. Forward pass: Calculate earliest start/finish times (ES/EF)
 //! 2. Backward pass: Calculate latest start/finish times (LS/LF)
 //! 3. Float calculation: slack = LS - ES
-//! 4. Critical path: Tasks where float = 0
+//! 4. Critical path: `critical_path` is one longest prerequisite chain in
+//!    execution order; `critical_ids` lists every zero-float (critical) task.
 //! 5. Batch identification: Group tasks by earliest start time
 //! 6. Bottleneck analysis: Identify tasks that block the most work
 
@@ -441,6 +442,11 @@ impl CpmAlgorithm {
             a.earliest_finish
                 .partial_cmp(&b.earliest_finish)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    a.earliest_start
+                        .partial_cmp(&b.earliest_start)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .then_with(|| b.id.cmp(&a.id))
         }) else {
             return Vec::new();
