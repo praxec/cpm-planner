@@ -44,6 +44,11 @@ jobs:
             [ "$server_version" = "$version" ] \
               || { echo "::error::tag $TAG (=$version) does not match server.json version $server_version"; exit 1; }
           fi
+          if [ -f npm/package.json ]; then
+            npm_version=$(python3 -c "import json;print(json.load(open('npm/package.json'))['version'])")
+            [ "$npm_version" = "$version" ] \
+              || { echo "::error::tag $TAG (=$version) does not match npm/package.json version $npm_version"; exit 1; }
+          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "source_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: create draft GitHub release
@@ -169,6 +174,29 @@ jobs:
           set -euo pipefail
           gh release upload "$TAG" dist/checksums.sha256 dist/release-manifest.json \
             scripts/install.sh scripts/install.ps1 --clobber
+      - uses: actions/setup-node@v4.4.0
+        with:
+          node-version: 22
+      # Packs the npm launcher (npm/) for the maintainer to publish by hand
+      # (docs/releasing.md). CI never publishes to npm and holds no
+      # npm token: this step only builds the tarball and attaches it.
+      - name: pack npm launcher and attach the tarball
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.create-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          npm_version=$(node -p "require('./npm/package.json').version")
+          [ "$npm_version" = "$VERSION" ] \
+            || { echo "::error::npm/package.json version $npm_version does not match release $VERSION"; exit 1; }
+          tarball="matthew-cochran-cpm-${VERSION}.tgz"
+          (cd npm && npm pack --ignore-scripts --pack-destination ../dist)
+          [ -s "dist/${tarball}" ] || { echo "::error::npm pack did not produce dist/${tarball}"; exit 1; }
+          # The maintainer checks the tarball against this digest before publishing.
+          (cd dist && sha256sum "${tarball}" > npm-package.sha256)
+          gh release upload "$TAG" "dist/${tarball}" dist/npm-package.sha256 --clobber
       - name: publish release (complete matrix verified)
         shell: bash
         env:

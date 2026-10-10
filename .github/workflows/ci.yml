@@ -33,6 +33,18 @@ jobs:
               run: cargo build --all-targets
             - name: Test
               run: cargo test
+            # Windows normally has no HOME: the server must fall back to
+            # USERPROFILE for its default database path and still start.
+            - name: MCP smoke without HOME (Windows)
+              if: runner.os == 'Windows'
+              shell: pwsh
+              run: |
+                  Remove-Item Env:HOME -ErrorAction SilentlyContinue
+                  Remove-Item Env:CPM_PLANNER_DB -ErrorAction SilentlyContinue
+                  node scripts/mcp-smoke.mjs target/debug/cpm-planner.exe
+                  if ($LASTEXITCODE -ne 0) { throw "mcp-smoke failed without HOME" }
+                  $db = Join-Path $env:USERPROFILE '.local\share\praxec\cpm-planner.db'
+                  if (-not (Test-Path $db)) { throw "database not created at $db" }
 
     lint:
         name: fmt + clippy
@@ -50,3 +62,58 @@ jobs:
               run: cargo fmt --all --check
             - name: clippy
               run: cargo clippy --all-targets -- -D warnings   # required: zero warnings
+
+    deny:
+        name: cargo-deny
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        steps:
+            - uses: actions/checkout@v4
+            - uses: EmbarkStudios/cargo-deny-action@v2
+              with:
+                  command: check
+
+    docs:
+        name: docs
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        env:
+            RUSTDOCFLAGS: -D warnings
+        steps:
+            - uses: actions/checkout@v4
+            - uses: dtolnay/rust-toolchain@1.99.0
+            - uses: Swatinem/rust-cache@v2
+            - name: cargo doc
+              run: cargo doc --no-deps --locked
+
+    package:
+        name: package
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        steps:
+            - uses: actions/checkout@v4
+            - uses: dtolnay/rust-toolchain@1.99.0
+            - uses: Swatinem/rust-cache@v2
+            - name: cargo package (list)
+              run: cargo package --locked --list
+            - name: cargo publish (dry run)
+              run: cargo publish --dry-run --locked
+
+    npm:
+        name: npm launcher (${{ matrix.os }})
+        strategy:
+            fail-fast: false
+            matrix:
+                os: [ubuntu-latest, macos-latest, windows-latest]
+        runs-on: ${{ matrix.os }}
+        timeout-minutes: 15
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4.4.0
+              with:
+                  node-version: 22
+            - name: launcher tests
+              run: node --test "npm/test/*.test.mjs"
+            - name: npm pack (dry run)
+              working-directory: npm
+              run: npm pack --dry-run --ignore-scripts

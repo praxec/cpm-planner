@@ -1,5 +1,15 @@
 //! [`JudgmentModel`] over Jev, via `rig-typesafeai`, pointed at OpenRouter.
 //!
+//! The request is `rig-typesafeai`'s (its [`JevConfig`] wire encodes it and
+//! [`DynamicQuery`] validates questions and answers), sent by rig's HTTP
+//! driver. Only the reply type is ours (`Reply`): rig-typesafeai 0.44
+//! decodes `usage` as rig-core's `Usage`, whose `cost` must be an object
+//! with a `total`, while OpenRouter reports `usage.cost` as a bare number,
+//! so every OpenRouter reply failed to decode. `Reply` reads `usage`
+//! leniently: `cost` may be a number or an object, unknown fields are
+//! ignored, and malformed accounting is dropped rather than failing the
+//! judgment.
+//!
 //! Error messages are tool-facing: scrubbed of the key, capped, and limited
 //! to the class plus an HTTP status or short reason. Upstream bodies are
 //! logged at `debug` only (scrubbed, then truncated, and Debug-escaped so a
@@ -17,16 +27,169 @@ use std::fmt;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use rig_core::completion::request::Cost;
 use rig_core::driver::Model;
-use rig_core::error::ProviderError;
-use rig_typesafeai::{DynamicQuery, Evaluate, JevConfig};
+use rig_core::error::{EncodeError, ProviderError};
+use rig_core::operation::Whole;
+use rig_core::wire::{
+    Call, Descriptor, Encoded, Free, Json, Mode, Operation, Wire, WireFrame, document,
+};
+use rig_typesafeai::{DynamicQuery, JevConfig, Query};
+use serde::Deserialize;
 
 use super::{
-    ApiKey, Decisions, JudgmentError, JudgmentErrorKind, JudgmentModel, LlmConfig, Question,
+    Answer, ApiKey, Decisions, JudgmentError, JudgmentErrorKind, JudgmentModel, LlmConfig,
+    Question, Usage,
 };
 
 /// Longest slice of a provider error body written to the debug log.
 const BODY_LOG_CHARS: usize = 200;
+
+/// One Jev evaluation whose reply decodes as [`Reply`]; otherwise
+/// rig-typesafeai's `Evaluation` (same request, one whole JSON reply),
+/// except that the reply's `provider_request_id` and `raw` document are not
+/// captured: nothing here reads them.
+struct Evaluation;
+
+impl Operation for Evaluation {
+    type Request = rig_typesafeai::types::Request;
+    type Event = std::convert::Infallible;
+    type End = Reply;
+    type Response = Reply;
+    type Fold = Whole<Self>;
+    type Emit = Free;
+
+    fn fold(_request: &Self::Request, _call: &mut Call<'_>) -> Whole<Self> {
+        Whole::<Self>::new()
+    }
+}
+
+/// rig-typesafeai's [`JevConfig`] wire (endpoint, model, bearer key, request
+/// body), answering with [`Reply`].
+#[derive(Clone)]
+struct JevWire(JevConfig);
+
+impl Wire for JevWire {
+    type Op = Evaluation;
+    type Payload = Encoded;
+    type Frame = WireFrame;
+    type Decoder<'id> = Json;
+    type Reassembler = document::Unreassembled;
+
+    fn describe(&self) -> Descriptor<'_> {
+        self.0.describe()
+    }
+
+    fn encode(
+        &self,
+        request: rig_typesafeai::types::Request,
+        mode: Mode,
+    ) -> Result<Encoded, EncodeError> {
+        self.0.encode(request, mode)
+    }
+
+    fn decoder<'id>(&self) -> Self::Decoder<'id> {
+        Json
+    }
+}
+
+/// A Jev reply. Fields other than these are ignored.
+#[derive(Debug, Deserialize)]
+struct Reply {
+    model: String,
+    answers: UniqueAnswers,
+    /// Read by [`lenient_usage`] after decoding, so bad accounting never
+    /// fails the reply.
+    #[serde(default)]
+    usage: Option<serde_json::Value>,
+}
+
+/// The `answers` object; like rig-typesafeai, an empty or repeated question
+/// id is a decode error rather than a silently merged map.
+#[derive(Debug)]
+struct UniqueAnswers(BTreeMap<String, Answer>);
+
+impl<'de> Deserialize<'de> for UniqueAnswers {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visit;
+        impl<'de> serde::de::Visitor<'de> for Visit {
+            type Value = UniqueAnswers;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an object keyed by unique question IDs")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<UniqueAnswers, M::Error> {
+                let mut answers = BTreeMap::new();
+                while let Some((id, answer)) = map.next_entry::<String, Answer>()? {
+                    if id.is_empty() || answers.insert(id, answer).is_some() {
+                        return Err(serde::de::Error::custom(
+                            "question IDs must be nonempty and unique",
+                        ));
+                    }
+                }
+                Ok(UniqueAnswers(answers))
+            }
+        }
+        deserializer.deserialize_map(Visit)
+    }
+}
+
+/// The `usage` counters rig-core's [`Usage`] reads, each a `u64`.
+const USAGE_COUNTERS: [&str; 7] = [
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "cached_input_tokens",
+    "cache_creation_input_tokens",
+    "tool_use_prompt_tokens",
+    "reasoning_tokens",
+];
+
+/// `usage` as rig-core's [`Usage`], tolerating provider dialects, and
+/// whether part of it was not understood and dropped. A bare number `cost`
+/// (OpenRouter) is its total and an object `cost` is read as [`Cost`]. Each
+/// part is kept or dropped on its own: a bad `cost` or a counter that is not
+/// a `u64` is dropped alone, unknown fields are ignored, and a `usage` that
+/// is not an object is `None`. Token accounting never fails a judgment.
+fn lenient_usage(raw: Option<&serde_json::Value>) -> (Option<Usage>, bool) {
+    use serde_json::Value;
+    let mut usage = match raw {
+        None | Some(Value::Null) => return (None, false),
+        Some(Value::Object(usage)) => usage.clone(),
+        Some(_) => return (None, true),
+    };
+    let mut dropped = false;
+    let cost = match usage.remove("cost") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(total)) => total.as_f64().map(Cost::from_total),
+        Some(other) => serde_json::from_value::<Cost>(other).ok(),
+    };
+    dropped |= cost.is_none() && raw.is_some_and(|u| !u["cost"].is_null());
+    usage.retain(|key, value| {
+        let bad = USAGE_COUNTERS.contains(&key.as_str()) && !value.is_u64() && !value.is_null();
+        dropped |= bad;
+        !bad
+    });
+    match serde_json::from_value::<Usage>(Value::Object(usage)) {
+        Ok(usage) => (Some(usage.cost(cost)), dropped),
+        // Unreachable after the filter above; kept total for safety.
+        Err(_) => (cost.map(|cost| Usage::new().cost(cost)), true),
+    }
+}
+
+/// Why `state` breaks rig-typesafeai's state rule (a string, object or
+/// array), if it does.
+fn state_problem(state: &serde_json::Value) -> Option<&'static str> {
+    match state {
+        serde_json::Value::String(_)
+        | serde_json::Value::Object(_)
+        | serde_json::Value::Array(_) => None,
+        serde_json::Value::Null => Some("state cannot be null"),
+        _ => Some("question content must be a string, object, array, or null"),
+    }
+}
 
 /// A reqwest client for one judge, configured like rig's shared client.
 ///
@@ -51,7 +214,7 @@ fn own_http_client() -> rig_reqwest::ReqwestClient {
 /// judge from one tokio runtime (clones share the pool).
 #[derive(Clone)]
 pub struct JevJudge {
-    model: Model<JevConfig>,
+    model: Model<JevWire, rig_reqwest::ReqwestClient>,
     model_id: String,
     endpoint: String,
     timeout: Duration,
@@ -61,12 +224,11 @@ pub struct JevJudge {
 impl JevJudge {
     /// Build the client from `config`. No network traffic happens here.
     pub fn new(config: &LlmConfig) -> Self {
-        let jev = JevConfig::new(config.api_key().expose())
+        let wire = JevConfig::new(config.api_key().expose())
             .model(config.jev_model())
-            .with_endpoint(config.jev_endpoint())
-            .connect(own_http_client());
+            .with_endpoint(config.jev_endpoint());
         Self {
-            model: jev.evaluation(),
+            model: Model::new(JevWire(wire), own_http_client()),
             model_id: config.jev_model().to_string(),
             endpoint: config.jev_endpoint().to_string(),
             timeout: config.timeout(),
@@ -212,8 +374,15 @@ impl JudgmentModel for JevJudge {
         questions: BTreeMap<String, Question>,
     ) -> Result<Decisions, JudgmentError> {
         let query = DynamicQuery::new(questions).map_err(|e| self.classify(&e))?;
-        let call = self.model.evaluate(&state, query);
-        let result = tokio::time::timeout(self.timeout, call)
+        if let Some(reason) = state_problem(&state) {
+            return Err(self.classify(&ProviderError::request(reason)));
+        }
+        let request = rig_typesafeai::types::Request {
+            state,
+            questions: serde_json::value::to_raw_value(&query)
+                .map_err(|e| self.classify(&e.into()))?,
+        };
+        let reply = tokio::time::timeout(self.timeout, self.model.call(request))
             .await
             .map_err(|_| {
                 self.error(
@@ -222,13 +391,24 @@ impl JudgmentModel for JevJudge {
                 )
             })?
             .map_err(|e| self.classify(&e))?;
+        let (usage, dropped) = lenient_usage(reply.usage.as_ref());
+        if dropped && let Some(raw) = &reply.usage {
+            tracing::debug!(
+                usage = ?self.log_excerpt(&raw.to_string()),
+                "jev usage not understood; dropped"
+            );
+        }
+        // rig's own answer validation: ids match, kinds and distributions fit.
+        let answers = query
+            .decode(reply.answers.0)
+            .map_err(|e| self.classify(&e))?;
         Ok(Decisions {
-            answers: result.answers,
+            answers,
             // Provider-authored: scrubbed of the key, then cut.
             model: self
                 .key
-                .excerpt(&result.model, super::MAX_REPORTED_MODEL_CHARS),
-            usage: result.usage,
+                .excerpt(&reply.model, super::MAX_REPORTED_MODEL_CHARS),
+            usage,
         })
     }
 
