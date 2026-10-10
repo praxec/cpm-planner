@@ -11,7 +11,7 @@
 **Spec:** user requests 2026-10-10 — "instructions for LLMs to wire this up and install the skills (cpm skills we can call with `/cpm-*`) … for any agentic coding tool (codex, claude code, cursor, agents.md, etc)" and "don't publish until we have a properly set up and documented repo with everything an open-source repo should have".
 
 ## Global Constraints
-- No tag, release, crates.io publish or MCP-registry publish in this plan. Release PR #43 stays unmerged; publishing is a separate, user-approved step after the final review.
+- No tag, release, crates.io, npm or MCP-registry publish in this plan; npm `@matthew-cochran/cpm` is published manually by the user per the runbook. Release PR #43 stays unmerged; publishing is a separate, user-approved step after the final review.
 - Next published version is **0.2.0** (new `skills` subcommand = feature); the unpublished `[0.1.1]` CHANGELOG section folds into `[0.2.0]` (Task 10).
 - One source of truth for skill content: `skills/`. Generated per-tool files are produced by code, never hand-edited copies in the repo.
 - Every per-tool path and invocation syntax is verified against that tool's official documentation (URL recorded in `docs/agents/tool-matrix.md`) — never from memory.
@@ -92,6 +92,16 @@ Via `gh api` (reversible; record before/after in the PR body):
 - [ ] AGENT-INSTALL: a decision table "which tool are you?" → exact numbered steps per tool: install binary (installer one-liner with pinned version), register MCP (snippet from Task 6), `cpm-planner skills install --target <tool> --user`, verify (`plan.status` visible; `/cpm-plan` resolves; `cpm-planner skills list`).
 - [ ] CI smoke (ubuntu/macos/windows): build, `skills install --target all --project $RUNNER_TEMP/proj`, assert expected files, rerun → all unchanged; `--user` with HOME/USERPROFILE redirected to a temp dir.
 - [ ] Test: `tests/repo_hygiene.rs::agent_install_names_only_existing_targets` (every `--target` value in AGENT-INSTALL.md is accepted by the CLI parser). Commit `docs(agents): AGENT-INSTALL guide, llms.txt, AGENTS.md; CI skills smoke`.
+
+### Task 11: npm installer `@matthew-cochran/cpm` (manual publish)
+**Files:** Create `npm/package.json`, `npm/bin/cpm-planner.js`, `npm/lib/install.js`, `npm/README.md`, `npm/test/*.test.mjs`; modify `.github/workflows/release.yml` (pack + attach tarball), `.github/workflows/ci.yml` (npm tests + `npm pack --dry-run`), `scripts/check-version-sync.sh` (also checks `npm/package.json`), `docs/releasing.md`, `docs/AGENT-INSTALL.md`, README.
+- [ ] Package: name `@matthew-cochran/cpm`, version = crate version, `bin: { "cpm-planner": "bin/cpm-planner.js", "cpm": "bin/cpm-planner.js" }`, `engines.node >= 18`, no runtime dependencies, `files` whitelist, `license Apache-2.0`, repository/homepage, `publishConfig.access public`.
+- [ ] Launcher: maps `process.platform`/`process.arch` to the six release targets (x86_64/aarch64 × linux-gnu/apple-darwin/pc-windows-msvc); on first run downloads `https://github.com/praxec/cpm-planner/releases/download/v<version>/<asset>` and `checksums.sha256` over HTTPS only, verifies SHA-256, extracts (tar.gz via `tar`, zip via PowerShell `Expand-Archive` on Windows) into a per-version cache (`$XDG_CACHE_HOME` / `~/.cache` / `%LOCALAPPDATA%` `cpm-planner/<version>/`), then spawns the binary with stdio inherited and forwards args/exit code/signals. Honours `CPM_PLANNER_BINARY` (use a local binary, skip download) and `CPM_PLANNER_DOWNLOAD_BASE` (mirror; https unless `PRAXEC_ALLOW_INSECURE=1`, matching install.sh). Never writes to stdout before the child starts (stdout is the MCP channel); progress/errors go to stderr.
+- [ ] Optional `postinstall` pre-fetch that never fails the install (offline/CI-safe: errors are warnings).
+- [ ] Tests (node:test, no network): target mapping for all six + unsupported platform error; checksum mismatch aborts and deletes the partial file; cache hit skips download (local HTTP fixture server); `CPM_PLANNER_BINARY` bypass; stdout untouched before spawn.
+- [ ] Release workflow: after binaries, `npm version` is NOT run (versions come from the repo); `npm pack` in `npm/` and upload `matthew-cochran-cpm-<version>.tgz` to the draft release. No `npm publish` in CI.
+- [ ] Runbook (`docs/releasing.md`): manual publish = download the tarball from the release, `npm publish ./matthew-cochran-cpm-<version>.tgz --access public` (2FA), verify with `npx -y @matthew-cochran/cpm --version` and the MCP smoke. AGENT-INSTALL/README gain the `npx -y @matthew-cochran/cpm` MCP command for every client.
+- [ ] Commit `feat(npm): @matthew-cochran/cpm launcher that downloads and verifies the release binary`.
 
 ### Task 10: Release readiness (no publish)
 - [ ] CHANGELOG: fold `[0.1.1]` into `[Unreleased]` → `[0.2.0] - <date set at release>` placeholder kept as `[Unreleased]` until the user approves; version bump to 0.2.0 across Cargo/lock/server.json; README pins → `v0.2.0`.
