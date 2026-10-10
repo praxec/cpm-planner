@@ -83,6 +83,6 @@ pub use planner::{
 };
 pub use server::{
     PLAN_TOOL_NAMES, PlanServer, TOOL_ACCEPT, TOOL_ACQUIRE_COHORT, TOOL_FORCE_RELEASE,
-    TOOL_HEARTBEAT, TOOL_MARK_STATUS, TOOL_STATUS, TOOL_SUBMIT, plan_tool_definitions,
+    TOOL_HEARTBEAT, TOOL_MARK_STATUS, TOOL_REVIEW, TOOL_STATUS, TOOL_SUBMIT, plan_tool_definitions,
 };
 pub use task::{Bottleneck, CriticalPathResult, Task, TaskBatch, TaskKind, TaskStatus};

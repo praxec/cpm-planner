@@ -35,6 +35,20 @@
 //! | `plan.select`            | [`Planner::select_variant`]   |
 //! | `plan.archive`           | [`Planner::archive`]          |
 //! | `plan.compare`           | [`Planner::compare_plans`]    |
+//! | `plan.review`            | [`crate::review::review`]     |
+//!
+//! # Plan review
+//!
+//! `plan.review`'s judge is fixed when the server is built:
+//! [`PlanServer::with_llm_config`] takes the result of
+//! [`LlmConfig::from_env`] (read once, at startup) and
+//! [`PlanServer::with_judge`] injects any [`JudgmentModel`] (tests). With no
+//! key, or an unusable configuration, the server still starts and the tool
+//! reports `review_unavailable` with a reason naming the setting. Each
+//! review runs on the blocking pool (it simulates the plan once per
+//! proposal) and records a `plan.review` audit event carrying the
+//! `prompt_hash`, model, endpoint host, status and question count — never
+//! the key or the prompt.
 //!
 //! # Error mapping
 //!
@@ -59,8 +73,11 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::audit::AuditEvent;
 use crate::compare::{CompareRequest, CompareWeights};
 use crate::edits::GraphEdit;
+use crate::llm::jev::JevJudge;
+use crate::llm::{ConfigError, JudgmentModel, LlmConfig};
 use crate::monte_carlo::MonteCarloRequest;
 use crate::plan::{
     AcceptRequest, AcquireRequest, CallerId, Cohort, ComparePlansRequest, DeliverableStatus,
@@ -70,6 +87,7 @@ use crate::plan::{
 use crate::ports::Planner;
 use crate::project::ProjectRoot;
 use crate::resource_schedule::{ScheduleRequest, resource_schedule};
+use crate::review::{Judge, ReviewReport, ReviewRequest};
 use crate::simulate::SimulateRequest;
 use rmcp::ErrorData as McpError;
 use rmcp::model::{
@@ -107,8 +125,9 @@ pub const TOOL_FORK: &str = "plan.fork";
 pub const TOOL_SELECT: &str = "plan.select";
 pub const TOOL_ARCHIVE: &str = "plan.archive";
 pub const TOOL_COMPARE: &str = "plan.compare";
+pub const TOOL_REVIEW: &str = "plan.review";
 
-/// All nineteen MCP tool names exposed by [`PlanServer`], in declaration order.
+/// All twenty MCP tool names exposed by [`PlanServer`], in declaration order.
 pub const PLAN_TOOL_NAMES: &[&str] = &[
     TOOL_SUBMIT,
     TOOL_ACQUIRE_COHORT,
@@ -129,6 +148,7 @@ pub const PLAN_TOOL_NAMES: &[&str] = &[
     TOOL_SELECT,
     TOOL_ARCHIVE,
     TOOL_COMPARE,
+    TOOL_REVIEW,
 ];
 
 // ---------------------------------------------------------------------------
@@ -378,6 +398,27 @@ struct CompareArgs {
     monte_carlo: Option<MonteCarloRequest>,
     #[serde(default)]
     weights: CompareWeights,
+}
+
+/// `plan.review`: the graph/plan selector, optional leveling inputs (flat,
+/// as in `plan.schedule`, but `capacities` optional) and the question cap.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewToolArgs {
+    #[serde(default)]
+    graph: Option<PlanGraph>,
+    #[serde(default)]
+    plan_id: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    capacities: Option<std::collections::BTreeMap<String, u32>>,
+    #[serde(default)]
+    resource_key: Option<String>,
+    #[serde(default)]
+    project_buffer_pct: Option<f32>,
+    #[serde(default)]
+    max_questions: Option<u16>,
 }
 
 // ---------------------------------------------------------------------------
@@ -987,6 +1028,40 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                 "additionalProperties": false
             })),
         ),
+        Tool::new(
+            Cow::Borrowed(TOOL_REVIEW),
+            Cow::Borrowed(
+                "Optional AI review of a graph, stored plan, or plan file (read-only; \
+                 provide exactly one of graph, plan_id, or path). Lint always runs; \
+                 lint errors return status invalid_graph without calling the judge. \
+                 Otherwise one batched call to Jev (calibrated judgments, via \
+                 OpenRouter) asks up to max_questions (1..64, default 64) questions \
+                 about likely false or missing dependencies, split and interface-split \
+                 candidates and crash options; findings carry advisory probabilities. \
+                 Proposals are plan.fork edit lists, each verified by simulate (lint \
+                 clean, makespan shorter) and ranked by hours_saved / max(cost, 1). \
+                 Without an OpenRouter key (or with an unusable LLM configuration) \
+                 status is review_unavailable with a reason, plus lint. The plan graph \
+                 (ids, descriptions, metadata) is sent to OpenRouter.",
+            ),
+            schema_object(json!({
+                "type": "object",
+                "properties": {
+                    "graph": graph_selector_schema(),
+                    "plan_id": plan_id_schema(),
+                    "path": path_schema(),
+                    "capacities": {
+                        "type": "object",
+                        "description": "Optional: level the plan so makespans account for resources (same rules as plan.schedule capacities).",
+                        "additionalProperties": { "type": "integer", "minimum": 0 }
+                    },
+                    "resource_key": { "type": "string", "description": "Metadata key naming a deliverable's resource (default \"owner\"); requires capacities." },
+                    "project_buffer_pct": { "type": "number", "minimum": 0, "maximum": 100, "description": "Project buffer percentage (default 25); requires capacities." },
+                    "max_questions": { "type": "integer", "minimum": 1, "maximum": 64, "description": "Question cap for the single Jev call (default 64); extra candidates are dropped and truncated is true." }
+                },
+                "additionalProperties": false
+            })),
+        ),
     ]
 }
 
@@ -1012,12 +1087,32 @@ fn schema_object(value: Value) -> Arc<rmcp::model::JsonObject> {
 // PlanServer
 // ---------------------------------------------------------------------------
 
-/// MCP server façade exposing a [`BasicCpmPlanner`] over nineteen tools.
+/// What `plan.review` judges with, fixed when the server is built.
+#[derive(Clone)]
+enum ReviewJudge {
+    Model(Arc<dyn JudgmentModel>),
+    NotConfigured,
+    /// Unusable configuration; the key-free reason to report.
+    Unusable(String),
+}
+
+impl ReviewJudge {
+    fn as_judge(&self) -> Judge<'_> {
+        match self {
+            Self::Model(model) => Judge::Model(model.as_ref()),
+            Self::NotConfigured => Judge::NotConfigured,
+            Self::Unusable(reason) => Judge::ConfigError(reason),
+        }
+    }
+}
+
+/// MCP server façade exposing a [`BasicCpmPlanner`] over twenty tools.
 #[derive(Clone)]
 pub struct PlanServer {
     planner: Arc<BasicCpmPlanner>,
     server_name: String,
     server_version: String,
+    judge: ReviewJudge,
 }
 
 impl PlanServer {
@@ -1027,7 +1122,42 @@ impl PlanServer {
             planner,
             server_name: "cpm-planner".to_string(),
             server_version: env!("CARGO_PKG_VERSION").to_string(),
+            judge: ReviewJudge::NotConfigured,
         }
+    }
+
+    /// Set `plan.review`'s judge: `None` means no key is configured (the
+    /// default). Tests inject a fake here.
+    pub fn with_judge(mut self, judge: Option<Arc<dyn JudgmentModel>>) -> Self {
+        self.judge = judge.map_or(ReviewJudge::NotConfigured, ReviewJudge::Model);
+        self
+    }
+
+    /// Set `plan.review`'s judge from [`LlmConfig::from_env`]'s result, read
+    /// once at startup: a key builds a [`JevJudge`]; no key leaves review
+    /// unavailable; a [`ConfigError`] is logged (it never carries the key)
+    /// and review reports [`ConfigError::review_reason`]. Never fails, so an
+    /// LLM misconfiguration cannot stop the server.
+    pub fn with_llm_config(mut self, config: Result<Option<LlmConfig>, ConfigError>) -> Self {
+        self.judge = match config {
+            Ok(Some(config)) => {
+                tracing::info!(
+                    model = config.jev_model(),
+                    endpoint = ?config.jev_endpoint_host(),
+                    "plan.review enabled"
+                );
+                ReviewJudge::Model(Arc::new(JevJudge::new(&config)))
+            }
+            Ok(None) => {
+                tracing::info!("no OpenRouter key configured; plan.review is unavailable");
+                ReviewJudge::NotConfigured
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "LLM configuration unusable; plan.review is unavailable");
+                ReviewJudge::Unusable(err.review_reason())
+            }
+        };
+        self
     }
 
     /// Override the advertised server identity. Defaults to
@@ -1152,6 +1282,7 @@ impl PlanServer {
             TOOL_SELECT => self.handle_select(args).await,
             TOOL_ARCHIVE => self.handle_archive(args).await,
             TOOL_COMPARE => self.handle_compare(args).await,
+            TOOL_REVIEW => self.handle_review(args).await,
             other => Err(McpError::invalid_params(
                 format!(
                     "Unknown tool '{other}'. Available: {}.",
@@ -1564,6 +1695,84 @@ impl PlanServer {
         let comparison = run_blocking(move || crate::compare::compare(&inputs, &request)).await?;
         to_value(&comparison)
     }
+
+    /// `plan.review`. Params are range-checked first (`invalid_params`).
+    /// The whole review runs on the blocking pool, with the runtime handle
+    /// driving its single judge call from there: the engine simulates the
+    /// plan up to once per proposal, which must not stall the async
+    /// workers. The store is not held: the graph is resolved (and any lock
+    /// released) before the review starts.
+    async fn handle_review(&self, args: Value) -> Result<Value, McpError> {
+        let ReviewToolArgs {
+            graph,
+            plan_id,
+            path,
+            capacities,
+            resource_key,
+            project_buffer_pct,
+            max_questions,
+        } = parse_args(args)?;
+        let request = review_request(capacities, resource_key, project_buffer_pct, max_questions)?;
+        let graph = self.resolve_graph(graph, plan_id, path).await?;
+        let judge = self.judge.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let report = run_blocking(move || {
+            runtime.block_on(crate::review::review(&graph, &request, judge.as_judge()))
+        })
+        .await?;
+        self.planner.record_audit(review_audit_event(&report)).await;
+        to_value(&report)
+    }
+}
+
+/// Build and range-check `plan.review`'s request (`invalid_params`).
+fn review_request(
+    capacities: Option<std::collections::BTreeMap<String, u32>>,
+    resource_key: Option<String>,
+    project_buffer_pct: Option<f32>,
+    max_questions: Option<u16>,
+) -> Result<ReviewRequest, McpError> {
+    if let Some(cap) = max_questions {
+        crate::review::check_max_questions(cap)
+            .map_err(|reason| McpError::invalid_params(reason, None))?;
+    }
+    let capacities = match capacities {
+        Some(capacities) => {
+            let schedule = ScheduleRequest {
+                capacities,
+                resource_key: resource_key
+                    .unwrap_or_else(crate::resource_schedule::default_resource_key),
+                project_buffer_pct: project_buffer_pct
+                    .unwrap_or_else(crate::resource_schedule::default_buffer_pct),
+            };
+            check_schedule_params(&schedule)?;
+            Some(schedule)
+        }
+        None if resource_key.is_some() || project_buffer_pct.is_some() => {
+            return Err(McpError::invalid_params(
+                "resource_key and project_buffer_pct require capacities",
+                None,
+            ));
+        }
+        None => None,
+    };
+    Ok(ReviewRequest {
+        capacities,
+        max_questions,
+    })
+}
+
+/// The `plan.review` audit record: what was asked of whom and the outcome,
+/// never the key or the prompt (only its hash).
+fn review_audit_event(report: &ReviewReport) -> AuditEvent {
+    AuditEvent::new("plan.review").with_payload(json!({
+        "status": report.status,
+        "question_count": report.question_count,
+        "prompt_hash": report.prompt_hash,
+        "model": report.model,
+        "endpoint": report.endpoint,
+        "jev_called": report.jev_called,
+    }))
 }
 
 /// Range checks the analysis tools apply before any work, as
@@ -1615,8 +1824,7 @@ impl ServerHandler for PlanServer {
             Implementation::new(self.server_name.clone(), self.server_version.clone());
         server_info.title = Some("cpm-planner".to_string());
         server_info.description = Some(
-            "MCP server exposing the open-source Praxec CPM planner via nineteen tools."
-                .to_string(),
+            "MCP server exposing the open-source Praxec CPM planner via twenty tools.".to_string(),
         );
 
         let mut info = InitializeResult::default();
@@ -1717,7 +1925,7 @@ fn planner_error_to_mcp(err: PlannerError) -> McpError {
 fn instructions() -> &'static str {
     r#"This is the cpm-planner MCP server — the open-source CPM planner.
 
-Tools (nineteen total, all `plan.<verb>`):
+Tools (twenty total, all `plan.<verb>`):
   plan.submit          — submit a PlanGraph, get a plan_id (idempotent on identical graphs)
                         a prerequisite is an id string or {id, consumes?, kind?: artifact|interface, lag_hours?}; a deliverable's duration_hours (calendar time; when absent the default is the effort estimate, explicit or estimator-derived) and lag_hours (minimum wait after a prerequisite finishes) drive the schedule
                         a milestone (milestone: true) is zero-length unless you give it an estimate or duration; it is still an ordinary deliverable someone must complete (accept or mark Complete), and it is not leased if metadata.kind=manual
@@ -1742,6 +1950,7 @@ Tools (nineteen total, all `plan.<verb>`):
   plan.select          — make a variant its line's selected (only executable) variant, carrying progress over; force releases locks on the previous variant
   plan.archive         — archive (archived defaults true) or unarchive a whole line or one variant; archived variants stay readable but refuse sync/select/execute
   plan.compare         — compare stored plans (plan_ids: 2..16 distinct ids, or plan line name in project, default the discovered root, for every live variant, at most 16) on the scorecard: Pareto front, weighted rank, recommended; weights must be finite and >= 0; the Monte Carlo budget (200000000) is shared across variants
+  plan.review          — optional AI review (read-only; graph, plan_id or path; optional capacities/resource_key/project_buffer_pct and max_questions 1..64, default 64): lint always runs and lint errors return status invalid_graph with no judge call; otherwise ONE batched call to Jev (TypeSafe's calibrated-judgment model, via OpenRouter) scores likely false dependencies, missing dependencies, split and interface-split candidates and crash options. Probabilities are advisory, not facts. proposals are plan.fork edit lists, each verified by simulate (lints clean, shortens the makespan) and ranked by hours_saved / max(cost, 1). Without an OpenRouter key, or with an unusable LLM setting, status is review_unavailable with a reason, plus lint; a provider failure is review_unavailable with "<class>: <message>". The plan graph is sent to OpenRouter
   plan.submit with a `name` (optional `project`/`variant`, variant defaults to "main") registers a named variant instead of an unnamed plan
   plan.lint, plan.simulate take exactly one of an inline graph, a stored plan_id, or a plan-file path; plan.schedule takes graph or plan_id; plan.schedule and plan.simulate reject what plan.submit rejects, and plan.lint reports it as findings
 
@@ -1752,6 +1961,11 @@ variants and pick one: plan.fork creates a draft variant from edits,
 plan.compare scores every live variant, and plan.select makes exactly one
 executable. Never keep untracked scratch graphs — the files under
 .cpm-planner/plans/ are the source of truth for definitions.
+
+Review workflow: plan.review {path} on a lint-clean plan; read findings as
+advisory judgments (check them against what you know), apply a proposal you
+agree with via plan.fork {edits} (or design the edits for split and
+missing-dependency findings yourself), then plan.compare and plan.select.
 
 Leases default to 5 minutes. Pass ttl_seconds (≤ server max, default 8h)
 on acquire/heartbeat for long-running work, and heartbeat at least every

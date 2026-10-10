@@ -342,6 +342,12 @@ impl BasicCpmPlanner {
         requested.unwrap_or(self.ttl).min(self.max_ttl)
     }
 
+    /// Record one audit event emitted outside the planner's own operations
+    /// (e.g. `plan.review`). Sink failures are logged, never returned.
+    pub async fn record_audit(&self, event: AuditEvent) {
+        self.flush_audit(vec![event]).await;
+    }
+
     /// Flush buffered audit events. Called after the mutex is dropped so a
     /// slow sink never blocks concurrent planner callers.
     async fn flush_audit(&self, events: Vec<AuditEvent>) {
