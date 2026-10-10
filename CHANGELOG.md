@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.0] - 2026-10-10
 
+**Release notes: roadmap EV (dogfood).** We tracked cpm-planner's own roadmap with its
+earned-value tools on this release candidate, using a wall-clock baseline that starts
+2026-10-09T15:00Z. At 2026-10-10T02:24Z the readings are SPI 1.26, CPI 1.61 and EAC 17.08 h
+against a BAC of 27.5 h. Seven of the ten phases are accepted on merged PRs. The
+remaining-work makespan is 6 h (point estimates, so Monte Carlo gives no spread; the stored
+plan's P80 equals its 21 h deterministic makespan). Actual hours are commit-span
+approximations. For the method, caveats and known limitations, see
+[docs/ev/backlog-roadmap.md](docs/ev/backlog-roadmap.md).
+
 ### Added
 
 - Library: `cpm_planner::schedule::compute_cpm` is public.
