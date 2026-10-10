@@ -50,3 +50,39 @@ jobs:
               run: cargo fmt --all --check
             - name: clippy
               run: cargo clippy --all-targets -- -D warnings   # required: zero warnings
+
+    deny:
+        name: cargo-deny
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        steps:
+            - uses: actions/checkout@v4
+            - uses: EmbarkStudios/cargo-deny-action@v2
+              with:
+                  command: check
+
+    docs:
+        name: docs
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        env:
+            RUSTDOCFLAGS: -D warnings
+        steps:
+            - uses: actions/checkout@v4
+            - uses: dtolnay/rust-toolchain@1.99.0
+            - uses: Swatinem/rust-cache@v2
+            - name: cargo doc
+              run: cargo doc --no-deps --locked
+
+    package:
+        name: package
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        steps:
+            - uses: actions/checkout@v4
+            - uses: dtolnay/rust-toolchain@1.99.0
+            - uses: Swatinem/rust-cache@v2
+            - name: cargo package (list)
+              run: cargo package --locked --list
+            - name: cargo publish (dry run)
+              run: cargo publish --dry-run --locked
