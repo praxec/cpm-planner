@@ -70,7 +70,8 @@ The workflow then runs these jobs:
 3. **aggregate metadata + publish**: writes `checksums.sha256` and
    `release-manifest.json` (it fails if the matrix is incomplete), uploads them
    with `install.sh` and `install.ps1`, runs `npm pack` in `npm/` and attaches
-   `matthew-cochran-cpm-X.Y.Z.tgz`, and publishes the release. It does not run
+   `matthew-cochran-cpm-X.Y.Z.tgz` with its digest in `npm-package.sha256`,
+   and publishes the release. It does not run
    `npm publish` and has no npm token.
 4. **container image**: builds the image, smoke-tests it, then pushes
    `ghcr.io/praxec/cpm-planner` for linux/amd64 and linux/arm64 with the tags
@@ -83,8 +84,8 @@ The workflow then runs these jobs:
 ## 5. Verify the release
 
 Assets: the release page lists six archives, `checksums.sha256`,
-`release-manifest.json`, `install.sh`, `install.ps1` and
-`matthew-cochran-cpm-X.Y.Z.tgz`.
+`release-manifest.json`, `install.sh`, `install.ps1`,
+`matthew-cochran-cpm-X.Y.Z.tgz` and `npm-package.sha256`.
 
 ```sh
 gh release view vX.Y.Z --json assets --jq '.assets[].name'
@@ -138,7 +139,9 @@ exactly the file attached to the release. You need to be logged in to npm
 
 ```sh
 mkdir -p /tmp/cpm-npm && cd /tmp/cpm-npm
-gh release download vX.Y.Z --repo praxec/cpm-planner --pattern 'matthew-cochran-cpm-X.Y.Z.tgz'
+gh release download vX.Y.Z --repo praxec/cpm-planner \
+  --pattern 'matthew-cochran-cpm-X.Y.Z.tgz' --pattern npm-package.sha256
+sha256sum -c npm-package.sha256          # must print OK; stop if it does not
 tar -tzf matthew-cochran-cpm-X.Y.Z.tgz   # package/{LICENSE,README.md,package.json,bin/,lib/} only, no tests
 npm publish ./matthew-cochran-cpm-X.Y.Z.tgz --access public   # prompts for the 2FA code
 ```

@@ -38,3 +38,34 @@ test('postinstall exits 0 when the pre-fetch download fails', async (t) => {
 test('postinstall writes nothing to stdout', async (t) => {
   assert.equal((await runFailingPostinstall(t)).stdout, '');
 });
+
+const { main } = createRequire(import.meta.url)('../lib/postinstall.js');
+
+function spy() {
+  const calls = [];
+  const fn = async (opts) => { calls.push(opts); };
+  fn.calls = calls;
+  return fn;
+}
+
+test('postinstall main() does not download when CPM_PLANNER_SKIP_DOWNLOAD=1', async () => {
+  const ensure = spy();
+  await main({ CPM_PLANNER_SKIP_DOWNLOAD: '1' }, ensure);
+  assert.equal(ensure.calls.length, 0);
+});
+
+test('postinstall main() pre-fetches when CI=false', async () => {
+  const ensure = spy();
+  await main({ CI: 'false' }, ensure);
+  assert.equal(ensure.calls.length, 1);
+});
+
+test('postinstall main() pre-fetches when CI=0', async () => {
+  const ensure = spy();
+  await main({ CI: '0' }, ensure);
+  assert.equal(ensure.calls.length, 1);
+});
+
+test('postinstall main() swallows a failing pre-fetch', async () => {
+  await assert.doesNotReject(main({}, async () => { throw new Error('offline'); }));
+});

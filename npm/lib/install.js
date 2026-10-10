@@ -22,13 +22,21 @@ const INSTALL_DOCS = `https://github.com/${REPO}/blob/main/docs/AGENT-INSTALL.md
 // CDN. Current releases redirect to release-assets.githubusercontent.com;
 // objects.githubusercontent.com is the older CDN host.
 const REDIRECT_HOSTS = ['github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com'];
-const MAX_REDIRECTS = 5;
-const MAX_BYTES = 134217728; // same cap as scripts/install.sh (PRAXEC_MAX_BYTES default)
-const IDLE_TIMEOUT_MS = 30000;
-const TOTAL_TIMEOUT_MS = 300000;
-const LOCK_STALE_MS = 10 * 60 * 1000;
-const LOCK_WAIT_MS = 6 * 60 * 1000;
-const LOCK_POLL_MS = 100;
+const VERIFIED_FILE = '.verified';
+const LOCK_FILE = '.lock';
+
+// Download limits. ensureBinary({ limits }) overrides them (tests only).
+const DEFAULT_LIMITS = {
+  maxBytes: 134217728, // same cap as scripts/install.sh (PRAXEC_MAX_BYTES default)
+  maxRedirects: 5,
+  idleTimeoutMs: 30000,
+  totalTimeoutMs: 300000,
+};
+// Lock timing. A lock whose owner process is gone is taken over at once; the
+// age threshold is only a fallback for locks whose owner cannot be checked
+// (unreadable, or written on another host sharing the cache). Waiting lasts
+// longer than the stale threshold so a waiter always outlives a dead owner.
+const DEFAULT_LOCK = { staleMs: 10 * 60 * 1000, waitMs: 11 * 60 * 1000, pollMs: 100 };
 
 class LauncherError extends Error {}
 
@@ -85,6 +93,19 @@ function insecureAllowed(env) {
   return env.PRAXEC_ALLOW_INSECURE === '1';
 }
 
+// Returns `url` without any user:password part, for logs and errors.
+function redact(url) {
+  try {
+    const u = new URL(String(url));
+    if (!u.username && !u.password) return u.href;
+    u.username = '';
+    u.password = '';
+    return u.href;
+  } catch {
+    return String(url).replace(/\/\/[^/@\s]*@/, '//');
+  }
+}
+
 // Validates the release base URL. https only unless PRAXEC_ALLOW_INSECURE=1,
 // the same rule as scripts/install.sh and scripts/install.ps1.
 function parseBase(base, env) {
@@ -92,12 +113,12 @@ function parseBase(base, env) {
   try {
     url = new URL(base);
   } catch {
-    throw new LauncherError(`invalid download base URL '${base}'`);
+    throw new LauncherError(`invalid download base URL '${redact(base)}'`);
   }
   const ok = url.protocol === 'https:' || (insecureAllowed(env) && url.protocol === 'http:');
   if (!ok) {
     throw new LauncherError(
-      `refusing non-https base URL '${base}' (set PRAXEC_ALLOW_INSECURE=1 to override for local testing)`,
+      `refusing non-https base URL '${redact(base)}' (set PRAXEC_ALLOW_INSECURE=1 to override for local testing)`,
     );
   }
   return url;
@@ -112,7 +133,7 @@ function checkRedirect(location, allowedHosts, env) {
 }
 
 // Streams `url` into a new file at `dest`, following only allowlisted redirects.
-function download(url, dest, { allowedHosts, env, version, maxBytes = MAX_BYTES }) {
+function download(url, dest, { allowedHosts, env, version, limits, maxBytes = limits.maxBytes }) {
   return new Promise((resolve, reject) => {
     let settled = false;
     let req;
@@ -128,30 +149,31 @@ function download(url, dest, { allowedHosts, env, version, maxBytes = MAX_BYTES 
       }
     };
     const deadline = setTimeout(
-      () => finish(new LauncherError(`download timed out after ${TOTAL_TIMEOUT_MS / 1000}s: ${url}`)),
-      TOTAL_TIMEOUT_MS,
+      () => finish(new LauncherError(`download timed out after ${limits.totalTimeoutMs / 1000}s: ${redact(url)}`)),
+      limits.totalTimeoutMs,
     );
 
     const get = (current, redirectsLeft) => {
+      const shown = redact(current);
       const mod = current.protocol === 'https:' ? https : http;
-      req = mod.get(current, { headers: { 'user-agent': `cpm-planner-npm/${version}` }, timeout: IDLE_TIMEOUT_MS }, (res) => {
+      req = mod.get(current, { headers: { 'user-agent': `cpm-planner-npm/${version}` }, timeout: limits.idleTimeoutMs }, (res) => {
         const status = res.statusCode || 0;
         if (status >= 300 && status < 400 && res.headers.location) {
           res.resume();
-          if (redirectsLeft <= 0) return finish(new LauncherError(`too many redirects: ${url}`));
+          if (redirectsLeft <= 0) return finish(new LauncherError(`too many redirects (more than ${limits.maxRedirects}): ${redact(url)}`));
           let next;
           try {
             next = new URL(res.headers.location, current);
             checkRedirect(next, allowedHosts, env);
           } catch (err) {
-            return finish(err);
+            return finish(err instanceof LauncherError ? err : new LauncherError(`invalid redirect from ${shown}`));
           }
           return get(next, redirectsLeft - 1);
         }
         if (status !== 200) {
           res.resume();
           const hint = status === 404 ? ` (is release v${version} published with this asset?)` : '';
-          return finish(new LauncherError(`download failed with HTTP ${status}: ${current.href}${hint}`));
+          return finish(new LauncherError(`download failed with HTTP ${status}: ${shown}${hint}`));
         }
         let bytes = 0;
         const out = fs.createWriteStream(dest, { flags: 'wx', mode: 0o600 });
@@ -160,21 +182,21 @@ function download(url, dest, { allowedHosts, env, version, maxBytes = MAX_BYTES 
           if (bytes > maxBytes) {
             res.destroy();
             out.destroy();
-            finish(new LauncherError(`download exceeds ${maxBytes} bytes: ${current.href}`));
+            finish(new LauncherError(`download exceeds ${maxBytes} bytes: ${shown}`));
           }
         });
-        res.on('error', (err) => finish(new LauncherError(`download interrupted: ${current.href}: ${err.message}`)));
+        res.on('error', (err) => finish(new LauncherError(`download interrupted: ${shown}: ${err.message}`)));
         out.on('error', (err) => finish(new LauncherError(`cannot write ${dest}: ${err.message}`)));
         out.on('close', () => {
-          if (bytes === 0) return finish(new LauncherError(`downloaded file is empty: ${current.href}`));
+          if (bytes === 0) return finish(new LauncherError(`downloaded file is empty: ${shown}`));
           finish();
         });
         res.pipe(out);
       });
-      req.on('timeout', () => req.destroy(new Error(`no data for ${IDLE_TIMEOUT_MS / 1000}s`)));
-      req.on('error', (err) => finish(err instanceof LauncherError ? err : new LauncherError(`download failed: ${current.href}: ${err.message}`)));
+      req.on('timeout', () => req.destroy(new Error(`no data for ${limits.idleTimeoutMs / 1000}s`)));
+      req.on('error', (err) => finish(err instanceof LauncherError ? err : new LauncherError(`download failed: ${shown}: ${err.message}`)));
     };
-    get(new URL(url), MAX_REDIRECTS);
+    get(new URL(url), limits.maxRedirects);
   });
 }
 
@@ -192,9 +214,15 @@ function expectedDigest(checksumsText, asset) {
   return null;
 }
 
+// True for archive entry names that could land outside the extract dir.
 function unsafeEntry(name) {
   const n = name.replace(/\\/g, '/');
   return n.startsWith('/') || /^[A-Za-z]:/.test(n) || n.split('/').includes('..');
+}
+
+// True for a `tar -tv` listing line describing a link or special file.
+function specialEntry(listingLine) {
+  return /^[lhbcp]/.test(listingLine);
 }
 
 // Extracts a .tar.gz with the system `tar` (GNU tar or bsdtar; Windows 10+
@@ -213,7 +241,7 @@ function extractTarGz(workDir, archiveName, extractName) {
   if (entries.length === 0) throw new LauncherError('archive is empty');
   const bad = entries.find(unsafeEntry);
   if (bad) throw new LauncherError(`refusing unsafe path in archive: ${bad}`);
-  if (verbose.split(/\r?\n/).filter(Boolean).some((l) => /^[lhbcp]/.test(l))) {
+  if (verbose.split(/\r?\n/).filter(Boolean).some(specialEntry)) {
     throw new LauncherError('refusing archive containing links or special files');
   }
   fs.mkdirSync(path.join(workDir, extractName));
@@ -250,10 +278,20 @@ function extractZip(workDir, archiveName, extractName) {
   }
 }
 
+// A regular file (not a link or directory) that is executable on POSIX.
+function isRunnableFile(file) {
+  const st = fs.lstatSync(file);
+  if (!st.isFile()) return false;
+  return process.platform === 'win32' || (st.mode & 0o111) !== 0;
+}
+
+// Finds the binary at the archive root, or anywhere below it as install.sh does.
 function findBinary(dir, name) {
-  const direct = path.join(dir, name);
-  if (fs.existsSync(direct)) return direct;
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  for (const entry of entries) {
+    if (entry.name === name && isRunnableFile(path.join(dir, name))) return path.join(dir, name);
+  }
+  for (const entry of entries) {
     if (entry.isDirectory()) {
       const found = findBinary(path.join(dir, entry.name), name);
       if (found) return found;
@@ -264,44 +302,113 @@ function findBinary(dir, name) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Cross-process lock: an exclusively created file. Returns a release function,
-// or null when `isDone()` became true while waiting (another process finished).
-async function acquireLock(lockPath, isDone, { staleMs = LOCK_STALE_MS, waitMs = LOCK_WAIT_MS } = {}) {
+// process.kill(pid, 0) probes a pid without signalling it: ESRCH means no such
+// process, EPERM means it exists but belongs to someone else.
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code !== 'ESRCH';
+  }
+}
+
+function readLock(lockPath) {
+  try {
+    const raw = fs.readFileSync(lockPath, 'utf8');
+    let owner = null;
+    try {
+      owner = JSON.parse(raw);
+    } catch {
+      // being written right now, or garbage: judged by age only
+    }
+    return { raw, owner, mtimeMs: fs.statSync(lockPath).mtimeMs };
+  } catch {
+    return null; // vanished
+  }
+}
+
+function lockIsStale(lock, staleMs) {
+  const { owner } = lock;
+  if (owner && Number.isInteger(owner.pid) && owner.host === os.hostname()) return !pidAlive(owner.pid);
+  return Date.now() - lock.mtimeMs > staleMs;
+}
+
+// Cross-process lock: an exclusively created file holding the owner's pid,
+// host and a random token. Returns a release function that deletes the lock
+// only while it still carries our token, or null when `isDone()` became true
+// while waiting (another process finished the download).
+async function acquireLock(lockPath, isDone, opts = {}) {
+  const { staleMs, waitMs, pollMs } = { ...DEFAULT_LOCK, ...opts };
+  const token = crypto.randomBytes(16).toString('hex');
   const started = Date.now();
   for (;;) {
     try {
-      const fd = fs.openSync(lockPath, 'wx');
-      fs.writeSync(fd, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+      const fd = fs.openSync(lockPath, 'wx', 0o600);
+      fs.writeSync(fd, JSON.stringify({ pid: process.pid, host: os.hostname(), token, at: new Date().toISOString() }));
       fs.closeSync(fd);
-      return () => fs.rmSync(lockPath, { force: true });
+      return () => {
+        const lock = readLock(lockPath);
+        if (lock && lock.owner && lock.owner.token === token) fs.rmSync(lockPath, { force: true });
+      };
     } catch (err) {
       if (err.code !== 'EEXIST') throw new LauncherError(`cannot create lock ${lockPath}: ${err.message}`);
     }
     if (isDone()) return null;
-    try {
-      if (Date.now() - fs.statSync(lockPath).mtimeMs > staleMs) {
-        fs.rmSync(lockPath, { force: true });
-        continue;
-      }
-    } catch {
-      continue; // lock vanished between open and stat: retry at once
+    const lock = readLock(lockPath);
+    if (!lock) continue; // released between open and read: retry at once
+    if (lockIsStale(lock, staleMs)) {
+      // Only remove the lock we judged; a fresh one written meanwhile stays.
+      const again = readLock(lockPath);
+      if (again && again.raw === lock.raw) fs.rmSync(lockPath, { force: true });
+      continue;
     }
     if (Date.now() - started > waitMs) {
       throw new LauncherError(`timed out waiting for another download to finish (lock ${lockPath}; delete it if no download is running)`);
     }
-    await sleep(LOCK_POLL_MS);
+    await sleep(pollMs);
   }
 }
 
-async function downloadAndInstall({ version, t, base, allowedHosts, env, versionDir, finalPath, log }) {
+// Refuses a cache directory another user could have written to (POSIX).
+function checkCacheDirTrust(versionDir) {
+  if (process.platform === 'win32' || typeof process.getuid !== 'function') return;
+  const st = fs.statSync(versionDir);
+  const remedy = `remove ${versionDir} so it is downloaded again, or set CPM_PLANNER_CACHE_DIR to a private directory`;
+  if (st.uid !== process.getuid()) {
+    throw new LauncherError(`refusing cached binary: ${versionDir} is owned by uid ${st.uid}, not ${process.getuid()}; ${remedy}`);
+  }
+  if ((st.mode & 0o022) !== 0) {
+    throw new LauncherError(`refusing cached binary: ${versionDir} is writable by group or others (mode ${(st.mode & 0o777).toString(8)}); ${remedy}`);
+  }
+}
+
+// Re-checks a cached binary against the digest recorded when it was installed.
+function checkCachedBinary(versionDir, finalPath) {
+  checkCacheDirTrust(versionDir);
+  const remedy = `remove ${versionDir} to download it again`;
+  let recorded;
+  try {
+    recorded = fs.readFileSync(path.join(versionDir, VERIFIED_FILE), 'utf8').trim();
+  } catch {
+    throw new LauncherError(`refusing cached binary ${finalPath}: no ${VERIFIED_FILE} digest; ${remedy}`);
+  }
+  const actual = sha256File(finalPath);
+  if (actual !== recorded) {
+    throw new LauncherError(`refusing cached binary ${finalPath}: sha256 ${actual} does not match the verified ${recorded}; ${remedy}`);
+  }
+}
+
+async function downloadAndInstall({ version, t, base, allowedHosts, env, versionDir, finalPath, log, limits, state }) {
   const releaseUrl = `${base.href.replace(/\/+$/, '')}/download/v${version}`;
   const workDir = fs.mkdtempSync(path.join(versionDir, '.download-'));
+  state.workDir = workDir;
   try {
     const archive = path.join(workDir, t.asset);
     const sums = path.join(workDir, 'checksums.sha256');
-    log(`downloading ${BIN} v${version} for ${t.target} from ${releaseUrl}/${t.asset}`);
-    await download(`${releaseUrl}/${t.asset}`, archive, { allowedHosts, env, version });
-    await download(`${releaseUrl}/checksums.sha256`, sums, { allowedHosts, env, version, maxBytes: 1024 * 1024 });
+    log(`downloading ${BIN} v${version} for ${t.target} from ${redact(`${releaseUrl}/${t.asset}`)}`);
+    await download(`${releaseUrl}/${t.asset}`, archive, { allowedHosts, env, version, limits });
+    await download(`${releaseUrl}/checksums.sha256`, sums, { allowedHosts, env, version, limits, maxBytes: 1024 * 1024 });
     const expected = expectedDigest(fs.readFileSync(sums, 'utf8'), t.asset);
     if (!expected) throw new LauncherError(`no checksum entry for ${t.asset} in checksums.sha256`);
     const actual = sha256File(archive);
@@ -312,45 +419,89 @@ async function downloadAndInstall({ version, t, base, allowedHosts, env, version
     if (t.ext === 'zip') extractZip(workDir, t.asset, 'extract');
     else extractTarGz(workDir, t.asset, 'extract');
     const src = findBinary(path.join(workDir, 'extract'), t.binary);
-    if (!src) throw new LauncherError(`binary '${t.binary}' not found inside ${t.asset}`);
-    if (fs.lstatSync(src).isSymbolicLink()) throw new LauncherError('refusing a symlinked binary');
+    if (!src) throw new LauncherError(`no executable file '${t.binary}' inside ${t.asset}`);
     if (process.platform !== 'win32') fs.chmodSync(src, 0o755);
+    // Record the digest first: a binary without a matching .verified is refused.
+    const verifiedTmp = path.join(workDir, VERIFIED_FILE);
+    fs.writeFileSync(verifiedTmp, `${sha256File(src)}\n`, { mode: 0o600 });
+    fs.renameSync(verifiedTmp, path.join(versionDir, VERIFIED_FILE));
     fs.renameSync(src, finalPath);
     log(`installed ${finalPath}`);
   } finally {
     fs.rmSync(workDir, { recursive: true, force: true });
+    state.workDir = null;
   }
 }
 
+// While the lock is held, a terminating signal removes the work dir and the
+// lock, then re-raises the signal so the process still dies by it.
+function cleanupOnSignals(cleanup) {
+  const signals = process.platform === 'win32' ? ['SIGINT', 'SIGTERM'] : ['SIGINT', 'SIGTERM', 'SIGHUP'];
+  const handlers = signals.map((sig) => {
+    const handler = () => {
+      remove();
+      try {
+        cleanup();
+      } finally {
+        process.kill(process.pid, sig);
+      }
+    };
+    process.on(sig, handler);
+    return [sig, handler];
+  });
+  function remove() {
+    for (const [sig, handler] of handlers) process.removeListener(sig, handler);
+  }
+  return remove;
+}
+
+function checkLocalBinary(file) {
+  if (/\.(cmd|bat)$/i.test(file)) {
+    throw new LauncherError(`CPM_PLANNER_BINARY must be a native executable (.exe on Windows), not a .cmd/.bat script: ${file}`);
+  }
+  if (!fs.existsSync(file)) {
+    throw new LauncherError(`CPM_PLANNER_BINARY points to a missing file: ${file}`);
+  }
+  return file;
+}
+
 // Returns the path of a runnable cpm-planner binary, downloading and verifying
-// it on first use. Options exist for tests; real runs use the defaults.
+// it on first use. Options other than the defaults exist for tests.
 async function ensureBinary(opts = {}) {
   const env = opts.env || process.env;
   const log = opts.log || ((msg) => process.stderr.write(`cpm-planner (npm): ${msg}\n`));
-  if (env.CPM_PLANNER_BINARY) {
-    if (!fs.existsSync(env.CPM_PLANNER_BINARY)) {
-      throw new LauncherError(`CPM_PLANNER_BINARY points to a missing file: ${env.CPM_PLANNER_BINARY}`);
-    }
-    return env.CPM_PLANNER_BINARY;
-  }
+  if (env.CPM_PLANNER_BINARY) return checkLocalBinary(env.CPM_PLANNER_BINARY);
+  const limits = { ...DEFAULT_LIMITS, ...opts.limits };
   const version = opts.version || PKG_VERSION;
   const t = opts.target || hostTarget(opts.platform, opts.arch);
   const versionDir = path.join(opts.cacheRoot || cacheRoot(env), BIN, version);
   const finalPath = path.join(versionDir, t.binary);
-  if (fs.existsSync(finalPath)) return finalPath;
+  if (fs.existsSync(finalPath)) {
+    checkCachedBinary(versionDir, finalPath);
+    return finalPath;
+  }
 
   const base = parseBase(env.CPM_PLANNER_DOWNLOAD_BASE || DEFAULT_BASE, env);
   const allowedHosts = [...new Set([base.host, ...REDIRECT_HOSTS])];
-  fs.mkdirSync(versionDir, { recursive: true });
-  const release = await acquireLock(path.join(versionDir, '.lock'), () => fs.existsSync(finalPath), opts.lock);
-  if (!release) return finalPath;
+  fs.mkdirSync(versionDir, { recursive: true, mode: 0o700 });
+  checkCacheDirTrust(versionDir);
+  // Handlers go in before the lock exists, so no signal can orphan it.
+  const state = { workDir: null, release: null };
+  const removeSignalHandlers = cleanupOnSignals(() => {
+    if (state.workDir) fs.rmSync(state.workDir, { recursive: true, force: true });
+    if (state.release) state.release();
+  });
   try {
-    if (!fs.existsSync(finalPath)) {
-      await downloadAndInstall({ version, t, base, allowedHosts, env, versionDir, finalPath, log });
+    state.release = await acquireLock(path.join(versionDir, LOCK_FILE), () => fs.existsSync(finalPath), opts.lock);
+    if (state.release && !fs.existsSync(finalPath)) {
+      await downloadAndInstall({ version, t, base, allowedHosts, env, versionDir, finalPath, log, limits, state });
+    } else {
+      checkCachedBinary(versionDir, finalPath);
     }
     return finalPath;
   } finally {
-    release();
+    removeSignalHandlers();
+    if (state.release) state.release();
   }
 }
 
@@ -372,7 +523,11 @@ module.exports = {
   hostTarget,
   cacheRoot,
   parseBase,
+  checkRedirect,
+  redact,
   expectedDigest,
+  unsafeEntry,
+  specialEntry,
   acquireLock,
   ensureBinary,
   formatError,

@@ -56,8 +56,9 @@ launcher.
    and `checksums.sha256` from the same release, where `<version>` is this
    package's version. Only HTTPS is used. Redirects are followed only to
    `github.com`, `objects.githubusercontent.com` and
-   `release-assets.githubusercontent.com` (or the mirror's own host). Each
-   download has a timeout and a 128 MiB size cap.
+   `release-assets.githubusercontent.com` (or the mirror's own host), at most
+   five times. Each download has a timeout and a 128 MiB size cap. A user and
+   password in a mirror URL are never printed.
 3. Verifies the archive's SHA-256 against `checksums.sha256` before extracting
    it. On any failure the partial files are deleted.
 4. Extracts the binary with the system tools. A `.tar.gz` goes through `tar`,
@@ -72,8 +73,16 @@ launcher.
    | Linux, macOS | `$XDG_CACHE_HOME/cpm-planner/<version>/`, else `~/.cache/cpm-planner/<version>/` |
 
    A lock file makes concurrent first runs (two MCP clients starting at once)
-   download only once. Later runs start the cached binary with no network
-   access.
+   download only once. The lock records its owner's pid, so a lock left by a
+   killed process is taken over at once, and an interrupted download removes
+   its lock and partial files before exiting. Later runs start the cached
+   binary with no network access.
+
+   The binary's SHA-256 is stored in `.verified` next to it and checked on
+   every start. On Linux and macOS the version directory is created private
+   (mode 700), and a cached binary is refused if that directory belongs to
+   another user or is writable by group or others. Delete the directory to
+   download the binary again.
 6. Starts the binary with stdin, stdout and stderr inherited, and forwards its
    exit code and the signals SIGINT, SIGTERM and (not on Windows) SIGHUP.
 
@@ -95,7 +104,7 @@ scripts are disabled (`--ignore-scripts`), when `CI` is set, when
 
 | Variable | Effect |
 | --- | --- |
-| `CPM_PLANNER_BINARY` | Path to a `cpm-planner` executable to run instead of downloading one. It must be a native executable, not a shell or `.cmd` script. |
+| `CPM_PLANNER_BINARY` | Path to a `cpm-planner` executable to run instead of downloading one. It must be a native executable (`cpm-planner.exe` on Windows); `.cmd` and `.bat` files are refused. |
 | `CPM_PLANNER_DOWNLOAD_BASE` | Release base URL for a mirror, in place of `https://github.com/praxec/cpm-planner/releases`. Files are fetched from `<base>/download/v<version>/`. |
 | `CPM_PLANNER_CACHE_DIR` | Cache root in place of the default above. |
 | `CPM_PLANNER_SKIP_DOWNLOAD=1` | Skip the install-time pre-fetch. |

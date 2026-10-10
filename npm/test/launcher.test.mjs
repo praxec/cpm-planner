@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { BIN_JS, launcher, releaseFiles, startServer, tempDir, insecureEnv } from './helpers.mjs';
+import { BIN_JS, PKG_VERSION, launcher, releaseFiles, startServer, tempDir, insecureEnv } from './helpers.mjs';
 
 const POSIX = process.platform !== 'win32';
 
@@ -88,4 +88,37 @@ test('a first run that downloads writes nothing to stdout before the server star
   child.stdout.on('data', (d) => { stdout += d; });
   await new Promise((resolve) => child.on('close', resolve));
   assert.equal(stdout, 'server-output\n');
+});
+
+test('a server killed by a signal makes the launcher die by the same signal', { skip: !POSIX }, (t) => {
+  const script = fakeServer(t, "process.kill(process.pid, 'SIGTERM');\nsetInterval(() => {}, 1000);\n");
+  const res = runLauncher([script], { CPM_PLANNER_BINARY: process.execPath });
+  assert.equal(res.signal, 'SIGTERM');
+});
+
+// Starts a first run against a release server that holds the asset response,
+// waits until the launcher holds the lock, then sends SIGTERM.
+async function interruptFirstDownload(t) {
+  const target = launcher.hostTarget();
+  const routes = releaseFiles(t, { target });
+  routes[`/download/v${PKG_VERSION}/${target.asset}`].delayMs = 5000;
+  const { base } = await startServer(t, routes);
+  const cache = tempDir(t);
+  const dir = path.join(cache, 'cpm-planner', PKG_VERSION);
+  const child = spawn(process.execPath, [BIN_JS], { env: cleanEnv(insecureEnv(base, { CPM_PLANNER_CACHE_DIR: cache })) });
+  child.stderr.resume();
+  while (!fs.existsSync(path.join(dir, '.lock'))) await new Promise((r) => setTimeout(r, 20));
+  child.kill('SIGTERM');
+  const signal = await new Promise((resolve) => child.on('exit', (_code, sig) => resolve(sig)));
+  return { dir, signal };
+}
+
+test('SIGTERM during the first download removes the lock and the partial download', { skip: !POSIX }, async (t) => {
+  const { dir } = await interruptFirstDownload(t);
+  assert.deepEqual(fs.readdirSync(dir), []);
+});
+
+test('SIGTERM during the first download still terminates the launcher by SIGTERM', { skip: !POSIX }, async (t) => {
+  const { signal } = await interruptFirstDownload(t);
+  assert.equal(signal, 'SIGTERM');
 });

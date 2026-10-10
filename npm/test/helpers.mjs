@@ -49,10 +49,20 @@ export function buildArchive(t, target, content) {
   return fs.readFileSync(path.join(work, target.asset));
 }
 
+// Packs whatever `setup(stageDir)` creates into a .tar.gz (POSIX tar layout).
+export function buildTarWith(t, name, setup) {
+  const work = tempDir(t, 'cpm-npm-archive-');
+  const stage = path.join(work, 'stage');
+  fs.mkdirSync(stage);
+  setup(stage);
+  execFileSync('tar', ['-czf', name, '-C', 'stage', ...fs.readdirSync(stage)], { cwd: work });
+  return fs.readFileSync(path.join(work, name));
+}
+
 // Release files for `version`: the archive plus a checksums.sha256 in the
 // release-manifest.sh format. `checksumOf` lets a test publish a wrong digest.
-export function releaseFiles(t, { version = PKG_VERSION, target, content = 'fake cpm-planner\n', checksumOf } = {}) {
-  const archive = buildArchive(t, target, content);
+export function releaseFiles(t, { version = PKG_VERSION, target, content = 'fake cpm-planner\n', checksumOf, archive: given } = {}) {
+  const archive = given ?? buildArchive(t, target, content);
   const digest = sha256(checksumOf ?? archive);
   return {
     [`/download/v${version}/${target.asset}`]: { body: archive },

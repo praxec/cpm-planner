@@ -23,15 +23,18 @@ function warn(msg) {
   }
 }
 
-async function main() {
-  const reason = skipReason(process.env);
-  if (reason) return;
+// Runs the pre-fetch unless skipReason() says not to. `ensure` is injectable
+// for tests. Resolves to the skip reason, or null when a pre-fetch was tried.
+async function main(env = process.env, ensure = null) {
+  const reason = skipReason(env);
+  if (reason) return reason;
   try {
-    const { ensureBinary } = require('./install.js');
-    await ensureBinary({ log: warn });
+    const run = ensure || require('./install.js').ensureBinary;
+    await run({ env, log: warn });
   } catch (err) {
     warn(`pre-fetch skipped (${err && err.message ? err.message : err}); the binary will be downloaded on first run`);
   }
+  return null;
 }
 
 if (require.main === module) {
@@ -40,4 +43,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { skipReason };
+module.exports = { skipReason, main };

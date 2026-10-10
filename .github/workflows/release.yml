@@ -194,7 +194,9 @@ jobs:
           tarball="matthew-cochran-cpm-${VERSION}.tgz"
           (cd npm && npm pack --ignore-scripts --pack-destination ../dist)
           [ -s "dist/${tarball}" ] || { echo "::error::npm pack did not produce dist/${tarball}"; exit 1; }
-          gh release upload "$TAG" "dist/${tarball}" --clobber
+          # The maintainer checks the tarball against this digest before publishing.
+          (cd dist && sha256sum "${tarball}" > npm-package.sha256)
+          gh release upload "$TAG" "dist/${tarball}" dist/npm-package.sha256 --clobber
       - name: publish release (complete matrix verified)
         shell: bash
         env:

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { launcher, INSTALL_JS, PKG_VERSION, releaseFiles, startServer, tempDir, insecureEnv, quiet } from './helpers.mjs';
+import { launcher, INSTALL_JS, PKG_VERSION, releaseFiles, sha256, startServer, tempDir, insecureEnv, quiet } from './helpers.mjs';
 
 const { ensureBinary, hostTarget } = launcher;
 const TARGET = hostTarget();
@@ -39,8 +39,9 @@ test('a checksum mismatch leaves no partial download or binary in the cache', as
 
 test('a cached binary is used without any download', async (t) => {
   const cache = tempDir(t);
-  fs.mkdirSync(versionDir(cache), { recursive: true });
+  fs.mkdirSync(versionDir(cache), { recursive: true, mode: 0o700 });
   fs.writeFileSync(path.join(versionDir(cache), TARGET.binary), 'cached');
+  fs.writeFileSync(path.join(versionDir(cache), '.verified'), `${sha256('cached')}\n`);
   const { base, hits } = await startServer(t, releaseFiles(t, { target: TARGET }));
   await install(cache, insecureEnv(base));
   assert.deepEqual(hits, {});
