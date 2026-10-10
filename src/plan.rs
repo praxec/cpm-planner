@@ -271,6 +271,20 @@ pub struct Estimate {
     pub pessimistic: f32,
 }
 
+/// How partial progress on a deliverable converts to earned percent for
+/// earned value ([`Deliverable::earning_rule`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EarningRule {
+    /// 100% only when Complete.
+    #[default]
+    ZeroHundred,
+    /// 50% once started (or any percent reported), 100% when Complete.
+    FiftyFifty,
+    /// The reported percent, 100% when Complete.
+    Weighted,
+}
+
 /// A single unit of work scheduled by the Planner.
 ///
 /// `owned_files` is the load-bearing field for concurrent dispatch: the
@@ -329,6 +343,25 @@ pub struct Deliverable {
     /// with `metadata.milestone == true` is treated the same way.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub milestone: bool,
+
+    /// How earned value credits partial progress. `None` means
+    /// [`EarningRule::ZeroHundred`]; an explicit `zero_hundred` deserializes
+    /// as `None` and hashes like it. Part of the plan's identity (hashed).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_earning_rule"
+    )]
+    pub earning_rule: Option<EarningRule>,
+}
+
+/// The default rule is normalised to `None`, so `"zero_hundred"` and an
+/// absent rule describe the same deliverable.
+fn deserialize_earning_rule<'de, D>(d: D) -> Result<Option<EarningRule>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<EarningRule>::deserialize(d)?.filter(|r| *r != EarningRule::ZeroHundred))
 }
 
 impl Deliverable {
@@ -427,12 +460,26 @@ impl AcquireRequest {
 }
 
 /// Request bundle for [`crate::ports::Planner::mark_status`].
+///
+/// The optional progress fields feed earned value and are validated as
+/// `INVALID_ACTUALS`: `earned_pct` is 0..=100 and only accepted with
+/// `InProgress` (with `Complete` it is accepted and ignored),
+/// `actual_effort_hours` is finite and in `0..=`[`MAX_HOURS`], and
+/// `evidence` is at most [`MAX_EVIDENCE_CHARS`] characters, with at most
+/// [`MAX_EVIDENCE_ENTRIES`] kept per deliverable.
 #[derive(Debug, Clone)]
 pub struct MarkStatusRequest {
     pub plan_id: PlanId,
     pub deliverable_id: String,
     pub caller_id: CallerId,
     pub status: DeliverableStatus,
+    /// Reported percent complete; replaces the stored value.
+    pub earned_pct: Option<u8>,
+    /// Reported total effort so far, in hours; replaces the stored value and
+    /// takes precedence over leased hours for actual cost.
+    pub actual_effort_hours: Option<f32>,
+    /// One evidence note, appended to the deliverable's evidence list.
+    pub evidence: Option<String>,
 }
 
 impl MarkStatusRequest {
@@ -447,7 +494,28 @@ impl MarkStatusRequest {
             deliverable_id: deliverable_id.into(),
             caller_id,
             status,
+            earned_pct: None,
+            actual_effort_hours: None,
+            evidence: None,
         }
+    }
+
+    /// Report the percent complete (0..=100).
+    pub fn with_earned_pct(mut self, pct: u8) -> Self {
+        self.earned_pct = Some(pct);
+        self
+    }
+
+    /// Report the total effort spent so far, in hours.
+    pub fn with_actual_effort_hours(mut self, hours: f32) -> Self {
+        self.actual_effort_hours = Some(hours);
+        self
+    }
+
+    /// Append one evidence note.
+    pub fn with_evidence(mut self, evidence: impl Into<String>) -> Self {
+        self.evidence = Some(evidence.into());
+        self
     }
 }
 
@@ -1013,6 +1081,13 @@ pub const MAX_DELIVERABLES: usize = 5000;
 /// overflow.
 pub const MAX_HOURS: f32 = 1_000_000.0;
 
+/// Longest `evidence` note `mark_status` accepts, in characters.
+pub const MAX_EVIDENCE_CHARS: usize = 2048;
+
+/// Most evidence entries one deliverable keeps; appending beyond it is
+/// `INVALID_ACTUALS`.
+pub const MAX_EVIDENCE_ENTRIES: usize = 100;
+
 /// Reserved id of the synthetic zero-effort source node in every plan's CPM.
 pub const START_ID: &str = "__start__";
 /// Reserved id of the synthetic zero-effort sink node in every plan's CPM.
@@ -1187,6 +1262,20 @@ pub enum PlannerError {
     #[error("ARCHIVE_REFUSED: {reason}")]
     ArchiveRefused { reason: String },
 
+    /// `mark_status` progress fields failed validation: `earned_pct` above
+    /// 100 or given with a status other than `in_progress`/`complete`,
+    /// `actual_effort_hours` not finite or outside `0..=1000000`, or
+    /// `evidence` longer than [`MAX_EVIDENCE_CHARS`] characters or beyond
+    /// [`MAX_EVIDENCE_ENTRIES`] entries for the deliverable.
+    #[error("INVALID_ACTUALS: {reason}")]
+    InvalidActuals { reason: String },
+
+    /// An earned-value read or snapshot (`plan.ev`, `plan.snapshot`)
+    /// targeted a plan that has no baseline yet; take one with
+    /// `plan.baseline` first.
+    #[error("NOT_BASELINED: plan {plan_id} has no baseline; take one with plan.baseline")]
+    NotBaselined { plan_id: String },
+
     /// Catch-all for backend failures (DB unavailable, serialization
     /// errors against the persistence layer, etc.). Wraps the underlying
     /// `anyhow::Error` so the caller can introspect via `source()`.
@@ -1214,6 +1303,7 @@ mod tests {
                 duration_hours: None,
                 estimate: None,
                 milestone: false,
+                earning_rule: None,
             }],
             max_chained_dispatch: Some(8),
         };
@@ -1233,6 +1323,18 @@ mod tests {
         assert_eq!(d.metadata, serde_json::json!({"description": "smoke test"}));
         assert_eq!(back.max_chained_dispatch, Some(8));
         Ok(())
+    }
+
+    #[test]
+    fn explicit_default_earning_rule_deserializes_as_absent() {
+        let d: Deliverable = serde_json::from_value(serde_json::json!({
+            "id": "a",
+            "owned_files": [],
+            "prerequisites": [],
+            "earning_rule": "zero_hundred"
+        }))
+        .unwrap();
+        assert_eq!(d.earning_rule, None);
     }
 
     /// `DeliverableStatus` uses an internally-tagged enum representation
@@ -1276,6 +1378,7 @@ mod tests {
                         duration_hours: None,
                         estimate: None,
                         milestone: false,
+                        earning_rule: None,
                     },
                     lock: LockInfo {
                         plan_id: plan_id.clone(),
@@ -1295,6 +1398,7 @@ mod tests {
                         duration_hours: None,
                         estimate: None,
                         milestone: false,
+                        earning_rule: None,
                     },
                     lock: LockInfo {
                         plan_id: plan_id.clone(),

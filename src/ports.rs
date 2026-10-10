@@ -3,8 +3,12 @@
 //! textbook Critical Path Method implementation shipped by this crate.
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 
 use crate::compare::Comparison;
+use crate::earned_value::{
+    BaselineOutcome, BaselineRequest, EvReport, SnapshotOutcome, SnapshotRequest,
+};
 use crate::plan::{
     AcceptRequest, AcquireRequest, Cohort, ComparePlansRequest, ForceReleaseRequest, ForkRequest,
     HeartbeatRequest, MarkStatusRequest, PlanDefinition, PlanGraph, PlanId, PlanLineSummary,
@@ -38,7 +42,9 @@ use crate::revise::RevisionDiff;
 ///   `accept`, `force_release`) on a named variant that is not its line's
 ///   selected variant return [`PlannerError::VariantNotSelected`], and on
 ///   any variant of an archived line [`PlannerError::ArchiveRefused`];
-///   unnamed plans and read/analysis methods are never gated.
+///   unnamed plans and read/analysis methods are never gated. The
+///   earned-value writes [`Planner::baseline`] and [`Planner::snapshot`] are
+///   gated the same way; [`Planner::ev`] is a read and is not.
 #[async_trait]
 pub trait Planner: Send + Sync {
     /// Submit a [`PlanGraph`]. Idempotent on `(graph, caller_id)`; an
@@ -54,7 +60,10 @@ pub trait Planner: Send + Sync {
 
     /// Update the lifecycle state of a deliverable. Setting `Complete` or
     /// `Failed` releases the lock; `caller_id` MUST be the lock holder or the
-    /// call is rejected with [`PlannerError::LockNotHeld`].
+    /// call is rejected with [`PlannerError::LockNotHeld`]. Optional
+    /// earned-value progress fields are validated as
+    /// [`PlannerError::InvalidActuals`] (see [`MarkStatusRequest`]) and
+    /// stored with the mark.
     async fn mark_status(&self, req: MarkStatusRequest) -> Result<(), PlannerError>;
 
     /// Refresh the TTL on a held lock. Rejected with
@@ -196,4 +205,47 @@ pub trait Planner: Send + Sync {
         path: Option<&str>,
         force: bool,
     ) -> Result<String, PlannerError>;
+
+    /// Freeze the plan's current CPM schedule and budgets as its next
+    /// numbered earned-value baseline. Baselines belong to one plan (one
+    /// variant): the first is number 1 and needs no reason; a re-baseline
+    /// needs a non-blank `reason` (`INVALID_GRAPH` otherwise) and keeps
+    /// actuals and snapshots. `start` defaults to now; `calendar` defaults
+    /// to wall-clock hours on the first baseline and to the previous
+    /// baseline's calendar on a re-baseline. Gated like the execution
+    /// methods. Audited as `plan.ev.baselined`.
+    async fn baseline(&self, req: BaselineRequest) -> Result<BaselineOutcome, PlannerError>;
+
+    /// The earned-value report of `plan_id` against its latest baseline as
+    /// of `as_of` (default now). `as_of` is the PV status date; EV and AC
+    /// reflect progress and actuals recorded up to the moment the call
+    /// runs. AC includes the spend of removed and unbaselined deliverables;
+    /// a removed baselined deliverable reports status `removed` and earns
+    /// its frozen percent. Alerts compare the two latest stored
+    /// non-backfilled snapshots (by `as_of`) of that baseline; the current
+    /// reading is not one of them. `NOT_BASELINED` before the first
+    /// baseline. Read-only.
+    ///
+    /// The returned future does its store reads and CPM work synchronously,
+    /// so it blocks whatever polls it; async callers should drive it on a
+    /// blocking thread (the MCP server does).
+    async fn ev(
+        &self,
+        plan_id: &PlanId,
+        as_of: Option<DateTime<Utc>>,
+    ) -> Result<EvReport, PlannerError>;
+
+    /// Compute the earned-value report (as [`Planner::ev`]) and append it as
+    /// a snapshot. Its alerts consider only readings up to its own
+    /// `(as_of, taken_at)` position: this snapshot and the latest earlier
+    /// one of the current baseline, skipping backfilled snapshots (`as_of`
+    /// more than an hour before `taken_at`; flagged `backfilled`, and a
+    /// backfilled snapshot raises no alerts itself, since its EV and AC are
+    /// today's). Returns the summary, the stored count
+    /// and an export of the newest snapshots by `as_of` (an older backfill
+    /// is counted but not listed). `NOT_BASELINED` before the first
+    /// baseline. Gated like the execution methods.
+    ///
+    /// Blocks its poller like [`Planner::ev`].
+    async fn snapshot(&self, req: SnapshotRequest) -> Result<SnapshotOutcome, PlannerError>;
 }

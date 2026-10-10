@@ -45,11 +45,17 @@ pub mod algorithm;
 pub mod audit;
 pub mod compare;
 pub mod drag;
+pub mod earned_value;
 pub mod edits;
 pub mod estimator;
+pub(crate) mod ev_store;
 mod graph;
+#[cfg(test)]
+mod lease_hours_tests;
 pub mod lint;
 mod locks;
+#[cfg(test)]
+mod mark_actuals_tests;
 pub mod metrics;
 pub mod monte_carlo;
 pub mod network_health;

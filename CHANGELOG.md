@@ -47,6 +47,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `duration_hours` (calendar time) per deliverable and `lag_hours` per prerequisite edge drive the schedule; effort stays the cost basis (#27).
 - `milestone: true` deliverables; `plan.status` reports per-milestone critical path and hours (#22).
 - `owned_files` entries may be `{path, mode: "append"}`; append claims may be co-leased and are reported in the cohort's `shared_paths` (#28).
+- `plan.baseline` freezes a plan's CPM schedule and budgets (effort × `metadata.cost_rate`) as a numbered earned-value baseline, with an optional working-time `calendar`; re-baselining requires a `reason`, keeps actuals and is audited as `plan.ev.baselined` (#16).
+- `plan.ev` reports PV, EV, AC, SV, CV, SPI, CPI, EAC, ETC, VAC and TCPI against the latest baseline as of any instant; undefined ratios are `null` with a reason in `undefined`, never NaN (#16).
+- `plan.snapshot` appends an EV snapshot and returns its summary with a JSON or Markdown (date, PV, EV, AC, SPI, CPI, EAC) export of the newest 100 snapshots by `as_of`; `SPI_BELOW_0_9` / `CPI_BELOW_0_9` alerts fire when the metric is below 0.9 on the two latest snapshots (by `as_of`) of the current baseline. Baselines and snapshots are per variant (#16).
+- Stable `NOT_BASELINED` error prefix for `plan.ev` and `plan.snapshot` on a plan without a baseline.
+- `plan.baseline` without `calendar` on a re-baseline keeps the previous baseline's calendar; the first baseline still counts wall-clock hours.
+- `Deliverable.earning_rule` (`zero_hundred` default, `fifty_fifty`, `weighted`) selects how a deliverable earns value. It is part of the plan's identity (dedup and drift hash); an explicit `zero_hundred` is the same as leaving it out.
+- `plan.mark_status` takes `earned_pct` (0–100, for `weighted`), `actual_effort_hours` and an `evidence` string (at most 2048 characters; at most 100 entries kept per deliverable). Invalid values are refused with the new stable `INVALID_ACTUALS` error prefix.
+- Leased hours accumulate on every lease end — release, completion, failure, force-release, TTL reaping, forced removal by `plan.revise`, and the startup quarantine — and serve as AC when no actual hours were reported.
+- `plan.select` carries the actuals (percent, hours, evidence) of the deliverables whose `Complete` status it carries over.
+- `plan.ev` / `plan.snapshot` semantics: `as_of` is the PV status date; EV and AC reflect progress and actuals recorded up to the moment the call runs. A snapshot whose `as_of` is more than an hour before its `taken_at` is marked `backfilled: true` and ignored by trend alerts, as the new reading and as an earlier one.
+- Removed scope in earned value: a baselined deliverable removed by `plan.revise` keeps the percent it had earned at removal (100 if `Complete`), and its `plan.ev` row reports status `removed`; adding the id back restarts its earned percent. AC sums every recorded hour of the plan (removed and unbaselined deliverables included, at rate 1 when the baseline has no row), so spend survives removal and re-baselining.
+- SQLite schema v4 (`PRAGMA user_version` = 4): `baselines`, `ev_actuals` (with `removed_at_us` / `frozen_pct` for removed scope) and `ev_snapshots`.
 
 ### Fixed
 
@@ -70,6 +82,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Library API (breaking for library users): `Deliverable` gains the public field `earning_rule` and `MarkStatusRequest` the public fields `earned_pct`, `actual_effort_hours` and `evidence` (struct literals must set them); `PlannerError` gains `InvalidActuals` and `NotBaselined`; the `Planner` trait gains required methods `baseline`, `ev` and `snapshot` (breaks other implementors). New public module `earned_value` (`Baseline`, `BaselineRow`, `Calendar`, `Actuals`, `EvReport`, `EvRow`, `EvRowStatus`, `EvSummary`, `BaselineRequest`, `BaselineOutcome`, `SnapshotRequest`, `SnapshotOutcome`, `SnapshotSummary`, `SnapshotFormat`, `compute_ev`, `build_baseline`, `trend_alerts`, `render_snapshots_markdown`, …) and `plan::EarningRule`.
 - The lease reaper and the startup quarantine re-derive a released deliverable's status with the single rule used by revision (`Ready` when every prerequisite is `Complete`, else `Pending`).
 - `definition_drift` compares the tracked file's graph with the head graph (re-formatting is not drift; an inline revise is drift until re-export or re-sync); an identical inline sync no longer resets the tracked file hash.
 - `plan.sync {path}` rejects a `name`, `variant` or `project` that contradicts the path; project keys reject invisible Unicode format characters (bidi overrides, zero-width, BOM, separators).

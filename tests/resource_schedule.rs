@@ -16,6 +16,7 @@ fn d(id: &str, hours: f32, owner: &str, prereqs: &[&str]) -> Deliverable {
         estimate: None,
         metadata: serde_json::json!({ "owner": owner }),
         milestone: false,
+        earning_rule: None,
     }
 }
 

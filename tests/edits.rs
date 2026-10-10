@@ -17,6 +17,7 @@ fn deliverable(id: &str, prereqs: &[&str]) -> Deliverable {
         estimate: None,
         metadata: serde_json::Value::Null,
         milestone: false,
+        earning_rule: None,
     }
 }
 

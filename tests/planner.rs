@@ -26,6 +26,7 @@ fn deliverable(id: &str, files: &[&str], prereqs: &[&str], effort: Option<f32>) 
         duration_hours: None,
         estimate: None,
         milestone: false,
+        earning_rule: None,
     }
 }
 
@@ -2123,4 +2124,151 @@ async fn submit_rejects_more_than_5000_deliverables() {
         err.to_string(),
         "INVALID_GRAPH: plan has 5001 deliverables; maximum is 5000"
     );
+}
+
+#[tokio::test]
+async fn earning_rule_changes_plan_identity() {
+    let planner = BasicCpmPlanner::new();
+    let plain = deliverable("a", &["src/a.rs"], &[], Some(1.0));
+    let mut weighted = plain.clone();
+    weighted.earning_rule = Some(cpm_planner::plan::EarningRule::Weighted);
+    let graph = |d: Deliverable| PlanGraph {
+        deliverables: vec![d],
+        max_chained_dispatch: None,
+    };
+    let id1 = planner.submit_plan(graph(plain)).await.unwrap();
+    let id2 = planner.submit_plan(graph(weighted)).await.unwrap();
+    assert_ne!(id1, id2);
+}
+
+/// One ready deliverable `a`, leased to `w1`.
+async fn leased_a() -> (BasicCpmPlanner, PlanId) {
+    let planner = BasicCpmPlanner::new();
+    let plan_id = planner
+        .submit_plan(PlanGraph {
+            deliverables: vec![deliverable("a", &["src/a.rs"], &[], Some(1.0))],
+            max_chained_dispatch: None,
+        })
+        .await
+        .unwrap();
+    planner
+        .acquire_cohort(AcquireRequest::new(plan_id.clone(), caller("w1"), 1))
+        .await
+        .unwrap();
+    (planner, plan_id)
+}
+
+fn mark_a(plan_id: &PlanId, status: DeliverableStatus) -> MarkStatusRequest {
+    MarkStatusRequest::new(plan_id.clone(), "a", caller("w1"), status)
+}
+
+async fn mark_error(req: impl FnOnce(&PlanId) -> MarkStatusRequest) -> String {
+    let (planner, plan_id) = leased_a().await;
+    planner
+        .mark_status(req(&plan_id))
+        .await
+        .unwrap_err()
+        .to_string()
+}
+
+#[tokio::test]
+async fn earned_pct_is_rejected_with_status_ready() {
+    let err = mark_error(|p| mark_a(p, DeliverableStatus::Ready).with_earned_pct(40)).await;
+    assert_eq!(
+        err,
+        "INVALID_ACTUALS: earned_pct is only accepted with status in_progress (or complete, where it is ignored)"
+    );
+}
+
+#[tokio::test]
+async fn earned_pct_is_rejected_with_status_failed() {
+    let err = mark_error(|p| {
+        mark_a(p, DeliverableStatus::Failed { reason: "x".into() }).with_earned_pct(40)
+    })
+    .await;
+    assert!(err.starts_with("INVALID_ACTUALS:"), "{err}");
+}
+
+#[tokio::test]
+async fn earned_pct_above_100_is_rejected() {
+    let err = mark_error(|p| mark_a(p, DeliverableStatus::InProgress).with_earned_pct(101)).await;
+    assert_eq!(
+        err,
+        "INVALID_ACTUALS: earned_pct must be an integer 0..=100, got 101"
+    );
+}
+
+#[tokio::test]
+async fn earned_pct_with_complete_is_accepted() {
+    let (planner, plan_id) = leased_a().await;
+    let out = planner
+        .mark_status(mark_a(&plan_id, DeliverableStatus::Complete).with_earned_pct(30))
+        .await;
+    assert!(out.is_ok());
+}
+
+#[tokio::test]
+async fn non_finite_actual_hours_are_rejected() {
+    let err =
+        mark_error(|p| mark_a(p, DeliverableStatus::InProgress).with_actual_effort_hours(f32::NAN))
+            .await;
+    assert_eq!(
+        err,
+        "INVALID_ACTUALS: actual_effort_hours must be a finite number between 0 and 1000000, got NaN"
+    );
+}
+
+#[tokio::test]
+async fn negative_actual_hours_are_rejected() {
+    let err =
+        mark_error(|p| mark_a(p, DeliverableStatus::InProgress).with_actual_effort_hours(-1.0))
+            .await;
+    assert!(
+        err.starts_with("INVALID_ACTUALS: actual_effort_hours"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn actual_hours_above_one_million_are_rejected() {
+    let err = mark_error(|p| {
+        mark_a(p, DeliverableStatus::InProgress).with_actual_effort_hours(1_000_001.0)
+    })
+    .await;
+    assert!(
+        err.starts_with("INVALID_ACTUALS: actual_effort_hours"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn evidence_over_2048_chars_is_rejected() {
+    let err =
+        mark_error(|p| mark_a(p, DeliverableStatus::InProgress).with_evidence("é".repeat(2049)))
+            .await;
+    assert_eq!(
+        err,
+        "INVALID_ACTUALS: evidence must be at most 2048 characters, got 2049"
+    );
+}
+
+#[tokio::test]
+async fn evidence_of_2048_chars_is_accepted() {
+    let (planner, plan_id) = leased_a().await;
+    let out = planner
+        .mark_status(
+            mark_a(&plan_id, DeliverableStatus::InProgress).with_evidence("é".repeat(2048)),
+        )
+        .await;
+    assert!(out.is_ok());
+}
+
+#[tokio::test]
+async fn rejected_actuals_leave_the_status_unchanged() {
+    let (planner, plan_id) = leased_a().await;
+    let _ = planner
+        .mark_status(mark_a(&plan_id, DeliverableStatus::Complete).with_actual_effort_hours(-1.0))
+        .await;
+    let status = planner.status(&plan_id).await.unwrap();
+    assert_eq!(status.deliverables[0].1, DeliverableStatus::InProgress);
 }

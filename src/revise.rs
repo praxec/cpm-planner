@@ -89,6 +89,10 @@ fn prereq_set(d: &Deliverable) -> BTreeSet<&str> {
 /// re-derived), falling back to the later one in graph order when neither or
 /// both changed.
 ///
+/// Every lease of `old` that does not survive (removed deliverable, forced
+/// release, lapsed) is credited with its hours up to `now` (up to its
+/// expiry when lapsed) in the new state's `leased_hours`.
+///
 /// Errors: `LOCK_HELD` when a removed deliverable holds a live lock, or two
 /// surviving leases would claim conflicting files, and `force` is false; any
 /// error from the CPM recomputation on `new`.
@@ -342,6 +346,17 @@ pub(crate) fn plan_revision(
         }
     }
     diff.released_locks.sort();
+    // Every lease that did not survive ended now (or at its expiry, if it
+    // had lapsed); lease hours already ended on `old` carry over.
+    for (id, hours) in &old.leased_hours {
+        *state.leased_hours.entry(id.clone()).or_insert(0.0) += hours;
+    }
+    state.actuals_updated_at = old.actuals_updated_at;
+    for (id, l) in &old.locks {
+        if !state.locks.contains_key(id) {
+            state.record_lease_end(l, l.expires_at.min(now));
+        }
+    }
     Ok((state, diff))
 }
 
@@ -370,6 +385,7 @@ mod tests {
             estimate: None,
             metadata: json!({}),
             milestone: false,
+            earning_rule: None,
         }
     }
 

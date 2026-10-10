@@ -65,6 +65,7 @@ fn deliverable(
         duration_hours: None,
         estimate: None,
         milestone: false,
+        earning_rule: None,
     }
 }
 

@@ -4,7 +4,8 @@
 //! plans (graph + cached CPM result), per-deliverable statuses, held
 //! cohort locks, the submit-dedup map, and (schema v3) the portfolio tables
 //! — named plan lines, variants and revisions, queried by
-//! `crate::portfolio`. Every planner operation loads
+//! `crate::portfolio` — and (schema v4) the earned-value tables, accessed
+//! through `crate::ev_store`. Every planner operation loads
 //! the relevant [`PlanState`] from SQLite, runs the in-memory scheduling
 //! logic, and writes the result back — all inside ONE
 //! `BEGIN IMMEDIATE` transaction.
@@ -29,7 +30,8 @@
 //! lapsed: the lock row is deleted and the deliverable's status goes back
 //! to `ready` (its prerequisites were complete when it was acquired and
 //! TTL expiry does not unwind upstream work — the same rule as
-//! [`PlanState::reap_expired`]). A deliverable left `in_progress` with no
+//! [`PlanState::reap_expired`]), and the lease's hours up to expiry are
+//! added to `ev_actuals.leased_hours`. A deliverable left `in_progress` with no
 //! lock row at all (a crash between partial writes on a pre-WAL database,
 //! or manual surgery) is likewise reset to `ready`. Locks that are still
 //! within TTL are preserved: another process may legitimately be working
@@ -173,6 +175,34 @@ impl SqlitePlanStore {
             stmt.query_map(params![now_us], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<Result<_, _>>()?
         };
+        // Each expired lease is credited with its hours up to expiry (the
+        // in-memory reaper's rule). Orphans have no lock row, so no hours.
+        {
+            let mut stmt = tx.prepare(
+                "SELECT plan_id, deliverable_id, acquired_at_us, expires_at_us
+                 FROM locks WHERE expires_at_us < ?1",
+            )?;
+            let leases: Vec<(String, String, i64, i64)> = stmt
+                .query_map(params![now_us], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })?
+                .collect::<Result<_, _>>()?;
+            for (plan_id, deliverable_id, acquired_us, expires_us) in leases {
+                let start = dt_from_micros(acquired_us, "locks.acquired_at_us")
+                    .map_err(|e| anyhow!("{e}"))?;
+                let end = dt_from_micros(expires_us, "locks.expires_at_us")
+                    .map_err(|e| anyhow!("{e}"))?;
+                let hours = crate::locks::hours_between(start, end);
+                crate::ev_store::add_leased_hours(
+                    &tx,
+                    &PlanId(plan_id),
+                    &deliverable_id,
+                    hours,
+                    end,
+                )
+                .map_err(|e| anyhow!("{e}"))?;
+            }
+        }
         let orphans: Vec<(String, String)> = {
             let mut stmt = tx.prepare(
                 "SELECT plan_id, deliverable_id FROM deliverable_statuses
@@ -277,8 +307,8 @@ impl SqlitePlanStore {
             return Ok(PlanId(plan_id));
         }
 
-        let (plan_id, state) = build()?;
-        insert_plan(&tx, &plan_id, &state, Utc::now())?;
+        let (plan_id, mut state) = build()?;
+        insert_plan(&tx, &plan_id, &mut state, Utc::now())?;
         tx.execute(
             "INSERT INTO submit_dedup (graph_hash, plan_id) VALUES (?1, ?2)",
             params![graph_hash, plan_id.0],
@@ -336,7 +366,7 @@ impl SqlitePlanStore {
                 plan_id: plan_id.0.clone(),
             })?;
         let out = f(&mut state)?;
-        save_plan_state(&tx, plan_id, &state)?;
+        save_plan_state(&tx, plan_id, &mut state)?;
         tx.commit().map_err(backend)?;
         Ok(out)
     }
@@ -410,9 +440,10 @@ impl SqlitePlanStore {
 /// last one applied. Each step must be idempotent against databases created
 /// before versioning existed (user_version 0 but tables present).
 const MIGRATIONS: &[fn(&Connection) -> anyhow::Result<()>] = &[
-    migrate_v1_base_schema, // tables + counter columns (pre-versioning layout)
-    migrate_v2_cpm_version, // plans.cpm_version
-    migrate_v3_portfolio,   // plan_lines, variants, revisions
+    migrate_v1_base_schema,  // tables + counter columns (pre-versioning layout)
+    migrate_v2_cpm_version,  // plans.cpm_version
+    migrate_v3_portfolio,    // plan_lines, variants, revisions
+    migrate_v4_earned_value, // baselines, ev_actuals, ev_snapshots
 ];
 
 /// Runs the whole ladder plus the stale sweep in one immediate transaction,
@@ -529,6 +560,52 @@ fn migrate_v3_portfolio(conn: &Connection) -> anyhow::Result<()> {
          );",
     )
     .context("creating portfolio tables")
+}
+
+/// Earned-value tables (see [`crate::ev_store`]): numbered frozen
+/// baselines, per-deliverable actuals (reported percent, actual hours,
+/// accumulated lease hours, evidence list) and EV snapshots. Rows of a
+/// deliverable later removed from the graph are kept: its baselined budget
+/// and actual cost still count.
+fn migrate_v4_earned_value(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS baselines (
+             plan_id       TEXT NOT NULL REFERENCES plans(plan_id) ON DELETE CASCADE,
+             number        INTEGER NOT NULL,
+             start_us      INTEGER NOT NULL,
+             calendar      TEXT,
+             rows          TEXT NOT NULL,
+             bac           REAL NOT NULL,
+             reason        TEXT,
+             created_at_us INTEGER NOT NULL,
+             PRIMARY KEY (plan_id, number)
+         );
+         CREATE TABLE IF NOT EXISTS ev_actuals (
+             plan_id        TEXT NOT NULL REFERENCES plans(plan_id) ON DELETE CASCADE,
+             deliverable_id TEXT NOT NULL,
+             earned_pct     INTEGER,
+             actual_hours   REAL,
+             leased_hours   REAL NOT NULL DEFAULT 0,
+             evidence       TEXT NOT NULL DEFAULT '[]',
+             updated_at_us  INTEGER,
+             removed_at_us  INTEGER,
+             frozen_pct     INTEGER,
+             PRIMARY KEY (plan_id, deliverable_id)
+         );
+         CREATE TABLE IF NOT EXISTS ev_snapshots (
+             plan_id     TEXT NOT NULL REFERENCES plans(plan_id) ON DELETE CASCADE,
+             taken_at_us INTEGER NOT NULL,
+             as_of_us    INTEGER NOT NULL,
+             baseline_number INTEGER NOT NULL,
+             summary     TEXT NOT NULL,
+             PRIMARY KEY (plan_id, taken_at_us)
+         );
+         CREATE INDEX IF NOT EXISTS ev_snapshots_by_position
+             ON ev_snapshots(plan_id, baseline_number, as_of_us, taken_at_us);
+         CREATE INDEX IF NOT EXISTS ev_snapshots_by_as_of
+             ON ev_snapshots(plan_id, as_of_us, taken_at_us);",
+    )
+    .context("creating earned-value tables")
 }
 
 /// Recompute `cached_result` for every plan stored by an older CPM kernel.
@@ -718,6 +795,9 @@ pub(crate) fn load_plan_state(
         locks,
         file_claims,
         cached_result,
+        leased_hours: HashMap::new(),
+        reported_actuals: HashMap::new(),
+        actuals_updated_at: None,
     }))
 }
 
@@ -725,7 +805,7 @@ pub(crate) fn load_plan_state(
 pub(crate) fn insert_plan(
     tx: &Transaction<'_>,
     plan_id: &PlanId,
-    state: &PlanState,
+    state: &mut PlanState,
     now: DateTime<Utc>,
 ) -> Result<(), PlannerError> {
     let graph_json = serde_json::to_string(&state.graph).map_err(backend)?;
@@ -751,7 +831,7 @@ pub(crate) fn insert_plan(
 pub(crate) fn replace_plan_state(
     tx: &Transaction<'_>,
     plan_id: &PlanId,
-    state: &PlanState,
+    state: &mut PlanState,
 ) -> Result<(), PlannerError> {
     let graph_json = serde_json::to_string(&state.graph).map_err(backend)?;
     let result_json = serde_json::to_string(&state.cached_result).map_err(backend)?;
@@ -773,13 +853,15 @@ pub(crate) fn replace_plan_state(
     save_plan_state(tx, plan_id, state)
 }
 
-/// Persist the mutable parts of a [`PlanState`] (statuses + locks). The
+/// Persist the mutable parts of a [`PlanState`] (statuses, locks, and the
+/// lease hours ended and progress reported in this transaction, applied to
+/// `ev_actuals`). The
 /// graph and cached CPM result are written by [`insert_plan`] and only
 /// replaced by a revision ([`replace_plan_state`]).
 pub(crate) fn save_plan_state(
     tx: &Transaction<'_>,
     plan_id: &PlanId,
-    state: &PlanState,
+    state: &mut PlanState,
 ) -> Result<(), PlannerError> {
     {
         let mut stmt = tx
@@ -829,6 +911,18 @@ pub(crate) fn save_plan_state(
             .map_err(backend)?;
         }
     }
+
+    // Lease hours ended and progress reported in this transaction. They are
+    // deltas, consumed here, so saving the same state again adds nothing.
+    let deltas = state.take_actuals_deltas();
+    if let Some(at) = deltas.at {
+        for (deliverable_id, hours) in &deltas.leased_hours {
+            crate::ev_store::add_leased_hours(tx, plan_id, deliverable_id, *hours, at)?;
+        }
+        for (deliverable_id, report) in &deltas.reported {
+            crate::ev_store::record_reported(tx, plan_id, deliverable_id, report, at)?;
+        }
+    }
     Ok(())
 }
 
@@ -849,6 +943,7 @@ mod tests {
                 duration_hours: None,
                 estimate: None,
                 milestone: false,
+                earning_rule: None,
             }],
             max_chained_dispatch: None,
         };
@@ -1027,6 +1122,52 @@ mod tests {
                 let _ = std::fs::remove_file(PathBuf::from(p));
             }
         }
+    }
+
+    /// A v4 database stripped back to the v3 layout (earned-value tables
+    /// dropped, `user_version` 3) holding one plan.
+    fn v3_database(tag: &str) -> TempDbFile {
+        let db = TempDbFile::new(tag);
+        let store = SqlitePlanStore::open(&db.path).unwrap();
+        store
+            .submit_or_get("hash-1", || {
+                Ok((PlanId("plan_v3".into()), plan_state_with_one_ready()))
+            })
+            .unwrap();
+        drop(store);
+        let conn = Connection::open(&db.path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE baselines; DROP TABLE ev_actuals; DROP TABLE ev_snapshots;
+             PRAGMA user_version = 3;",
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn migrating_v3_to_v4_keeps_plans() {
+        let db = v3_database("v3-keeps");
+        let store = SqlitePlanStore::open(&db.path).unwrap();
+        let status = store
+            .read_plan(&PlanId("plan_v3".into()), |s| s.statuses.get("d1").cloned())
+            .unwrap();
+        assert_eq!(status, Some(DeliverableStatus::Ready));
+    }
+
+    #[test]
+    fn migrating_v3_to_v4_creates_the_earned_value_tables() {
+        let db = v3_database("v3-tables");
+        drop(SqlitePlanStore::open(&db.path).unwrap());
+        let conn = Connection::open(&db.path).unwrap();
+        let tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
+                 AND name IN ('baselines', 'ev_actuals', 'ev_snapshots')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 3);
     }
 
     /// Migration safety: a database created BEFORE the circuit-breaker

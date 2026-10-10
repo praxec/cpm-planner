@@ -52,7 +52,9 @@ use execution_policy::classify::{FailureClass, RetryDecision};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::locks::{FileClaim, PlanState, add_file_claims, modes_conflict, release_file_claims};
+use crate::locks::{FileClaim, PlanState, add_file_claims, modes_conflict};
+
+mod ev;
 
 /// Default TTL applied to newly acquired locks. Five minutes is the
 /// open-source default called out in SPEC §33 PA3.
@@ -219,6 +221,12 @@ impl BasicCpmPlanner {
     pub fn with_project_root(mut self, root: ProjectRoot) -> Self {
         self.project_root = Some(root);
         self
+    }
+
+    /// The backing store, for in-crate tests that inspect tables directly.
+    #[cfg(test)]
+    pub(crate) fn store(&self) -> &SqlitePlanStore {
+        &self.store
     }
 
     /// The project root given with [`Self::with_project_root`], if any. The
@@ -442,7 +450,7 @@ pub(crate) fn canonical_deliverable(d: &Deliverable) -> serde_json::Value {
         .map(|f| json!({ "path": f.path().to_string_lossy(), "mode": f.mode() }))
         .collect();
     files.sort_by_cached_key(ToString::to_string);
-    json!({
+    let mut canonical = json!({
         "id": d.id,
         "owned_files": files,
         "prerequisites": prereqs,
@@ -451,7 +459,17 @@ pub(crate) fn canonical_deliverable(d: &Deliverable) -> serde_json::Value {
         "estimate": d.estimate,
         "metadata": d.metadata,
         "milestone": d.milestone,
-    })
+    });
+    // Only when set to a non-default rule, so graphs without one keep the
+    // hash they had before the field existed (dedup and inline sync stay
+    // stable) and an explicit `zero_hundred` hashes like an absent rule.
+    if let Some(rule) = d
+        .earning_rule
+        .filter(|r| *r != crate::plan::EarningRule::ZeroHundred)
+    {
+        canonical["earning_rule"] = json!(rule);
+    }
+    canonical
 }
 
 /// Deterministic content hash of a [`PlanGraph`]. Same logical graph -> same
@@ -924,6 +942,50 @@ fn make_circuit_break_event(
     }))
 }
 
+/// Validate `mark_status` progress fields (`INVALID_ACTUALS`). Takes wide
+/// types (any JSON number) so the server can check raw wire values with the
+/// same messages: a negative, fractional or > 100 `earned_pct` is refused.
+pub(crate) fn validate_actuals(
+    status: &DeliverableStatus,
+    earned_pct: Option<f64>,
+    actual_effort_hours: Option<f64>,
+    evidence: Option<&str>,
+) -> Result<(), PlannerError> {
+    let bad = |reason: String| Err(PlannerError::InvalidActuals { reason });
+    if let Some(pct) = earned_pct {
+        if !(pct.fract() == 0.0 && (0.0..=100.0).contains(&pct)) {
+            return bad(format!("earned_pct must be an integer 0..=100, got {pct}"));
+        }
+        if !matches!(
+            status,
+            DeliverableStatus::InProgress | DeliverableStatus::Complete
+        ) {
+            return bad(
+                "earned_pct is only accepted with status in_progress (or complete, where it is \
+                 ignored)"
+                    .to_string(),
+            );
+        }
+    }
+    if let Some(h) = actual_effort_hours
+        && !(h.is_finite() && (0.0..=f64::from(crate::plan::MAX_HOURS)).contains(&h))
+    {
+        return bad(format!(
+            "actual_effort_hours must be a finite number between 0 and 1000000, got {h}"
+        ));
+    }
+    if let Some(e) = evidence {
+        let chars = e.chars().count();
+        if chars > crate::plan::MAX_EVIDENCE_CHARS {
+            return bad(format!(
+                "evidence must be at most {} characters, got {chars}",
+                crate::plan::MAX_EVIDENCE_CHARS
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Missing (non-Complete) prerequisites of `deliverable_id`.
 fn incomplete_prerequisites(state: &PlanState, deliverable_id: &str) -> Vec<String> {
     state
@@ -940,8 +1002,8 @@ fn incomplete_prerequisites(state: &PlanState, deliverable_id: &str) -> Vec<Stri
         .unwrap_or_default()
 }
 
-/// Mark a deliverable `Complete`: release any lock (and its file index,
-/// emitting a released event), set the status, and promote dependents whose
+/// Mark a deliverable `Complete`: end any lease at `now` (dropping its file
+/// claims, crediting its hours, emitting a released event), set the status, and promote dependents whose
 /// prerequisites are now all complete. Shared by `mark_status` and `accept`.
 ///
 /// Returns true when this completion made every deliverable `Complete`
@@ -952,24 +1014,10 @@ fn complete_deliverable(
     deliverable_id: &str,
     audit_buf: &mut Vec<AuditEvent>,
     release_reason: &str,
+    now: DateTime<Utc>,
 ) -> bool {
     let was_complete = all_complete(state);
-    if let Some(lock) = state.locks.remove(deliverable_id) {
-        // Callers verified the deliverable exists; a held lock implies the
-        // graph entry exists.
-        let owned_files: Vec<OwnedFile> = match state
-            .graph
-            .deliverables
-            .iter()
-            .find(|d| d.id == deliverable_id)
-        {
-            Some(d) => d.owned_files.clone(),
-            None => unreachable!(
-                "deliverable {deliverable_id} present in locks but missing from graph — \
-                 invariant broken"
-            ),
-        };
-        release_file_claims(&mut state.file_claims, deliverable_id, &owned_files);
+    if let Some(lock) = state.end_lease(deliverable_id, now) {
         audit_buf.push(make_released_event(&lock, release_reason));
     }
 
@@ -1285,6 +1333,28 @@ impl Planner for BasicCpmPlanner {
                 .write_tx(|tx| crate::portfolio::set_content_hash(tx, plan_id, &hash))?;
         }
         Ok(file.rel_path)
+    }
+
+    async fn baseline(
+        &self,
+        req: crate::earned_value::BaselineRequest,
+    ) -> Result<crate::earned_value::BaselineOutcome, PlannerError> {
+        self.take_baseline(req).await
+    }
+
+    async fn ev(
+        &self,
+        plan_id: &PlanId,
+        as_of: Option<DateTime<Utc>>,
+    ) -> Result<crate::earned_value::EvReport, PlannerError> {
+        self.ev_report(plan_id, as_of)
+    }
+
+    async fn snapshot(
+        &self,
+        req: crate::earned_value::SnapshotRequest,
+    ) -> Result<crate::earned_value::SnapshotOutcome, PlannerError> {
+        self.take_snapshot(req)
     }
 
     async fn list_plans(
@@ -1653,9 +1723,25 @@ impl Planner for BasicCpmPlanner {
             deliverable_id,
             caller_id,
             status,
+            earned_pct,
+            actual_effort_hours,
+            evidence,
         } = req;
+        validate_actuals(
+            &status,
+            earned_pct.map(f64::from),
+            actual_effort_hours.map(f64::from),
+            evidence.as_deref(),
+        )?;
+        let report = crate::ev_store::ReportedActuals {
+            // Accepted alongside Complete, but ignored there.
+            earned_pct: earned_pct.filter(|_| status == DeliverableStatus::InProgress),
+            actual_hours: actual_effort_hours,
+            evidence,
+        };
         let deliverable_id = deliverable_id.as_str();
         let caller_id = &caller_id;
+        let now = self.now();
         let mut audit_buf: Vec<AuditEvent> = Vec::new();
         self.store.mutate_executable_plan(&plan_id, |state| {
             // Deliverable existence.
@@ -1700,6 +1786,10 @@ impl Planner for BasicCpmPlanner {
                     deliverable_id: deliverable_id.to_string(),
                 });
             }
+
+            // Progress fields ride along with every accepted mark (also an
+            // idempotent Complete); a refused mark rolls them back.
+            state.report_actuals(deliverable_id, report, now);
 
             // Completing without a lease: every prerequisite must be done,
             // and the bypass is audited.
@@ -1752,23 +1842,8 @@ impl Planner for BasicCpmPlanner {
 
             // Lock release on Failed.
             if matches!(status, DeliverableStatus::Failed { .. })
-                && let Some(lock) = state.locks.remove(deliverable_id)
+                && let Some(lock) = state.end_lease(deliverable_id, now)
             {
-                // Deliverable existence was verified at the top of
-                // `mark_status`; `.find()` is guaranteed to succeed.
-                let owned_files: Vec<OwnedFile> = match state
-                    .graph
-                    .deliverables
-                    .iter()
-                    .find(|d| d.id == deliverable_id)
-                {
-                    Some(d) => d.owned_files.clone(),
-                    None => unreachable!(
-                        "deliverable {deliverable_id} present in locks but missing from \
-                         graph — invariant broken"
-                    ),
-                };
-                release_file_claims(&mut state.file_claims, deliverable_id, &owned_files);
                 audit_buf.push(make_released_event(&lock, "failed"));
             }
 
@@ -1791,7 +1866,7 @@ impl Planner for BasicCpmPlanner {
             }
 
             if is_complete {
-                if complete_deliverable(state, deliverable_id, &mut audit_buf, "completed") {
+                if complete_deliverable(state, deliverable_id, &mut audit_buf, "completed", now) {
                     audit_buf.push(make_plan_completed_event(
                         &plan_id,
                         state.graph.deliverables.len(),
@@ -2017,7 +2092,8 @@ impl Planner for BasicCpmPlanner {
                 });
             }
 
-            let plan_done = complete_deliverable(state, deliverable_id, &mut audit_buf, "accepted");
+            let plan_done =
+                complete_deliverable(state, deliverable_id, &mut audit_buf, "accepted", now);
             audit_buf.push(make_accepted_event(
                 &req,
                 overrode.as_deref(),
@@ -2045,6 +2121,7 @@ impl Planner for BasicCpmPlanner {
         } = req;
         let deliverable_id = deliverable_id.as_str();
         let reason = reason.as_str();
+        let now = self.now();
         let mut audit_buf: Vec<AuditEvent> = Vec::new();
         self.store.mutate_executable_plan(&plan_id, |state| {
             if !state
@@ -2059,21 +2136,7 @@ impl Planner for BasicCpmPlanner {
                 });
             }
 
-            if let Some(lock) = state.locks.remove(deliverable_id) {
-                // Deliverable existence was verified above; the held lock
-                // implies the graph entry exists.
-                let owned_files: Vec<OwnedFile> = match state
-                    .graph
-                    .deliverables
-                    .iter()
-                    .find(|d| d.id == deliverable_id)
-                {
-                    Some(d) => d.owned_files.clone(),
-                    None => unreachable!(
-                        "deliverable {deliverable_id} present in locks but missing from graph"
-                    ),
-                };
-                release_file_claims(&mut state.file_claims, deliverable_id, &owned_files);
+            if let Some(lock) = state.end_lease(deliverable_id, now) {
                 state
                     .statuses
                     .insert(deliverable_id.to_string(), DeliverableStatus::Ready);
@@ -2140,7 +2203,26 @@ mod tests {
             duration_hours: None,
             estimate: None,
             milestone: false,
+            earning_rule: None,
         }
+    }
+
+    #[test]
+    fn explicit_default_earning_rule_hashes_like_absent() {
+        let absent = deliverable("D1", Some(1.0), json!({}));
+        let mut explicit = absent.clone();
+        explicit.earning_rule = Some(crate::plan::EarningRule::ZeroHundred);
+        let graph = |d: Deliverable| PlanGraph {
+            deliverables: vec![d],
+            max_chained_dispatch: None,
+        };
+        assert_eq!(hash_graph(&graph(explicit)), hash_graph(&graph(absent)));
+    }
+
+    #[test]
+    fn canonical_form_omits_an_absent_earning_rule() {
+        let d = deliverable("D1", Some(1.0), json!({}));
+        assert!(canonical_deliverable(&d).get("earning_rule").is_none());
     }
 
     #[test]

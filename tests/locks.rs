@@ -30,6 +30,7 @@ fn deliverable(id: &str, files: &[&str], prereqs: &[&str], effort: Option<f32>) 
         duration_hours: None,
         estimate: None,
         milestone: false,
+        earning_rule: None,
     }
 }
 

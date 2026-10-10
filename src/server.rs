@@ -35,6 +35,9 @@
 //! | `plan.select`            | [`Planner::select_variant`]   |
 //! | `plan.archive`           | [`Planner::archive`]          |
 //! | `plan.compare`           | [`Planner::compare_plans`]    |
+//! | `plan.baseline`          | [`Planner::baseline`]         |
+//! | `plan.ev`                | [`Planner::ev`]               |
+//! | `plan.snapshot`          | [`Planner::snapshot`]         |
 //!
 //! # Error mapping
 //!
@@ -44,7 +47,7 @@
 //! `OVERLAP_DETECTED:`, `MISSING_PREREQUISITE:`, `PLAN_NOT_FOUND:`,
 //! `DELIVERABLE_NOT_FOUND:`, `LAPSE_LIMIT:`, `PREREQUISITES_INCOMPLETE:`, `INVALID_GRAPH:`,
 //! `INVALID_CAPACITIES:`, `VARIANT_NOT_SELECTED:`, `ARCHIVE_REFUSED:`,
-//! `INVALID_PATH:`, `BACKEND_ERROR:`) are
+//! `INVALID_PATH:`, `INVALID_ACTUALS:`, `NOT_BASELINED:`, `BACKEND_ERROR:`) are
 //! stable machine-parseable signals — see `core::plan` for the contract.
 //! Malformed arguments yield `invalid_params` with the serde error.
 //!
@@ -60,6 +63,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::compare::{CompareRequest, CompareWeights};
+use crate::earned_value::{BaselineRequest, Calendar, SnapshotFormat, SnapshotRequest};
 use crate::edits::GraphEdit;
 use crate::monte_carlo::MonteCarloRequest;
 use crate::plan::{
@@ -71,6 +75,7 @@ use crate::ports::Planner;
 use crate::project::ProjectRoot;
 use crate::resource_schedule::{ScheduleRequest, resource_schedule};
 use crate::simulate::SimulateRequest;
+use chrono::{DateTime, Utc};
 use rmcp::ErrorData as McpError;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, Implementation, InitializeRequestParams,
@@ -107,8 +112,11 @@ pub const TOOL_FORK: &str = "plan.fork";
 pub const TOOL_SELECT: &str = "plan.select";
 pub const TOOL_ARCHIVE: &str = "plan.archive";
 pub const TOOL_COMPARE: &str = "plan.compare";
+pub const TOOL_BASELINE: &str = "plan.baseline";
+pub const TOOL_EV: &str = "plan.ev";
+pub const TOOL_SNAPSHOT: &str = "plan.snapshot";
 
-/// All nineteen MCP tool names exposed by [`PlanServer`], in declaration order.
+/// All twenty-two MCP tool names exposed by [`PlanServer`], in declaration order.
 pub const PLAN_TOOL_NAMES: &[&str] = &[
     TOOL_SUBMIT,
     TOOL_ACQUIRE_COHORT,
@@ -129,6 +137,9 @@ pub const PLAN_TOOL_NAMES: &[&str] = &[
     TOOL_SELECT,
     TOOL_ARCHIVE,
     TOOL_COMPARE,
+    TOOL_BASELINE,
+    TOOL_EV,
+    TOOL_SNAPSHOT,
 ];
 
 // ---------------------------------------------------------------------------
@@ -200,6 +211,14 @@ struct MarkStatusArgs {
     deliverable_id: String,
     caller_id: String,
     status: DeliverableStatus,
+    /// Any JSON number, so negative, fractional or out-of-range values get
+    /// `INVALID_ACTUALS`, not a parse error.
+    #[serde(default)]
+    earned_pct: Option<f64>,
+    #[serde(default)]
+    actual_effort_hours: Option<f64>,
+    #[serde(default)]
+    evidence: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -380,6 +399,41 @@ struct CompareArgs {
     weights: CompareWeights,
 }
 
+// ── Earned-value tool args ──────────────────────────────────────────────────
+
+/// `plan.baseline`: freeze the plan's schedule and budgets as a baseline.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BaselineArgs {
+    plan_id: String,
+    #[serde(default)]
+    start: Option<DateTime<Utc>>,
+    #[serde(default)]
+    calendar: Option<Calendar>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// `plan.ev`: the earned-value report against the latest baseline.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EvArgs {
+    plan_id: String,
+    #[serde(default)]
+    as_of: Option<DateTime<Utc>>,
+}
+
+/// `plan.snapshot`: append an EV snapshot and render the history.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotArgs {
+    plan_id: String,
+    #[serde(default)]
+    as_of: Option<DateTime<Utc>>,
+    #[serde(default)]
+    format: SnapshotFormat,
+}
+
 // ---------------------------------------------------------------------------
 // Per-tool response shapes
 // ---------------------------------------------------------------------------
@@ -455,6 +509,7 @@ fn graph_schema() -> Value {
                             "pessimistic": { "type": "number", "minimum": 0, "maximum": 1000000 }
                         }, "required": ["optimistic", "likely", "pessimistic"], "additionalProperties": false },
                         "milestone":              { "type": "boolean", "description": "Acceptance point; reported in plan.status milestones with its own critical path." },
+                        "earning_rule":           { "type": "string", "enum": ["zero_hundred", "fifty_fifty", "weighted"], "description": "How earned value credits partial progress: zero_hundred (default; 100% only when complete), fifty_fifty (50% once in progress or any earned_pct is reported), weighted (the reported earned_pct). Part of the plan's identity." },
                         "metadata":              {}
                     },
                     "required": ["id", "owned_files", "prerequisites"]
@@ -516,6 +571,19 @@ fn weights_schema() -> Value {
             "criticality_risk": criterion(),
             "total_effort": criterion(),
             "peak_load": criterion()
+        },
+        "additionalProperties": false
+    })
+}
+
+fn calendar_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Working-time calendar: only working hours advance the PV clock. Omitted: wall-clock hours. A workday contributes hours_per_day hours starting at 00:00 local time.",
+        "properties": {
+            "hours_per_day": { "type": "number", "exclusiveMinimum": 0, "maximum": 24, "description": "Default 8." },
+            "workdays": { "type": "array", "minItems": 1, "items": { "type": "string", "enum": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] }, "description": "Default mon..fri." },
+            "utc_offset_minutes": { "type": "integer", "minimum": -1440, "maximum": 1440, "description": "Local offset from UTC; default 0." }
         },
         "additionalProperties": false
     })
@@ -624,7 +692,13 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                  Complete, Ready or InProgress requires all prerequisites \
                  complete (PREREQUISITES_INCOMPLETE) and is audited; other \
                  lockless marks are audited too, and an already-complete deliverable \
-                 cannot be changed (LOCK_NOT_HELD).",
+                 cannot be changed (LOCK_NOT_HELD). Optional earned-value progress: \
+                 earned_pct (0..100, only with in_progress; ignored with complete), \
+                 actual_effort_hours (total so far, 0..1000000; replaces leased hours \
+                 as actual cost) and evidence (<= 2048 chars, appended to a list of \
+                 at most 100); \
+                 violations are INVALID_ACTUALS. Every lease that ends adds its hours \
+                 to the deliverable's leased hours.",
             ),
             schema_object(json!({
                 "type": "object",
@@ -635,6 +709,23 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                     "status": {
                         "type": "object",
                         "description": "Internally-tagged: {\"status\":\"pending|ready|in_progress|complete\"} or {\"status\":\"failed\",\"reason\":\"...\"}"
+                    },
+                    "earned_pct": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": "Percent complete (used by the weighted earning rule). Only with status in_progress; accepted and ignored with complete."
+                    },
+                    "actual_effort_hours": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1000000,
+                        "description": "Total effort spent so far, in hours; replaces the stored value and takes precedence over leased hours for actual cost."
+                    },
+                    "evidence": {
+                        "type": "string",
+                        "maxLength": 2048,
+                        "description": "One evidence note, appended to the deliverable's evidence list (at most 100 entries)."
                     }
                 },
                 "required": ["plan_id", "deliverable_id", "caller_id", "status"]
@@ -987,6 +1078,84 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                 "additionalProperties": false
             })),
         ),
+        Tool::new(
+            Cow::Borrowed(TOOL_BASELINE),
+            Cow::Borrowed(
+                "Freeze the plan's current CPM schedule (earliest start/finish) and budgets \
+                 (effort basis x metadata.cost_rate) as its next numbered baseline for earned \
+                 value. The first baseline is number 1; re-baselining needs a non-blank \
+                 `reason` (INVALID_GRAPH otherwise) and keeps actuals and snapshots. \
+                 Without `calendar`, a re-baseline keeps the previous baseline's calendar \
+                 (the first baseline counts wall-clock hours). Execution-side: the plan must be its line's selected, unarchived variant \
+                 (VARIANT_NOT_SELECTED / ARCHIVE_REFUSED). Audited as plan.ev.baselined.",
+            ),
+            schema_object(json!({
+                "type": "object",
+                "properties": {
+                    "plan_id": { "type": "string" },
+                    "start": { "type": "string", "format": "date-time", "description": "RFC 3339 instant the PV clock starts from; defaults to now." },
+                    "calendar": calendar_schema(),
+                    "reason": { "type": "string", "maxLength": 2048, "description": "Why the plan is re-baselined; required when a baseline exists." }
+                },
+                "required": ["plan_id"],
+                "additionalProperties": false
+            })),
+        ),
+        Tool::new(
+            Cow::Borrowed(TOOL_EV),
+            Cow::Borrowed(
+                "Earned-value report against the plan's latest baseline as of `as_of` \
+                 (default now). `as_of` is the PV status date; EV and AC reflect progress \
+                 and actuals recorded up to the moment the call runs. Returns BAC, PV, EV, \
+                 AC, SV, CV, SPI, CPI, EAC, ETC, VAC, TCPI, per-deliverable rows (a \
+                 baselined deliverable later removed by plan.revise has status `removed` \
+                 and keeps the percent it had earned: 100 if complete), critical float \
+                 consumed, SPI_BELOW_0_9 / CPI_BELOW_0_9 alerts from the two latest \
+                 stored non-backfilled snapshots (by as_of) of the current baseline, and \
+                 deliverables added since the baseline. AC counts every recorded hour of \
+                 the plan, including removed and unbaselined deliverables (rate 1 when the \
+                 baseline has no row). A \
+                 ratio whose denominator is 0 is null and explained in `undefined`. \
+                 Read-only; works on any variant. \
+                 NOT_BASELINED before plan.baseline.",
+            ),
+            schema_object(json!({
+                "type": "object",
+                "properties": {
+                    "plan_id": { "type": "string" },
+                    "as_of": { "type": "string", "format": "date-time", "description": "RFC 3339 PV status date; defaults to now. EV and AC are always as recorded when the call runs." }
+                },
+                "required": ["plan_id"],
+                "additionalProperties": false
+            })),
+        ),
+        Tool::new(
+            Cow::Borrowed(TOOL_SNAPSHOT),
+            Cow::Borrowed(
+                "Compute the earned-value report (as plan.ev) and append it as a \
+                 snapshot. `as_of` is the PV status date; EV and AC are the progress \
+                 recorded when the call runs, so a snapshot whose as_of is more than an \
+                 hour before its taken_at is marked `backfilled: true` and ignored by \
+                 alerts. Returns the snapshot summary (alerts consider this snapshot and \
+                 the latest earlier non-backfilled one by as_of of the current baseline) \
+                 and an export \
+                 of the newest 100 snapshots by as_of, oldest first (an older backfill \
+                 is counted but not listed): a list of \
+                 summaries (format json, default) or a Markdown table with columns \
+                 date, PV, EV, AC, SPI, CPI, EAC (format markdown). \
+                 Execution-side like plan.baseline. NOT_BASELINED before plan.baseline.",
+            ),
+            schema_object(json!({
+                "type": "object",
+                "properties": {
+                    "plan_id": { "type": "string" },
+                    "as_of": { "type": "string", "format": "date-time", "description": "RFC 3339 PV status date; defaults to now. EV and AC are always as recorded when the call runs." },
+                    "format": { "type": "string", "enum": ["json", "markdown"], "description": "Export format (default json)." }
+                },
+                "required": ["plan_id"],
+                "additionalProperties": false
+            })),
+        ),
     ]
 }
 
@@ -1012,7 +1181,7 @@ fn schema_object(value: Value) -> Arc<rmcp::model::JsonObject> {
 // PlanServer
 // ---------------------------------------------------------------------------
 
-/// MCP server façade exposing a [`BasicCpmPlanner`] over nineteen tools.
+/// MCP server façade exposing a [`BasicCpmPlanner`] over twenty-two tools.
 #[derive(Clone)]
 pub struct PlanServer {
     planner: Arc<BasicCpmPlanner>,
@@ -1152,6 +1321,9 @@ impl PlanServer {
             TOOL_SELECT => self.handle_select(args).await,
             TOOL_ARCHIVE => self.handle_archive(args).await,
             TOOL_COMPARE => self.handle_compare(args).await,
+            TOOL_BASELINE => self.handle_baseline(args).await,
+            TOOL_EV => self.handle_ev(args).await,
+            TOOL_SNAPSHOT => self.handle_snapshot(args).await,
             other => Err(McpError::invalid_params(
                 format!(
                     "Unknown tool '{other}'. Available: {}.",
@@ -1257,13 +1429,32 @@ impl PlanServer {
 
     async fn handle_mark_status(&self, args: Value) -> Result<Value, McpError> {
         let parsed: MarkStatusArgs = parse_args(args)?;
+        crate::planner::validate_actuals(
+            &parsed.status,
+            parsed.earned_pct,
+            parsed.actual_effort_hours,
+            parsed.evidence.as_deref(),
+        )
+        .map_err(planner_error_to_mcp)?;
+        let mut request = MarkStatusRequest::new(
+            PlanId(parsed.plan_id),
+            parsed.deliverable_id,
+            CallerId(parsed.caller_id),
+            parsed.status,
+        );
+        // Validated above: the percent is an integer 0..=100 and the hours
+        // fit an f32.
+        if let Some(pct) = parsed.earned_pct {
+            request = request.with_earned_pct(pct as u8);
+        }
+        if let Some(hours) = parsed.actual_effort_hours {
+            request = request.with_actual_effort_hours(hours as f32);
+        }
+        if let Some(evidence) = parsed.evidence {
+            request = request.with_evidence(evidence);
+        }
         self.planner
-            .mark_status(MarkStatusRequest::new(
-                PlanId(parsed.plan_id),
-                parsed.deliverable_id,
-                CallerId(parsed.caller_id),
-                parsed.status,
-            ))
+            .mark_status(request)
             .await
             .map_err(planner_error_to_mcp)?;
         to_value(&OkResponse::new())
@@ -1564,6 +1755,45 @@ impl PlanServer {
         let comparison = run_blocking(move || crate::compare::compare(&inputs, &request)).await?;
         to_value(&comparison)
     }
+
+    // ── Earned-value handlers ──────────────────────────────────────────────
+
+    async fn handle_baseline(&self, args: Value) -> Result<Value, McpError> {
+        let parsed: BaselineArgs = parse_args(args)?;
+        let mut request = BaselineRequest::new(PlanId(parsed.plan_id));
+        request.start = parsed.start;
+        request.calendar = parsed.calendar;
+        request.reason = parsed.reason;
+        let outcome = self
+            .planner
+            .baseline(request)
+            .await
+            .map_err(planner_error_to_mcp)?;
+        to_value(&outcome)
+    }
+
+    async fn handle_ev(&self, args: Value) -> Result<Value, McpError> {
+        let parsed: EvArgs = parse_args(args)?;
+        let planner = Arc::clone(&self.planner);
+        let plan_id = PlanId(parsed.plan_id);
+        let report =
+            run_blocking_planner(
+                async move { Planner::ev(&*planner, &plan_id, parsed.as_of).await },
+            )
+            .await?;
+        to_value(&report)
+    }
+
+    async fn handle_snapshot(&self, args: Value) -> Result<Value, McpError> {
+        let parsed: SnapshotArgs = parse_args(args)?;
+        let mut request = SnapshotRequest::new(PlanId(parsed.plan_id)).with_format(parsed.format);
+        request.as_of = parsed.as_of;
+        let planner = Arc::clone(&self.planner);
+        let outcome =
+            run_blocking_planner(async move { Planner::snapshot(&*planner, request).await })
+                .await?;
+        to_value(&outcome)
+    }
 }
 
 /// Range checks the analysis tools apply before any work, as
@@ -1593,6 +1823,17 @@ fn check_compare_weights(weights: &CompareWeights) -> Result<(), McpError> {
     Ok(())
 }
 
+/// Run a [`Planner`] call whose future does synchronous store and CPM work
+/// (`plan.ev`, `plan.snapshot`) on a blocking thread, driven to completion
+/// there, so it never stalls the runtime's worker threads.
+async fn run_blocking_planner<T, Fut>(call: Fut) -> Result<T, McpError>
+where
+    T: Send + 'static,
+    Fut: std::future::Future<Output = Result<T, PlannerError>> + Send + 'static,
+{
+    run_blocking(move || tokio::runtime::Handle::current().block_on(call)).await
+}
+
 /// Run CPU-bound analysis off the async runtime's worker threads.
 async fn run_blocking<T, F>(work: F) -> Result<T, McpError>
 where
@@ -1615,7 +1856,7 @@ impl ServerHandler for PlanServer {
             Implementation::new(self.server_name.clone(), self.server_version.clone());
         server_info.title = Some("cpm-planner".to_string());
         server_info.description = Some(
-            "MCP server exposing the open-source Praxec CPM planner via nineteen tools."
+            "MCP server exposing the open-source Praxec CPM planner via twenty-two tools."
                 .to_string(),
         );
 
@@ -1717,15 +1958,17 @@ fn planner_error_to_mcp(err: PlannerError) -> McpError {
 fn instructions() -> &'static str {
     r#"This is the cpm-planner MCP server — the open-source CPM planner.
 
-Tools (nineteen total, all `plan.<verb>`):
+Tools (twenty-two total, all `plan.<verb>`):
   plan.submit          — submit a PlanGraph, get a plan_id (idempotent on identical graphs)
                         a prerequisite is an id string or {id, consumes?, kind?: artifact|interface, lag_hours?}; a deliverable's duration_hours (calendar time; when absent the default is the effort estimate, explicit or estimator-derived) and lag_hours (minimum wait after a prerequisite finishes) drive the schedule
                         a milestone (milestone: true) is zero-length unless you give it an estimate or duration; it is still an ordinary deliverable someone must complete (accept or mark Complete), and it is not leased if metadata.kind=manual
+                        an optional earning_rule (zero_hundred default: 100% only when complete; fifty_fifty: 50% once in progress or any earned_pct is reported; weighted: the reported earned_pct) sets how earned value credits progress; it is part of the plan's identity
                         an optional estimate {optimistic, likely, pessimistic} (0 <= optimistic <= likely <= pessimistic) is a three-point effort estimate; scheduled length precedence is duration_hours > estimated_effort_hours > estimate.likely > 0 for a milestone > estimator default, and Monte Carlo samples the estimate only when neither duration_hours nor estimated_effort_hours is set
                         limits: at most 5000 deliverables; every hour value (effort, duration, lag, estimate) must be finite and between 0 and 1000000 (INVALID_GRAPH)
   plan.acquire_cohort  — atomically acquire ready deliverables with no conflicting file claims (an owned_files entry may be {path, mode: "append"}: append claims on one path may be co-leased and are listed in the response's shared_paths; exclusive claims never overlap anything at once; plan.submit accepts a shared file only when the claimants are ordered by prerequisites, or all claims are append)
   plan.heartbeat       — refresh a held lock's TTL
   plan.mark_status     — set a deliverable's status (Complete/Failed releases the lock); lockless Complete/Ready/InProgress requires complete prerequisites (PREREQUISITES_INCOMPLETE) and is audited
+                        optional earned-value progress: earned_pct (integer 0..100, only with in_progress; accepted and ignored with complete), actual_effort_hours (total so far, finite 0..1000000; replaces leased hours as actual cost), evidence (<= 2048 chars, appended to the deliverable's list, at most 100 entries); violations are INVALID_ACTUALS. plan.select copies the actuals of every deliverable whose Complete status it carries (leased hours add up; the carried deliverable's reported earned_pct and hours win; the newest 100 evidence entries are kept). Every lease that ends (complete, failed, force_release, expiry, accept override, forced revise/select/archive) adds its hours (up to expiry for a lapsed lease) to the deliverable's leased hours
   plan.status          — read-only snapshot ([id, status, attempt_count, failure_count, lapse_count] rows, critical_path (one real chain, always __start__ to __finish__), critical_ids, per-deliverable schedule (es/ef/ls/lf/float, hours; synthetic __start__/__finish__ endpoint rows have synthetic=true and critical=true; critical_ids lists only real deliverables), the ready set in acquire/ready priority order (smallest latest start first, i.e. longest remaining tail, then least float, then id), plan_complete, milestones (one row per `milestone: true` deliverable, or metadata.milestone == true: id, critical_path from __start__ to it, hours = its earliest finish, complete), held locks; for a named variant also name, variant, selected and definition_drift). __start__ and __finish__ are reserved deliverable ids (INVALID_GRAPH)
                         definition_drift: null when unknown (no root for the variant's project, no tracked file, file missing/unreadable/over 8 MiB); false when the file matches the last synced/exported bytes or its graph equals the head graph (re-formatting is not drift); true when the file's graph differs from the head or does not parse — so after an inline revise it is true until plan.export or plan.sync {path}
   plan.get             — return the submitted PlanGraph (deliverables, estimates, files, metadata) for a plan_id
@@ -1739,9 +1982,12 @@ Tools (nineteen total, all `plan.<verb>`):
   plan.export          — write the head graph of a plan_id to its variant file (or a confined path) and return the root-relative path; refuses another variant's tracked file or unsynced local edits unless force; the file is not synced (exporting to the variant's own tracked file records its hash)
   plan.revise          — replace a plan's graph in place, carrying progress over; returns the new revision and diff; force releases live locks of removed deliverables
   plan.fork            — copy a named variant's head graph, apply ordered edits, register it as a new draft (not selected) variant; an archived line is refused (ARCHIVE_REFUSED) before any file is written
-  plan.select          — make a variant its line's selected (only executable) variant, carrying progress over; force releases locks on the previous variant
+  plan.select          — make a variant its line's selected (only executable) variant, carrying progress over (Complete statuses of identically defined deliverables, with their earned-value actuals); force releases locks on the previous variant
   plan.archive         — archive (archived defaults true) or unarchive a whole line or one variant; archived variants stay readable but refuse sync/select/execute
   plan.compare         — compare stored plans (plan_ids: 2..16 distinct ids, or plan line name in project, default the discovered root, for every live variant, at most 16) on the scorecard: Pareto front, weighted rank, recommended; weights must be finite and >= 0; the Monte Carlo budget (200000000) is shared across variants
+  plan.baseline        — freeze the plan's CPM schedule (es/ef) and budgets (effort basis x metadata.cost_rate, default 1) as its next numbered earned-value baseline; optional start (RFC 3339, default now) and calendar {hours_per_day (0 < h <= 24, default 8), workdays (default mon..fri), utc_offset_minutes (default 0)} (omitted: wall-clock hours on the first baseline, the previous baseline's calendar on a re-baseline); re-baselining needs a non-blank reason (<= 2048 chars, INVALID_GRAPH otherwise) and keeps actuals and snapshots; baselines, actuals and snapshots belong to one variant, so a newly selected variant takes its own baseline 1 with no reason needed; selected, unarchived variant only; audited as plan.ev.baselined
+  plan.ev              — earned-value report against the latest baseline as of as_of (RFC 3339, default now; as_of is the PV status date, while EV and AC reflect progress and actuals recorded up to the moment the call runs): bac, pv, ev, ac, sv, cv, spi, cpi, eac, etc, vac, tcpi, per-deliverable rows, critical_float_consumed_hours, alerts (SPI_BELOW_0_9 / CPI_BELOW_0_9 when below 0.9 on the two latest stored non-backfilled snapshots by as_of of the current baseline; the current reading is not one of them), excluded_unbaselined; AC sums every recorded hour of the plan (removed and unbaselined deliverables included, at rate 1 when the baseline has no row); a baselined deliverable removed by plan.revise reports status "removed" and keeps its earned percent at removal (100 if complete), and re-adding it restarts its earned percent (hours keep accumulating); a ratio with a zero denominator is null and explained in `undefined` (never NaN); read-only on any variant; NOT_BASELINED before plan.baseline
+  plan.snapshot        — compute the plan.ev report and append it as a snapshot (as_of is the PV status date; EV and AC are as recorded when the call runs, so a snapshot whose as_of is more than an hour before taken_at is marked backfilled: true, raises no alerts and is skipped by later alerts); returns summary (undefined explains each null ratio; alerts consider only readings up to its own position: this snapshot and the latest earlier one by as_of of the current baseline, so a backfill never takes alerts from newer readings), snapshot_count and export of the newest 100 snapshots by as_of (ties by taken_at), oldest first, so a backfilled as_of lands in date order; a backfill older than those 100 is stored and counted but not listed: a list of summaries (format "json", default) or a Markdown table with columns date, PV, EV, AC, SPI, CPI, EAC (format "markdown"); selected, unarchived variant only; NOT_BASELINED before plan.baseline
   plan.submit with a `name` (optional `project`/`variant`, variant defaults to "main") registers a named variant instead of an unnamed plan
   plan.lint, plan.simulate take exactly one of an inline graph, a stored plan_id, or a plan-file path; plan.schedule takes graph or plan_id; plan.schedule and plan.simulate reject what plan.submit rejects, and plan.lint reports it as findings
 
@@ -1761,7 +2007,7 @@ Errors carry stable prefixes: LOCK_HELD, LOCK_NOT_HELD, LOCK_EXPIRED,
 OVERLAP_DETECTED, MISSING_PREREQUISITE, PLAN_NOT_FOUND,
 DELIVERABLE_NOT_FOUND, LAPSE_LIMIT, PREREQUISITES_INCOMPLETE, INVALID_GRAPH,
 INVALID_CAPACITIES, VARIANT_NOT_SELECTED, ARCHIVE_REFUSED, INVALID_PATH,
-BACKEND_ERROR.
+INVALID_ACTUALS, NOT_BASELINED, BACKEND_ERROR.
 
 DeliverableStatus is internally tagged on `status`:
   {"status":"pending"} | {"status":"ready"} | {"status":"in_progress"} |
