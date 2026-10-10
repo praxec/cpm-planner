@@ -136,8 +136,8 @@ Read P80 with care, for two reasons:
   most of the better P80 comes from removing its uncertainty, not from faster work. To keep
   a crashed deliverable sampled, use `set_estimate` with a shorter range.
 - **Monte Carlo ignores resource limits.** It samples the CPM network without levelling, so
-  no variant's P80 includes resource waits. In `crash-service`, `export-ui` still waits
-  4.2 h for the agent.
+  no variant's P80 includes resource waits. In `crash-service`, `export-service` still waits
+  5 h for the agent (levelling adds 4.2 h to the makespan).
 
 ## 5. Explain the trade-off
 

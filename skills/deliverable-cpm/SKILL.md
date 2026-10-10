@@ -181,7 +181,7 @@ Design several variants and pick one. Never edit the selected variant to try an 
    |---|---|---|
    | Add capacity to the bottleneck | `set_metadata owner`, or more capacity in the schedule | review becomes the next bottleneck |
    | Move work to a cheaper pool | `set_metadata owner`, plus `set_effort` for review time | security- or judgment-heavy work stays put |
-   | Crash a critical deliverable | `set_duration`, plus `set_effort` for the added cost | the cost is real effort: record it. Either edit stops Monte Carlo sampling a deliverable that has an `estimate`, so a better P80 can come only from removing its uncertainty. Use `set_estimate` with a shorter range to keep it sampled |
+   | Crash a critical deliverable | `set_duration`, plus `set_effort` for the added cost | the cost is real effort: record it. Either edit stops Monte Carlo sampling a deliverable that has an `estimate`, so much of a better P80 can come from removing its uncertainty rather than from the shorter length. `set_estimate` with a shorter range keeps it sampled, but lowers its effort basis, so note the crash cost outside the scorecard |
    | Split along file or contract seams | `remove_deliverable`, `add_deliverable`, `add_edge` | each part needs its own artifact |
    | Contract first | `add_deliverable` with `metadata.contract`; then `remove_deliverable` + `add_deliverable` for each consumer, with an `interface` edge (`add_edge` has no `kind`) | the contract must be accepted, not just drafted |
    | Fast-track by removing an edge | `remove_edge` | only if nothing was actually consumed |
