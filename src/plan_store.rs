@@ -588,6 +588,8 @@ fn migrate_v4_earned_value(conn: &Connection) -> anyhow::Result<()> {
              leased_hours   REAL NOT NULL DEFAULT 0,
              evidence       TEXT NOT NULL DEFAULT '[]',
              updated_at_us  INTEGER,
+             removed_at_us  INTEGER,
+             frozen_pct     INTEGER,
              PRIMARY KEY (plan_id, deliverable_id)
          );
          CREATE TABLE IF NOT EXISTS ev_snapshots (

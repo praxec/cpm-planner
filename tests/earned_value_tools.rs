@@ -10,10 +10,12 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use cpm_planner::BasicCpmPlanner;
 use cpm_planner::audit::MemoryAuditSink;
-use cpm_planner::earned_value::{BaselineRequest, SnapshotFormat, SnapshotRequest};
+use cpm_planner::earned_value::{
+    BaselineRequest, Calendar, EvRowStatus, SnapshotFormat, SnapshotRequest,
+};
 use cpm_planner::plan::{
     AcquireRequest, CallerId, Deliverable, DeliverableStatus, MarkStatusRequest, PlanGraph, PlanId,
-    PlannerError, SyncRequest,
+    PlannerError, ReviseRequest, SyncRequest,
 };
 use cpm_planner::ports::Planner;
 
@@ -638,4 +640,139 @@ async fn alert_window_is_not_crowded_out_by_previous_baseline_history() {
     snapshot_at(&f, &plan_id, 10).await;
     let alerts = snapshot_at(&f, &plan_id, 12).await;
     assert!(alerts.contains(&"SPI_BELOW_0_9".to_string()), "{alerts:?}");
+}
+
+// ── Final fix wave: removed scope, backfill flag, calendar inheritance ───
+
+/// Only `b`, with no prerequisites (removes `a`).
+fn graph_without_a() -> PlanGraph {
+    PlanGraph {
+        deliverables: vec![deliverable("b", 10.0, &[])],
+        max_chained_dispatch: None,
+    }
+}
+
+/// Only `a` (removes `b`).
+fn graph_without_b() -> PlanGraph {
+    PlanGraph {
+        deliverables: vec![deliverable("a", 10.0, &[])],
+        max_chained_dispatch: None,
+    }
+}
+
+impl Fixture {
+    async fn revise(&self, plan_id: &PlanId, graph: PlanGraph) {
+        self.planner
+            .revise_plan(ReviseRequest::new(plan_id.clone(), graph).force(true))
+            .await
+            .unwrap();
+    }
+
+    async fn complete_a(&self, plan_id: &PlanId) {
+        self.planner
+            .acquire_cohort(AcquireRequest::new(plan_id.clone(), worker(), 1))
+            .await
+            .unwrap();
+        self.planner
+            .mark_status(MarkStatusRequest::new(
+                plan_id.clone(),
+                "a",
+                worker(),
+                DeliverableStatus::Complete,
+            ))
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn removed_complete_deliverable_keeps_its_earned_value() {
+    let f = Fixture::new();
+    let plan_id = f.baselined().await;
+    f.complete_a(&plan_id).await;
+    f.revise(&plan_id, graph_without_a()).await;
+    let r = f.planner.ev(&plan_id, None).await.unwrap();
+    assert_eq!(r.ev, 10.0);
+}
+
+#[tokio::test]
+async fn removed_deliverable_reports_removed_status() {
+    let f = Fixture::new();
+    let plan_id = f.baselined().await;
+    f.revise(&plan_id, graph_without_b()).await;
+    let r = f.planner.ev(&plan_id, None).await.unwrap();
+    let b = r.rows.iter().find(|row| row.id == "b").unwrap();
+    assert_eq!(b.status, EvRowStatus::Removed);
+}
+
+#[tokio::test]
+async fn actual_cost_survives_rebaseline_for_removed_deliverable() {
+    let f = Fixture::new();
+    let plan_id = f.baselined().await;
+    f.report_a(&plan_id, 4.0).await;
+    f.revise(&plan_id, graph_without_a()).await;
+    f.planner
+        .baseline(BaselineRequest::new(plan_id.clone()).with_reason("scope cut"))
+        .await
+        .unwrap();
+    let r = f.planner.ev(&plan_id, None).await.unwrap();
+    assert_eq!(r.ac, 4.0);
+}
+
+#[tokio::test]
+async fn readded_deliverable_restarts_earned_progress() {
+    let f = Fixture::new();
+    let plan_id = f.baselined().await;
+    f.report_a(&plan_id, 4.0).await;
+    f.revise(&plan_id, graph_without_a()).await;
+    f.revise(&plan_id, graph()).await;
+    let r = f.planner.ev(&plan_id, None).await.unwrap();
+    let a = r.rows.iter().find(|row| row.id == "a").unwrap();
+    assert_eq!(a.ev, 0.0);
+}
+
+#[tokio::test]
+async fn snapshot_with_past_as_of_is_marked_backfilled() {
+    let f = Fixture::new();
+    let plan_id = f.baselined().await;
+    f.advance(5);
+    let out = f
+        .planner
+        .snapshot(SnapshotRequest::new(plan_id).with_as_of(t0() + Duration::hours(2)))
+        .await
+        .unwrap();
+    assert!(out.summary.backfilled);
+}
+
+#[tokio::test]
+async fn alerts_ignore_backfilled_snapshots() {
+    let f = Fixture::new();
+    let plan_id = f.baselined().await;
+    f.report_a(&plan_id, 1.0).await;
+    f.advance(20);
+    // SPI 0.5 as of 10h, but taken at 20h: backfilled.
+    snapshot_at(&f, &plan_id, 10).await;
+    // SPI 0.25 as of now: the only reading alerts may use.
+    let alerts = snapshot_at(&f, &plan_id, 20).await;
+    assert!(alerts.is_empty(), "{alerts:?}");
+}
+
+#[tokio::test]
+async fn rebaseline_without_calendar_inherits_previous_calendar() {
+    let f = Fixture::new();
+    let plan_id = f.plan().await;
+    let calendar = Calendar {
+        hours_per_day: 6.0,
+        ..Calendar::default()
+    };
+    f.planner
+        .baseline(BaselineRequest::new(plan_id.clone()).with_calendar(calendar.clone()))
+        .await
+        .unwrap();
+    let out = f
+        .planner
+        .baseline(BaselineRequest::new(plan_id).with_reason("replan"))
+        .await
+        .unwrap();
+    assert_eq!(out.calendar, Some(calendar));
 }

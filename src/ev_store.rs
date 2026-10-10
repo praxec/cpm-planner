@@ -6,7 +6,9 @@
 //!
 //! Tables (created by the v4 migration in [`crate::plan_store`]):
 //! - `baselines(plan_id, number, start_us, calendar, rows, bac, reason, created_at_us)`
-//! - `ev_actuals(plan_id, deliverable_id, earned_pct, actual_hours, leased_hours, evidence, updated_at_us)`
+//! - `ev_actuals(plan_id, deliverable_id, earned_pct, actual_hours, leased_hours, evidence, updated_at_us,
+//!   removed_at_us, frozen_pct)`; a row outlives its deliverable (spend is real), and a revise that
+//!   removes a baselined deliverable freezes its earned percent ([`freeze_removed`])
 //! - `ev_snapshots(plan_id, taken_at_us, as_of_us, baseline_number, summary)`; reads are bounded
 //!   to the newest [`SNAPSHOT_HISTORY_LIMIT`] by `as_of`
 
@@ -66,7 +68,8 @@ pub(crate) fn load_actuals(
 ) -> Result<HashMap<String, Actuals>, PlannerError> {
     let mut stmt = conn
         .prepare(
-            "SELECT deliverable_id, earned_pct, actual_hours, leased_hours, evidence
+            "SELECT deliverable_id, earned_pct, actual_hours, leased_hours, evidence,
+                    removed_at_us, frozen_pct
              FROM ev_actuals WHERE plan_id = ?1",
         )
         .map_err(backend)?;
@@ -78,20 +81,28 @@ pub(crate) fn load_actuals(
                 r.get::<_, Option<f64>>(2)?,
                 r.get::<_, f64>(3)?,
                 r.get::<_, String>(4)?,
+                r.get::<_, Option<i64>>(5)?,
+                r.get::<_, Option<i64>>(6)?,
             ))
         })
         .map_err(backend)?;
     let mut out = HashMap::new();
     for row in rows {
-        let (id, pct, actual, leased, evidence) = row.map_err(backend)?;
-        let earned_pct = pct
-            .map(|p| {
+        let (id, pct, actual, leased, evidence, removed_us, frozen) = row.map_err(backend)?;
+        let percent = |p: Option<i64>, column: &str| {
+            p.map(|p| {
                 u8::try_from(p).ok().filter(|p| *p <= 100).ok_or_else(|| {
                     backend(anyhow::anyhow!(
-                        "plan {plan_id}: stored earned_pct {p} for {id} is outside 0..=100"
+                        "plan {plan_id}: stored {column} {p} for {id} is outside 0..=100"
                     ))
                 })
             })
+            .transpose()
+        };
+        let earned_pct = percent(pct, "earned_pct")?;
+        let frozen_pct = percent(frozen, "frozen_pct")?;
+        let removed_at = removed_us
+            .map(|us| dt(us, "ev_actuals.removed_at_us"))
             .transpose()?;
         let evidence: Vec<String> = serde_json::from_str(&evidence).map_err(|e| {
             backend(anyhow::anyhow!(
@@ -105,6 +116,8 @@ pub(crate) fn load_actuals(
                 actual_hours: actual.map(|h| h as f32),
                 leased_hours: leased as f32,
                 evidence,
+                removed_at,
+                frozen_pct,
             },
         );
     }
@@ -194,6 +207,54 @@ pub(crate) fn record_reported(
         ],
     )
     .map_err(backend)?;
+    Ok(())
+}
+
+/// Freeze the progress of deliverables a revise removed from `plan_id`'s
+/// graph: each `(id, pct)` gets `removed_at_us = at` and `frozen_pct = pct`
+/// on its `ev_actuals` row (created if absent; hours are left alone).
+pub(crate) fn freeze_removed(
+    conn: &Connection,
+    plan_id: &PlanId,
+    frozen: &[(String, u8)],
+    at: DateTime<Utc>,
+) -> Result<(), PlannerError> {
+    for (id, pct) in frozen {
+        conn.execute(
+            "INSERT INTO ev_actuals
+                 (plan_id, deliverable_id, updated_at_us, removed_at_us, frozen_pct)
+             VALUES (?1, ?2, ?3, ?3, ?4)
+             ON CONFLICT (plan_id, deliverable_id) DO UPDATE
+                 SET removed_at_us = excluded.removed_at_us,
+                     frozen_pct = excluded.frozen_pct,
+                     updated_at_us = excluded.updated_at_us",
+            params![plan_id.0, id, at.timestamp_micros(), pct],
+        )
+        .map_err(backend)?;
+    }
+    Ok(())
+}
+
+/// Restart the earned progress of ids a revise added back to `plan_id`:
+/// a row frozen by [`freeze_removed`] loses `removed_at_us`, `frozen_pct`
+/// and `earned_pct`. Actual and leased hours keep accumulating (spend is
+/// real); rows that were never removed are untouched.
+pub(crate) fn reopen_readded(
+    conn: &Connection,
+    plan_id: &PlanId,
+    ids: &[String],
+    at: DateTime<Utc>,
+) -> Result<(), PlannerError> {
+    for id in ids {
+        conn.execute(
+            "UPDATE ev_actuals
+                 SET removed_at_us = NULL, frozen_pct = NULL, earned_pct = NULL,
+                     updated_at_us = ?3
+             WHERE plan_id = ?1 AND deliverable_id = ?2 AND removed_at_us IS NOT NULL",
+            params![plan_id.0, id, at.timestamp_micros()],
+        )
+        .map_err(backend)?;
+    }
     Ok(())
 }
 
@@ -437,13 +498,19 @@ const ALERT_WINDOW_SQL: &str = "SELECT taken_at_us, as_of_us, summary FROM ev_sn
      WHERE plan_id = ?1
        AND baseline_number = ?2
        AND (?3 IS NULL OR as_of_us < ?3 OR (as_of_us = ?3 AND taken_at_us <= ?4))
+       AND as_of_us >= taken_at_us - ?6
      ORDER BY as_of_us DESC, taken_at_us DESC LIMIT ?5";
+
+/// Backfill tolerance ([`crate::earned_value::BACKFILL_TOLERANCE_HOURS`])
+/// in microseconds.
+const BACKFILL_TOLERANCE_US: i64 = crate::earned_value::BACKFILL_TOLERANCE_HOURS * 3_600_000_000;
 
 /// The latest `limit` snapshots of `plan_id` taken against baseline
 /// `baseline_number` at or before the position `(as_of, taken_at)` (no
-/// bound when `None`), oldest first in `(as_of, taken_at)` order. The
-/// baseline filter runs in the query, so snapshots of earlier baselines
-/// never crowd the window out.
+/// bound when `None`), oldest first in `(as_of, taken_at)` order.
+/// Backfilled snapshots (`as_of` more than an hour before `taken_at`) are
+/// skipped. Both filters run in the query, so snapshots of earlier
+/// baselines or backfills never crowd the window out.
 pub(crate) fn alert_window(
     conn: &Connection,
     plan_id: &PlanId,
@@ -457,7 +524,14 @@ pub(crate) fn alert_window(
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
     let rows = stmt
         .query_map(
-            params![plan_id.0, baseline_number, as_of, taken_at, limit],
+            params![
+                plan_id.0,
+                baseline_number,
+                as_of,
+                taken_at,
+                limit,
+                BACKFILL_TOLERANCE_US
+            ],
             |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
@@ -975,7 +1049,9 @@ mod tests {
                     .prepare(&format!("EXPLAIN QUERY PLAN {ALERT_WINDOW_SQL}"))
                     .map_err(backend)?;
                 let rows = stmt
-                    .query_map(params!["p", 1, 0, 0, 10], |r| r.get::<_, String>(3))
+                    .query_map(params!["p", 1, 0, 0, 10, BACKFILL_TOLERANCE_US], |r| {
+                        r.get::<_, String>(3)
+                    })
                     .map_err(backend)?;
                 rows.collect::<Result<_, _>>().map_err(backend)
             })

@@ -17,7 +17,13 @@
 //! `as_of`, ties by `taken_at`) and kept in that order, so a backfilled
 //! snapshot lands in date order. Alert windows are their own bounded,
 //! per-baseline query ([`ev_store::alert_window`]): a snapshot's alerts
-//! see only readings at or before its own `(as_of, taken_at)`.
+//! see only readings at or before its own `(as_of, taken_at)`, and never
+//! backfilled ones.
+//!
+//! `as_of` is the PV status date only: EV and AC are read from the
+//! statuses and actuals stored when the call runs. A snapshot whose `as_of`
+//! is more than an hour before its `taken_at` is flagged `backfilled` and
+//! raises no alerts of its own.
 
 use std::collections::HashMap;
 
@@ -119,6 +125,8 @@ impl BasicCpmPlanner {
     /// re-baseline takes the next number and needs a non-blank `reason`
     /// (`INVALID_GRAPH` otherwise). Actuals and snapshots are kept: only
     /// the PV curve and budgets change. `start` defaults to the clock's now.
+    /// `calendar` defaults to wall-clock hours on the first baseline and to
+    /// the previous baseline's calendar on a re-baseline.
     /// Gated like execution (selected, unarchived variant only). Audited as
     /// `plan.ev.baselined`.
     pub(super) async fn take_baseline(
@@ -132,7 +140,12 @@ impl BasicCpmPlanner {
         let (outcome, previous) = self.store.write_tx(|tx| {
             crate::portfolio::ensure_executable(tx, &plan_id)?;
             let state = load_state(tx, &plan_id)?;
-            let previous = ev_store::latest_baseline(tx, &plan_id)?.map(|b| b.baseline.number);
+            let latest = ev_store::latest_baseline(tx, &plan_id)?;
+            let previous = latest.as_ref().map(|b| b.baseline.number);
+            // A re-baseline without a calendar keeps the previous one.
+            let calendar = req
+                .calendar
+                .or_else(|| latest.and_then(|b| b.baseline.calendar));
             let number = match previous {
                 None => 1,
                 Some(n) if reason.is_none() => {
@@ -147,13 +160,8 @@ impl BasicCpmPlanner {
                     reason: format!("plan {plan_id} has used every baseline number"),
                 })?,
             };
-            let baseline = build_baseline(
-                &state.graph,
-                &state.cached_result,
-                start,
-                req.calendar,
-                number,
-            )?;
+            let baseline =
+                build_baseline(&state.graph, &state.cached_result, start, calendar, number)?;
             ev_store::insert_baseline(tx, &plan_id, &baseline, reason.as_deref(), now)?;
             let outcome = BaselineOutcome {
                 plan_id: plan_id.0.clone(),
@@ -183,9 +191,10 @@ impl BasicCpmPlanner {
 
     /// The earned-value report of `plan_id` against its latest baseline
     /// (`plan.ev`), as of `as_of` (default: the clock's now). Read-only and
-    /// ungated. Trend alerts look at the two latest stored snapshots (by
-    /// `as_of`) of the latest baseline; the current reading is not one of
-    /// them. `NOT_BASELINED` before the first baseline.
+    /// ungated. `as_of` sets PV only; EV and AC are the progress stored
+    /// now. Trend alerts look at the two latest stored non-backfilled
+    /// snapshots (by `as_of`) of the latest baseline; the current reading is
+    /// not one of them. `NOT_BASELINED` before the first baseline.
     ///
     /// Blocking: the report recomputes the CPM, so async callers should run
     /// it off the runtime's worker threads (the MCP server does).

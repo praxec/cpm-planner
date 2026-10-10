@@ -284,6 +284,7 @@ pub(crate) fn revise(
         .filter_map(|id| state.locks.get(id).cloned())
         .collect();
     replace_plan_state(tx, plan_id, &mut new_state)?;
+    record_scope_change(tx, plan_id, &state, &diff, now)?;
 
     // An unnamed plan (no `variants` row) must be found by the global dedup
     // under the graph it now holds; named plans are never in that map. If
@@ -358,6 +359,57 @@ pub(crate) fn revise(
         no_op: false,
         completed,
     })
+}
+
+/// Earned-value side of a revision. A removed deliverable with a row in the
+/// latest baseline keeps the percent it had earned at removal (100 if
+/// `Complete`, else its rule's percent; [`crate::ev_store::freeze_removed`]);
+/// an id added back restarts its earned progress
+/// ([`crate::ev_store::reopen_readded`]). Hours are never dropped.
+fn record_scope_change(
+    tx: &Transaction<'_>,
+    plan_id: &PlanId,
+    old: &PlanState,
+    diff: &RevisionDiff,
+    now: DateTime<Utc>,
+) -> Result<(), PlannerError> {
+    crate::ev_store::reopen_readded(tx, plan_id, &diff.added, now)?;
+    if diff.removed.is_empty() {
+        return Ok(());
+    }
+    let Some(baseline) = crate::ev_store::latest_baseline(tx, plan_id)? else {
+        return Ok(());
+    };
+    let baselined: HashSet<&str> = baseline
+        .baseline
+        .rows
+        .iter()
+        .map(|r| r.id.as_str())
+        .collect();
+    let actuals = crate::ev_store::load_actuals(tx, plan_id)?;
+    let frozen: Vec<(String, u8)> = diff
+        .removed
+        .iter()
+        .filter(|id| baselined.contains(id.as_str()))
+        .map(|id| {
+            let rule = old
+                .graph
+                .deliverables
+                .iter()
+                .find(|d| &d.id == id)
+                .and_then(|d| d.earning_rule)
+                .unwrap_or_default();
+            let status = old
+                .statuses
+                .get(id)
+                .cloned()
+                .unwrap_or(DeliverableStatus::Pending);
+            let reported = actuals.get(id).and_then(|a| a.earned_pct);
+            let pct = crate::earned_value::frozen_pct(rule, &status, reported);
+            (id.clone(), pct)
+        })
+        .collect();
+    crate::ev_store::freeze_removed(tx, plan_id, &frozen, now)
 }
 
 /// [`sync`] that only ever creates: an existing `(project, name, variant)`

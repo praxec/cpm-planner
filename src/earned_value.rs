@@ -6,11 +6,33 @@
 //! (finite, >= 0, default 1.0). Every division is guarded; an undefined ratio
 //! becomes `None` plus an [`Undefined`] entry, never NaN or infinity.
 //!
+//! `as_of` is the status date of the planned value only: PV is the baseline
+//! curve at `as_of`, while EV and AC reflect the progress and actuals
+//! recorded up to the moment the call runs (actuals are not versioned in
+//! time). A reading with a past `as_of` therefore pairs an old PV with
+//! today's EV and AC; a snapshot more than an hour behind its `taken_at` is
+//! flagged [`SnapshotSummary::backfilled`] and ignored by [`trend_alerts`].
+//!
 //! Rows are taken from the baseline only. Deliverables added after the
-//! baseline contribute nothing to BAC, PV, EV or AC until re-baseline; they
-//! are listed in [`EvReport::excluded_unbaselined`]. Cost rates are frozen in
-//! the baseline, so later rate edits (or removed deliverables) do not change
-//! budget or AC.
+//! baseline contribute nothing to BAC, PV or EV until re-baseline; they are
+//! listed in [`EvReport::excluded_unbaselined`]. Cost rates are frozen in
+//! the baseline, so later rate edits do not change budget or AC.
+//!
+//! Actual cost never disappears: AC sums every actuals row of the plan
+//! (reported hours, else leased hours), at the row's baseline cost rate, or
+//! 1.0 for an id the baseline does not have (added later, or removed before
+//! a re-baseline). So per-row `ac` can sum to less than the total.
+//!
+//! Removed scope: when a revise removes a baselined deliverable, its earned
+//! percent is frozen ([`Actuals::frozen_pct`]: 100 if it was `Complete`,
+//! else its rule's percent then). Its row then reports
+//! [`EvRowStatus::Removed`] and earns that share of its budget (0 without a
+//! frozen percent). Adding the id back clears the freeze and the reported
+//! percent, so earning restarts; its hours keep accumulating.
+//!
+//! Known limitation: selecting variant A, then B, then A again after a
+//! revise reopened a carried deliverable can count copied leased hours
+//! twice (each select carries the source's leased hours onto the target).
 
 use crate::estimator::EffortEstimator;
 pub use crate::plan::EarningRule;
@@ -98,6 +120,59 @@ pub struct Actuals {
     pub actual_hours: Option<f32>,
     pub leased_hours: f32,
     pub evidence: Vec<String>,
+    /// When a revise removed this deliverable from the graph; cleared when a
+    /// later revise adds the id back.
+    #[serde(default)]
+    pub removed_at: Option<DateTime<Utc>>,
+    /// Earned percent frozen at removal (100 if it was `Complete`, else its
+    /// earned percent under its rule then). A removed baseline row earns
+    /// this share of its budget.
+    #[serde(default)]
+    pub frozen_pct: Option<u8>,
+}
+
+/// Status of one EV row: the deliverable's live status, or `removed` for a
+/// baseline row whose id is no longer in the graph. Serialised like
+/// [`DeliverableStatus`] (`{"status": "..."}`), with the extra value
+/// `"removed"`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum EvRowStatus {
+    Pending,
+    Ready,
+    InProgress,
+    Complete,
+    Failed {
+        reason: String,
+    },
+    /// A revise removed the deliverable after it was baselined; it earns its
+    /// frozen percent ([`Actuals::frozen_pct`], 0 if none).
+    Removed,
+}
+
+impl From<DeliverableStatus> for EvRowStatus {
+    fn from(s: DeliverableStatus) -> Self {
+        match s {
+            DeliverableStatus::Pending => Self::Pending,
+            DeliverableStatus::Ready => Self::Ready,
+            DeliverableStatus::InProgress => Self::InProgress,
+            DeliverableStatus::Complete => Self::Complete,
+            DeliverableStatus::Failed { reason } => Self::Failed { reason },
+        }
+    }
+}
+
+impl PartialEq<DeliverableStatus> for EvRowStatus {
+    fn eq(&self, other: &DeliverableStatus) -> bool {
+        match (self, other) {
+            (Self::Pending, DeliverableStatus::Pending)
+            | (Self::Ready, DeliverableStatus::Ready)
+            | (Self::InProgress, DeliverableStatus::InProgress)
+            | (Self::Complete, DeliverableStatus::Complete) => true,
+            (Self::Failed { reason: a }, DeliverableStatus::Failed { reason: b }) => a == b,
+            _ => false,
+        }
+    }
 }
 
 /// An EV field that could not be computed.
@@ -115,8 +190,10 @@ pub struct EvRow {
     pub pv: f32,
     pub earned_pct: f32,
     pub ev: f32,
+    /// This row's spend at its baseline cost rate.
     pub ac: f32,
-    pub status: DeliverableStatus,
+    /// Live status, or `removed` when the id left the graph after baselining.
+    pub status: EvRowStatus,
 }
 
 /// The ratios of an earlier snapshot, used for trend alerts.
@@ -127,11 +204,17 @@ pub struct EvSummary {
     pub baseline_number: u32,
     pub spi: Option<f32>,
     pub cpi: Option<f32>,
+    /// The snapshot was backfilled ([`SnapshotSummary::backfilled`]); alerts
+    /// ignore it.
+    #[serde(default)]
+    pub backfilled: bool,
 }
 
 /// Full earned-value report.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvReport {
+    /// PV status date. EV and AC reflect progress and actuals recorded up
+    /// to the moment the report was computed.
     pub as_of: DateTime<Utc>,
     pub baseline_number: u32,
     pub bac: f32,
@@ -214,6 +297,13 @@ fn finish_of(cpm: &CriticalPathResult) -> f32 {
                 .map(|t| t.earliest_finish)
                 .fold(0.0, f32::max)
         })
+}
+
+/// The percent a deliverable removed from the graph keeps
+/// ([`Actuals::frozen_pct`]): 100 if it was `Complete`, else its earned
+/// percent under `rule` with the `reported` percent (0 if none).
+pub fn frozen_pct(rule: EarningRule, status: &DeliverableStatus, reported: Option<u8>) -> u8 {
+    earned_pct(rule, status, reported.map(|p| p.min(100))).clamp(0.0, 100.0) as u8
 }
 
 fn earned_pct(rule: EarningRule, status: &DeliverableStatus, reported: Option<u8>) -> f64 {
@@ -374,7 +464,12 @@ pub fn build_baseline(
 /// Critical-float consumption is approximated as
 /// `max(0, current __finish__ EF - baseline finish)`.
 /// Rows are taken from the baseline only. Deliverables added after the baseline
-/// contribute nothing to BAC, PV, EV or AC until re-baseline.
+/// contribute nothing to BAC, PV or EV until re-baseline; AC sums every
+/// entry of `actuals` (see the module docs). A baseline row whose id is not
+/// in `graph` is `removed` and earns its frozen percent.
+///
+/// `as_of` sets PV only; EV and AC come from `statuses` and `actuals` as
+/// given (the progress recorded when the call runs).
 ///
 /// `critical_float_consumed_hours` reflects only graph/estimate changes: it
 /// ignores statuses, actuals and `as_of`, so it does not show execution
@@ -402,6 +497,17 @@ pub fn compute_ev(
     )?);
     let (mut pv, mut ev, mut ac) = (0.0_f64, 0.0_f64, 0.0_f64);
     let mut rows = Vec::with_capacity(baseline.rows.len());
+    let live: std::collections::HashSet<&str> =
+        graph.deliverables.iter().map(|d| d.id.as_str()).collect();
+    let valid = |h: f32| h.is_finite() && h >= 0.0;
+    // Actual hours, else leased hours; invalid values count as 0.
+    let hours_of = |a: &Actuals| -> f32 {
+        let h = match a.actual_hours {
+            Some(h) if valid(h) => h,
+            _ => a.leased_hours,
+        };
+        if valid(h) { h } else { 0.0 }
+    };
     for r in &baseline.rows {
         let budget = f64::from(r.budget);
         let (es, ef) = (f64::from(r.es), f64::from(r.ef));
@@ -410,28 +516,25 @@ pub fn compute_ev(
         } else {
             budget * ((t - es) / (ef - es)).clamp(0.0, 1.0)
         };
-        let status = statuses
-            .get(&r.id)
-            .cloned()
-            .unwrap_or(DeliverableStatus::Pending);
         let act = actuals.get(&r.id);
-        let rule = rules.get(&r.id).copied().unwrap_or_default();
-        let reported = act.and_then(|a| a.earned_pct).map(|p| p.min(100));
-        let pct = earned_pct(rule, &status, reported);
-        let rate = r.cost_rate;
-        let valid = |h: f32| h.is_finite() && h >= 0.0;
-        let hours = act
-            .map(|a| match a.actual_hours {
-                Some(h) if valid(h) => h,
-                _ => a.leased_hours,
-            })
-            .filter(|h| valid(*h))
-            .unwrap_or(0.0);
+        let (status, pct) = if live.contains(r.id.as_str()) {
+            let status = statuses
+                .get(&r.id)
+                .cloned()
+                .unwrap_or(DeliverableStatus::Pending);
+            let rule = rules.get(&r.id).copied().unwrap_or_default();
+            let reported = act.and_then(|a| a.earned_pct).map(|p| p.min(100));
+            let pct = earned_pct(rule, &status, reported);
+            (EvRowStatus::from(status), pct)
+        } else {
+            let frozen = act.and_then(|a| a.frozen_pct).map_or(0, |p| p.min(100));
+            (EvRowStatus::Removed, f64::from(frozen))
+        };
+        let hours = act.map_or(0.0, hours_of);
         let row_ev = budget * pct / 100.0;
-        let row_ac = f64::from(rate) * f64::from(hours);
+        let row_ac = f64::from(r.cost_rate) * f64::from(hours);
         pv += row_pv;
         ev += row_ev;
-        ac += row_ac;
         rows.push(EvRow {
             id: r.id.clone(),
             budget: r.budget,
@@ -441,6 +544,19 @@ pub fn compute_ev(
             ac: row_ac as f32,
             status,
         });
+    }
+    // AC is every actuals row of the plan (spend never disappears): baseline
+    // rows at their frozen cost rate, any other id at rate 1.0.
+    let rates: HashMap<&str, f32> = baseline
+        .rows
+        .iter()
+        .map(|r| (r.id.as_str(), r.cost_rate))
+        .collect();
+    let mut spend: Vec<(&String, &Actuals)> = actuals.iter().collect();
+    spend.sort_by(|a, b| a.0.cmp(b.0));
+    for (id, a) in spend {
+        let rate = rates.get(id.as_str()).copied().unwrap_or(1.0);
+        ac += f64::from(rate) * f64::from(hours_of(a));
     }
     let bac: f64 = baseline.rows.iter().map(|r| f64::from(r.budget)).sum();
     let mut undefined = Vec::new();
@@ -619,7 +735,10 @@ pub enum SnapshotFormat {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SnapshotRequest {
     pub plan_id: PlanId,
-    /// Status date of the reading; defaults to the planner clock's now.
+    /// Status date of the reading's PV; defaults to the planner clock's now.
+    /// EV and AC are always the progress recorded when the snapshot is
+    /// taken, so a past `as_of` (over an hour back) marks it
+    /// [`SnapshotSummary::backfilled`].
     pub as_of: Option<DateTime<Utc>>,
     pub format: SnapshotFormat,
 }
@@ -662,13 +781,15 @@ pub struct SnapshotOutcome {
 /// Trend alerts over snapshot ratios in `as_of` order: `SPI_BELOW_0_9` /
 /// `CPI_BELOW_0_9` when the metric is defined and below 0.9 on both of the
 /// two latest snapshots taken against `baseline_number` (snapshots of
-/// earlier baselines are ignored). Fewer than two such snapshots raise
-/// nothing.
+/// earlier baselines are ignored). Backfilled snapshots
+/// ([`SnapshotSummary::backfilled`]) are ignored too, as the new reading
+/// and as the previous one: their EV and AC are today's, not the past
+/// date's. Fewer than two remaining snapshots raise nothing.
 pub fn trend_alerts(snapshots: &[EvSummary], baseline_number: u32) -> Vec<String> {
     let mut alerts = Vec::new();
     let current: Vec<&EvSummary> = snapshots
         .iter()
-        .filter(|s| s.baseline_number == baseline_number)
+        .filter(|s| s.baseline_number == baseline_number && !s.backfilled)
         .collect();
     if let [.., a, b] = current.as_slice() {
         let low = |v: Option<f32>| v.is_some_and(|x| x < 0.9);
@@ -707,6 +828,21 @@ pub struct SnapshotSummary {
     #[serde(default)]
     pub undefined: Vec<Undefined>,
     pub alerts: Vec<String>,
+    /// `as_of` is more than [`BACKFILL_TOLERANCE_HOURS`] before `taken_at`.
+    /// EV and AC are measured when the snapshot is taken, so a backfilled
+    /// snapshot pairs a past PV with present progress; trend alerts ignore
+    /// it. Absent (false) in summaries stored before this field existed.
+    #[serde(default)]
+    pub backfilled: bool,
+}
+
+/// How far `as_of` may lag `taken_at` before a snapshot counts as
+/// backfilled ([`SnapshotSummary::backfilled`]).
+pub const BACKFILL_TOLERANCE_HOURS: i64 = 1;
+
+/// Whether a reading at `as_of`, taken at `taken_at`, is backfilled.
+pub fn is_backfilled(as_of: DateTime<Utc>, taken_at: DateTime<Utc>) -> bool {
+    as_of < taken_at - Duration::hours(BACKFILL_TOLERANCE_HOURS)
 }
 
 impl SnapshotSummary {
@@ -730,6 +866,7 @@ impl SnapshotSummary {
             tcpi: report.tcpi,
             undefined: report.undefined.clone(),
             alerts: report.alerts.clone(),
+            backfilled: is_backfilled(report.as_of, taken_at),
         }
     }
 
@@ -739,6 +876,7 @@ impl SnapshotSummary {
             baseline_number: self.baseline_number,
             spi: self.spi,
             cpi: self.cpi,
+            backfilled: self.backfilled,
         }
     }
 }
@@ -1481,6 +1619,7 @@ mod tests {
             baseline_number: 1,
             spi: Some(spi),
             cpi: Some(cpi),
+            backfilled: false,
         }
     }
 
@@ -1529,6 +1668,7 @@ mod tests {
             baseline_number: 1,
             spi: None,
             cpi: None,
+            backfilled: false,
         };
         assert!(alerts_with(&[snap(0.5, 0.5), none]).is_empty());
     }
@@ -1924,6 +2064,71 @@ mod tests {
                 .nth(2)
                 .is_some_and(|l| l.ends_with("| n/a | n/a |"))
         );
+    }
+
+    #[test]
+    fn alerts_ignore_a_backfilled_new_reading() {
+        let mut backfilled = snap(0.5, 1.0);
+        backfilled.backfilled = true;
+        assert!(trend_alerts(&[snap(0.5, 1.0), backfilled], 1).is_empty());
+    }
+
+    #[test]
+    fn snapshot_more_than_an_hour_behind_its_taken_at_is_backfilled() {
+        let r = textbook();
+        assert!(SnapshotSummary::from_report(&r, r.as_of + Duration::minutes(61)).backfilled);
+    }
+
+    #[test]
+    fn snapshot_within_an_hour_of_its_taken_at_is_not_backfilled() {
+        let r = textbook();
+        assert!(!SnapshotSummary::from_report(&r, r.as_of + Duration::minutes(60)).backfilled);
+    }
+
+    #[test]
+    fn removed_row_earns_its_frozen_percent() {
+        let b = baseline(vec![row("a", 0.0, 10.0, 100.0)]);
+        let actuals = HashMap::from([(
+            "a".to_string(),
+            Actuals {
+                frozen_pct: Some(40),
+                ..Actuals::default()
+            },
+        )]);
+        let r = report(&b, &graph(vec![]), &HashMap::new(), &e2(), &actuals, 5);
+        assert!(near(r.ev, 40.0));
+    }
+
+    #[test]
+    fn removed_row_without_frozen_percent_earns_nothing() {
+        let b = baseline(vec![row("a", 0.0, 10.0, 100.0)]);
+        let st = statuses(&[("a", DeliverableStatus::Complete)]);
+        let r = report(&b, &graph(vec![]), &st, &e2(), &HashMap::new(), 5);
+        assert!(near(r.ev, 0.0));
+    }
+
+    #[test]
+    fn unbaselined_actuals_count_in_ac_at_rate_one() {
+        let b = baseline(vec![row("a", 0.0, 10.0, 100.0)]);
+        let g = graph(vec![
+            deliverable("a", 100.0, &[]),
+            deliverable("n", 5.0, &[]),
+        ]);
+        let actuals = HashMap::from([(
+            "n".to_string(),
+            Actuals {
+                actual_hours: Some(3.0),
+                ..Actuals::default()
+            },
+        )]);
+        let r = report(&b, &g, &HashMap::new(), &e2(), &actuals, 5);
+        assert!(near(r.ac, 3.0));
+    }
+
+    #[test]
+    fn frozen_pct_of_a_complete_deliverable_is_100() {
+        let pct = frozen_pct(EarningRule::ZeroHundred, &DeliverableStatus::Complete, None);
+        assert_eq!(pct, 100);
     }
 
     #[test]
