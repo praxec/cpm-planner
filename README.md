@@ -1,26 +1,62 @@
 # cpm-planner
 
 [![CI](https://github.com/praxec/cpm-planner/actions/workflows/ci.yml/badge.svg)](https://github.com/praxec/cpm-planner/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/cpm-planner.svg)](https://crates.io/crates/cpm-planner)
-[![docs.rs](https://docs.rs/cpm-planner/badge.svg)](https://docs.rs/cpm-planner)
+[![Release](https://img.shields.io/github/v/release/praxec/cpm-planner)](https://github.com/praxec/cpm-planner/releases/latest)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-cpm-planner is a Critical Path Method (CPM) planner exposed as an MCP server. You
-submit a task graph; it computes the schedule — earliest/latest start and finish,
-slack, the critical path, and the bottleneck tasks that actually gate completion —
-and it coordinates **lock-aware cohort scheduling** so multiple workers can run
-disjoint deliverables in parallel without colliding. Any MCP client (Claude Code,
-Cursor, a custom orchestrator, or an [praxec](https://github.com/praxec/praxec)
-workflow) drives it over the standard protocol.
+cpm-planner is a Critical Path Method (CPM) planner for agent work, exposed as an
+MCP server. You submit a task graph and it computes the schedule: earliest and
+latest start and finish, slack, the critical path and the bottleneck tasks that
+gate completion. It then leases **lock-aware cohorts** of ready deliverables with
+disjoint file sets, so several workers can run in parallel without colliding.
+Plans can live in the repository as plan-as-code files with forkable, comparable
+variants; read-only tools lint, level against resource capacities and run Monte
+Carlo risk; earned-value tools track PV, EV, AC, SPI and CPI against a frozen
+baseline; and an optional AI review proposes verified schedule improvements. Any
+MCP client (Claude Code, Cursor, VS Code, Codex, a custom orchestrator, or a
+[praxec](https://github.com/praxec/praxec) workflow) drives it over stdio. It is a
+standalone tool with no dependency on praxec.
 
-It is a standalone tool: it has no dependency on praxec and is consumed
-purely over MCP.
+## Contents
+
+- [Install](#install)
+  - [Prebuilt binary (recommended)](#prebuilt-binary-recommended)
+  - [Pin a version](#pin-a-version)
+  - [From source](#from-source)
+  - [Docker](#docker)
+  - [Verify the install](#verify-the-install)
+  - [For AI agents](#for-ai-agents)
+- [Quickstart: plan as code](#quickstart-plan-as-code)
+- [Quickstart: earned value](#quickstart-earned-value)
+- [Register as an MCP server](#register-as-an-mcp-server)
+  - [Claude Code](#claude-code)
+  - [Claude Desktop](#claude-desktop)
+  - [Cursor](#cursor)
+  - [VS Code](#vs-code)
+  - [Codex CLI](#codex-cli)
+  - [Agent self-install](#agent-self-install)
+- [Agent skill](#agent-skill)
+- [MCP tools](#mcp-tools)
+  - [Plan-as-code workflow](#plan-as-code-workflow)
+  - [Plan review (optional)](#plan-review-optional)
+- [Use as a library](#use-as-a-library)
+- [Praxec](#praxec)
+- [Environment variables](#environment-variables)
+- [Documentation](#documentation)
+- [Contributing](#contributing)
+- [License](#license)
 
 ## Install
 
 ### Prebuilt binary (recommended)
 
-Prebuilt packages are published for Linux, macOS and Windows on x86_64 and ARM64. The installers resolve your OS and CPU, download the matching archive, **verify its SHA-256 against the release's `checksums.sha256` before installing**, and atomically replace the binary in a user-local directory. A checksum mismatch aborts with a non-zero exit and installs nothing. Re-running the installer upgrades in place.
+Prebuilt packages are published for Linux, macOS and Windows on x86_64 and ARM64.
+
+The installers resolve your OS and CPU and download the matching archive. They
+**verify its SHA-256 against the release's `checksums.sha256` before installing**,
+then atomically replace the binary in a user-local directory. A checksum mismatch
+aborts with a non-zero exit and installs nothing. Re-running the installer upgrades
+in place.
 
 ```sh
 # Linux / macOS  ->  ~/.local/bin/cpm-planner
@@ -30,37 +66,50 @@ curl -fsSL https://github.com/praxec/cpm-planner/releases/latest/download/instal
 irm https://github.com/praxec/cpm-planner/releases/latest/download/install.ps1 | iex
 ```
 
-Pin a release (shown for v0.1.1):
+The installer prints the absolute path it installed to. Use that path when you
+register the server with a GUI client.
 
-```sh
-# Linux / macOS
-curl -fsSL https://github.com/praxec/cpm-planner/releases/latest/download/install.sh | sh -s -- --version v0.1.1
+<details>
+<summary>Installer details: inspecting the script, PATH, upgrades and direct downloads</summary>
 
-# Windows (PowerShell): the piped form cannot take parameters, so use the environment variable...
-$env:PRAXEC_VERSION = 'v0.1.1'; irm https://github.com/praxec/cpm-planner/releases/latest/download/install.ps1 | iex
-# ...or a script block
-& ([scriptblock]::Create((irm https://github.com/praxec/cpm-planner/releases/latest/download/install.ps1))) -Version v0.1.1
-```
-
-If you would rather read the script before running it, download, inspect, then run:
+If you would rather read the script before running it, download, inspect, then run
+(see [Pin a version](#pin-a-version) for `<version>`):
 
 ```sh
 # Linux / macOS
 curl -fsSLO https://github.com/praxec/cpm-planner/releases/latest/download/install.sh
 less install.sh
-sh install.sh --version v0.1.1
+sh install.sh --version <version>
 ```
 
 ```powershell
 # Windows
 irm https://github.com/praxec/cpm-planner/releases/latest/download/install.ps1 -OutFile install.ps1
 Get-Content install.ps1
-.\install.ps1 -Version v0.1.1
+.\install.ps1 -Version <version>
 ```
 
-The installers print the absolute path they installed to (for example `~/.local/bin/cpm-planner`) and, if that directory is not on your `PATH`, the exact line to add. Pass `--add-to-path` (`-AddToPath` on Windows) to have the installer do it for you (user-level only, never sudo). On Linux/macOS it appends to `~/.zshrc` (zsh), `~/.bash_profile` if it exists else `~/.bashrc` (bash), or `~/.profile` (other shells), only if the line is not already there; for fish it prints `fish_add_path <dir>` for you to run instead of writing a file. They only accept `https://` download URLs. After upgrading, restart your MCP client so it launches the new binary (on Windows the old exe is renamed to `cpm-planner.exe.old` and removed on the next run).
+**PATH.** If the install directory is not on your `PATH`, the installer prints the
+exact line to add. Pass `--add-to-path` (`-AddToPath` on Windows) to have it do that
+for you, user-level only and never with sudo.
 
-Or download an archive directly and check it against `checksums.sha256` (a machine-readable `release-manifest.json` is published too):
+On Linux and macOS it appends the line only if it is not already there, to:
+
+- `~/.zshrc` for zsh;
+- `~/.bash_profile` if it exists, else `~/.bashrc`, for bash;
+- `~/.profile` for other shells.
+
+For fish it prints `fish_add_path <dir>` for you to run instead of writing a file.
+
+**Downloads.** The installers only accept `https://` download URLs.
+
+**Upgrades.** After upgrading, restart your MCP client so it launches the new
+binary. On Windows the old exe is renamed to `cpm-planner.exe.old` and removed on
+the next run.
+
+**Direct downloads.** You can also download an archive yourself and check it
+against `checksums.sha256`; a machine-readable `release-manifest.json` is published
+too. All assets are at <https://github.com/praxec/cpm-planner/releases/latest>.
 
 | Platform | Asset |
 |----------|-------|
@@ -71,19 +120,78 @@ Or download an archive directly and check it against `checksums.sha256` (a machi
 | Windows x86_64 | `cpm-planner-x86_64-pc-windows-msvc.zip` |
 | Windows ARM64 | `cpm-planner-aarch64-pc-windows-msvc.zip` |
 
-All assets are at <https://github.com/praxec/cpm-planner/releases/latest>.
+</details>
+
+### Pin a version
+
+In the commands in this README, `<version>` is a release tag such as `v0.2.0`. Pick
+one from the [releases page](https://github.com/praxec/cpm-planner/releases).
+
+```sh
+# Linux / macOS
+curl -fsSL https://github.com/praxec/cpm-planner/releases/latest/download/install.sh | sh -s -- --version <version>
+
+# Windows (PowerShell): the piped form cannot take parameters, so use the environment variable...
+$env:PRAXEC_VERSION = '<version>'; irm https://github.com/praxec/cpm-planner/releases/latest/download/install.ps1 | iex
+# ...or a script block
+& ([scriptblock]::Create((irm https://github.com/praxec/cpm-planner/releases/latest/download/install.ps1))) -Version <version>
+```
 
 ### From source
 
+Build and install a tagged release with Cargo (Rust 1.99 or newer):
+
 ```sh
-cargo install cpm-planner
+cargo install --git https://github.com/praxec/cpm-planner --tag <version> --locked
 ```
+
+The crates.io listing lags behind the GitHub releases until the next
+`cargo publish`, so `cargo install cpm-planner` does not give you the current
+version yet. Install from the tag as above.
 
 ### Docker
 
 ```sh
 docker pull ghcr.io/praxec/cpm-planner
+docker run -i --rm -v cpm-planner-data:/data ghcr.io/praxec/cpm-planner
 ```
+
+`-i` keeps stdin open for the stdio transport.
+
+The image sets `CPM_PLANNER_DB=/data/cpm-planner.db` and declares `/data` as a
+volume owned by the unprivileged `app` user, so a named volume persists plan state
+across runs. For a bind mount (`-v "$PWD:/data"`), run as yourself so the directory
+is writable: `--user "$(id -u):$(id -g)"`. Pass `-e CPM_PLANNER_DB=...` only to
+override the path.
+
+To register the image with a client, put `docker` in `command` and the rest in
+`args`. For example, in Claude Code:
+
+```sh
+claude mcp add cpm-planner --scope user -- docker run -i --rm -v cpm-planner-data:/data ghcr.io/praxec/cpm-planner
+```
+
+### Verify the install
+
+```sh
+cpm-planner --version
+```
+
+It prints `cpm-planner <version>`. To check the MCP side without a client, run the smoke
+script from the repository. It performs the MCP `initialize` and `tools/list` handshake and
+fails if `plan.submit`, `plan.status` or `plan.get` is missing:
+
+```sh
+node scripts/mcp-smoke.mjs /absolute/path/to/cpm-planner
+```
+
+### For AI agents
+
+[docs/AGENT-INSTALL.md](docs/AGENT-INSTALL.md) takes an agent (or you) from
+"which tool am I?" to a verified install: the program, MCP registration, the
+skills and the checks, for Claude Code, Codex, Cursor, Copilot, Gemini CLI and
+other tools. [llms.txt](llms.txt) indexes the docs for LLMs. The short version
+is [Agent self-install](#agent-self-install) below.
 
 ## Quickstart: plan as code
 
@@ -115,10 +223,21 @@ A ratio with a zero denominator is `null` and explained in `undefined`; alerts
 
 cpm-planner speaks MCP over stdio. Register the `cpm-planner` command with your client. Every snippet below has an optional `env` block; drop it to use the defaults (see [Environment variables](#environment-variables)). Snippets use the bare command `cpm-planner`; if it is not on your `PATH` (or for any GUI client), use the absolute path the installer printed.
 
+Each client also has an **npx** form, which needs only Node 18 or later: the
+command is `npx` and the arguments are `-y` and `@matthew-cochran/cpm`. The
+launcher downloads the release binary on first run, verifies its checksum and
+caches it. The npx form works once `@matthew-cochran/cpm` is published to npm
+(from 0.2.0); until then use the installed binary. For per-client steps and
+troubleshooting, see [docs/AGENT-INSTALL.md](docs/AGENT-INSTALL.md).
+
+To run the container image instead of a local binary, see [Docker](#docker). For praxec workflows, see [Praxec](#praxec).
+
 ### Claude Code
 
 ```sh
 claude mcp add cpm-planner --scope user -- cpm-planner
+# npx
+claude mcp add --transport stdio --scope user cpm-planner -- npx -y @matthew-cochran/cpm
 # with environment variables (put another option between --env and the name)
 claude mcp add --env CPM_PLANNER_DB=/path/to/cpm-planner.db --env CPM_MAX_TTL_SECS=28800 --transport stdio --scope user cpm-planner -- cpm-planner
 ```
@@ -160,6 +279,12 @@ Edit `claude_desktop_config.json` (Settings, Developer, Edit Config) and restart
 
 On Windows use an absolute command path with escaped backslashes, e.g. `C:\\Users\\you\\AppData\\Local\\Programs\\cpm-planner\\cpm-planner.exe`.
 
+npx form:
+
+```json
+{ "mcpServers": { "cpm-planner": { "command": "npx", "args": ["-y", "@matthew-cochran/cpm"] } } }
+```
+
 ### Cursor
 
 Use the absolute path the installer printed as `command` (GUI apps do not inherit your shell `PATH`).
@@ -177,6 +302,12 @@ Use the absolute path the installer printed as `command` (GUI apps do not inheri
     }
   }
 }
+```
+
+npx form:
+
+```json
+{ "mcpServers": { "cpm-planner": { "type": "stdio", "command": "npx", "args": ["-y", "@matthew-cochran/cpm"] } } }
 ```
 
 ### VS Code
@@ -198,10 +329,22 @@ Use the absolute path the installer printed as `command` (GUI apps do not inheri
 }
 ```
 
+npx form, in `.vscode/mcp.json` or from the command line for your user profile:
+
+```json
+{ "servers": { "cpm-planner": { "type": "stdio", "command": "npx", "args": ["-y", "@matthew-cochran/cpm"] } } }
+```
+
+```sh
+code --add-mcp '{"name":"cpm-planner","command":"npx","args":["-y","@matthew-cochran/cpm"]}'
+```
+
 ### Codex CLI
 
 ```sh
 codex mcp add cpm-planner --env CPM_PLANNER_DB=/path/to/cpm-planner.db -- cpm-planner
+# npx
+codex mcp add cpm-planner -- npx -y @matthew-cochran/cpm
 ```
 
 or in `~/.codex/config.toml`:
@@ -215,30 +358,14 @@ args = []
 CPM_PLANNER_DB = "/path/to/cpm-planner.db"
 ```
 
-### Docker
-
-```sh
-docker run -i --rm -v cpm-planner-data:/data ghcr.io/praxec/cpm-planner
-```
-
-`-i` keeps stdin open for the stdio transport. The image sets `CPM_PLANNER_DB=/data/cpm-planner.db` and declares `/data` as a volume owned by the unprivileged `app` user, so a named volume persists plan state across runs. For a bind mount (`-v "$PWD:/data"`) run as yourself so the directory is writable: `--user "$(id -u):$(id -g)"`. Pass `-e CPM_PLANNER_DB=...` only to override the path.
-
-As a client config, put `docker` in `command` and the rest in `args`, for example in Claude Code:
-
-```sh
-claude mcp add cpm-planner --scope user -- docker run -i --rm -v cpm-planner-data:/data ghcr.io/praxec/cpm-planner
-```
-
-### praxec
-
-See [Use with an MCP client](#use-with-an-mcp-client-eg-praxec) below for the YAML connection and [Using it with Praxec](#using-it-with-praxec) for the `packs/setup.sh` one-command setup.
+npx form: `command = "npx"` and `args = ["-y", "@matthew-cochran/cpm"]`.
 
 ### Agent self-install
 
 An agent can install and verify cpm-planner itself:
 
 1. Detect the OS and CPU architecture (`uname -sm`, or `$env:PROCESSOR_ARCHITECTURE` on Windows).
-2. Run the installer for that OS (`install.sh` or `install.ps1` above). It verifies the SHA-256 and exits non-zero on any mismatch; stop if it does. Note the absolute path it prints (e.g. `/home/you/.local/bin/cpm-planner`).
+2. Run the installer for that OS (`install.sh` or `install.ps1`, see [Install](#install)). It verifies the SHA-256 and exits non-zero on any mismatch; stop if it does. Note the absolute path it prints (e.g. `/home/you/.local/bin/cpm-planner`).
 3. Register the server with your own client using the matching section above, with that absolute path as the command (for Claude Code: `claude mcp add cpm-planner --scope user -- /home/you/.local/bin/cpm-planner`). Restart or reload the client if it requires that.
 4. Confirm `plan.status` appears among your available tools. You can also check registration from the CLI: `claude mcp list` / `claude mcp get cpm-planner` (Claude Code) or `codex mcp list` (Codex).
 5. Call `plan.submit` with these arguments (a two-deliverable smoke plan), then read it back with `plan.get` using the returned plan id and confirm both deliverables round-trip:
@@ -247,42 +374,68 @@ An agent can install and verify cpm-planner itself:
 {"graph":{"deliverables":[{"id":"a","owned_files":["a.txt"],"prerequisites":[],"estimated_effort_hours":1},{"id":"b","owned_files":["b.txt"],"prerequisites":["a"],"estimated_effort_hours":1}]}}
 ```
 
-To check a binary without any MCP client, download `scripts/mcp-smoke.mjs` from the repository and run `node mcp-smoke.mjs /absolute/path/to/cpm-planner`; it performs the MCP `initialize` and `tools/list` handshake and fails if `plan.submit`, `plan.status` or `plan.get` is missing.
+To check a binary without any MCP client, use the smoke script from [Verify the install](#verify-the-install).
 
 ## Agent skill
 
-The `deliverable-cpm` skill teaches an agent the plan-as-code method this server is built
-for: deliverables as artifacts, consumption edges, lint, sync, levelling, the
-fork/compare/select improvement loop, leased execution and earned value. It lives in
-[`skills/deliverable-cpm/`](skills/deliverable-cpm/): `SKILL.md` plus a lint-clean example
-plan and a worked improvement loop. Install it by copying that directory into your agent's
-skills directory.
+Six agent skills ship inside the binary. `deliverable-cpm` teaches the plan-as-code method
+this server is built for: deliverables as artifacts, consumption edges, lint, sync,
+levelling, the fork/compare/select improvement loop, leased execution and earned value.
+Five short skills sit on top of it: `cpm-plan`, `cpm-improve`, `cpm-run`, `cpm-ev` and
+`cpm-revise`. The sources are in [`skills/`](skills/).
 
-| Agent | Skills directory |
-|---|---|
-| Claude Code, all projects | `~/.claude/skills/deliverable-cpm/` |
-| Claude Code, one project | `<project>/.claude/skills/deliverable-cpm/` |
-| Codex, all projects | `~/.agents/skills/deliverable-cpm/` |
-| Codex, one project | `<project>/.agents/skills/deliverable-cpm/` |
+Install them for your agent with `cpm-planner skills install`. Pick `--user` for all your
+projects, or `--project <dir>` for one repository:
 
-From the repository:
+| Agent | Command | Writes | You type |
+|---|---|---|---|
+| Claude Code | `cpm-planner skills install --target claude --user` | `~/.claude/skills/` (project: `.claude/skills/`) | `/cpm-plan` |
+| Codex | `cpm-planner skills install --target codex --user` | `~/.agents/skills/` (project: `.agents/skills/`) | `$cpm-plan` |
+| Cursor | `cpm-planner skills install --target cursor --user` | `~/.cursor/skills/` (project: `.cursor/skills/`) | `/cpm-plan` |
+| GitHub Copilot (VS Code) | `cpm-planner skills install --target copilot --user` | `~/.copilot/skills/` (project: `.github/skills/`) | `/cpm-plan` |
+| Gemini CLI | `cpm-planner skills install --target gemini --user` | `~/.agents/skills/` plus one command per skill in `~/.gemini/commands/cpm-*.toml` | `/cpm-plan` (the command) |
+| Any AGENTS.md reader | `cpm-planner skills install --target agents-md --project .` | a managed block in `AGENTS.md`, plus `.agents/skills/` | depends on the tool |
+| Several of the above | `cpm-planner skills install --target all --project .` | `.claude/skills/` and `.agents/skills/` only | as above |
 
-```bash
-git clone --depth 1 https://github.com/praxec/cpm-planner.git
-mkdir -p ~/.claude/skills
-cp -R cpm-planner/skills/deliverable-cpm ~/.claude/skills/
+The same goes for the other skills: `/cpm-improve`, `$cpm-run`, and so on. Agents also load
+a skill by themselves when your request matches its description. `--target all` writes only
+`.claude/skills/` (Claude Code) and `.agents/skills/` (Codex, Gemini and others). Cursor and
+Copilot read both of those directories and may list each skill twice; to avoid that, install
+for them with `--target cursor` or `--target copilot` alone. Uninstalling one target keeps a
+shared directory such as `.agents/skills/` until the last target that uses it is
+uninstalled. The `agents-md` block sits between `<!-- cpm-planner:begin -->` and
+`<!-- cpm-planner:end -->`; the rest of `AGENTS.md` is left byte for byte as it was.
+
+The installer:
+
+- prints one line per file (`created`, `updated`, `unchanged`, `modified, skipped`,
+  `foreign, skipped` or `removed`), then a summary;
+- records what it wrote in `.cpm-planner-skills.json` in each skills directory. A file you
+  edited, or one it did not write, is kept and reported as skipped; `--force` overwrites
+  it. A newer cpm-planner updates the files that still match what the older one wrote;
+- never writes MCP configuration. It prints the registration command for your agent
+  instead (see [Register as an MCP server](#register-as-an-mcp-server)). On Windows the
+  printed commands paste into both cmd and PowerShell: paths use `\` and a path with
+  spaces is in double quotes. In PowerShell, a path containing `$` or a backtick needs
+  single quotes instead, and for `code --add-mcp` use the printed JSON snippet (in
+  "MCP: Open User Configuration"), because PowerShell strips the `\"` escapes;
+- takes `--dry-run` to show what it would do without writing anything;
+- refuses (exit 1, nothing changed) a manifest with unsafe paths, a symlink that leads out of
+  the skills directory, or `AGENTS.md` markers that are nested, duplicated or unbalanced.
+
+```sh
+cpm-planner skills list                                   # what is installed, user and current project
+cpm-planner skills uninstall --target claude --user       # removes only files that still match the manifest
 ```
 
-From a release, use the tag's source archive. The binary archives contain only the binary.
+Restart the agent, or start a new session, so it loads the skills. Per-tool paths and
+sources are in [docs/agents/tool-matrix.md](docs/agents/tool-matrix.md); step-by-step setup
+per tool is in [docs/AGENT-INSTALL.md](docs/AGENT-INSTALL.md).
 
-```bash
-curl -fsSL https://github.com/praxec/cpm-planner/archive/refs/tags/v0.1.1.tar.gz | tar -xz
-mkdir -p .agents/skills
-cp -R cpm-planner-0.1.0/skills/deliverable-cpm .agents/skills/
-```
-
-On Windows, use `Copy-Item -Recurse` in place of `cp -R`. Swap the destination for the
-directory from the table. Restart the agent, or start a new session, so it loads the skill.
+To install by hand instead, download the source archive of your release,
+`https://github.com/praxec/cpm-planner/archive/refs/tags/v<version>.tar.gz` (here `<version>`
+is the number without the `v`, such as `0.2.0`), and copy the directories under
+`cpm-planner-<version>/skills/` into the agent's skills directory from the table.
 
 ## MCP tools
 
@@ -408,19 +561,21 @@ println!("critical path: {:?}", result.critical_path); // ["design", "build", "t
 // and per-task .float (slack) / .is_critical on each Task.
 ```
 
-See the [API docs](https://docs.rs/cpm-planner).
+The crate-level docs (`cargo doc --open`, or [docs.rs](https://docs.rs/cpm-planner)
+once a current version is published there) have a runnable example that drives the
+planner through submit, lease and complete.
 
 `llm::jev::JevJudge` (the `plan.review` judge) owns its HTTP client and
 connection pool. A pooled connection is driven by the tokio runtime that
 opened it, so use a judge (and its clones) from one runtime, and build a new
 judge for another runtime.
 
-## Use with an MCP client (e.g. praxec)
+## Praxec
 
-cpm-planner is fully standalone — it speaks plain MCP and has no code dependency
-on any particular client. As one example, you can wire it into an
-[praxec](https://github.com/praxec/praxec) workflow as an MCP
-connection (protocol only, no shared code):
+cpm-planner is fully standalone: it speaks plain MCP and has no code dependency on
+any particular client. [Praxec](https://github.com/praxec/praxec) packs use it as an
+MCP tool. To wire it into a praxec workflow, declare an MCP connection (protocol
+only, no shared code):
 
 ```yaml
 connections:
@@ -429,17 +584,15 @@ connections:
     command: cpm-planner
 ```
 
-## Using it with Praxec
-
-This is an MCP tool used by [Praxec](https://github.com/praxec/praxec) packs. The easiest way to
-get it — and a workflow pack that uses it — up and running is the one-command setup:
+The easiest way to get it, plus a workflow pack that uses it, up and running is the
+one-command setup:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/praxec/packs/main/setup.sh | bash
 ```
 
-See the [pack registry](https://github.com/praxec/packs) for this tool's provider coordinates
-(container image / release binary) and which packs depend on it.
+See the [pack registry](https://github.com/praxec/packs) for this tool's provider
+coordinates (container image or release binary) and which packs depend on it.
 
 ## Environment variables
 
@@ -447,9 +600,9 @@ Set these in a client's `env` block (or `-e`/`--env` flag, or `docker run -e`). 
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `CPM_PLANNER_DB` | OS data dir (`~/.local/share/praxec/cpm-planner.db`); `/data/cpm-planner.db` in the Docker image | SQLite path for durable, cross-process planner state; `:memory:` gives ephemeral state. |
+| `CPM_PLANNER_DB` | `~/.local/share/praxec/cpm-planner.db` on every OS (`~` is `HOME`, else `USERPROFILE`: `%USERPROFILE%\.local\share\praxec\cpm-planner.db` on Windows); `/data/cpm-planner.db` in the Docker image | SQLite path for durable, cross-process planner state; `:memory:` gives ephemeral state. |
 | `CPM_PROJECT_ROOT` | nearest ancestor of cwd with `.cpm-planner/` or `.git` | Repo root for plan-as-code files (`.cpm-planner/plans/<name>/<variant>.json`). Tools that need a root report `INVALID_PATH: no project root (set CPM_PROJECT_ROOT or run inside a repo)` when none is found. |
-| `CPM_MAX_TTL_SECS` | `28800` (8h) | Server-side ceiling for `ttl_seconds` on `plan.acquire_cohort` and `plan.heartbeat`; larger requested values are clamped. Must be a positive integer — any other value aborts startup. |
+| `CPM_MAX_TTL_SECS` | `28800` (8h) | Server-side ceiling for `ttl_seconds` on `plan.acquire_cohort` and `plan.heartbeat`; larger requested values are clamped. Must be an integer in 1..=2592000 (at most 30 days) — any other value aborts startup. |
 | `OPENROUTER_API_KEY` | unset | OpenRouter key for `plan.review`. Unset or blank: `plan.review` reports `review_unavailable` ("no OpenRouter key configured"). Never logged or returned. |
 | `CPM_OPENROUTER_KEY_FILE` | unset | File holding the OpenRouter key (contents trimmed; at most 4096 bytes), used when `OPENROUTER_API_KEY` is unset. On unix a world-readable (`o+r`) or empty file is ignored with a warning (`chmod 600` it). |
 | `CPM_JEV_MODEL` | `typesafe/jev-1.13` | Jev model id for `plan.review`: at most 128 characters of `A-Z a-z 0-9 . _ : / -`, and never containing the key; anything else is logged (naming the variable, not the value) and makes `plan.review` unavailable. |
@@ -458,6 +611,20 @@ Set these in a client's `env` block (or `-e`/`--env` flag, or `docker run -e`). 
 | `CPM_LLM_MODEL` | `openai/gpt-5-mini` | Generative (chat) model id; not used by any tool yet. |
 
 Leases default to 5 minutes. For long-running work pass `ttl_seconds` (≤ the server maximum) on acquire/heartbeat, and heartbeat at least every `ttl/3`.
+
+## Documentation
+
+- [docs/README.md](docs/README.md): index of the project documentation.
+- [docs/AGENT-INSTALL.md](docs/AGENT-INSTALL.md): install, register and verify cpm-planner for your AI coding tool.
+- [docs/architecture.md](docs/architecture.md): modules, request flow, store schema and concurrency.
+- [docs/releasing.md](docs/releasing.md): the release runbook.
+- [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), [SUPPORT.md](SUPPORT.md), [CHANGELOG.md](CHANGELOG.md).
+
+## Contributing
+
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the toolchain,
+the gates and the branch model. Everyone taking part agrees to the
+[Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## License
 

@@ -1,18 +1,21 @@
-//! Lock store for [`BasicCpmPlanner`].
+//! Per-plan working state for [`BasicCpmPlanner`].
 //!
-//! Each plan owns one [`PlanState`]: the submitted graph, per-deliverable
-//! status, an `id -> LockInfo` map, an inverse `file -> deliverable_id`
-//! index for O(file_count) overlap checks, and a cached
-//! [`CriticalPathResult`] computed at submit time.
+//! [`PlanState`] is what the planner loads from
+//! [`SqlitePlanStore`](crate::plan_store::SqlitePlanStore) for a single
+//! operation: the submitted graph, per-deliverable status, an
+//! `id -> LockInfo` map, an inverse `file -> deliverable_id` index for
+//! O(file_count) overlap checks, and the cached [`CriticalPathResult`]. The
+//! operation mutates it in memory and saves it back in the same transaction.
 //!
-//! The whole `BasicCpmPlanner` keeps a single
-//! `tokio::sync::Mutex<HashMap<PlanId, PlanState>>`; holding that mutex
-//! for the entirety of an `acquire_cohort` body is the atomicity story
-//! — no other concurrent acquirer can see a half-applied lock map.
+//! Atomicity comes from the store, not from this module: every mutating
+//! operation runs inside one `BEGIN IMMEDIATE` transaction
+//! (`SqlitePlanStore::write_tx` and its siblings), which takes SQLite's
+//! database-wide write lock at `BEGIN`. No other acquirer, in this process or
+//! another one pointed at the same database, can see a half-applied lock map.
 //!
-//! Audit emission deliberately does NOT happen inside the locked region.
-//! Lifecycle methods drain pending events into a `Vec<AuditEvent>` while
-//! holding the mutex, then flush after dropping it.
+//! Audit emission deliberately does NOT happen inside the transaction.
+//! Lifecycle methods buffer pending events into a `Vec<AuditEvent>` while it
+//! is open, and the planner flushes them to the sink after it commits.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;

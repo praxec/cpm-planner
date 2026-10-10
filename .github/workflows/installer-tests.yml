@@ -35,3 +35,25 @@ jobs:
         run: |
           $target = ./scripts/install.ps1 -PrintTarget
           if ($target -ne 'x86_64-pc-windows-msvc') { throw "Wrong target: $target" }
+  # `cpm-planner skills install|list|uninstall` against the real binary, on
+  # every OS, so Windows paths (USERPROFILE, backslashes, a home with spaces)
+  # are exercised. Lives here with the other install-behaviour checks.
+  skills-smoke:
+    name: skills install smoke (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --locked --bin cpm-planner
+      - name: skills install, rerun, list, uninstall
+        run: scripts/skills-smoke.sh target/debug/cpm-planner "$RUNNER_TEMP"

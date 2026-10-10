@@ -7,11 +7,19 @@
 //! cargo run -p cpm-planner
 //! ```
 //!
-//! After `cargo install cpm-planner` (or from a release bundle) the
+//! After installing it (a release installer, or `cargo install --git` from a tag) the
 //! binary is on your PATH as:
 //!
 //! ```bash
 //! cpm-planner
+//! ```
+//!
+//! With no arguments the binary is the MCP server. It also takes:
+//!
+//! ```bash
+//! cpm-planner --version
+//! cpm-planner --help
+//! cpm-planner skills install --target claude --user
 //! ```
 //!
 //! The server speaks MCP over stdio (the standard transport for Claude
@@ -20,6 +28,7 @@
 //! audit wiring (file path, syslog, etc.) is a follow-up.
 
 use std::env::VarError;
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,8 +39,72 @@ use cpm_planner::project::{PROJECT_ROOT_ENV, ProjectRoot};
 use cpm_planner::{BasicCpmPlanner, PlanServer, SqlitePlanStore};
 use tracing_subscriber::EnvFilter;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+const USAGE: &str = "\
+cpm-planner: Critical Path Method planner as an MCP server.
+
+Usage:
+  cpm-planner                 Run the MCP server on stdio (how MCP clients start it)
+  cpm-planner skills <cmd>    Install, uninstall or list the agent skills
+  cpm-planner --version       Print the version
+  cpm-planner --help          Print this help
+";
+
+fn main() -> ExitCode {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    // No arguments: the MCP stdio server, exactly as every MCP client runs it.
+    // Nothing else may reach stdout in this mode.
+    if args.is_empty() {
+        return run_server();
+    }
+    let Some(args) = args
+        .into_iter()
+        .map(|a| a.into_string().ok())
+        .collect::<Option<Vec<String>>>()
+    else {
+        eprintln!("cpm-planner: arguments must be valid UTF-8");
+        return ExitCode::from(cpm_planner::skills::EXIT_USAGE);
+    };
+    match args[0].as_str() {
+        "--version" | "-V" if args.len() == 1 => {
+            println!("cpm-planner {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
+        "--help" | "-h" | "help" if args.len() == 1 => {
+            print!("{USAGE}\n{}", cpm_planner::skills::USAGE);
+            ExitCode::SUCCESS
+        }
+        "skills" => ExitCode::from(cpm_planner::skills::run(&args[1..])),
+        _ => {
+            eprintln!(
+                "cpm-planner: unexpected arguments `{}`\n\n{USAGE}",
+                args.join(" ")
+            );
+            ExitCode::from(cpm_planner::skills::EXIT_USAGE)
+        }
+    }
+}
+
+fn run_server() -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(err) => {
+            eprintln!("Error: cannot start the async runtime: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match runtime.block_on(serve()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("Error: {err:?}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn serve() -> anyhow::Result<()> {
     init_tracing();
 
     // PA4 baseline: NullAuditSink. The planner trait impl swallows audit

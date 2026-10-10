@@ -1,6 +1,6 @@
 ---
 name: deliverable-cpm
-description: Use when the cpm-planner MCP server (plan.* tools) is available and work spans several deliverables, repos, agents or people whose order matters; when asked to plan a project, find its critical path (CPM), level resources, shorten or crash a schedule, compare plan variants, run a plan with leases, or track earned value (EV, SPI, CPI, baseline); or when editing a .cpm-planner/plans/<name>/<variant>.json plan file. Covers deliverables as artifacts, consumption edges, lint, sync, the fork/simulate/compare/select improvement loop, execution and re-baselining.
+description: "Use when you need the full method reference behind the cpm-plan, cpm-improve, cpm-run, cpm-ev and cpm-revise skills, or when no narrower cpm-* skill fits a cpm-planner (plan.* tools) task that spans the whole lifecycle. Covers the deliverable-based CPM method end to end: deliverables as artifacts, consumption edges, lint findings, sync and drift, resource levelling, the review/fork/simulate/compare/select improvement loop, leases and acceptance, baselines and earned value, and revising a plan file under .cpm-planner/plans/<name>/<variant>.json."
 ---
 
 # Deliverable-based CPM with cpm-planner
@@ -182,22 +182,25 @@ Design several variants and pick one. Never edit the selected variant to try an 
    | Add capacity to the bottleneck | `set_metadata owner`, or more capacity in the schedule | review becomes the next bottleneck |
    | Move work to a cheaper pool | `set_metadata owner`, plus `set_effort` for review time | security- or judgment-heavy work stays put |
    | Crash a critical deliverable | `set_duration`, plus `set_effort` for the added cost | the cost is real effort: record it. Either edit stops Monte Carlo sampling a deliverable that has an `estimate`, so much of a better P80 can come from removing its uncertainty rather than from the shorter length. `set_estimate` with a shorter range keeps it sampled, but lowers its effort basis, so note the crash cost outside the scorecard |
-   | Split along file or contract seams | `remove_deliverable`, `add_deliverable`, `add_edge` | each part needs its own artifact |
-   | Contract first | `add_deliverable` with `metadata.contract`; then `remove_deliverable` + `add_deliverable` for each consumer, with an `interface` edge (`add_edge` has no `kind`) | the contract must be accepted, not just drafted |
+   | Split along file or contract seams | `remove_edge` for each of its dependents, `remove_deliverable`, `add_deliverable` for the parts, then `add_edge` the dependents back | each part needs its own artifact |
+   | Contract first | `add_deliverable` with `metadata.contract`; then for each consumer `remove_edge` its dependents, `remove_deliverable` + `add_deliverable` with an `interface` edge (`add_edge` has no `kind`), and `add_edge` the dependents back | the contract must be accepted, not just drafted |
    | Fast-track by removing an edge | `remove_edge` | only if nothing was actually consumed |
    | Split scope into milestones | `add_deliverable` with `"milestone": true` | each milestone needs an acceptance artifact |
 3. **Fork.** Run `plan.fork {plan_id, variant, edits}`. The edit ops are `remove_edge
    {from, to}`, `add_edge {from, to, consumes}`, `set_effort {id, hours}`, `set_duration
    {id, hours}`, `set_estimate {id, estimate}`, `set_metadata {id, key, value}`,
-   `remove_deliverable {id}` and `add_deliverable {deliverable}`. The fork is written to
+   `remove_deliverable {id}` and `add_deliverable {deliverable}`. `remove_deliverable` is
+   refused while others depend on it: `remove_edge` each dependent first, then `add_edge`
+   them back after the `add_deliverable`. The fork is written to
    `.cpm-planner/plans/<name>/<variant>.json` as a draft. It is not selected.
 4. **Measure.** Run `plan.simulate {plan_id, schedule: {capacities}, monte_carlo: {}}` on
    any variant, then `plan.compare {plan: "<name>", schedule: {capacities}, monte_carlo: {}}`.
    This scores every live variant on makespan (levelled when `schedule` is given), P80,
    criticality risk, total effort and peak load. The capacities must cover every pool of
    every variant, or the call fails with `INVALID_CAPACITIES`. P80 comes from Monte Carlo
-   on the unlevelled network, so it ignores resource waits. Read `pareto_optimal`, `rank`,
-   `rationale` and `recommended`. Change the priorities with `weights`.
+   on the unlevelled network, so it ignores resource waits. Read `pareto_optimal`, `rank` and
+   `rationale` on each `variants[]` entry, and the top-level `recommended`. Change the
+   priorities with `weights`.
 5. **Explain the trade-off** to the user before you select, in numbers: what each candidate
    gains, what it costs (effort, risk band, P80), and which assumption it depends on (for
    example, that a worker pool exists). Rejected variants are results too.
@@ -230,9 +233,13 @@ Execute the selected variant's `plan_id`.
     "failed", "reason": "..."}`;
   - for earned value add `earned_pct` (an integer 0 to 100, only with `in_progress`),
     `actual_effort_hours` (total so far; replaces the leased hours as actual cost) and
-    `evidence` (a link or commit, appended to the list);
+    `evidence` (a link or commit, appended to the list; at most 100 entries per
+    deliverable. Past that, any mark carrying `evidence`, including `complete`, is refused
+    with `INVALID_ACTUALS`, so omit `evidence` then);
   - mark `complete` only when the artifact meets its acceptance criteria, with evidence. A
-    report of done is not acceptance. Three explicit failures trip the circuit breaker.
+    report of done is not acceptance. A `failed` mark leaves it Failed (`NOT_READY`);
+    retry with a lockless `{"status": "ready"}` mark. Three explicit failures, across
+    those retries, trip the circuit breaker.
   - a lockless `in_progress` (owner or manual work, no lease) persists across server
     restarts and is not leasable. Hand it back with a lockless `{"status": "ready"}` (or
     another status) mark; `plan.force_release` does not affect it, since there is no lock.

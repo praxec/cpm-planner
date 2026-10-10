@@ -7,10 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.1] - 2026-10-10
+## [0.2.0] - 2026-10-10
+
+### Added
+
+- `cpm-planner skills install --target <claude|codex|cursor|copilot|gemini|agents-md|all> (--project <dir> | --user) [--dry-run] [--force]` installs the embedded agent skills (`deliverable-cpm` and the `cpm-*` family) where each tool reads them, per `docs/agents/tool-matrix.md`. `gemini` also writes one `.gemini/commands/cpm-*.toml` command per skill; `agents-md` writes a managed `<!-- cpm-planner:begin -->`/`<!-- cpm-planner:end -->` block in `AGENTS.md`; `all` writes `.claude/skills` and `.agents/skills` only, to avoid duplicate listings.
+- A `.cpm-planner-skills.json` manifest (sha256 of each file written) in every skills directory: files the user edited or did not come from cpm-planner are kept and reported as skipped unless `--force`; upgrades update only files that still match the old manifest. Each manifest also records the targets that installed into its directory, so `uninstall` of one target keeps a shared directory (`.agents/skills`) until the last target using it is removed. A run validates everything first (manifest paths, symlinks, whole-line `AGENTS.md` markers) and refuses with exit 1 before writing; it holds a `.cpm-planner-skills.lock` per directory. Writes are atomic, keep the `AGENTS.md` line-ending style, and refuse symlinks that lead out of the target directory. No MCP configuration is written; the registration command is printed instead.
+- `cpm-planner skills uninstall` (removes only files that still match the manifest) and `cpm-planner skills list`.
+- `cpm-planner --version` and `cpm-planner --help`. With no arguments the binary is still the MCP stdio server.
+- npm launcher `@matthew-cochran/cpm` (`npm/`): `npx -y @matthew-cochran/cpm` downloads the release binary for the platform over HTTPS (redirects only to GitHub hosts), verifies it against `checksums.sha256`, caches it per version and runs it over stdio with arguments, exit code and signals passed through. `CPM_PLANNER_BINARY` uses a local binary instead; `CPM_PLANNER_DOWNLOAD_BASE` sets a mirror. No runtime dependencies. The release workflow attaches `matthew-cochran-cpm-<version>.tgz` to the GitHub release; publishing to npm is a manual step (`docs/releasing.md`).
+- npm launcher cache and install-time pre-fetch: binaries are cached in `<root>/cpm-planner/<version>/`, where `<root>` is `CPM_PLANNER_CACHE_DIR` if set, else `%LOCALAPPDATA%` on Windows, else `$XDG_CACHE_HOME` or `~/.cache`. A `postinstall` script pre-fetches the binary so the first MCP start does not wait for a download; it never fails the install, and is skipped with `--ignore-scripts`, in CI, when `CPM_PLANNER_BINARY` is set, or with `CPM_PLANNER_SKIP_DOWNLOAD=1`.
+- `scripts/check-version-sync.sh` also checks that `npm/package.json` has the `Cargo.toml` version.
+- `docs/AGENT-INSTALL.md`: an end-to-end install guide for agents and people. A "which tool are you?" table leads to numbered steps per tool (Claude Code, Codex, Cursor, Copilot, Gemini CLI, Zed, Windsurf and other AGENTS.md readers, Claude Desktop): install the binary or use npx, register the MCP server (binary and npx forms), `skills install`, verify; plus uninstall and troubleshooting (GUI `PATH`, Windows quoting, a stale launcher cache, offline use with `CPM_PLANNER_BINARY`). The README's MCP registration sections show the npx form next to the binary form.
+- `docs/architecture.md` (layers, module map, request flow, store schema, concurrency, security boundaries), `docs/releasing.md` (the maintainer release runbook), a docs index (`docs/README.md`) and crate-level rustdoc for docs.rs.
+- `llms.txt` (llmstxt.org format) indexing the install guide, README sections, architecture, skills and CHANGELOG for LLMs.
+- `AGENTS.md`: instructions for coding agents contributing to this repository (gates, branch model, conventions, skills, the opt-in live test).
+- CI: a `skills install` smoke on Linux, macOS and Windows (project and user scope, idempotent rerun, `list`, `uninstall`).
+
+### Changed
+
+- Repository text files are normalized to LF (`.gitattributes`, `.editorconfig`), guarded by `tests/repo_hygiene.rs`.
+- `execution-policy` is now a crates.io dependency (0.0.6, identical source to the previously pinned git revision), so the crate can be published.
+- New community and supply-chain files: `CODE_OF_CONDUCT.md`, `SUPPORT.md`, issue forms, a PR template, `CODEOWNERS`, Dependabot, `cargo-deny` and CI jobs for docs, packaging and the npm launcher; `CONTRIBUTING.md` and `SECURITY.md` rewritten.
+- Five focused agent skills (`cpm-plan`, `cpm-improve`, `cpm-run`, `cpm-ev`, `cpm-revise`) alongside the `deliverable-cpm` method reference.
 
 ### Fixed
 
+- Windows: the server no longer exits when `HOME` is unset (the Windows default). The default database path falls back to `USERPROFILE` and keeps the same layout on every OS, `~/.local/share/praxec/cpm-planner.db` (`%USERPROFILE%\.local\share\praxec\cpm-planner.db`), so data written under Git Bash's `HOME` stays where it is. `skills` uses the same lookup. Startup fails only when neither variable is set.
 - `plan.review` no longer fails with `review_unavailable` (`decode: ... expected struct Cost`) against OpenRouter: Jev replies are decoded with a reply type whose `usage` accepts `cost` as a bare number (OpenRouter) or an object, ignores unknown fields, and drops malformed accounting instead of failing the judgment. Requests and answer validation are still rig-typesafeai's.
 
 ## [0.1.0] - 2026-10-10
@@ -166,8 +189,8 @@ approximations. For the method, caveats and known limitations, see
 - Six-tool MCP surface: `plan.submit`, `plan.acquire_cohort`, `plan.heartbeat`,
   `plan.mark_status`, `plan.status`, and `plan.force_release`.
 
-[Unreleased]: https://github.com/praxec/cpm-planner/compare/v0.1.1...HEAD
-[0.1.1]: https://github.com/praxec/cpm-planner/compare/v0.1.0...v0.1.1
+[Unreleased]: https://github.com/praxec/cpm-planner/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/praxec/cpm-planner/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/praxec/cpm-planner/compare/v0.0.2...v0.1.0
 [0.0.2]: https://github.com/praxec/cpm-planner/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/praxec/cpm-planner/releases/tag/v0.0.1
