@@ -234,7 +234,9 @@ pub struct EvReport {
     pub critical_float_consumed_hours: f32,
     pub alerts: Vec<String>,
     /// Ids in the live graph but absent from the baseline (sorted, synthetic
-    /// endpoints excluded). They contribute nothing until re-baseline.
+    /// endpoints excluded). They earn no value and carry no budget until a
+    /// re-baseline, but their spend counts in AC at rate 1.0 (their live
+    /// `cost_rate` applies only once a baseline row exists).
     pub excluded_unbaselined: Vec<String>,
 }
 
@@ -555,6 +557,8 @@ pub fn compute_ev(
     let mut spend: Vec<(&String, &Actuals)> = actuals.iter().collect();
     spend.sort_by(|a, b| a.0.cmp(b.0));
     for (id, a) in spend {
+        // Spend with no baseline row (added after the baseline, or descoped by
+        // a re-baseline) counts at rate 1.0 until a baseline records its rate.
         let rate = rates.get(id.as_str()).copied().unwrap_or(1.0);
         ac += f64::from(rate) * f64::from(hours_of(a));
     }
