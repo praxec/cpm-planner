@@ -73,9 +73,10 @@ launcher.
    | Linux, macOS | `$XDG_CACHE_HOME/cpm-planner/<version>/`, else `~/.cache/cpm-planner/<version>/` |
 
    A lock file makes concurrent first runs (two MCP clients starting at once)
-   download only once. The lock records its owner's pid, so a lock left by a
-   killed process is taken over at once, and an interrupted download removes
-   its lock and partial files before exiting. Later runs start the cached
+   download only once. The holder refreshes the lock every 30 seconds; a lock
+   that names a dead process, or has not been refreshed for 2 minutes, is
+   taken over, and the new holder removes any partial download left behind.
+   An interrupted download removes its lock and partial files before exiting. Later runs start the cached
    binary with no network access.
 
    The binary's SHA-256 is stored in `.verified` next to it and checked on

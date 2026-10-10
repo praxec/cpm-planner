@@ -32,11 +32,14 @@ const DEFAULT_LIMITS = {
   idleTimeoutMs: 30000,
   totalTimeoutMs: 300000,
 };
-// Lock timing. A lock whose owner process is gone is taken over at once; the
-// age threshold is only a fallback for locks whose owner cannot be checked
-// (unreadable, or written on another host sharing the cache). Waiting lasts
-// longer than the stale threshold so a waiter always outlives a dead owner.
-const DEFAULT_LOCK = { staleMs: 10 * 60 * 1000, waitMs: 11 * 60 * 1000, pollMs: 100 };
+// Lock timing. The holder refreshes the lock's mtime every heartbeatMs, so a
+// lock not touched for staleMs is abandoned whatever pid it names (pids are
+// reused, e.g. pid 1 in containers). A lock naming a dead pid on this host is
+// taken over at once. Waiting outlasts both the stale threshold and a full
+// download (DEFAULT_LIMITS.totalTimeoutMs).
+const DEFAULT_LOCK = { staleMs: 2 * 60 * 1000, heartbeatMs: 30 * 1000, waitMs: 6 * 60 * 1000, pollMs: 100 };
+// Tokens of the locks this process holds right now.
+const heldTokens = new Set();
 
 class LauncherError extends Error {}
 
@@ -200,8 +203,15 @@ function download(url, dest, { allowedHosts, env, version, limits, maxBytes = li
   });
 }
 
+// Streams the file through the hash so a large binary is never fully in memory.
 function sha256File(file) {
-  return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha256');
+    fs.createReadStream(file)
+      .on('error', reject)
+      .on('data', (chunk) => hash.update(chunk))
+      .on('end', () => resolve(hash.digest('hex')));
+  });
 }
 
 // Reads "<hex>  <asset>" (or "<hex> *<asset>") lines, the sha256sum format
@@ -329,27 +339,45 @@ function readLock(lockPath) {
 }
 
 function lockIsStale(lock, staleMs) {
+  if (Date.now() - lock.mtimeMs > staleMs) return true; // no heartbeat: abandoned
   const { owner } = lock;
-  if (owner && Number.isInteger(owner.pid) && owner.host === os.hostname()) return !pidAlive(owner.pid);
-  return Date.now() - lock.mtimeMs > staleMs;
+  if (!owner || !Number.isInteger(owner.pid) || owner.host !== os.hostname()) return false;
+  // Our own pid on a lock we do not hold: a previous process with this pid died.
+  if (owner.pid === process.pid) return !heldTokens.has(owner.token);
+  return !pidAlive(owner.pid);
 }
 
 // Cross-process lock: an exclusively created file holding the owner's pid,
-// host and a random token. Returns a release function that deletes the lock
-// only while it still carries our token, or null when `isDone()` became true
-// while waiting (another process finished the download).
+// host and a random token, kept fresh by a heartbeat while held. Returns a
+// release function that stops the heartbeat and deletes the lock only while it
+// still carries our token, or null when `isDone()` became true while waiting
+// (another process finished the download).
 async function acquireLock(lockPath, isDone, opts = {}) {
-  const { staleMs, waitMs, pollMs } = { ...DEFAULT_LOCK, ...opts };
+  const { staleMs, heartbeatMs, waitMs, pollMs } = { ...DEFAULT_LOCK, ...opts };
   const token = crypto.randomBytes(16).toString('hex');
+  const ours = () => {
+    const lock = readLock(lockPath);
+    return Boolean(lock && lock.owner && lock.owner.token === token);
+  };
   const started = Date.now();
   for (;;) {
     try {
       const fd = fs.openSync(lockPath, 'wx', 0o600);
       fs.writeSync(fd, JSON.stringify({ pid: process.pid, host: os.hostname(), token, at: new Date().toISOString() }));
       fs.closeSync(fd);
+      heldTokens.add(token);
+      const heartbeat = setInterval(() => {
+        try {
+          if (ours()) fs.utimesSync(lockPath, new Date(), new Date());
+        } catch {
+          // lock gone or unwritable: the next waiter will judge it
+        }
+      }, heartbeatMs);
+      heartbeat.unref();
       return () => {
-        const lock = readLock(lockPath);
-        if (lock && lock.owner && lock.owner.token === token) fs.rmSync(lockPath, { force: true });
+        clearInterval(heartbeat);
+        heldTokens.delete(token);
+        if (ours()) fs.rmSync(lockPath, { force: true });
       };
     } catch (err) {
       if (err.code !== 'EEXIST') throw new LauncherError(`cannot create lock ${lockPath}: ${err.message}`);
@@ -370,6 +398,14 @@ async function acquireLock(lockPath, isDone, opts = {}) {
   }
 }
 
+// Removes work dirs left by a holder that died without cleaning up (SIGKILL,
+// power loss). Called only while holding the lock, so none of them is live.
+function removeStaleWorkDirs(versionDir) {
+  for (const name of fs.readdirSync(versionDir)) {
+    if (name.startsWith('.download-')) fs.rmSync(path.join(versionDir, name), { recursive: true, force: true });
+  }
+}
+
 // Refuses a cache directory another user could have written to (POSIX).
 function checkCacheDirTrust(versionDir) {
   if (process.platform === 'win32' || typeof process.getuid !== 'function') return;
@@ -384,7 +420,7 @@ function checkCacheDirTrust(versionDir) {
 }
 
 // Re-checks a cached binary against the digest recorded when it was installed.
-function checkCachedBinary(versionDir, finalPath) {
+async function checkCachedBinary(versionDir, finalPath) {
   checkCacheDirTrust(versionDir);
   const remedy = `remove ${versionDir} to download it again`;
   let recorded;
@@ -393,7 +429,7 @@ function checkCachedBinary(versionDir, finalPath) {
   } catch {
     throw new LauncherError(`refusing cached binary ${finalPath}: no ${VERIFIED_FILE} digest; ${remedy}`);
   }
-  const actual = sha256File(finalPath);
+  const actual = await sha256File(finalPath);
   if (actual !== recorded) {
     throw new LauncherError(`refusing cached binary ${finalPath}: sha256 ${actual} does not match the verified ${recorded}; ${remedy}`);
   }
@@ -401,6 +437,7 @@ function checkCachedBinary(versionDir, finalPath) {
 
 async function downloadAndInstall({ version, t, base, allowedHosts, env, versionDir, finalPath, log, limits, state }) {
   const releaseUrl = `${base.href.replace(/\/+$/, '')}/download/v${version}`;
+  removeStaleWorkDirs(versionDir);
   const workDir = fs.mkdtempSync(path.join(versionDir, '.download-'));
   state.workDir = workDir;
   try {
@@ -411,7 +448,7 @@ async function downloadAndInstall({ version, t, base, allowedHosts, env, version
     await download(`${releaseUrl}/checksums.sha256`, sums, { allowedHosts, env, version, limits, maxBytes: 1024 * 1024 });
     const expected = expectedDigest(fs.readFileSync(sums, 'utf8'), t.asset);
     if (!expected) throw new LauncherError(`no checksum entry for ${t.asset} in checksums.sha256`);
-    const actual = sha256File(archive);
+    const actual = await sha256File(archive);
     if (actual !== expected) {
       throw new LauncherError(`checksum mismatch for ${t.asset} (expected ${expected}, got ${actual})`);
     }
@@ -423,7 +460,7 @@ async function downloadAndInstall({ version, t, base, allowedHosts, env, version
     if (process.platform !== 'win32') fs.chmodSync(src, 0o755);
     // Record the digest first: a binary without a matching .verified is refused.
     const verifiedTmp = path.join(workDir, VERIFIED_FILE);
-    fs.writeFileSync(verifiedTmp, `${sha256File(src)}\n`, { mode: 0o600 });
+    fs.writeFileSync(verifiedTmp, `${await sha256File(src)}\n`, { mode: 0o600 });
     fs.renameSync(verifiedTmp, path.join(versionDir, VERIFIED_FILE));
     fs.renameSync(src, finalPath);
     log(`installed ${finalPath}`);
@@ -477,7 +514,7 @@ async function ensureBinary(opts = {}) {
   const versionDir = path.join(opts.cacheRoot || cacheRoot(env), BIN, version);
   const finalPath = path.join(versionDir, t.binary);
   if (fs.existsSync(finalPath)) {
-    checkCachedBinary(versionDir, finalPath);
+    await checkCachedBinary(versionDir, finalPath);
     return finalPath;
   }
 
@@ -496,7 +533,7 @@ async function ensureBinary(opts = {}) {
     if (state.release && !fs.existsSync(finalPath)) {
       await downloadAndInstall({ version, t, base, allowedHosts, env, versionDir, finalPath, log, limits, state });
     } else {
-      checkCachedBinary(versionDir, finalPath);
+      await checkCachedBinary(versionDir, finalPath);
     }
     return finalPath;
   } finally {

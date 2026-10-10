@@ -107,3 +107,14 @@ test('concurrent first runs download the asset once', async (t) => {
   await Promise.all([installInChildProcess(cache, base), installInChildProcess(cache, base)]);
   assert.equal(hits[ASSET_PATH], 1);
 });
+
+test('a work dir left by a killed download is removed by the next download', async (t) => {
+  const cache = tempDir(t);
+  const leftover = path.join(versionDir(cache), '.download-killed');
+  fs.mkdirSync(leftover, { recursive: true, mode: 0o700 });
+  fs.chmodSync(versionDir(cache), 0o700);
+  fs.writeFileSync(path.join(leftover, 'partial'), 'half an archive');
+  const { base } = await startServer(t, releaseFiles(t, { target: TARGET }));
+  await install(cache, insecureEnv(base));
+  assert.equal(fs.existsSync(leftover), false);
+});
