@@ -47,6 +47,7 @@ fn graph() -> PlanGraph {
     .unwrap()
 }
 
+#[cfg(unix)]
 fn forged_ref(name: &str, variant: &str) -> cpm_planner::project::PlanFileRef {
     cpm_planner::project::PlanFileRef {
         name: name.into(),

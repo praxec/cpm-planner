@@ -18,30 +18,210 @@ purely over MCP.
 
 ## Install
 
-From crates.io:
+### Prebuilt binary (recommended)
+
+Prebuilt packages are published for Linux, macOS and Windows on x86_64 and ARM64. The installers resolve your OS and CPU, download the matching archive, **verify its SHA-256 against the release's `checksums.sha256` before installing**, and atomically replace the binary in a user-local directory. A checksum mismatch aborts with a non-zero exit and installs nothing. Re-running the installer upgrades in place.
+
+```sh
+# Linux / macOS  ->  ~/.local/bin/cpm-planner
+curl -fsSL https://github.com/praxec/cpm-planner/releases/latest/download/install.sh | sh
+
+# Windows (PowerShell)  ->  %LOCALAPPDATA%\Programs\cpm-planner\cpm-planner.exe
+irm https://github.com/praxec/cpm-planner/releases/latest/download/install.ps1 | iex
+```
+
+Pin a release (shown for v0.0.3):
+
+```sh
+# Linux / macOS
+curl -fsSL https://github.com/praxec/cpm-planner/releases/latest/download/install.sh | sh -s -- --version v0.0.3
+
+# Windows (PowerShell): the piped form cannot take parameters, so use the environment variable...
+$env:PRAXEC_VERSION = 'v0.0.3'; irm https://github.com/praxec/cpm-planner/releases/latest/download/install.ps1 | iex
+# ...or a script block
+& ([scriptblock]::Create((irm https://github.com/praxec/cpm-planner/releases/latest/download/install.ps1))) -Version v0.0.3
+```
+
+If you would rather read the script before running it, download, inspect, then run:
+
+```sh
+# Linux / macOS
+curl -fsSLO https://github.com/praxec/cpm-planner/releases/latest/download/install.sh
+less install.sh
+sh install.sh --version v0.0.3
+```
+
+```powershell
+# Windows
+irm https://github.com/praxec/cpm-planner/releases/latest/download/install.ps1 -OutFile install.ps1
+Get-Content install.ps1
+.\install.ps1 -Version v0.0.3
+```
+
+The installers print the absolute path they installed to (for example `~/.local/bin/cpm-planner`) and, if that directory is not on your `PATH`, the exact line to add. Pass `--add-to-path` (`-AddToPath` on Windows) to have the installer do it for you (user-level only, never sudo). On Linux/macOS it appends to `~/.zshrc` (zsh), `~/.bash_profile` if it exists else `~/.bashrc` (bash), or `~/.profile` (other shells), only if the line is not already there; for fish it prints `fish_add_path <dir>` for you to run instead of writing a file. They only accept `https://` download URLs. After upgrading, restart your MCP client so it launches the new binary (on Windows the old exe is renamed to `cpm-planner.exe.old` and removed on the next run).
+
+Or download an archive directly and check it against `checksums.sha256` (a machine-readable `release-manifest.json` is published too):
+
+| Platform | Asset |
+|----------|-------|
+| Linux x86_64 | `cpm-planner-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux ARM64 | `cpm-planner-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS x86_64 | `cpm-planner-x86_64-apple-darwin.tar.gz` |
+| macOS Apple Silicon | `cpm-planner-aarch64-apple-darwin.tar.gz` |
+| Windows x86_64 | `cpm-planner-x86_64-pc-windows-msvc.zip` |
+| Windows ARM64 | `cpm-planner-aarch64-pc-windows-msvc.zip` |
+
+All assets are at <https://github.com/praxec/cpm-planner/releases/latest>.
+
+### From source
 
 ```sh
 cargo install cpm-planner
 ```
 
-Or download a pre-built binary for your platform from the
-[latest release](https://github.com/praxec/cpm-planner/releases/latest)
-(verify against the release's `checksums.sha256`):
+### Docker
 
-| Platform | Download |
-|----------|----------|
-| Linux x86_64 | [`.tar.gz`](https://github.com/praxec/cpm-planner/releases/latest/download/cpm-planner-x86_64-unknown-linux-gnu.tar.gz) |
-| Linux ARM64 | [`.tar.gz`](https://github.com/praxec/cpm-planner/releases/latest/download/cpm-planner-aarch64-unknown-linux-gnu.tar.gz) |
-| macOS x86_64 | [`.tar.gz`](https://github.com/praxec/cpm-planner/releases/latest/download/cpm-planner-x86_64-apple-darwin.tar.gz) |
-| macOS Apple Silicon | [`.tar.gz`](https://github.com/praxec/cpm-planner/releases/latest/download/cpm-planner-aarch64-apple-darwin.tar.gz) |
-| Windows x86_64 | [`.zip`](https://github.com/praxec/cpm-planner/releases/latest/download/cpm-planner-x86_64-pc-windows-msvc.zip) |
-
-It speaks MCP over stdio (the standard transport). Wire it into your editor like
-any other MCP server:
-
-```jsonc
-{ "command": "cpm-planner", "args": [] }
+```sh
+docker pull ghcr.io/praxec/cpm-planner
 ```
+
+## Register as an MCP server
+
+cpm-planner speaks MCP over stdio. Register the `cpm-planner` command with your client. Every snippet below has an optional `env` block; drop it to use the defaults (see [Environment variables](#environment-variables)). Snippets use the bare command `cpm-planner`; if it is not on your `PATH` (or for any GUI client), use the absolute path the installer printed.
+
+### Claude Code
+
+```sh
+claude mcp add cpm-planner --scope user -- cpm-planner
+# with environment variables (put another option between --env and the name)
+claude mcp add --env CPM_PLANNER_DB=/path/to/cpm-planner.db --env CPM_MAX_TTL_SECS=28800 --transport stdio --scope user cpm-planner -- cpm-planner
+```
+
+`--scope user` registers it for all your projects; `--scope project` writes a shared `.mcp.json` in the project root; the default `local` scope is private to the current project. The `.mcp.json` equivalent:
+
+```json
+{
+  "mcpServers": {
+    "cpm-planner": {
+      "command": "cpm-planner",
+      "args": [],
+      "env": { "CPM_PLANNER_DB": "/path/to/cpm-planner.db" }
+    }
+  }
+}
+```
+
+### Claude Desktop
+
+GUI apps do not inherit your shell `PATH`: use the absolute path the installer printed as `command`.
+
+Edit `claude_desktop_config.json` (Settings, Developer, Edit Config) and restart Claude Desktop:
+
+- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+
+```json
+{
+  "mcpServers": {
+    "cpm-planner": {
+      "command": "cpm-planner",
+      "args": [],
+      "env": { "CPM_PLANNER_DB": "/path/to/cpm-planner.db" }
+    }
+  }
+}
+```
+
+On Windows use an absolute command path with escaped backslashes, e.g. `C:\\Users\\you\\AppData\\Local\\Programs\\cpm-planner\\cpm-planner.exe`.
+
+### Cursor
+
+Use the absolute path the installer printed as `command` (GUI apps do not inherit your shell `PATH`).
+
+`~/.cursor/mcp.json` (all projects) or `.cursor/mcp.json` (one project):
+
+```json
+{
+  "mcpServers": {
+    "cpm-planner": {
+      "type": "stdio",
+      "command": "cpm-planner",
+      "args": [],
+      "env": { "CPM_PLANNER_DB": "/path/to/cpm-planner.db" }
+    }
+  }
+}
+```
+
+### VS Code
+
+Use the absolute path the installer printed as `command` (GUI apps do not inherit your shell `PATH`).
+
+`.vscode/mcp.json` in the workspace. Note the top-level key is `servers`, not `mcpServers`:
+
+```json
+{
+  "servers": {
+    "cpm-planner": {
+      "type": "stdio",
+      "command": "cpm-planner",
+      "args": [],
+      "env": { "CPM_PLANNER_DB": "/path/to/cpm-planner.db" }
+    }
+  }
+}
+```
+
+### Codex CLI
+
+```sh
+codex mcp add cpm-planner --env CPM_PLANNER_DB=/path/to/cpm-planner.db -- cpm-planner
+```
+
+or in `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.cpm-planner]
+command = "cpm-planner"
+args = []
+
+[mcp_servers.cpm-planner.env]
+CPM_PLANNER_DB = "/path/to/cpm-planner.db"
+```
+
+### Docker
+
+```sh
+docker run -i --rm -v cpm-planner-data:/data ghcr.io/praxec/cpm-planner
+```
+
+`-i` keeps stdin open for the stdio transport. The image sets `CPM_PLANNER_DB=/data/cpm-planner.db` and declares `/data` as a volume owned by the unprivileged `app` user, so a named volume persists plan state across runs. For a bind mount (`-v "$PWD:/data"`) run as yourself so the directory is writable: `--user "$(id -u):$(id -g)"`. Pass `-e CPM_PLANNER_DB=...` only to override the path.
+
+As a client config, put `docker` in `command` and the rest in `args`, for example in Claude Code:
+
+```sh
+claude mcp add cpm-planner --scope user -- docker run -i --rm -v cpm-planner-data:/data ghcr.io/praxec/cpm-planner
+```
+
+### praxec
+
+See [Use with an MCP client](#use-with-an-mcp-client-eg-praxec) below for the YAML connection and [Using it with Praxec](#using-it-with-praxec) for the `packs/setup.sh` one-command setup.
+
+### Agent self-install
+
+An agent can install and verify cpm-planner itself:
+
+1. Detect the OS and CPU architecture (`uname -sm`, or `$env:PROCESSOR_ARCHITECTURE` on Windows).
+2. Run the installer for that OS (`install.sh` or `install.ps1` above). It verifies the SHA-256 and exits non-zero on any mismatch; stop if it does. Note the absolute path it prints (e.g. `/home/you/.local/bin/cpm-planner`).
+3. Register the server with your own client using the matching section above, with that absolute path as the command (for Claude Code: `claude mcp add cpm-planner --scope user -- /home/you/.local/bin/cpm-planner`). Restart or reload the client if it requires that.
+4. Confirm `plan.status` appears among your available tools. You can also check registration from the CLI: `claude mcp list` / `claude mcp get cpm-planner` (Claude Code) or `codex mcp list` (Codex).
+5. Call `plan.submit` with these arguments (a two-deliverable smoke plan), then read it back with `plan.get` using the returned plan id and confirm both deliverables round-trip:
+
+```json
+{"graph":{"deliverables":[{"id":"a","owned_files":["a.txt"],"prerequisites":[],"estimated_effort_hours":1},{"id":"b","owned_files":["b.txt"],"prerequisites":["a"],"estimated_effort_hours":1}]}}
+```
+
+To check a binary without any MCP client, download `scripts/mcp-smoke.mjs` from the repository and run `node mcp-smoke.mjs /absolute/path/to/cpm-planner`; it performs the MCP `initialize` and `tools/list` handshake and fails if `plan.submit`, `plan.status` or `plan.get` is missing.
 
 ## MCP tools
 
@@ -136,11 +316,14 @@ See the [pack registry](https://github.com/praxec/packs) for this tool's provide
 
 ## Environment variables
 
+Set these in a client's `env` block (or `-e`/`--env` flag, or `docker run -e`). All are optional.
+
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `CPM_PLANNER_DB` | OS data dir (`~/.local/share/praxec/cpm-planner.db`) | SQLite path for durable, cross-process planner state; `:memory:` gives ephemeral state. |
+| `CPM_PLANNER_DB` | OS data dir (`~/.local/share/praxec/cpm-planner.db`); `/data/cpm-planner.db` in the Docker image | SQLite path for durable, cross-process planner state; `:memory:` gives ephemeral state. |
 | `CPM_PROJECT_ROOT` | nearest ancestor of cwd with `.cpm-planner/` or `.git` | Repo root for plan-as-code files (`.cpm-planner/plans/<name>/<variant>.json`). Tools that need a root report `INVALID_PATH: no project root (set CPM_PROJECT_ROOT or run inside a repo)` when none is found. |
 | `CPM_MAX_TTL_SECS` | `28800` (8h) | Server-side ceiling for `ttl_seconds` on `plan.acquire_cohort` and `plan.heartbeat`; larger requested values are clamped. Must be a positive integer — any other value aborts startup. |
+| `OPENROUTER_API_KEY` | none | Optional; will enable `plan.review` (P6, planned); not yet used. |
 
 Leases default to 5 minutes. For long-running work pass `ttl_seconds` (≤ the server maximum) on acquire/heartbeat, and heartbeat at least every `ttl/3`.
 
