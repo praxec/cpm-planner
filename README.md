@@ -30,16 +30,16 @@ curl -fsSL https://github.com/praxec/cpm-planner/releases/latest/download/instal
 irm https://github.com/praxec/cpm-planner/releases/latest/download/install.ps1 | iex
 ```
 
-Pin a release (shown for v0.1.0):
+Pin a release (shown for v0.1.1):
 
 ```sh
 # Linux / macOS
-curl -fsSL https://github.com/praxec/cpm-planner/releases/latest/download/install.sh | sh -s -- --version v0.1.0
+curl -fsSL https://github.com/praxec/cpm-planner/releases/latest/download/install.sh | sh -s -- --version v0.1.1
 
 # Windows (PowerShell): the piped form cannot take parameters, so use the environment variable...
-$env:PRAXEC_VERSION = 'v0.1.0'; irm https://github.com/praxec/cpm-planner/releases/latest/download/install.ps1 | iex
+$env:PRAXEC_VERSION = 'v0.1.1'; irm https://github.com/praxec/cpm-planner/releases/latest/download/install.ps1 | iex
 # ...or a script block
-& ([scriptblock]::Create((irm https://github.com/praxec/cpm-planner/releases/latest/download/install.ps1))) -Version v0.1.0
+& ([scriptblock]::Create((irm https://github.com/praxec/cpm-planner/releases/latest/download/install.ps1))) -Version v0.1.1
 ```
 
 If you would rather read the script before running it, download, inspect, then run:
@@ -48,14 +48,14 @@ If you would rather read the script before running it, download, inspect, then r
 # Linux / macOS
 curl -fsSLO https://github.com/praxec/cpm-planner/releases/latest/download/install.sh
 less install.sh
-sh install.sh --version v0.1.0
+sh install.sh --version v0.1.1
 ```
 
 ```powershell
 # Windows
 irm https://github.com/praxec/cpm-planner/releases/latest/download/install.ps1 -OutFile install.ps1
 Get-Content install.ps1
-.\install.ps1 -Version v0.1.0
+.\install.ps1 -Version v0.1.1
 ```
 
 The installers print the absolute path they installed to (for example `~/.local/bin/cpm-planner`) and, if that directory is not on your `PATH`, the exact line to add. Pass `--add-to-path` (`-AddToPath` on Windows) to have the installer do it for you (user-level only, never sudo). On Linux/macOS it appends to `~/.zshrc` (zsh), `~/.bash_profile` if it exists else `~/.bashrc` (bash), or `~/.profile` (other shells), only if the line is not already there; for fish it prints `fish_add_path <dir>` for you to run instead of writing a file. They only accept `https://` download URLs. After upgrading, restart your MCP client so it launches the new binary (on Windows the old exe is renamed to `cpm-planner.exe.old` and removed on the next run).
@@ -276,7 +276,7 @@ cp -R cpm-planner/skills/deliverable-cpm ~/.claude/skills/
 From a release, use the tag's source archive. The binary archives contain only the binary.
 
 ```bash
-curl -fsSL https://github.com/praxec/cpm-planner/archive/refs/tags/v0.1.0.tar.gz | tar -xz
+curl -fsSL https://github.com/praxec/cpm-planner/archive/refs/tags/v0.1.1.tar.gz | tar -xz
 mkdir -p .agents/skills
 cp -R cpm-planner-0.1.0/skills/deliverable-cpm .agents/skills/
 ```
