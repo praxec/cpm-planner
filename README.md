@@ -362,9 +362,11 @@ projects, or `--project <dir>` for one repository:
 
 The same goes for the other skills: `/cpm-improve`, `$cpm-run`, and so on. Agents also load
 a skill by themselves when your request matches its description. `--target all` writes only
-the two shared directories, because Cursor, Copilot and Gemini also read
-`.agents/skills/` (and Cursor and Copilot read `.claude/skills/`), so each skill is listed
-once. The `agents-md` block sits between `<!-- cpm-planner:begin -->` and
+`.claude/skills/` (Claude Code) and `.agents/skills/` (Codex, Gemini and others). Cursor and
+Copilot read both of those directories and may list each skill twice; to avoid that, install
+for them with `--target cursor` or `--target copilot` alone. Uninstalling one target keeps a
+shared directory such as `.agents/skills/` until the last target that uses it is
+uninstalled. The `agents-md` block sits between `<!-- cpm-planner:begin -->` and
 `<!-- cpm-planner:end -->`; the rest of `AGENTS.md` is left byte for byte as it was.
 
 The installer:
@@ -376,7 +378,9 @@ The installer:
   it. A newer cpm-planner updates the files that still match what the older one wrote;
 - never writes MCP configuration. It prints the registration command for your agent
   instead (see [Register as an MCP server](#register-as-an-mcp-server));
-- takes `--dry-run` to show what it would do without writing anything.
+- takes `--dry-run` to show what it would do without writing anything;
+- refuses (exit 1, nothing changed) a manifest with unsafe paths, a symlink that leads out of
+  the skills directory, or `AGENTS.md` markers that are nested, duplicated or unbalanced.
 
 ```sh
 cpm-planner skills list                                   # what is installed, user and current project
@@ -386,9 +390,10 @@ cpm-planner skills uninstall --target claude --user       # removes only files t
 Restart the agent, or start a new session, so it loads the skills. Per-tool paths and
 sources are in [docs/agents/tool-matrix.md](docs/agents/tool-matrix.md).
 
-To install by hand instead, copy the directories under `skills/` from the source archive of
-your release tag (`https://github.com/praxec/cpm-planner/archive/refs/tags/<version>.tar.gz`)
-into the agent's skills directory from the table.
+To install by hand instead, download the source archive of your release,
+`https://github.com/praxec/cpm-planner/archive/refs/tags/v<version>.tar.gz` (here `<version>`
+is the number without the `v`, such as `0.2.0`), and copy the directories under
+`cpm-planner-<version>/skills/` into the agent's skills directory from the table.
 
 ## MCP tools
 
