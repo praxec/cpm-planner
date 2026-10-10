@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-10
+
 ### Added
 
 - `cpm-planner skills install --target <claude|codex|cursor|copilot|gemini|agents-md|all> (--project <dir> | --user) [--dry-run] [--force]` installs the embedded agent skills (`deliverable-cpm` and the `cpm-*` family) where each tool reads them, per `docs/agents/tool-matrix.md`. `gemini` also writes one `.gemini/commands/cpm-*.toml` command per skill; `agents-md` writes a managed `<!-- cpm-planner:begin -->`/`<!-- cpm-planner:end -->` block in `AGENTS.md`; `all` writes `.claude/skills` and `.agents/skills` only, to avoid duplicate listings.
@@ -20,7 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `AGENTS.md`: instructions for coding agents contributing to this repository (gates, branch model, conventions, skills, the opt-in live test).
 - CI: a `skills install` smoke on Linux, macOS and Windows (project and user scope, idempotent rerun, `list`, `uninstall`).
 
-## [0.1.1] - 2026-10-10
+### Changed
+
+- Repository text files are normalized to LF (`.gitattributes`, `.editorconfig`), guarded by `tests/repo_hygiene.rs`.
+- `execution-policy` is now a crates.io dependency (0.0.6, identical source to the previously pinned git revision), so the crate can be published.
+- New community and supply-chain files: `CODE_OF_CONDUCT.md`, `SUPPORT.md`, issue forms, a PR template, `CODEOWNERS`, Dependabot, `cargo-deny` and CI jobs for docs, packaging and the npm launcher; `CONTRIBUTING.md` and `SECURITY.md` rewritten.
+- Five focused agent skills (`cpm-plan`, `cpm-improve`, `cpm-run`, `cpm-ev`, `cpm-revise`) alongside the `deliverable-cpm` method reference.
 
 ### Fixed
 
@@ -179,8 +186,8 @@ approximations. For the method, caveats and known limitations, see
 - Six-tool MCP surface: `plan.submit`, `plan.acquire_cohort`, `plan.heartbeat`,
   `plan.mark_status`, `plan.status`, and `plan.force_release`.
 
-[Unreleased]: https://github.com/praxec/cpm-planner/compare/v0.1.1...HEAD
-[0.1.1]: https://github.com/praxec/cpm-planner/compare/v0.1.0...v0.1.1
+[Unreleased]: https://github.com/praxec/cpm-planner/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/praxec/cpm-planner/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/praxec/cpm-planner/compare/v0.0.2...v0.1.0
 [0.0.2]: https://github.com/praxec/cpm-planner/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/praxec/cpm-planner/releases/tag/v0.0.1

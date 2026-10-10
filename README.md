@@ -124,7 +124,7 @@ too. All assets are at <https://github.com/praxec/cpm-planner/releases/latest>.
 
 ### Pin a version
 
-In the commands in this README, `<version>` is a release tag such as `v0.1.1`. Pick
+In the commands in this README, `<version>` is a release tag such as `v0.2.0`. Pick
 one from the [releases page](https://github.com/praxec/cpm-planner/releases).
 
 ```sh
