@@ -184,4 +184,8 @@ impl JudgmentModel for JevJudge {
     fn endpoint_host(&self) -> Option<String> {
         JevJudge::endpoint_host(self)
     }
+
+    fn model_id(&self) -> Option<String> {
+        Some(self.model_id.clone())
+    }
 }

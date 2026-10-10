@@ -105,7 +105,7 @@ fn config_timeout_of_zero_is_rejected() {
         ("CPM_LLM_TIMEOUT_SECS", "0"),
     ]))
     .unwrap_err();
-    assert!(matches!(err, ConfigError::InvalidTimeout { .. }));
+    assert!(matches!(err, ConfigError::InvalidTimeout));
 }
 
 #[test]
@@ -115,7 +115,7 @@ fn config_timeout_above_three_hundred_is_rejected() {
         ("CPM_LLM_TIMEOUT_SECS", "301"),
     ]))
     .unwrap_err();
-    assert!(matches!(err, ConfigError::InvalidTimeout { .. }));
+    assert!(matches!(err, ConfigError::InvalidTimeout));
 }
 
 #[test]
@@ -125,7 +125,7 @@ fn config_non_numeric_timeout_is_rejected() {
         ("CPM_LLM_TIMEOUT_SECS", "soon"),
     ]))
     .unwrap_err();
-    assert!(matches!(err, ConfigError::InvalidTimeout { .. }));
+    assert!(matches!(err, ConfigError::InvalidTimeout));
 }
 
 #[test]
@@ -686,7 +686,6 @@ fn empty_key_file_is_reported_as_ignored() {
 #[test]
 fn key_file_ignored_error_names_reason() {
     let err = ConfigError::KeyFileIgnored {
-        path: "/tmp/k".into(),
         reason: KeyFileIgnoredReason::WorldReadable,
     };
     assert!(err.to_string().contains("key file ignored: world-readable"));
@@ -705,7 +704,6 @@ fn partial_key_cut_by_truncation_boundary_is_dropped() {
 #[test]
 fn ignored_key_file_review_reason_names_the_setting() {
     let err = ConfigError::KeyFileIgnored {
-        path: "/home/someone/secret-dir/k".into(),
         reason: KeyFileIgnoredReason::WorldReadable,
     };
     assert_eq!(
@@ -728,10 +726,21 @@ fn invalid_timeout_review_reason_names_the_variable() {
 }
 
 #[test]
-fn unreadable_key_file_review_reason_omits_the_path() {
-    let err = ConfigError::KeyFile {
-        path: "/home/someone/secret-dir/k".into(),
-        reason: "entity not found".to_string(),
-    };
-    assert!(!err.review_reason().contains("secret-dir"));
+fn key_file_error_never_echoes_the_path() {
+    let err = LlmConfig::from_lookup(lookup(&[(
+        "CPM_OPENROUTER_KEY_FILE",
+        "/nonexistent/secret-dir/k",
+    )]))
+    .unwrap_err();
+    assert!(!format!("{err} {err:?} {}", err.review_reason()).contains("secret-dir"));
+}
+
+#[test]
+fn invalid_timeout_error_never_echoes_the_value() {
+    let err = LlmConfig::from_lookup(lookup(&[
+        ("OPENROUTER_API_KEY", "k"),
+        ("CPM_LLM_TIMEOUT_SECS", SENTINEL),
+    ]))
+    .unwrap_err();
+    assert!(!format!("{err} {err:?}").contains(SENTINEL));
 }

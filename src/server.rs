@@ -127,6 +127,10 @@ pub const TOOL_ARCHIVE: &str = "plan.archive";
 pub const TOOL_COMPARE: &str = "plan.compare";
 pub const TOOL_REVIEW: &str = "plan.review";
 
+/// Most `plan.review` calls running at once; further calls wait for a slot.
+/// Each review is one billed OpenRouter request plus up to 65 simulates.
+pub const MAX_CONCURRENT_REVIEWS: usize = 2;
+
 /// All twenty MCP tool names exposed by [`PlanServer`], in declaration order.
 pub const PLAN_TOOL_NAMES: &[&str] = &[
     TOOL_SUBMIT,
@@ -1104,6 +1108,13 @@ impl ReviewJudge {
             Self::Unusable(reason) => Judge::ConfigError(reason),
         }
     }
+
+    fn configured_model(&self) -> Option<String> {
+        match self {
+            Self::Model(model) => model.model_id(),
+            Self::NotConfigured | Self::Unusable(_) => None,
+        }
+    }
 }
 
 /// MCP server façade exposing a [`BasicCpmPlanner`] over twenty tools.
@@ -1113,6 +1124,8 @@ pub struct PlanServer {
     server_name: String,
     server_version: String,
     judge: ReviewJudge,
+    /// [`MAX_CONCURRENT_REVIEWS`] permits, shared by every clone.
+    review_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl PlanServer {
@@ -1123,6 +1136,7 @@ impl PlanServer {
             server_name: "cpm-planner".to_string(),
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             judge: ReviewJudge::NotConfigured,
+            review_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REVIEWS)),
         }
     }
 
@@ -1153,8 +1167,11 @@ impl PlanServer {
                 ReviewJudge::NotConfigured
             }
             Err(err) => {
-                tracing::warn!(error = %err, "LLM configuration unusable; plan.review is unavailable");
-                ReviewJudge::Unusable(err.review_reason())
+                // Only the key-free reason: it names the variable, never
+                // its value or the key-file path.
+                let reason = err.review_reason();
+                tracing::warn!(%reason, "LLM configuration unusable; plan.review is unavailable");
+                ReviewJudge::Unusable(reason)
             }
         };
         self
@@ -1697,11 +1714,13 @@ impl PlanServer {
     }
 
     /// `plan.review`. Params are range-checked first (`invalid_params`).
+    /// At most [`MAX_CONCURRENT_REVIEWS`] run at once (later calls wait).
     /// The whole review runs on the blocking pool, with the runtime handle
     /// driving its single judge call from there: the engine simulates the
     /// plan up to once per proposal, which must not stall the async
     /// workers. The store is not held: the graph is resolved (and any lock
-    /// released) before the review starts.
+    /// released) before the review starts. Every outcome but a panic or bad
+    /// params is audited; an engine error keeps its [`PlannerError`] prefix.
     async fn handle_review(&self, args: Value) -> Result<Value, McpError> {
         let ReviewToolArgs {
             graph,
@@ -1713,15 +1732,24 @@ impl PlanServer {
             max_questions,
         } = parse_args(args)?;
         let request = review_request(capacities, resource_key, project_buffer_pct, max_questions)?;
+        let audited_plan_id = plan_id.clone();
         let graph = self.resolve_graph(graph, plan_id, path).await?;
+        let _slot = self
+            .review_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| McpError::internal_error("review task failed", None))?;
         let judge = self.judge.clone();
+        let configured_model = judge.configured_model();
         let runtime = tokio::runtime::Handle::current();
-        let report = run_blocking(move || {
+        let outcome = spawn_analysis("review", move || {
             runtime.block_on(crate::review::review(&graph, &request, judge.as_judge()))
         })
         .await?;
-        self.planner.record_audit(review_audit_event(&report)).await;
-        to_value(&report)
+        let event = review_audit_event(&outcome, audited_plan_id, configured_model);
+        self.planner.record_audit(event).await;
+        to_value(&outcome.map_err(planner_error_to_mcp)?)
     }
 }
 
@@ -1763,16 +1791,47 @@ fn review_request(
 }
 
 /// The `plan.review` audit record: what was asked of whom and the outcome,
-/// never the key or the prompt (only its hash).
-fn review_audit_event(report: &ReviewReport) -> AuditEvent {
-    AuditEvent::new("plan.review").with_payload(json!({
-        "status": report.status,
-        "question_count": report.question_count,
-        "prompt_hash": report.prompt_hash,
-        "model": report.model,
-        "endpoint": report.endpoint,
-        "jev_called": report.jev_called,
-    }))
+/// never the key or the prompt (only its hash). `model` is the provider's,
+/// else the configured one when the judge was called; an engine error is
+/// status `"error"` with its stable `code` (the `PlannerError` prefix).
+fn review_audit_event(
+    outcome: &Result<ReviewReport, PlannerError>,
+    plan_id: Option<String>,
+    configured_model: Option<String>,
+) -> AuditEvent {
+    let payload = match outcome {
+        Ok(report) => json!({
+            "status": report.status,
+            "code": null,
+            "plan_id": plan_id,
+            "question_count": report.question_count,
+            "prompt_hash": report.prompt_hash,
+            "model": report.model.clone().or(if report.jev_called { configured_model } else { None }),
+            "endpoint": report.endpoint,
+            "jev_called": report.jev_called,
+        }),
+        Err(err) => json!({
+            "status": "error",
+            "code": error_code(err),
+            "plan_id": plan_id,
+            "question_count": 0,
+            "prompt_hash": null,
+            "model": null,
+            "endpoint": null,
+            "jev_called": false,
+        }),
+    };
+    AuditEvent::new("plan.review").with_payload(payload)
+}
+
+/// The stable prefix of a [`PlannerError`] (`INVALID_CAPACITIES`, …).
+fn error_code(err: &PlannerError) -> String {
+    let text = err.to_string();
+    text.split(':')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string()
 }
 
 /// Range checks the analysis tools apply before any work, as
@@ -1808,10 +1867,23 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T, PlannerError> + Send + 'static,
 {
-    tokio::task::spawn_blocking(work)
-        .await
-        .map_err(|e| McpError::internal_error(format!("analysis task failed: {e}"), None))?
+    spawn_analysis("analysis", work)
+        .await?
         .map_err(planner_error_to_mcp)
+}
+
+/// Run `work` on the blocking pool. A panic or cancellation becomes the
+/// generic `internal_error` "`<what>` task failed"; the detail (which may
+/// quote data) goes to the log only.
+async fn spawn_analysis<T, F>(what: &'static str, work: F) -> Result<T, McpError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(work).await.map_err(|e| {
+        tracing::error!(error = %e, "{what} task failed");
+        McpError::internal_error(format!("{what} task failed"), None)
+    })
 }
 
 // ---------------------------------------------------------------------------

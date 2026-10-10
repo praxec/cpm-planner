@@ -3,7 +3,8 @@
 //! the `#[ignore]`d live smoke test.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -196,13 +197,96 @@ fn jev_judge(mock: &MockServer) -> Arc<dyn JudgmentModel> {
 }
 
 async fn mock_replying(status: u16) -> MockServer {
+    mock_with(ResponseTemplate::new(status).set_body_string(format!("bad key {SENTINEL}"))).await
+}
+
+async fn mock_with(response: ResponseTemplate) -> MockServer {
     let mock = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/systemone"))
-        .respond_with(ResponseTemplate::new(status).set_body_string(format!("bad key {SENTINEL}")))
+        .respond_with(response)
         .mount(&mock)
         .await;
     mock
+}
+
+async fn reason_for(response: ResponseTemplate, timeout: Duration) -> String {
+    let mock = mock_with(response).await;
+    let cfg = LlmConfig::new(SENTINEL)
+        .with_jev_endpoint(format!("{}/v1/systemone", mock.uri()))
+        .with_timeout(timeout);
+    let judge: Arc<dyn JudgmentModel> = Arc::new(JevJudge::new(&cfg));
+    let resp = review(&server_with(Some(judge)), json!({ "graph": graph() })).await;
+    resp["reason"].as_str().unwrap_or_default().to_string()
+}
+
+/// Captures every tracing line written while it is the default subscriber.
+#[derive(Clone, Default)]
+struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl LogCapture {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+/// Counts callers and holds each until released (or 10 s pass).
+#[derive(Default)]
+struct SlotJudge {
+    entered: AtomicUsize,
+    released: Mutex<bool>,
+    wake: Condvar,
+}
+
+impl SlotJudge {
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.wake.notify_all();
+    }
+}
+
+#[async_trait]
+impl JudgmentModel for SlotJudge {
+    async fn decide(
+        &self,
+        _state: Value,
+        _questions: BTreeMap<String, Question>,
+    ) -> Result<Decisions, JudgmentError> {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        let guard = self.released.lock().unwrap();
+        let _ = self
+            .wake
+            .wait_timeout_while(guard, Duration::from_secs(10), |released| !*released)
+            .unwrap();
+        Ok(Decisions {
+            answers: BTreeMap::new(),
+            model: "fake/slot".to_string(),
+            usage: None,
+        })
+    }
+}
+
+struct PanickingJudge;
+
+#[async_trait]
+impl JudgmentModel for PanickingJudge {
+    async fn decide(
+        &self,
+        _state: Value,
+        _questions: BTreeMap<String, Question>,
+    ) -> Result<Decisions, JudgmentError> {
+        panic!("judge exploded with secret detail");
+    }
 }
 
 fn review_events(sink: &MemoryAuditSink) -> Vec<Value> {
@@ -227,11 +311,8 @@ async fn review_without_key_is_unavailable_with_no_key_reason() {
 
 #[tokio::test]
 async fn review_with_invalid_config_names_the_setting() {
-    let server = PlanServer::new(Arc::new(BasicCpmPlanner::new())).with_llm_config(Err(
-        ConfigError::InvalidTimeout {
-            value: "0".to_string(),
-        },
-    ));
+    let server = PlanServer::new(Arc::new(BasicCpmPlanner::new()))
+        .with_llm_config(Err(ConfigError::InvalidTimeout));
     let resp = review(&server, json!({ "graph": graph() })).await;
     assert!(
         resp["reason"]
@@ -243,11 +324,8 @@ async fn review_with_invalid_config_names_the_setting() {
 
 #[tokio::test]
 async fn review_with_invalid_config_still_reports_lint_errors() {
-    let server = PlanServer::new(Arc::new(BasicCpmPlanner::new())).with_llm_config(Err(
-        ConfigError::InvalidTimeout {
-            value: "0".to_string(),
-        },
-    ));
+    let server = PlanServer::new(Arc::new(BasicCpmPlanner::new()))
+        .with_llm_config(Err(ConfigError::InvalidTimeout));
     let resp = review(&server, json!({ "graph": cyclic_graph() })).await;
     assert_eq!(resp["status"], json!("invalid_graph"));
 }
@@ -403,9 +481,11 @@ async fn review_audit_event_omits_the_prompt() {
     assert_eq!(
         keys,
         vec![
+            "code",
             "endpoint",
             "jev_called",
             "model",
+            "plan_id",
             "prompt_hash",
             "question_count",
             "status"
@@ -484,4 +564,159 @@ fn review_tool_schema_caps_max_questions_at_64() {
         tool.input_schema["properties"]["max_questions"]["maximum"],
         json!(64)
     );
+}
+
+// ---------------------------------------------------------------- fix round 1
+
+#[tokio::test]
+async fn misplaced_key_in_config_vars_is_never_logged_or_returned() {
+    let logs = LogCapture::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let configs = [
+        LlmConfig::from_lookup(|name| {
+            (name == "CPM_OPENROUTER_KEY_FILE").then(|| SENTINEL.to_string())
+        }),
+        LlmConfig::from_lookup(|name| match name {
+            "OPENROUTER_API_KEY" => Some("real-key".to_string()),
+            "CPM_LLM_TIMEOUT_SECS" => Some(SENTINEL.to_string()),
+            _ => None,
+        }),
+    ];
+    let mut output = String::new();
+    for config in configs {
+        let server = PlanServer::new(Arc::new(BasicCpmPlanner::new())).with_llm_config(config);
+        output.push_str(
+            &review(&server, json!({ "graph": graph() }))
+                .await
+                .to_string(),
+        );
+    }
+    assert!(!format!("{}{output}", logs.text()).contains(SENTINEL));
+}
+
+#[tokio::test]
+async fn review_engine_error_keeps_its_planner_error_prefix() {
+    let judge: Arc<dyn JudgmentModel> = Arc::new(FakeJudge { noul: 0.0 });
+    let err = server_with(Some(judge))
+        .dispatch_call(call_args(
+            TOOL_REVIEW,
+            json!({ "graph": graph(), "capacities": { "nobody": 1 } }),
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        err.message.starts_with("INVALID_CAPACITIES:"),
+        "{}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn review_engine_error_is_audited_with_its_code() {
+    let (server, sink) = audited_server(Arc::new(FakeJudge { noul: 0.0 }));
+    let _ = server
+        .dispatch_call(call_args(
+            TOOL_REVIEW,
+            json!({ "graph": graph(), "capacities": { "nobody": 1 } }),
+        ))
+        .await;
+    let event = review_events(&sink).pop().unwrap();
+    assert_eq!(
+        (event["status"].clone(), event["code"].clone()),
+        (json!("error"), json!("INVALID_CAPACITIES"))
+    );
+}
+
+#[tokio::test]
+async fn review_audit_model_is_the_configured_model_when_the_judge_fails() {
+    let mock = mock_replying(500).await;
+    let (server, sink) = audited_server(jev_judge(&mock));
+    review(&server, json!({ "graph": graph() })).await;
+    let event = review_events(&sink).pop().unwrap();
+    assert_eq!(event["model"], json!(cpm_planner::llm::DEFAULT_JEV_MODEL));
+}
+
+#[tokio::test]
+async fn review_audit_carries_plan_id_for_a_stored_plan() {
+    let (server, sink) = audited_server(Arc::new(FakeJudge { noul: 0.0 }));
+    let submitted = server
+        .dispatch_call(call_args(TOOL_SUBMIT, json!({ "graph": graph() })))
+        .await
+        .unwrap();
+    review(&server, json!({ "plan_id": submitted["plan_id"] })).await;
+    let event = review_events(&sink).pop().unwrap();
+    assert_eq!(event["plan_id"], submitted["plan_id"]);
+}
+
+#[tokio::test]
+async fn review_audit_plan_id_is_null_for_an_inline_graph() {
+    let (server, sink) = audited_server(Arc::new(FakeJudge { noul: 0.0 }));
+    review(&server, json!({ "graph": graph() })).await;
+    let event = review_events(&sink).pop().unwrap();
+    assert_eq!(event["plan_id"], Value::Null);
+}
+
+#[tokio::test]
+async fn review_reports_truncated_when_max_questions_cuts_candidates() {
+    let judge: Arc<dyn JudgmentModel> = Arc::new(FakeJudge { noul: 0.0 });
+    let args = json!({ "graph": chain_graph(40), "max_questions": 5 });
+    let resp = review(&server_with(Some(judge)), args).await;
+    assert_eq!(resp["truncated"], json!(true));
+}
+
+#[tokio::test]
+async fn review_upstream_rate_limit_is_unavailable_with_its_class() {
+    let reason = reason_for(ResponseTemplate::new(429), Duration::from_secs(5)).await;
+    assert!(reason.starts_with("rate_limited: "), "{reason}");
+}
+
+#[tokio::test]
+async fn review_upstream_server_error_is_unavailable_with_its_class() {
+    let reason = reason_for(ResponseTemplate::new(500), Duration::from_secs(5)).await;
+    assert!(reason.starts_with("upstream: "), "{reason}");
+}
+
+#[tokio::test]
+async fn review_upstream_timeout_is_unavailable_with_its_class() {
+    let slow = ResponseTemplate::new(200).set_delay(Duration::from_secs(5));
+    let reason = reason_for(slow, Duration::from_millis(100)).await;
+    assert!(reason.starts_with("timeout: "), "{reason}");
+}
+
+#[tokio::test]
+async fn review_panic_is_a_generic_internal_error() {
+    let judge: Arc<dyn JudgmentModel> = Arc::new(PanickingJudge);
+    let err = server_with(Some(judge))
+        .dispatch_call(call_args(TOOL_REVIEW, json!({ "graph": graph() })))
+        .await
+        .unwrap_err();
+    assert_eq!(err.message, "review task failed");
+}
+
+#[tokio::test]
+async fn third_concurrent_review_waits_for_a_slot() {
+    let judge = Arc::new(SlotJudge::default());
+    let shared: Arc<dyn JudgmentModel> = judge.clone();
+    let server = server_with(Some(shared));
+    let reviews: Vec<_> = (0..3)
+        .map(|_| {
+            let server = server.clone();
+            tokio::spawn(async move { review(&server, json!({ "graph": graph() })).await })
+        })
+        .collect();
+    while judge.entered.load(Ordering::SeqCst) < 2 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let entered_while_two_held = judge.entered.load(Ordering::SeqCst);
+    judge.release();
+    for r in reviews {
+        r.await.unwrap();
+    }
+    assert_eq!(entered_while_two_held, 2);
 }

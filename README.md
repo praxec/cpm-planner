@@ -96,16 +96,41 @@ reports `review_unavailable` with a reason naming the setting.
 - **Probabilities are advisory.** Treat findings as a second opinion. Proposals
   are verified mechanically (the edited plan must lint clean and simulate to a
   shorter makespan); apply one with `plan.fork {edits}`, then `plan.compare`.
-- **Cost.** One call per review; Jev costs about $0.042 per million input
-  tokens on OpenRouter. Each report carries the provider's `usage` when given.
-- **Privacy.** The plan graph is sent to OpenRouter: the makespan, the
-  critical path, and for every deliverable a question names its id, scheduled
-  hours and float, owned file paths, prerequisites (ids, `consumes`, kind) and
-  its `description`, `artifact` and `owner` metadata (each cut to 500
-  characters). Do not review plans whose contents you may not share with
-  OpenRouter. The key is never logged or returned; each review
-  records a `plan.review` audit event with the `prompt_hash`, model, endpoint
-  host, status and question count, never the key or the prompt.
+- **Cost.** Each `plan.review` call that reaches the judge is one billed
+  OpenRouter request; Jev costs about $0.042 per million input tokens on
+  OpenRouter. Each report carries the provider's `usage` when given. At most 2
+  reviews run at once per server; further calls wait for a slot.
+- **Privacy.** This is everything sent to OpenRouter in that one request:
+  - a fixed task sentence, the plan makespan and the critical path (ids);
+  - the questions: for each, its kind, the deliverable ids it names, and a
+    question sentence that quotes those ids;
+  - for every deliverable a question names: its id, scheduled hours, float
+    hours, `critical` and `milestone` flags, owned file paths (sent in full,
+    not truncated), prerequisites (id, `consumes`, kind) and its
+    `description`, `artifact` and `owner` metadata. `description`,
+    `artifact`, `owner` and `consumes` are cut to 500 characters each.
+
+  Nothing else in the graph (other deliverables, other metadata keys,
+  estimates) is sent. Do not review plans whose contents you may not share
+  with OpenRouter.
+- **Audit.** The key is never logged or returned, and neither is a misplaced
+  value of any LLM variable. Each review (whatever its outcome, except
+  rejected params) records one `plan.review` audit event with exactly these
+  fields:
+  - `status`: `ok`, `review_unavailable`, `invalid_graph`, or `error` (the
+    review failed, e.g. `INVALID_CAPACITIES`);
+  - `code`: the error prefix for `error`, else null;
+  - `plan_id`: the stored plan reviewed, null for an inline `graph` or `path`;
+  - `question_count`: questions sent (0 when the judge was not called);
+  - `jev_called`: whether the judge was called;
+  - `prompt_hash`: sha256 of the canonical request, null when the judge was
+    not called;
+  - `model`: the model the provider reported, else the configured model when
+    the call failed; null when the judge was not called;
+  - `endpoint`: the judge endpoint's host; null when no judge is configured,
+    lint found errors, or the review failed with `error`.
+
+  The prompt itself is never recorded.
 
 ## Use as a library
 

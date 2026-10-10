@@ -22,7 +22,7 @@ pub mod openrouter;
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -107,12 +107,17 @@ impl fmt::Debug for ApiKey {
     }
 }
 
-/// Why the LLM configuration is unusable. Messages never contain the key.
+/// Why the LLM configuration is unusable.
+///
+/// Neither `Display` nor `Debug` carries a variable's value or the key-file
+/// path: a key pasted into the wrong variable must not reach a log. Each
+/// message names the variable and the rule it breaks.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    /// `CPM_LLM_TIMEOUT_SECS` is not an integer in 1..=300.
-    #[error("{LLM_TIMEOUT_ENV} must be an integer number of seconds in 1..=300; got '{value}'")]
-    InvalidTimeout { value: String },
+    /// `CPM_LLM_TIMEOUT_SECS` is not an integer in 1..=300. The value is not
+    /// kept.
+    #[error("{LLM_TIMEOUT_ENV} must be an integer number of seconds in 1..=300")]
+    InvalidTimeout,
     /// `CPM_JEV_ENDPOINT` is not an acceptable URL. The value itself is not
     /// echoed (it may carry credentials).
     #[error(
@@ -121,16 +126,14 @@ pub enum ConfigError {
     )]
     InvalidEndpoint { reason: String },
     /// `CPM_OPENROUTER_KEY_FILE` names something that cannot be used as a
-    /// key file (missing, unreadable, not a regular file, too large).
-    #[error("{OPENROUTER_KEY_FILE_ENV} '{}' cannot be read: {reason}", path.display())]
-    KeyFile { path: PathBuf, reason: String },
-    /// The key file was read but deliberately ignored (a warning is logged
-    /// too). Distinct from "no key configured" so callers can say why.
-    #[error("{OPENROUTER_KEY_FILE_ENV} '{}': key file ignored: {reason}", path.display())]
-    KeyFileIgnored {
-        path: PathBuf,
-        reason: KeyFileIgnoredReason,
-    },
+    /// key file (missing, unreadable, not a regular file, too large). The
+    /// path is not kept.
+    #[error("{OPENROUTER_KEY_FILE_ENV}: key file cannot be read: {reason}")]
+    KeyFile { reason: String },
+    /// The key file was read but deliberately ignored. Distinct from "no key
+    /// configured" so callers can say why. The path is not kept.
+    #[error("{OPENROUTER_KEY_FILE_ENV}: key file ignored: {reason}")]
+    KeyFileIgnored { reason: KeyFileIgnoredReason },
 }
 
 impl ConfigError {
@@ -139,14 +142,14 @@ impl ConfigError {
     /// variable name and the validation reason).
     pub fn review_reason(&self) -> String {
         match self {
-            Self::InvalidTimeout { .. } => format!(
+            Self::InvalidTimeout => format!(
                 "{LLM_TIMEOUT_ENV} invalid: must be an integer number of seconds in 1..=300"
             ),
             Self::InvalidEndpoint { reason } => format!("{JEV_ENDPOINT_ENV} invalid: {reason}"),
-            Self::KeyFile { reason, .. } => {
+            Self::KeyFile { reason } => {
                 format!("key file unreadable: {reason} ({OPENROUTER_KEY_FILE_ENV})")
             }
-            Self::KeyFileIgnored { reason, .. } => {
+            Self::KeyFileIgnored { reason } => {
                 format!("key file ignored: {reason} ({OPENROUTER_KEY_FILE_ENV})")
             }
         }
@@ -202,7 +205,8 @@ impl LlmConfig {
     ///
     /// The key comes from `OPENROUTER_API_KEY`, else from the file named by
     /// `CPM_OPENROUTER_KEY_FILE` (contents trimmed). A world-readable (unix)
-    /// or empty key file is [`ConfigError::KeyFileIgnored`] plus a warning.
+    /// or empty key file is [`ConfigError::KeyFileIgnored`] (not logged here:
+    /// the caller logs it once).
     /// A blank env key counts as absent. The endpoint is validated here:
     /// https, or http to a loopback host, with no credentials.
     pub fn from_lookup(
@@ -299,9 +303,7 @@ fn parse_timeout(raw: &str) -> Result<Duration, ConfigError> {
         .ok()
         .filter(|secs| TIMEOUT_SECS_RANGE.contains(secs))
         .map(Duration::from_secs)
-        .ok_or_else(|| ConfigError::InvalidTimeout {
-            value: raw.to_string(),
-        })
+        .ok_or(ConfigError::InvalidTimeout)
 }
 
 fn parse_endpoint(raw: &str) -> Result<String, ConfigError> {
@@ -330,22 +332,13 @@ fn parse_endpoint(raw: &str) -> Result<String, ConfigError> {
 
 /// Read and trim the key file. It must be a regular file of at most
 /// [`MAX_KEY_FILE_BYTES`]; a world-readable (unix) or empty file is
-/// [`ConfigError::KeyFileIgnored`] with a warning. Messages name the path,
-/// never the key.
+/// [`ConfigError::KeyFileIgnored`]. Nothing is logged here (the caller logs
+/// the error once); errors carry neither the path nor the key.
 fn read_key_file(path: &Path) -> Result<Option<String>, ConfigError> {
     use std::io::Read;
-    let key_file_error = |reason: String| ConfigError::KeyFile {
-        path: path.to_path_buf(),
-        reason,
-    };
+    let key_file_error = |reason: String| ConfigError::KeyFile { reason };
     let io_error = |e: std::io::Error| key_file_error(e.kind().to_string());
-    let ignored = |reason: KeyFileIgnoredReason| {
-        tracing::warn!(path = %path.display(), %reason, "{OPENROUTER_KEY_FILE_ENV}: key file ignored");
-        ConfigError::KeyFileIgnored {
-            path: path.to_path_buf(),
-            reason,
-        }
-    };
+    let ignored = |reason: KeyFileIgnoredReason| ConfigError::KeyFileIgnored { reason };
 
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -483,6 +476,12 @@ pub trait JudgmentModel: Send + Sync {
     /// Host of the endpoint this model calls, for the review report. `None`
     /// when unknown (fakes) or unparseable.
     fn endpoint_host(&self) -> Option<String> {
+        None
+    }
+
+    /// The model id this judge is configured to ask, for audit records when
+    /// the provider never reported one. `None` when unknown (fakes).
+    fn model_id(&self) -> Option<String> {
         None
     }
 }
