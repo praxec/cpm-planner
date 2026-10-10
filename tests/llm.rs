@@ -304,6 +304,61 @@ async fn jev_success_reports_usage() {
     assert_eq!(decisions.usage.and_then(|u| u.total_tokens), Some(123));
 }
 
+/// A live OpenRouter reply (2026-10-10), with the question id renamed to
+/// this file's and the generation id replaced.
+fn openrouter_reply() -> serde_json::Value {
+    json!({
+        "model": "typesafe/jev-1.13-20260917",
+        "answers": { "dep_real": { "type": "noul", "noul": 0.81 } },
+        "usage": { "input_tokens": 330, "output_tokens": 21, "cost": 0.00001386 },
+        "id": "gen-dec-0000000000-XXXXXXXXXXXXXXXXXXXX",
+        "provider": "TypeSafe"
+    })
+}
+
+#[tokio::test]
+async fn jev_reply_with_numeric_usage_cost_decodes() {
+    let decisions = decide_with(ResponseTemplate::new(200).set_body_json(openrouter_reply()))
+        .await
+        .unwrap();
+    assert_eq!(
+        decisions.usage.and_then(|u| u.cost).map(|c| c.total),
+        Some(0.00001386)
+    );
+}
+
+#[tokio::test]
+async fn jev_reply_with_object_usage_cost_decodes() {
+    let mut body = openrouter_reply();
+    body["usage"]["cost"] = json!({ "input": 0.00001, "output": 0.00000386, "total": 0.00001386 });
+    let decisions = decide_with(ResponseTemplate::new(200).set_body_json(body))
+        .await
+        .unwrap();
+    assert_eq!(
+        decisions.usage.and_then(|u| u.cost).map(|c| c.total),
+        Some(0.00001386)
+    );
+}
+
+#[tokio::test]
+async fn jev_reply_without_usage_decodes() {
+    let mut body = openrouter_reply();
+    body.as_object_mut().unwrap().remove("usage");
+    let decisions = decide_with(ResponseTemplate::new(200).set_body_json(body))
+        .await
+        .unwrap();
+    assert!(decisions.usage.is_none());
+}
+
+#[tokio::test]
+async fn jev_reply_with_repeated_question_id_is_decode() {
+    let body = r#"{"model":"m","answers":{"dep_real":{"type":"noul","noul":0.5},"dep_real":{"type":"noul","noul":0.6}}}"#;
+    let err = decide_with(ResponseTemplate::new(200).set_body_string(body))
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), JudgmentErrorKind::Decode);
+}
+
 #[tokio::test]
 async fn jev_request_sends_bearer_key_model_and_questions() {
     let server = MockServer::start().await;
