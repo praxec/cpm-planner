@@ -351,6 +351,58 @@ async fn jev_reply_without_usage_decodes() {
 }
 
 #[tokio::test]
+async fn jev_reply_with_unparseable_usage_still_decodes_answers() {
+    let mut body = openrouter_reply();
+    body["usage"] = json!({ "input_tokens": "many", "cost": "abc" });
+    let decisions = decide_with(ResponseTemplate::new(200).set_body_json(body))
+        .await
+        .unwrap();
+    assert!(matches!(
+        decisions.answers.get("dep_real"),
+        Some(Answer::Noul { noul }) if (*noul - 0.81).abs() < 1e-9
+    ));
+}
+
+#[tokio::test]
+async fn jev_reply_with_bad_counter_keeps_cost() {
+    let mut body = openrouter_reply();
+    body["usage"]["input_tokens"] = json!("many");
+    let decisions = decide_with(ResponseTemplate::new(200).set_body_json(body))
+        .await
+        .unwrap();
+    assert_eq!(
+        decisions.usage.and_then(|u| u.cost).map(|c| c.total),
+        Some(0.00001386)
+    );
+}
+
+async fn decide_state_without_sending(state: serde_json::Value) -> JudgmentErrorKind {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+        .expect(0)
+        .mount(&server)
+        .await;
+    judge_for(&server)
+        .decide(state, noul_question())
+        .await
+        .unwrap_err()
+        .kind()
+}
+
+#[tokio::test]
+async fn jev_null_state_is_invalid_request_without_sending() {
+    let kind = decide_state_without_sending(serde_json::Value::Null).await;
+    assert_eq!(kind, JudgmentErrorKind::InvalidRequest);
+}
+
+#[tokio::test]
+async fn jev_numeric_state_is_invalid_request_without_sending() {
+    let kind = decide_state_without_sending(json!(42)).await;
+    assert_eq!(kind, JudgmentErrorKind::InvalidRequest);
+}
+
+#[tokio::test]
 async fn jev_reply_with_repeated_question_id_is_decode() {
     let body = r#"{"model":"m","answers":{"dep_real":{"type":"noul","noul":0.5},"dep_real":{"type":"noul","noul":0.6}}}"#;
     let err = decide_with(ResponseTemplate::new(200).set_body_string(body))
