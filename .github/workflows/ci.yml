@@ -86,3 +86,22 @@ jobs:
               run: cargo package --locked --list
             - name: cargo publish (dry run)
               run: cargo publish --dry-run --locked
+
+    npm:
+        name: npm launcher (${{ matrix.os }})
+        strategy:
+            fail-fast: false
+            matrix:
+                os: [ubuntu-latest, macos-latest, windows-latest]
+        runs-on: ${{ matrix.os }}
+        timeout-minutes: 15
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4.4.0
+              with:
+                  node-version: 22
+            - name: launcher tests
+              run: node --test "npm/test/*.test.mjs"
+            - name: npm pack (dry run)
+              working-directory: npm
+              run: npm pack --dry-run --ignore-scripts

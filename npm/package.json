@@ -1,0 +1,45 @@
+{
+  "name": "@matthew-cochran/cpm",
+  "version": "0.1.1",
+  "description": "npx launcher for the cpm-planner MCP server: downloads the verified release binary for your platform and runs it over stdio.",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "cpm",
+    "critical-path",
+    "project-planning",
+    "cpm-planner"
+  ],
+  "license": "Apache-2.0",
+  "author": "Matthew Cochran <matthew@cochranweb.com>",
+  "homepage": "https://github.com/praxec/cpm-planner#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/praxec/cpm-planner.git",
+    "directory": "npm"
+  },
+  "bugs": {
+    "url": "https://github.com/praxec/cpm-planner/issues"
+  },
+  "bin": {
+    "cpm-planner": "bin/cpm-planner.js",
+    "cpm": "bin/cpm-planner.js"
+  },
+  "files": [
+    "bin/cpm-planner.js",
+    "lib/install.js",
+    "lib/postinstall.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "postinstall": "node lib/postinstall.js",
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

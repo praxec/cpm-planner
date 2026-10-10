@@ -16,7 +16,8 @@ On a branch off `dev`, set the same version in every place that carries it:
   lock file records the new version.
 - `server.json`: the top-level `version`, `packages[].version`, and the tag of
   the OCI identifier (`ghcr.io/praxec/cpm-planner:X.Y.Z`).
-- `npm/package.json`: `version`, once the npm launcher exists.
+- `npm/package.json`: `version` (the npm launcher downloads the release with
+  this version, so it must match).
 
 Then check them:
 
@@ -24,7 +25,8 @@ Then check them:
 scripts/check-version-sync.sh
 ```
 
-It fails when any `server.json` version or OCI tag differs from `Cargo.toml`.
+It fails when any `server.json` version or OCI tag, or the `npm/package.json`
+version, differs from `Cargo.toml`.
 The release workflow repeats the check against the tag and refuses to build on
 a mismatch. Also update version pins in the README (installer `--version`
 examples and the `cargo install --git ... --tag` line).
@@ -67,7 +69,9 @@ The workflow then runs these jobs:
    `tools/list`) and uploaded to the draft.
 3. **aggregate metadata + publish**: writes `checksums.sha256` and
    `release-manifest.json` (it fails if the matrix is incomplete), uploads them
-   with `install.sh` and `install.ps1`, and publishes the release.
+   with `install.sh` and `install.ps1`, runs `npm pack` in `npm/` and attaches
+   `matthew-cochran-cpm-X.Y.Z.tgz`, and publishes the release. It does not run
+   `npm publish` and has no npm token.
 4. **container image**: builds the image, smoke-tests it, then pushes
    `ghcr.io/praxec/cpm-planner` for linux/amd64 and linux/arm64 with the tags
    `X.Y.Z`, `X.Y` and `latest`.
@@ -79,7 +83,8 @@ The workflow then runs these jobs:
 ## 5. Verify the release
 
 Assets: the release page lists six archives, `checksums.sha256`,
-`release-manifest.json`, `install.sh` and `install.ps1`.
+`release-manifest.json`, `install.sh`, `install.ps1` and
+`matthew-cochran-cpm-X.Y.Z.tgz`.
 
 ```sh
 gh release view vX.Y.Z --json assets --jq '.assets[].name'
@@ -122,9 +127,32 @@ a few minutes after publishing.
 
 ## 7. Publish to npm (manual)
 
-Placeholder: the npm launcher (`npm/`) and its publish steps are added later in
-this release. This section will cover `npm/package.json`, a dry run and
-`npm publish`.
+The workflow packs the npm launcher (`npm/`, package `@matthew-cochran/cpm`)
+and attaches the tarball to the release, but never publishes it. The launcher
+downloads the GitHub release whose version equals its own, so publish only
+after the release in step 4 is public and its assets are verified (step 5).
+
+Publish the tarball the workflow built, not a local `npm pack`, so npm gets
+exactly the file attached to the release. You need to be logged in to npm
+(`npm login`) as an owner of the `@matthew-cochran` scope, with 2FA:
+
+```sh
+mkdir -p /tmp/cpm-npm && cd /tmp/cpm-npm
+gh release download vX.Y.Z --repo praxec/cpm-planner --pattern 'matthew-cochran-cpm-X.Y.Z.tgz'
+tar -tzf matthew-cochran-cpm-X.Y.Z.tgz   # package/{LICENSE,README.md,package.json,bin/,lib/} only, no tests
+npm publish ./matthew-cochran-cpm-X.Y.Z.tgz --access public   # prompts for the 2FA code
+```
+
+Verify from a clean cache, outside the repository:
+
+```sh
+npx -y @matthew-cochran/cpm@X.Y.Z --version
+node scripts/mcp-smoke.mjs npx -y @matthew-cochran/cpm@X.Y.Z   # from a checkout of vX.Y.Z
+```
+
+The first command prints `cpm-planner X.Y.Z` on stdout after a one-time
+download whose progress goes to stderr. The smoke test checks that the launcher
+keeps stdout clean for MCP (`initialize` and `tools/list`).
 
 ## Rollback
 
@@ -155,5 +183,14 @@ this release. This section will cover `npm/package.json`, a dry run and
 - **A bad image was pushed.** Push the fixed release, which moves `latest` and
   `X.Y`. Delete the bad `X.Y.Z` tag from the GHCR package settings only if it is
   harmful to keep.
+- **A bad npm version was published.** npm versions cannot be reused.
+  Deprecate it and publish the fixed version:
+
+  ```sh
+  npm deprecate @matthew-cochran/cpm@X.Y.Z "broken release, use X.Y.(Z+1)"
+  ```
+
+  `npm unpublish` works only within 72 hours and blocks the version number
+  for good, so prefer deprecation.
 - **A bad MCP registry entry.** Publish the fixed version; the registry lists
   the newest version.
