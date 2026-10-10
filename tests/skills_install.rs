@@ -85,8 +85,14 @@ fn agents_md(dir: &Path) -> PathBuf {
     dir.join("AGENTS.md")
 }
 
+/// `base` joined with a `/`-separated `rel`, using native separators, so it
+/// compares equal to the paths the binary prints.
+fn under(base: &Path, rel: &str) -> PathBuf {
+    rel.split('/').fold(base.to_path_buf(), |p, c| p.join(c))
+}
+
 fn claude_plan_skill(dir: &Path) -> PathBuf {
-    dir.join(".claude/skills/cpm-plan/SKILL.md")
+    under(dir, ".claude/skills/cpm-plan/SKILL.md")
 }
 
 /// The per-file lines of an install/uninstall run (before the summary).
@@ -246,14 +252,15 @@ fn gemini_command_prompt_points_at_the_installed_skill() {
 #[test]
 fn gemini_user_command_parses_with_a_spaced_home() {
     let tmp = TempDir::new().unwrap();
-    let home = tmp.path().join("home \"with\" spaces");
+    // Only characters every OS allows; TOML quote/backslash escaping is unit-tested.
+    let home = tmp.path().join("home with spaces & 'apostrophes'");
     std::fs::create_dir(&home).unwrap();
     run(
         &home,
         &["skills", "install", "--target", "gemini", "--user"],
     );
     let table = gemini_table(&home, "cpm-run");
-    let skill = home.join(".agents/skills/cpm-run/SKILL.md");
+    let skill = under(&home, ".agents/skills/cpm-run/SKILL.md");
     let prompt = table.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
     assert!(prompt.contains(&skill.display().to_string()));
 }
@@ -300,10 +307,11 @@ fn install_records_the_target_in_the_manifest() {
 }
 
 #[test]
-fn install_leaves_no_lock_file() {
+fn lock_file_is_released_when_install_ends() {
     let dir = TempDir::new().unwrap();
     install(dir.path(), "claude", &[]);
-    assert!(!dir.path().join(".claude/skills").join(LOCK_FILE).exists());
+    let lock = std::fs::File::open(dir.path().join(".claude/skills").join(LOCK_FILE)).unwrap();
+    assert!(lock.try_lock().is_ok());
 }
 
 #[test]
@@ -344,13 +352,19 @@ fn gemini_install_prints_npx_and_binary_commands() {
     let dir = TempDir::new().unwrap();
     let out = stdout(&install(dir.path(), "gemini", &[]));
     let exe = env!("CARGO_BIN_EXE_cpm-planner");
-    assert!(
-        out.contains("gemini mcp add -s project cpm-planner npx -y @matthew-cochran/cpm")
-            && out.contains(&format!("gemini mcp add -s project cpm-planner {exe}"))
+    let prefix = "gemini mcp add -s project cpm-planner ";
+    let commands: Vec<&str> = out
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix(prefix))
+        .collect();
+    assert_eq!(
+        (
+            commands.contains(&"npx -y @matthew-cochran/cpm"),
+            commands.iter().any(|c| c.contains(exe))
+        ),
+        (true, true)
     );
 }
-
-// ------------------------------------------------------------ re-runs and edits
 
 #[test]
 fn second_install_reports_all_unchanged() {
@@ -546,8 +560,20 @@ fn held_lock_makes_install_exit_1() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join(".claude/skills");
     std::fs::create_dir_all(&root).unwrap();
-    std::fs::write(root.join(LOCK_FILE), "12345\n").unwrap();
-    assert_eq!(install(dir.path(), "claude", &[]).status.code(), Some(1));
+    let held = std::fs::File::create(root.join(LOCK_FILE)).unwrap();
+    held.lock().unwrap();
+    let code = install(dir.path(), "claude", &[]).status.code();
+    drop(held);
+    assert_eq!(code, Some(1));
+}
+
+#[test]
+fn stale_lock_file_without_holder_does_not_block_install() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join(".claude/skills");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join(LOCK_FILE), "left by a killed run\n").unwrap();
+    assert_eq!(install(dir.path(), "claude", &[]).status.code(), Some(0));
 }
 
 // ------------------------------------------------------------ AGENTS.md
@@ -860,7 +886,7 @@ fn list_reports_an_installed_root() {
     let out = stdout(&run(dir.path(), &["skills", "list", "--project", path]));
     assert!(out.contains(&format!(
         "{}  (project)",
-        dir.path().join(".claude/skills").display()
+        under(dir.path(), ".claude/skills").display()
     )));
 }
 

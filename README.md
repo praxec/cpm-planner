@@ -377,7 +377,11 @@ The installer:
   edited, or one it did not write, is kept and reported as skipped; `--force` overwrites
   it. A newer cpm-planner updates the files that still match what the older one wrote;
 - never writes MCP configuration. It prints the registration command for your agent
-  instead (see [Register as an MCP server](#register-as-an-mcp-server));
+  instead (see [Register as an MCP server](#register-as-an-mcp-server)). On Windows the
+  printed commands paste into both cmd and PowerShell: paths use `\` and a path with
+  spaces is in double quotes. In PowerShell, a path containing `$` or a backtick needs
+  single quotes instead, and for `code --add-mcp` use the printed JSON snippet (in
+  "MCP: Open User Configuration"), because PowerShell strips the `\"` escapes;
 - takes `--dry-run` to show what it would do without writing anything;
 - refuses (exit 1, nothing changed) a manifest with unsafe paths, a symlink that leads out of
   the skills directory, or `AGENTS.md` markers that are nested, duplicated or unbalanced.

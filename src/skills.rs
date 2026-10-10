@@ -337,15 +337,31 @@ fn toml_string(text: &str) -> String {
     format!("\"{}\"", toml_escape(text).replace('\n', "\\n"))
 }
 
-/// Quote one shell word: POSIX single quotes, or double quotes on Windows
-/// (PowerShell and cmd; Windows paths cannot contain `"`).
+/// Quote one shell word for the platform's shells.
 fn shell_quote(word: &str) -> String {
-    if cfg!(windows) {
-        return format!("\"{}\"", word.replace('"', "\\\""));
-    }
-    let safe = |b: u8| b.is_ascii_alphanumeric() || b"/._-+=:@%,".contains(&b);
+    quote_word(word, cfg!(windows))
+}
+
+/// Quote one shell word. POSIX (`windows == false`): bare when safe, else
+/// single quotes with `'\''` for an embedded quote. Windows: bare when safe,
+/// else double quotes with `\"` for an embedded quote. A double-quoted path
+/// is one argument in both cmd and PowerShell (Windows paths cannot contain
+/// `"`); `\"` inside JSON follows the cmd / MSVC argv convention.
+fn quote_word(word: &str, windows: bool) -> String {
+    let safe = |b: u8| {
+        // cmd splits arguments on `=` and `,`, so they are bare only on POSIX.
+        b.is_ascii_alphanumeric()
+            || b"/._-+:@".contains(&b)
+            || (if windows {
+                b == b'\\'
+            } else {
+                b"=,".contains(&b)
+            })
+    };
     if !word.is_empty() && word.bytes().all(safe) {
         word.to_string()
+    } else if windows {
+        format!("\"{}\"", word.replace('"', "\\\""))
     } else {
         format!("'{}'", word.replace('\'', "'\\''"))
     }
@@ -629,17 +645,48 @@ fn join_rel(root: &Path, rel: &str) -> PathBuf {
     rel.split('/').fold(root.to_path_buf(), |p, c| p.join(c))
 }
 
-/// A held `.cpm-planner-skills.lock`. Dropping it removes the lock file and
-/// any directories that taking it created (when they are still empty).
+/// A held OS lock on `<root>/.cpm-planner-skills.lock`.
+///
+/// The lock is an exclusive `File::lock` (flock / LockFileEx), so the OS
+/// releases it however the process ends (Ctrl-C and kill included). The file
+/// itself stays on disk as an inert anchor: deleting it on release could race
+/// with another process that already has it open. The only exception is a
+/// root left holding nothing but the lock file (after the last uninstall, or a
+/// refused install that created the directory): then the file and the empty
+/// directories go too.
 struct RootLock {
+    file: Option<fs::File>,
+    root: PathBuf,
     path: PathBuf,
+    /// Directories this run created to take the lock, deepest first.
     created_dirs: Vec<PathBuf>,
+    /// Remove the root when it holds only the lock file (uninstall).
+    remove_if_empty: bool,
 }
 
 impl Drop for RootLock {
     fn drop(&mut self) {
+        if let Some(file) = self.file.take() {
+            let _ = file.unlock();
+        }
+        if !self.remove_if_empty && self.created_dirs.is_empty() {
+            return;
+        }
+        let only_lock = fs::read_dir(&self.root).is_ok_and(|entries| {
+            let names: Vec<_> = entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name())
+                .collect();
+            names.len() == 1 && names[0] == LOCK_FILE
+        });
+        if !only_lock {
+            return;
+        }
         let _ = fs::remove_file(&self.path);
-        for dir in &self.created_dirs {
+        if fs::remove_dir(&self.root).is_err() {
+            return;
+        }
+        for dir in self.created_dirs.iter().filter(|d| **d != self.root) {
             if fs::remove_dir(dir).is_err() {
                 break;
             }
@@ -647,7 +694,19 @@ impl Drop for RootLock {
     }
 }
 
-fn lock_root(root: &Path) -> Result<RootLock, CliError> {
+fn open_lock_file(path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Never follow a planted symlink.
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
+fn lock_root(root: &Path, remove_if_empty: bool) -> Result<RootLock, CliError> {
     let mut created_dirs = Vec::new();
     let mut dir = Some(root);
     while let Some(d) = dir {
@@ -659,45 +718,43 @@ fn lock_root(root: &Path) -> Result<RootLock, CliError> {
     }
     fs::create_dir_all(root).map_err(|e| io_err(root.display(), e))?;
     let path = root.join(LOCK_FILE);
+    check_inside(root, &path)?;
+    let file = open_lock_file(&path).map_err(|e| io_err(path.display(), e))?;
     let deadline = Instant::now() + LOCK_WAIT;
     loop {
-        // create_new never follows a symlink, so a planted link fails here.
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut file) => {
-                let _ = writeln!(file, "{}", std::process::id());
-                return Ok(RootLock { path, created_dirs });
+        match file.try_lock() {
+            Ok(()) => {
+                return Ok(RootLock {
+                    file: Some(file),
+                    root: root.to_path_buf(),
+                    path,
+                    created_dirs,
+                    remove_if_empty,
+                });
             }
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            Err(fs::TryLockError::WouldBlock) => {
                 if Instant::now() >= deadline {
-                    // Undo only the (still empty) directories this run created.
-                    drop(RootLock {
-                        path: PathBuf::new(),
-                        created_dirs,
-                    });
                     return Err(CliError::Io(format!(
-                        "{} is locked by another cpm-planner skills run; wait for it to \
-                         finish, or delete {} if none is running",
-                        root.display(),
-                        path.display()
+                        "{} is locked by another running cpm-planner skills command; wait \
+                         for it to finish and try again",
+                        root.display()
                     )));
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            Err(err) => return Err(io_err(path.display(), err)),
+            Err(fs::TryLockError::Error(err)) => return Err(io_err(path.display(), err)),
         }
     }
 }
 
 /// Lock every distinct root, in path order.
-fn lock_all(roots: &[&Path]) -> Result<Vec<RootLock>, CliError> {
+fn lock_all(roots: &[&Path], remove_if_empty: bool) -> Result<Vec<RootLock>, CliError> {
     let mut dirs: Vec<&Path> = roots.to_vec();
     dirs.sort();
     dirs.dedup();
-    dirs.into_iter().map(lock_root).collect()
+    dirs.into_iter()
+        .map(|root| lock_root(root, remove_if_empty))
+        .collect()
 }
 
 // ---------------------------------------------------------------- manifest
@@ -1330,7 +1387,10 @@ fn install(opts: &Options, out: &mut dyn io::Write) -> Result<(), CliError> {
     let _locks = if opts.dry_run {
         Vec::new()
     } else {
-        lock_all(&roots.iter().map(|r| r.dir.as_path()).collect::<Vec<_>>())?
+        lock_all(
+            &roots.iter().map(|r| r.dir.as_path()).collect::<Vec<_>>(),
+            false,
+        )?
     };
     // Validate and plan everything before the first write.
     let plans = roots
@@ -1396,7 +1456,10 @@ fn uninstall(opts: &Options, out: &mut dyn io::Write) -> Result<(), CliError> {
     let locks = if opts.dry_run {
         Vec::new()
     } else {
-        lock_all(&roots.iter().map(|r| r.dir.as_path()).collect::<Vec<_>>())?
+        lock_all(
+            &roots.iter().map(|r| r.dir.as_path()).collect::<Vec<_>>(),
+            true,
+        )?
     };
     let plans = roots
         .iter()
@@ -1594,9 +1657,11 @@ fn registration(target: Target, scope: &Scope) -> String {
                     serde_json::json!({"name": "cpm-planner", "command": &exe, "args": []});
                 let _ = writeln!(
                     text,
-                    "  code --add-mcp {}\n  or, for this binary:\n  code --add-mcp {}",
+                    "  code --add-mcp {}\n  or, for this binary:\n  code --add-mcp {}\n  \
+                     or run \"MCP: Open User Configuration\" in VS Code and add:\n{}",
                     shell_quote(&npx_arg.to_string()),
-                    shell_quote(&exe_arg.to_string())
+                    shell_quote(&exe_arg.to_string()),
+                    json("servers", true)
                 );
             } else {
                 let _ = writeln!(
@@ -1632,6 +1697,13 @@ fn registration(target: Target, scope: &Scope) -> String {
             );
         }
     }
+    if cfg!(windows) {
+        text.push_str(
+            "On Windows these commands work in cmd and PowerShell. A path with spaces is in \
+             double quotes; in PowerShell, a path containing `$` or a backtick needs single \
+             quotes instead. For JSON arguments in PowerShell, prefer the JSON snippet.\n",
+        );
+    }
     text.push_str("See docs/agents/tool-matrix.md for every client.");
     text
 }
@@ -1666,19 +1738,52 @@ mod tests {
         assert_eq!(toml_string("a\"b\\c\nd"), "\"a\\\"b\\\\c\\nd\"");
     }
 
-    #[cfg(not(windows))]
     #[test]
-    fn shell_quote_wraps_spaces_and_single_quotes() {
-        assert_eq!(shell_quote("/a b/it's"), "'/a b/it'\\''s'");
+    fn posix_quote_wraps_spaces_and_single_quotes() {
+        assert_eq!(quote_word("/a b/it's", false), "'/a b/it'\\''s'");
     }
 
-    #[cfg(not(windows))]
     #[test]
-    fn shell_quote_leaves_plain_paths_bare() {
+    fn posix_quote_leaves_plain_paths_bare() {
         assert_eq!(
-            shell_quote("/usr/local/bin/cpm-planner"),
+            quote_word("/usr/local/bin/cpm-planner", false),
             "/usr/local/bin/cpm-planner"
         );
+    }
+
+    #[test]
+    fn windows_quote_double_quotes_a_spaced_path() {
+        assert_eq!(
+            quote_word("C:\\Program Files\\cpm\\cpm-planner.exe", true),
+            "\"C:\\Program Files\\cpm\\cpm-planner.exe\""
+        );
+    }
+
+    #[test]
+    fn windows_quote_leaves_plain_paths_bare() {
+        assert_eq!(
+            quote_word("C:\\tools\\cpm-planner.exe", true),
+            "C:\\tools\\cpm-planner.exe"
+        );
+    }
+
+    #[test]
+    fn windows_quote_escapes_json_quotes() {
+        assert_eq!(quote_word("{\"a\":1}", true), "\"{\\\"a\\\":1}\"");
+    }
+
+    #[test]
+    fn gemini_command_toml_round_trips_quotes_and_backslashes() {
+        let home = PathBuf::from("/h/a \"q\" b\\c");
+        let cmd = gemini_command("cpm-plan", &Scope::User(home.clone()));
+        let table: toml::Table = toml::from_str(&cmd).expect("valid TOML");
+        let skill = home
+            .join(".agents")
+            .join("skills")
+            .join("cpm-plan")
+            .join("SKILL.md");
+        let prompt = table.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(prompt.contains(&skill.display().to_string()));
     }
 
     #[test]
