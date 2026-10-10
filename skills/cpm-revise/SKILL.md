@@ -1,6 +1,6 @@
 ---
 name: cpm-revise
-description: Use when the definition of a cpm-planner plan (plan.* tools) must change, before or during execution; when an approved definition change must be applied: scope changes, a deliverable is added, removed, split or re-estimated for real, an edge is wrong, a contract changes, plan.status shows definition_drift, or the plan file and the stored head disagree. Covers editing the .cpm-planner/plans/<name>/<variant>.json file, plan.lint, plan.sync with its diff (added, removed, changed, reopened, released_locks), the carry-over rules, definition_drift true/false/null, and plan.export.
+description: "Use when the definition of a cpm-planner plan (plan.* tools) must change, before or during execution; when an approved definition change must be applied: scope changes, a deliverable is added, removed, split or re-estimated for real, an edge is wrong, a contract changes, plan.status shows definition_drift, or the plan file and the stored head disagree. Covers editing the .cpm-planner/plans/<name>/<variant>.json file, plan.lint, plan.sync with its diff (added, removed, changed, reopened, released_locks), the carry-over rules, definition_drift true/false/null, and plan.export."
 ---
 
 # cpm-revise: change the file, sync, resolve reopened work

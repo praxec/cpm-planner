@@ -1,6 +1,6 @@
 ---
 name: deliverable-cpm
-description: Use when you need the full method reference behind the cpm-plan, cpm-improve, cpm-run, cpm-ev and cpm-revise skills, or when no narrower cpm-* skill fits a cpm-planner (plan.* tools) task that spans the whole lifecycle. Covers the deliverable-based CPM method end to end: deliverables as artifacts, consumption edges, lint findings, sync and drift, resource levelling, the review/fork/simulate/compare/select improvement loop, leases and acceptance, baselines and earned value, and revising a plan file under .cpm-planner/plans/<name>/<variant>.json.
+description: "Use when you need the full method reference behind the cpm-plan, cpm-improve, cpm-run, cpm-ev and cpm-revise skills, or when no narrower cpm-* skill fits a cpm-planner (plan.* tools) task that spans the whole lifecycle. Covers the deliverable-based CPM method end to end: deliverables as artifacts, consumption edges, lint findings, sync and drift, resource levelling, the review/fork/simulate/compare/select improvement loop, leases and acceptance, baselines and earned value, and revising a plan file under .cpm-planner/plans/<name>/<variant>.json."
 ---
 
 # Deliverable-based CPM with cpm-planner

@@ -153,17 +153,15 @@ fn plan_tokens(text: &str) -> BTreeSet<String> {
     out
 }
 
-/// The value of `key` in `dir`'s SKILL.md YAML frontmatter (single-line
-/// values). Windows checkouts may convert the skill to CRLF; either parses.
+/// The string value of `key` in `dir`'s SKILL.md YAML frontmatter. Windows checkouts may convert the skill to CRLF; either parses.
 fn frontmatter_of(dir: &Path, key: &str) -> Option<String> {
     let text = read_skill(dir);
     let body = text.strip_prefix("---\n")?;
     let end = body.find("\n---\n")?;
-    let prefix = format!("{key}: ");
-    body[..end]
-        .lines()
-        .find_map(|l| l.strip_prefix(&prefix))
-        .map(str::to_string)
+    // Parse as real YAML so quoting is honoured and a value a strict parser
+    // rejects fails here, the way it would in a client.
+    let front: serde_yaml_ng::Value = serde_yaml_ng::from_str(&body[..end]).ok()?;
+    front.get(key)?.as_str().map(str::to_string)
 }
 
 fn frontmatter(key: &str) -> Option<String> {

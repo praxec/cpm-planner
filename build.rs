@@ -52,11 +52,11 @@ fn run() -> Result<(), String> {
             .filter(|raw| !raw.starts_with(['"', '\'']));
         if plain.is_some_and(|raw| raw.contains(": ") || raw.contains(" #")) {
             // Lenient readers take the whole line; strict YAML parsers reject
-            // `: ` and read ` #` as a comment. Warn until the skill is quoted.
-            println!(
-                "cargo:warning=skills/{rel}: `description` is a plain YAML scalar containing \
+            // `: ` and read ` #` as a comment, so refuse to build.
+            return Err(format!(
+                "skills/{rel}: `description` is a plain YAML scalar containing \
                  `: ` or ` #`, which strict YAML parsers reject; quote the value"
-            );
+            ));
         }
         descriptions.push((name.to_string(), description));
     }
