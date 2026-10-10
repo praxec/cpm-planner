@@ -7,6 +7,7 @@ description: Use when executing the selected variant of a cpm-planner plan (plan
 
 Execute the selected variant's `plan_id` one cohort at a time. The full method is in
 [the deliverable-cpm skill](../deliverable-cpm/SKILL.md) (section 7).
+Summarises deliverable-cpm; if they ever disagree, the server's behaviour wins.
 
 ## When to use
 
@@ -14,6 +15,7 @@ Execute the selected variant's `plan_id` one cohort at a time. The full method i
   baselined (`cpm-ev`). Only the selected variant executes; others refuse with
   `VARIANT_NOT_SELECTED`.
 - `plan.status {plan_id}` shows the `ready` set, `plan_complete` and `locks_held`.
+- Not for: changing what a deliverable is or adding work → use cpm-revise.
 
 ## 1. Claim a cohort
 
@@ -59,15 +61,21 @@ plan.mark_status {"plan_id": "<plan_id>", "deliverable_id": "<id>", "caller_id":
 
 - `status` is `{"status": "in_progress"}`, `{"status": "complete"}`, `{"status": "ready"}` or
   `{"status": "failed", "reason": "..."}`. Complete and failed release the lock.
-- `earned_pct`: integer 0..100, only meaningful with `in_progress` (ignored with complete).
+- `earned_pct`: integer 0..100, only meaningful with `in_progress`; ignored with `complete`,
+  and refused with `INVALID_ACTUALS` with `ready` or `failed`.
 - `actual_effort_hours`: total so far (not a delta), 0..1000000; it replaces the leased
   hours as actual cost.
-- `evidence`: up to 2048 chars, appended (at most 100 kept).
+- `evidence`: up to 2048 chars, appended; at most 100 entries per deliverable. Past that,
+  any mark carrying `evidence` (including `complete`) is refused with `INVALID_ACTUALS`, so
+  omit `evidence` then.
 - Bad values are `INVALID_ACTUALS`.
 - Mark `complete` only when the artifact meets its acceptance criteria, with evidence. A
   report of done is not acceptance.
-- Three explicit `failed` marks trip the circuit breaker: the next acquire auto-fails it.
-  Revive it with `plan.force_release {..., reset_counters: true}` after fixing the cause.
+- A `failed` mark leaves the deliverable Failed (acquire reports `NOT_READY`). To retry,
+  hand it back with a lockless `{"status": "ready"}` mark, then acquire it again.
+- Three explicit `failed` marks trip the circuit breaker, counted across those retries: the
+  next acquire auto-fails it. Revive it with `plan.force_release {..., reset_counters: true}`
+  after fixing the cause.
 
 ## 4. Owner and manual work (no lease)
 

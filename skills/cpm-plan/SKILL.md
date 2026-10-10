@@ -1,6 +1,6 @@
 ---
 name: cpm-plan
-description: Use when the cpm-planner MCP server (plan.* tools) is available and the user wants to plan a project, break work into deliverables with dependencies, estimate effort, find the critical path (CPM), check milestones, or level the schedule against real capacity (resource levelling, bottleneck, makespan). Covers authoring a .cpm-planner/plans/<name>/<variant>.json plan file of artifact deliverables and consumption edges, plan.lint until clean, plan.sync, reading critical_path and milestones in plan.status, and plan.schedule with capacities.
+description: Use when the cpm-planner MCP server (plan.* tools) is available and the user wants to plan a project, break work into deliverables with dependencies, estimate effort, find the critical path (CPM), check milestones, or level the schedule against real capacity to see the critical path and the levelled bottleneck (resource levelling, makespan). Covers authoring a .cpm-planner/plans/<name>/<variant>.json plan file of artifact deliverables and consumption edges, plan.lint until clean, plan.sync, reading critical_path and milestones in plan.status, and plan.schedule with capacities.
 ---
 
 # cpm-plan: author, lint, sync and level a plan
@@ -8,6 +8,7 @@ description: Use when the cpm-planner MCP server (plan.* tools) is available and
 Turn the user's goal into a tracked plan file, register it and check that its critical path
 and levelled schedule make sense. The full method (artifact rules, edge rules, examples) is
 in [the deliverable-cpm skill](../deliverable-cpm/SKILL.md); this skill is the short path.
+Summarises deliverable-cpm; if they ever disagree, the server's behaviour wins.
 
 ## When to use
 
@@ -16,6 +17,7 @@ in [the deliverable-cpm skill](../deliverable-cpm/SKILL.md); this skill is the s
   "where is the bottleneck".
 - Next steps: shorten it with `cpm-improve`, execute it with `cpm-run`, baseline it with
   `cpm-ev`, change it later with `cpm-revise`.
+- Not for: shortening or comparing variants → use cpm-improve; changing a synced plan → use cpm-revise.
 
 ## 1. Write the file
 

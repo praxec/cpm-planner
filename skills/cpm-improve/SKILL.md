@@ -1,6 +1,6 @@
 ---
 name: cpm-improve
-description: Use when a cpm-planner plan (plan.* tools) is synced and the user wants it shorter, cheaper or less risky; when asked to crash or fast-track a schedule, remove a bottleneck, split a deliverable, try contract-first, compare plan variants, run Monte Carlo (P80, sensitivity), or get an AI plan review (Jev via OpenRouter). Covers optional plan.review, plan.fork with edits, plan.simulate and plan.compare, explaining the trade-off in numbers, plan.select and plan.archive.
+description: Use when a cpm-planner plan (plan.* tools) is synced and the user wants it shorter, cheaper or less risky; when asked to crash or fast-track a schedule, shorten it past a known bottleneck, try a split or contract-first as a variant, compare plan variants, run Monte Carlo (P80, sensitivity), or get an AI plan review (Jev via OpenRouter). Covers optional plan.review, plan.fork with edits, plan.simulate and plan.compare, explaining the trade-off in numbers, plan.select and plan.archive.
 ---
 
 # cpm-improve: fork, measure, compare, select
@@ -9,11 +9,13 @@ Design several variants, measure each, explain the trade-off, and select one. Ne
 selected variant to try an idea. The full method and move table are in
 [the deliverable-cpm skill](../deliverable-cpm/SKILL.md) (section 6), with a worked run in
 [improvement-loop.md](../deliverable-cpm/examples/improvement-loop.md).
+Summarises deliverable-cpm; if they ever disagree, the server's behaviour wins.
 
 ## When to use
 
 - After `cpm-plan`: the plan lints clean, is synced, and you have a `plan_id`.
 - During execution, on the remaining work, when `cpm-ev` alerts fire.
+- Not for: applying an approved definition change to the selected variant → use cpm-revise.
 
 ## 1. Review (optional)
 
@@ -41,8 +43,8 @@ plan.review {"path": ".cpm-planner/plans/<name>/main.json", "capacities": {"agen
 | Add capacity to the bottleneck | `set_metadata` `owner`, or more capacity in `schedule` |
 | Move work to a cheaper pool | `set_metadata` `owner`, plus `set_effort` for review time |
 | Crash a critical deliverable | `set_duration`, plus `set_effort` for the added cost |
-| Split along file or contract seams | `remove_deliverable`, `add_deliverable`, `add_edge` |
-| Contract first | `add_deliverable` with `metadata.contract`; re-add consumers with an `interface` edge |
+| Split along file or contract seams | `remove_edge` its dependents, `remove_deliverable`, `add_deliverable` the parts, `add_edge` the dependents back |
+| Contract first | `add_deliverable` with `metadata.contract`; for each consumer, `remove_edge` its dependents, `remove_deliverable`, `add_deliverable` with an `interface` edge, `add_edge` the dependents back |
 | Fast-track | `remove_edge`, only if nothing was actually consumed |
 
 Use the levelled `driving_chain`, `load` and Monte Carlo `sensitivity` to pick moves.
@@ -57,6 +59,8 @@ plan.fork {"plan_id": "<main plan_id>", "variant": "ui-worker",
 Edit ops (tagged by `op`, unknown fields rejected):
 - `remove_edge {from, to}`; `add_edge {from, to, consumes}` (no `kind`: for an interface
   edge, `remove_deliverable` then `add_deliverable` with the object prerequisite);
+- `remove_deliverable` is refused while other deliverables depend on it: `remove_edge`
+  each dependent first, then `add_edge` them back after the `add_deliverable`;
 - `set_effort {id, hours}`; `set_duration {id, hours}` (`null` clears);
   `set_estimate {id, estimate}` (`{optimistic, likely, pessimistic}` or `null`);
 - `set_metadata {id, key, value}`; `remove_deliverable {id}`;
@@ -79,7 +83,8 @@ plan.compare  {"plan": "<name>", "schedule": {"capacities": {...}}, "monte_carlo
   (2..16), optional `project`, `schedule`, `monte_carlo` and `weights`
   `{makespan, p80, criticality_risk, total_effort, peak_load}` (finite, >= 0).
 - `capacities` must cover every pool of every variant, or `INVALID_CAPACITIES`.
-- Read `pareto_optimal`, `rank`, `rationale` and `recommended`.
+- Read `pareto_optimal`, `rank` and `rationale` on each `variants[]` entry, and the
+  top-level `recommended`.
 
 ## 5. Explain, then select
 

@@ -1,18 +1,19 @@
 ---
 name: cpm-revise
-description: Use when the definition of a cpm-planner plan (plan.* tools) must change, before or during execution; when scope changes, a deliverable is added, removed, split or re-estimated, an edge is wrong, a contract changes, plan.status shows definition_drift, or the plan file and the stored head disagree. Covers editing the .cpm-planner/plans/<name>/<variant>.json file, plan.lint, plan.sync with its diff (added, removed, changed, reopened, released_locks), the carry-over rules, definition_drift true/false/null, and plan.export.
+description: Use when the definition of a cpm-planner plan (plan.* tools) must change, before or during execution; when an approved definition change must be applied: scope changes, a deliverable is added, removed, split or re-estimated for real, an edge is wrong, a contract changes, plan.status shows definition_drift, or the plan file and the stored head disagree. Covers editing the .cpm-planner/plans/<name>/<variant>.json file, plan.lint, plan.sync with its diff (added, removed, changed, reopened, released_locks), the carry-over rules, definition_drift true/false/null, and plan.export.
 ---
 
 # cpm-revise: change the file, sync, resolve reopened work
 
 The plan file is the definition. Every change goes through it. The full method is in
 [the deliverable-cpm skill](../deliverable-cpm/SKILL.md) (section 9).
+Summarises deliverable-cpm; if they ever disagree, the server's behaviour wins.
 
 ## When to use
 
 - Scope or estimates change, or an edge turns out to be false or missing.
 - `plan.status` shows `definition_drift: true` or `null`.
-- Not for trying ideas: use `cpm-improve` (`plan.fork`) for variants.
+- Not for: trying an idea as a variant (split, crash, fast-track) → use cpm-improve.
 
 ## 1. Edit, lint, sync
 

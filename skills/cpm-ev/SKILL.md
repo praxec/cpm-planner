@@ -8,12 +8,14 @@ description: Use when tracking a cpm-planner plan (plan.* tools) against a basel
 Freeze the selected variant's schedule and budgets as a baseline, then measure progress
 against it. The full method is in [the deliverable-cpm skill](../deliverable-cpm/SKILL.md)
 (section 8).
+Summarises deliverable-cpm; if they ever disagree, the server's behaviour wins.
 
 ## When to use
 
 - Right after `plan.select` (each variant has its own baselines), before work starts.
 - At a steady cadence during `cpm-run`, such as each working day or each cohort.
 - After an approved scope change made with `cpm-revise`.
+- Not for: claiming or closing work, or recording hours → use cpm-run.
 
 ## 1. Baseline
 
