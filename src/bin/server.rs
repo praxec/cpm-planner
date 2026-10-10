@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cpm_planner::audit::{AuditSink, NullAuditSink};
+use cpm_planner::llm::LlmConfig;
 use cpm_planner::planner::{DEFAULT_MAX_TTL, MAX_TTL_CEILING};
 use cpm_planner::project::{PROJECT_ROOT_ENV, ProjectRoot};
 use cpm_planner::{BasicCpmPlanner, PlanServer, SqlitePlanStore};
@@ -66,9 +67,17 @@ async fn main() -> anyhow::Result<()> {
     }
     let planner = Arc::new(planner_builder);
 
+    // plan.review's judge: the LLM settings are read once, here. A bad
+    // setting is logged and only disables plan.review (it reports
+    // review_unavailable naming the setting); it never stops the server.
+    let llm_config = LlmConfig::from_env();
+
     tracing::info!("starting cpm-planner stdio server");
     // The server reads the project root from the planner.
-    PlanServer::new(planner).serve_stdio().await?;
+    PlanServer::new(planner)
+        .with_llm_config(llm_config)
+        .serve_stdio()
+        .await?;
     Ok(())
 }
 

@@ -53,6 +53,7 @@ mod graph;
 #[cfg(test)]
 mod lease_hours_tests;
 pub mod lint;
+pub mod llm;
 mod locks;
 #[cfg(test)]
 mod mark_actuals_tests;
@@ -66,6 +67,7 @@ mod portfolio;
 pub mod ports;
 pub mod project;
 pub mod resource_schedule;
+pub mod review;
 pub mod revise;
 pub mod risk;
 pub mod schedule;
@@ -87,6 +89,6 @@ pub use planner::{
 };
 pub use server::{
     PLAN_TOOL_NAMES, PlanServer, TOOL_ACCEPT, TOOL_ACQUIRE_COHORT, TOOL_FORCE_RELEASE,
-    TOOL_HEARTBEAT, TOOL_MARK_STATUS, TOOL_STATUS, TOOL_SUBMIT, plan_tool_definitions,
+    TOOL_HEARTBEAT, TOOL_MARK_STATUS, TOOL_REVIEW, TOOL_STATUS, TOOL_SUBMIT, plan_tool_definitions,
 };
 pub use task::{Bottleneck, CriticalPathResult, Task, TaskBatch, TaskKind, TaskStatus};
