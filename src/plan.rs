@@ -281,7 +281,7 @@ pub struct Estimate {
 /// write-write conflicts; implementations of [`crate::ports::Planner`]
 /// must therefore reject any plan that contains a deliverable whose
 /// `owned_files` are not specified up front.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Deliverable {
     /// Unique identifier within the plan. The Planner rejects duplicate
     /// ids at submit time with [`PlannerError::InvalidGraph`].
@@ -547,6 +547,231 @@ impl AcceptRequest {
     }
 }
 
+/// Request bundle for [`crate::ports::Planner::sync_plan`]: register or
+/// update the variant `variant` of the plan line `(project, name)`.
+#[derive(Debug, Clone)]
+pub struct SyncRequest {
+    pub project: String,
+    pub name: String,
+    pub variant: String,
+    pub graph: PlanGraph,
+    /// Where the graph was read from (relative to the project root), if it
+    /// came from a plan file. `None` for an inline graph.
+    pub source_path: Option<String>,
+    /// Hash of the source file's bytes. `None` for an inline graph, which is
+    /// then identified by its canonical graph hash.
+    pub content_hash: Option<String>,
+    /// Passed to the revision when the content changed: release live locks
+    /// of removed deliverables instead of refusing. Defaults to `false`.
+    pub force: bool,
+}
+
+impl SyncRequest {
+    pub fn new(
+        project: impl Into<String>,
+        name: impl Into<String>,
+        variant: impl Into<String>,
+        graph: PlanGraph,
+    ) -> Self {
+        Self {
+            project: project.into(),
+            name: name.into(),
+            variant: variant.into(),
+            graph,
+            source_path: None,
+            content_hash: None,
+            force: false,
+        }
+    }
+
+    /// Record the plan file the graph was read from.
+    pub fn with_source_path(mut self, path: impl Into<String>) -> Self {
+        self.source_path = Some(path.into());
+        self
+    }
+
+    /// Record the hash of the plan file's bytes.
+    pub fn with_content_hash(mut self, hash: impl Into<String>) -> Self {
+        self.content_hash = Some(hash.into());
+        self
+    }
+
+    /// Set whether a changed graph may force-release live locks.
+    pub fn force(mut self, yes: bool) -> Self {
+        self.force = yes;
+        self
+    }
+}
+
+/// Request bundle for [`crate::ports::Planner::revise_plan`].
+#[derive(Debug, Clone)]
+pub struct ReviseRequest {
+    pub plan_id: PlanId,
+    pub graph: PlanGraph,
+    /// Release live locks of removed (or claim-conflicting) deliverables
+    /// instead of refusing with `LOCK_HELD`. Defaults to `false`.
+    pub force: bool,
+}
+
+impl ReviseRequest {
+    pub fn new(plan_id: PlanId, graph: PlanGraph) -> Self {
+        Self {
+            plan_id,
+            graph,
+            force: false,
+        }
+    }
+
+    /// Set whether live locks may be force-released.
+    pub fn force(mut self, yes: bool) -> Self {
+        self.force = yes;
+        self
+    }
+}
+
+/// Request bundle for [`crate::ports::Planner::fork_plan`]: copy the head
+/// graph of the named variant `plan_id`, apply `edits`, and register the
+/// result as the new draft variant `variant` of the same plan line.
+#[derive(Debug, Clone)]
+pub struct ForkRequest {
+    pub plan_id: PlanId,
+    pub variant: String,
+    /// Applied in order with [`crate::edits::apply_edits`].
+    pub edits: Vec<crate::edits::GraphEdit>,
+    /// Where to write the new variant's plan file. Falls back to the
+    /// planner's own root; with neither, the variant is registered inline.
+    pub project_root: Option<crate::project::ProjectRoot>,
+}
+
+impl ForkRequest {
+    pub fn new(plan_id: PlanId, variant: impl Into<String>) -> Self {
+        Self {
+            plan_id,
+            variant: variant.into(),
+            edits: Vec::new(),
+            project_root: None,
+        }
+    }
+
+    /// Set the edits applied to the copied graph.
+    pub fn with_edits(mut self, edits: Vec<crate::edits::GraphEdit>) -> Self {
+        self.edits = edits;
+        self
+    }
+
+    /// Write the new variant's file under `root`.
+    pub fn with_project_root(mut self, root: crate::project::ProjectRoot) -> Self {
+        self.project_root = Some(root);
+        self
+    }
+}
+
+/// Request bundle for [`crate::ports::Planner::compare_plans`]. Exactly one
+/// of `plan_ids` (two or more plans, any variants or unnamed plans) or
+/// `plan` (`(project, name)`: every non-archived variant of that line) is
+/// given.
+#[derive(Debug, Clone)]
+pub struct ComparePlansRequest {
+    pub plan_ids: Option<Vec<PlanId>>,
+    pub plan: Option<(String, String)>,
+    pub request: crate::compare::CompareRequest,
+}
+
+impl ComparePlansRequest {
+    /// Compare the given plans, in this order.
+    pub fn by_ids(plan_ids: Vec<PlanId>, request: crate::compare::CompareRequest) -> Self {
+        Self {
+            plan_ids: Some(plan_ids),
+            plan: None,
+            request,
+        }
+    }
+
+    /// Compare every non-archived variant of the line `(project, name)`.
+    pub fn by_plan(
+        project: impl Into<String>,
+        name: impl Into<String>,
+        request: crate::compare::CompareRequest,
+    ) -> Self {
+        Self {
+            plan_ids: None,
+            plan: Some((project.into(), name.into())),
+            request,
+        }
+    }
+}
+
+/// One variant of a plan line, as reported by
+/// [`crate::ports::Planner::list_plans`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VariantSummary {
+    pub variant: String,
+    pub plan_id: PlanId,
+    /// True for the line's one executable variant.
+    pub selected: bool,
+    pub archived: bool,
+    pub head_revision: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    /// Deliverables `Complete`.
+    pub complete: usize,
+    /// Deliverables in the head graph.
+    pub total: usize,
+    /// True when every deliverable is `Complete` (vacuously for none).
+    pub plan_complete: bool,
+    /// Head graph's CPM makespan in hours.
+    pub makespan: f32,
+}
+
+/// A named plan line and its variants, sorted by variant name.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanLineSummary {
+    pub project: String,
+    pub name: String,
+    pub selected_variant: Option<String>,
+    pub archived: bool,
+    pub variants: Vec<VariantSummary>,
+}
+
+/// Result of [`crate::ports::Planner::sync_plan`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SyncOutcome {
+    pub plan_id: PlanId,
+    pub name: String,
+    pub variant: String,
+    /// The variant's head revision after the sync.
+    pub revision: u32,
+    /// True when this sync registered the variant.
+    pub created: bool,
+    /// True when this sync created the variant or a new revision.
+    pub changed: bool,
+    /// What the revision changed; `None` unless a new revision was made.
+    #[serde(default)]
+    pub diff: Option<crate::revise::RevisionDiff>,
+}
+
+/// Result of [`crate::ports::Planner::select_variant`]. Selection does not
+/// change any graph, so this is a dedicated summary rather than a
+/// [`crate::revise::RevisionDiff`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SelectOutcome {
+    pub plan_id: PlanId,
+    pub project: String,
+    pub name: String,
+    /// The variant now selected (the one `plan_id` belongs to).
+    pub variant: String,
+    /// The previously selected variant; `None` when the line had none.
+    pub previous: Option<String>,
+    /// False when `variant` was already selected (a no-op).
+    pub changed: bool,
+    /// Sorted ids whose `Complete` status was copied from the previously
+    /// selected variant (identical canonical definition in both).
+    pub carried: Vec<String>,
+    /// Sorted ids of the previous variant's live locks released by a forced
+    /// selection.
+    pub released_locks: Vec<String>,
+}
+
 /// Snapshot of a held lock. The Planner records one [`LockInfo`] per
 /// acquired deliverable and surfaces them in [`Cohort::locks`] and
 /// [`PlanStatus::locks_held`].
@@ -749,6 +974,22 @@ pub struct PlanStatus {
     /// One row per milestone deliverable, in graph order.
     #[serde(default)]
     pub milestones: Vec<MilestoneRow>,
+    /// Plan line name of a named variant; `None` for an unnamed plan.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Variant name of a named variant; `None` for an unnamed plan.
+    #[serde(default)]
+    pub variant: Option<String>,
+    /// Whether this variant is its line's selected (executable) variant;
+    /// `None` for an unnamed plan.
+    #[serde(default)]
+    pub selected: Option<bool>,
+    /// `Some(true)` when the variant's plan file no longer matches what was
+    /// last synced (by content hash), `Some(false)` when it matches. `None`
+    /// (unknown) when the variant has no source file, the planner has no
+    /// project root for the variant's project, or the file is unreadable.
+    #[serde(default)]
+    pub definition_drift: Option<bool>,
 }
 
 /// A milestone's schedule summary, reported by [`PlanStatus::milestones`].
@@ -914,10 +1155,37 @@ pub enum PlannerError {
     #[error("INVALID_GRAPH: {reason}")]
     InvalidGraph { reason: String },
 
+    /// A project/plan-file path failed validation: not a valid slug, not of the
+    /// form `.cpm-planner/plans/<name>/<variant>.json`, absolute, contains `..`,
+    /// or resolves (e.g. via a symlink) outside the plans directory.
+    #[error("INVALID_PATH: {reason}")]
+    InvalidPath { reason: String },
+
     /// `plan.schedule` was given no usable capacity (missing or zero) for
     /// one or more resources that scheduled work needs. `missing` is sorted.
     #[error("INVALID_CAPACITIES: no capacity for resources [{}]", missing.join(", "))]
     InvalidCapacities { missing: Vec<String> },
+
+    /// An execution operation (`acquire_cohort`, `heartbeat`, `mark_status`,
+    /// `accept`, `force_release`) targeted a named plan variant that is not
+    /// its line's selected variant. Read and analysis tools are never gated.
+    #[error(
+        "VARIANT_NOT_SELECTED: plan {plan_id} is variant '{variant}' of '{name}'; selected is \
+         '{selected}'"
+    )]
+    VariantNotSelected {
+        plan_id: String,
+        name: String,
+        variant: String,
+        selected: String,
+    },
+
+    /// An operation was refused because of archiving: archiving the selected
+    /// variant alone, syncing into / selecting an archived variant or line,
+    /// unarchiving a variant of an archived line, or an execution operation
+    /// on any variant of an archived line.
+    #[error("ARCHIVE_REFUSED: {reason}")]
+    ArchiveRefused { reason: String },
 
     /// Catch-all for backend failures (DB unavailable, serialization
     /// errors against the persistence layer, etc.). Wraps the underlying

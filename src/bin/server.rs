@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use cpm_planner::audit::{AuditSink, NullAuditSink};
 use cpm_planner::planner::{DEFAULT_MAX_TTL, MAX_TTL_CEILING};
+use cpm_planner::project::{PROJECT_ROOT_ENV, ProjectRoot};
 use cpm_planner::{BasicCpmPlanner, PlanServer, SqlitePlanStore};
 use tracing_subscriber::EnvFilter;
 
@@ -48,12 +49,50 @@ async fn main() -> anyhow::Result<()> {
     let store = SqlitePlanStore::open(&db_path)?;
     let max_ttl = resolve_max_ttl()?;
     tracing::info!(max_ttl_secs = max_ttl.as_secs(), "lease TTL ceiling");
-    let planner = Arc::new(BasicCpmPlanner::with_store(store, audit).with_max_ttl(max_ttl));
+
+    // Discover the repo root for plan-as-code tools: CPM_PROJECT_ROOT if
+    // set, else the nearest ancestor of cwd containing .cpm-planner/ or
+    // .git. The server stays usable without one (inline/unnamed plans);
+    // only path-based portfolio tools report INVALID_PATH.
+    let project_root = discover_project_root();
+    match &project_root {
+        Some(root) => tracing::info!(root = %root.root().display(), "project root discovered"),
+        None => tracing::info!("no project root discovered; path-based tools disabled"),
+    }
+
+    let mut planner_builder = BasicCpmPlanner::with_store(store, audit).with_max_ttl(max_ttl);
+    if let Some(root) = project_root {
+        planner_builder = planner_builder.with_project_root(root);
+    }
+    let planner = Arc::new(planner_builder);
 
     tracing::info!("starting cpm-planner stdio server");
-    let server = PlanServer::new(planner);
-    server.serve_stdio().await?;
+    // The server reads the project root from the planner.
+    PlanServer::new(planner).serve_stdio().await?;
     Ok(())
+}
+
+/// The project root: `CPM_PROJECT_ROOT` when set (a warning and no root
+/// when it is not a usable directory), else discovery from the current
+/// directory. An unreadable current directory is a warning and no root, not
+/// a startup failure: the server stays usable for inline and unnamed plans.
+fn discover_project_root() -> Option<ProjectRoot> {
+    if let Some(value) = std::env::var_os(PROJECT_ROOT_ENV).filter(|v| !v.is_empty()) {
+        return match ProjectRoot::from_path(std::path::Path::new(&value)) {
+            Ok(root) => Some(root),
+            Err(err) => {
+                tracing::warn!(error = %err, "{PROJECT_ROOT_ENV} is set but invalid; no project root");
+                None
+            }
+        };
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => ProjectRoot::discover(&cwd),
+        Err(err) => {
+            tracing::warn!(error = %err, "cannot read the current directory; no project root");
+            None
+        }
+    }
 }
 
 /// Resolve the lease TTL ceiling from `CPM_MAX_TTL_SECS`.

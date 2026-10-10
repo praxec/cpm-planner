@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `plan.sync` registers or updates one variant of a named plan line from a plan file (`.cpm-planner/plans/<name>/<variant>.json`) or an inline graph; files are tracked by content hash for drift.
+- `plan.list` lists a project's plan lines and variants (archived hidden unless `include_archived`).
+- `plan.export` writes a plan's head graph to its variant file or a confined path.
+- `plan.revise` replaces a plan's graph in place with progress carry-over and returns the new revision and diff.
+- `plan.fork` copies a named variant, applies structured edits, and registers a new draft variant.
+- `plan.select` makes exactly one variant of a line the executable one, carrying progress over.
+- `plan.archive` archives or unarchives a whole line or one variant; archived variants stay readable but refuse sync, selection and execution (`ARCHIVE_REFUSED`).
+- `plan.compare` scores plans (by id or per line variant) on the scorecard with a Pareto front, weighted rank and recommended plan. Weights must be finite and `>= 0`.
+- Portfolio SQLite schema v3 (`plan_lines`, `variants`, `revisions`); named plans dedup within `(project, name, variant)` and keep a stable `plan_id` across revisions.
+- Plan-as-code files under `.cpm-planner/plans/<name>/<variant>.json`, resolved from `CPM_PROJECT_ROOT` or the nearest ancestor containing `.cpm-planner/` or `.git`; path arguments are confined and rejected with `INVALID_PATH`.
+- `plan.lint` and `plan.simulate` accept a plan-file `path` as a third input alongside `graph` and `plan_id`; `plan.status` reports `definition_drift` when a tracked file no longer matches its synced hash.
+- Stable `VARIANT_NOT_SELECTED`, `ARCHIVE_REFUSED` and `INVALID_PATH` error prefixes.
+- `plan.compare` limits: at most 16 variants (`INVALID_GRAPH: compare accepts at most 16 variants`; schema `maxItems: 16`), distinct `plan_ids` (`plan_ids must be distinct`), and one Monte Carlo work budget shared across all variants; `plan.compare` takes an optional `project` for `plan`.
+- `plan.export` `force: true` overwrites another variant's tracked file or unsynced local edits, which are otherwise refused (`INVALID_PATH`).
+- Plan files over 8 MiB are refused (`INVALID_PATH: plan file exceeds 8 MiB`).
 - `plan.lint` reports cycles (with the loop), redundant edges, edges without rationale, interface edges not targeting a contract, deliverables feeding no milestone, and unordered file overlaps — without creating a plan (#20).
 - `plan.schedule` levels a plan against resource capacities (`metadata.owner` by default): makespan, per-deliverable start/finish, per-resource load, the driving chain (dependency vs resource waits), project and feeding buffers (#19).
 - Plan scorecard (makespan, criticality risk and band, DRAG, diameter, cyclomatic complexity, merge bias, parallelism, peak load, lint counts) returned by `plan.simulate`.
@@ -55,6 +70,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The lease reaper and the startup quarantine re-derive a released deliverable's status with the single rule used by revision (`Ready` when every prerequisite is `Complete`, else `Pending`).
+- `definition_drift` compares the tracked file's graph with the head graph (re-formatting is not drift; an inline revise is drift until re-export or re-sync); an identical inline sync no longer resets the tracked file hash.
+- `plan.sync {path}` rejects a `name`, `variant` or `project` that contradicts the path; project keys reject invisible Unicode format characters (bidi overrides, zero-width, BOM, separators).
+- `plan.fork` refuses an archived line before writing the plan file and removes the file if registration fails; on filesystems without hard links the create-only write falls back to an exclusive (non-atomic) create.
+- Undoing a carried `Complete` on select restores the deliverable's previous status (a `Failed` keeps its reason).
+- Errors from the final validation of `plan.fork` edits start with `after applying <n> edits: `.
+- `plan.submit` accepts optional `project`/`name`/`variant` (variant defaults to `main`); when `name` is given it registers a named variant (via `sync_plan`) instead of an unnamed plan.
 - A plan may have at most 5000 deliverables (`INVALID_GRAPH: plan has <n> deliverables; maximum is 5000`); `plan.lint` reports a larger graph as one `TOO_MANY_DELIVERABLES` error.
 - Every hour value (effort, duration, lag and estimate points) must be finite and between 0 and 1000000 (`... must be a finite number between 0 and 1000000`).
 - Monte Carlo rejects runs where `iterations × (deliverables + prerequisite edges)` exceeds 200000000 (`INVALID_GRAPH: monte carlo budget exceeded ...`).

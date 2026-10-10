@@ -2,7 +2,9 @@
 //!
 //! The store is the single source of truth for planner state: submitted
 //! plans (graph + cached CPM result), per-deliverable statuses, held
-//! cohort locks, and the submit-dedup map. Every planner operation loads
+//! cohort locks, the submit-dedup map, and (schema v3) the portfolio tables
+//! — named plan lines, variants and revisions, queried by
+//! `crate::portfolio`. Every planner operation loads
 //! the relevant [`PlanState`] from SQLite, runs the in-memory scheduling
 //! logic, and writes the result back — all inside ONE
 //! `BEGIN IMMEDIATE` transaction.
@@ -55,7 +57,7 @@ pub const DB_PATH_ENV: &str = "CPM_PLANNER_DB";
 const DEFAULT_DB_RELATIVE: &str = ".local/share/praxec/cpm-planner.db";
 
 /// Map any backend failure into the planner's wire-stable error variant.
-fn backend(err: impl Into<anyhow::Error>) -> PlannerError {
+pub(crate) fn backend(err: impl Into<anyhow::Error>) -> PlannerError {
     PlannerError::BackendError(err.into())
 }
 
@@ -142,7 +144,8 @@ impl SqlitePlanStore {
     }
 
     /// Reap every lock whose TTL lapsed before `now`: the deliverable
-    /// goes back to `ready`, its `lapse_count` is incremented (the lease
+    /// is re-derived (`ready` if every prerequisite is complete, else
+    /// `pending`), its `lapse_count` is incremented (the lease
     /// was lost ENVIRONMENTALLY — no terminal mark was ever recorded —
     /// so it feeds the lapse bound, never the failure circuit-breaker),
     /// and the lock row is deleted. Also resets any orphaned
@@ -157,31 +160,80 @@ impl SqlitePlanStore {
             .map_err(|_| anyhow!("planner store mutex poisoned"))?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let ready = serde_json::to_string(&DeliverableStatus::Ready)?;
         let in_progress = serde_json::to_string(&DeliverableStatus::InProgress)?;
         let now_us = now.timestamp_micros();
 
-        tx.execute(
-            "UPDATE deliverable_statuses SET status = ?1, lapse_count = lapse_count + 1
-             WHERE (plan_id, deliverable_id) IN
-                   (SELECT plan_id, deliverable_id FROM locks WHERE expires_at_us < ?2)",
-            params![ready, now_us],
-        )?;
+        // Targets: deliverables with an expired lock, plus orphaned
+        // in_progress ones with no lock at all (cannot be legitimately held
+        // by anyone). Losing the lease without a terminal mark is an
+        // environmental loss, so each counts as a lapse.
+        let expired: Vec<(String, String)> = {
+            let mut stmt =
+                tx.prepare("SELECT plan_id, deliverable_id FROM locks WHERE expires_at_us < ?1")?;
+            stmt.query_map(params![now_us], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<_, _>>()?
+        };
+        let orphans: Vec<(String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT plan_id, deliverable_id FROM deliverable_statuses
+                 WHERE status = ?1
+                   AND (plan_id, deliverable_id) NOT IN
+                       (SELECT plan_id, deliverable_id FROM locks)",
+            )?;
+            stmt.query_map(params![in_progress], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<_, _>>()?
+        };
+
+        // Re-derive (Ready if every prerequisite is Complete, else Pending)
+        // with the same rule as the in-memory reaper.
+        type PlanSnapshot = Option<(PlanGraph, HashMap<String, DeliverableStatus>)>;
+        let mut plans: HashMap<String, PlanSnapshot> = HashMap::new();
+        for (plan_id, deliverable_id) in expired.iter().chain(orphans.iter()) {
+            if !plans.contains_key(plan_id) {
+                let graph: Option<PlanGraph> = tx
+                    .query_row(
+                        "SELECT graph FROM plans WHERE plan_id = ?1",
+                        params![plan_id],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .and_then(|g| serde_json::from_str(&g).ok());
+                let mut statuses = HashMap::new();
+                let mut stmt = tx.prepare(
+                    "SELECT deliverable_id, status FROM deliverable_statuses WHERE plan_id = ?1",
+                )?;
+                for row in stmt.query_map(params![plan_id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })? {
+                    let (id, st) = row?;
+                    if let Ok(st) = serde_json::from_str(&st) {
+                        statuses.insert(id, st);
+                    }
+                }
+                plans.insert(plan_id.clone(), graph.map(|g| (g, statuses)));
+            }
+            // An undecodable stored graph cannot be consulted: fall back to Ready.
+            let status = plans
+                .get(plan_id)
+                .and_then(Option::as_ref)
+                .and_then(|(g, st)| {
+                    g.deliverables
+                        .iter()
+                        .find(|d| &d.id == deliverable_id)
+                        .map(|d| crate::locks::rederive_status(d, st))
+                })
+                .unwrap_or(DeliverableStatus::Ready);
+            tx.execute(
+                "UPDATE deliverable_statuses SET status = ?1, lapse_count = lapse_count + 1
+                 WHERE plan_id = ?2 AND deliverable_id = ?3",
+                params![serde_json::to_string(&status)?, plan_id, deliverable_id],
+            )?;
+        }
         let reaped = tx.execute(
             "DELETE FROM locks WHERE expires_at_us < ?1",
             params![now_us],
         )?;
-
-        // Orphaned in_progress with no lock at all: cannot be legitimately
-        // held by anyone, so it goes back to the pool. Losing the lock row
-        // without a terminal mark is an environmental loss — count the lapse.
-        let orphaned = tx.execute(
-            "UPDATE deliverable_statuses SET status = ?1, lapse_count = lapse_count + 1
-             WHERE status = ?2
-               AND (plan_id, deliverable_id) NOT IN
-                   (SELECT plan_id, deliverable_id FROM locks)",
-            params![ready, in_progress],
-        )?;
+        let orphaned = orphans.len();
 
         tx.commit()?;
         if reaped > 0 || orphaned > 0 {
@@ -226,21 +278,7 @@ impl SqlitePlanStore {
         }
 
         let (plan_id, state) = build()?;
-        let graph_json = serde_json::to_string(&state.graph).map_err(backend)?;
-        let result_json = serde_json::to_string(&state.cached_result).map_err(backend)?;
-        tx.execute(
-            "INSERT INTO plans (plan_id, graph, cached_result, created_at_us, cpm_version)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                plan_id.0,
-                graph_json,
-                result_json,
-                Utc::now().timestamp_micros(),
-                crate::algorithm::CPM_VERSION
-            ],
-        )
-        .map_err(backend)?;
-        save_plan_state(&tx, &plan_id, &state)?;
+        insert_plan(&tx, &plan_id, &state, Utc::now())?;
         tx.execute(
             "INSERT INTO submit_dedup (graph_hash, plan_id) VALUES (?1, ?2)",
             params![graph_hash, plan_id.0],
@@ -256,15 +294,43 @@ impl SqlitePlanStore {
     /// `BEGIN IMMEDIATE` transaction. An `Err` from `f` rolls the
     /// transaction back, so failed operations never persist partial
     /// mutations.
+    ///
+    /// Ungated; production execution paths use
+    /// [`Self::mutate_executable_plan`].
+    #[cfg(test)]
     pub(crate) fn mutate_plan<R>(
         &self,
         plan_id: &PlanId,
+        f: impl FnOnce(&mut PlanState) -> Result<R, PlannerError>,
+    ) -> Result<R, PlannerError> {
+        self.mutate_plan_inner(plan_id, false, f)
+    }
+
+    /// [`Self::mutate_plan`] for an execution operation: inside the same
+    /// transaction, first refuse a named variant that is not its line's
+    /// selected variant (`VARIANT_NOT_SELECTED`, see
+    /// [`crate::portfolio::ensure_executable`]).
+    pub(crate) fn mutate_executable_plan<R>(
+        &self,
+        plan_id: &PlanId,
+        f: impl FnOnce(&mut PlanState) -> Result<R, PlannerError>,
+    ) -> Result<R, PlannerError> {
+        self.mutate_plan_inner(plan_id, true, f)
+    }
+
+    fn mutate_plan_inner<R>(
+        &self,
+        plan_id: &PlanId,
+        gated: bool,
         f: impl FnOnce(&mut PlanState) -> Result<R, PlannerError>,
     ) -> Result<R, PlannerError> {
         let mut conn = self.lock_conn()?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(backend)?;
+        if gated {
+            crate::portfolio::ensure_executable(&tx, plan_id)?;
+        }
         let mut state =
             load_plan_state(&tx, plan_id)?.ok_or_else(|| PlannerError::PlanNotFound {
                 plan_id: plan_id.0.clone(),
@@ -290,6 +356,49 @@ impl SqlitePlanStore {
         Ok(f(&state))
     }
 
+    /// [`Self::read_plan`] that also returns, from the same snapshot, the
+    /// named variant owning the plan (`None` for an unnamed plan).
+    pub(crate) fn read_plan_and_variant<R>(
+        &self,
+        plan_id: &PlanId,
+        f: impl FnOnce(&PlanState) -> R,
+    ) -> Result<(R, Option<crate::portfolio::VariantInfo>), PlannerError> {
+        self.read_tx(|tx| {
+            let state =
+                load_plan_state(tx, plan_id)?.ok_or_else(|| PlannerError::PlanNotFound {
+                    plan_id: plan_id.0.clone(),
+                })?;
+            let info = crate::portfolio::variant_info(tx, plan_id)?;
+            Ok((f(&state), info))
+        })
+    }
+
+    /// Run `f` inside ONE `BEGIN IMMEDIATE` transaction and commit on `Ok`.
+    /// An `Err` from `f` rolls everything back. For multi-table writes
+    /// (the portfolio operations) that do not fit [`Self::mutate_plan`].
+    pub(crate) fn write_tx<R>(
+        &self,
+        f: impl FnOnce(&Transaction<'_>) -> Result<R, PlannerError>,
+    ) -> Result<R, PlannerError> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(backend)?;
+        let out = f(&tx)?;
+        tx.commit().map_err(backend)?;
+        Ok(out)
+    }
+
+    /// Run `f` over a consistent read snapshot (deferred transaction).
+    pub(crate) fn read_tx<R>(
+        &self,
+        f: impl FnOnce(&Transaction<'_>) -> Result<R, PlannerError>,
+    ) -> Result<R, PlannerError> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction().map_err(backend)?;
+        f(&tx)
+    }
+
     fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, PlannerError> {
         self.conn
             .lock()
@@ -303,6 +412,7 @@ impl SqlitePlanStore {
 const MIGRATIONS: &[fn(&Connection) -> anyhow::Result<()>] = &[
     migrate_v1_base_schema, // tables + counter columns (pre-versioning layout)
     migrate_v2_cpm_version, // plans.cpm_version
+    migrate_v3_portfolio,   // plan_lines, variants, revisions
 ];
 
 /// Runs the whole ladder plus the stale sweep in one immediate transaction,
@@ -381,6 +491,44 @@ fn migrate_v2_cpm_version(conn: &Connection) -> anyhow::Result<()> {
             .context("adding plans.cpm_version column")?;
     }
     Ok(())
+}
+
+/// Portfolio tables: named plan lines, their variants (each one plan row),
+/// and every variant's revision history. Legacy plans have no rows here
+/// until their first revision (`revisions` only). `variants.content_hash`
+/// is the plan file's content hash when `source_path` is set (file-backed
+/// sync) and the canonical graph hash otherwise (inline sync, revise); drift
+/// detection compares against a file hash only when `source_path` is set.
+fn migrate_v3_portfolio(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS plan_lines (
+             project          TEXT,
+             name             TEXT,
+             selected_variant TEXT,
+             archived         INTEGER NOT NULL DEFAULT 0,
+             PRIMARY KEY (project, name)
+         );
+         CREATE TABLE IF NOT EXISTS variants (
+             project       TEXT,
+             name          TEXT,
+             variant       TEXT,
+             plan_id       TEXT NOT NULL UNIQUE REFERENCES plans(plan_id) ON DELETE CASCADE,
+             source_path   TEXT,
+             content_hash  TEXT,
+             head_revision INTEGER NOT NULL,
+             archived      INTEGER NOT NULL DEFAULT 0,
+             PRIMARY KEY (project, name, variant)
+         );
+         CREATE TABLE IF NOT EXISTS revisions (
+             plan_id       TEXT REFERENCES plans(plan_id) ON DELETE CASCADE,
+             revision      INTEGER,
+             graph         TEXT NOT NULL,
+             content_hash  TEXT,
+             created_at_us INTEGER NOT NULL,
+             PRIMARY KEY (plan_id, revision)
+         );",
+    )
+    .context("creating portfolio tables")
 }
 
 /// Recompute `cached_result` for every plan stored by an older CPM kernel.
@@ -463,7 +611,7 @@ fn migrate_counter_columns(conn: &Connection) -> anyhow::Result<()> {
 /// not exist. The `file -> deliverable` inverse index is rebuilt from the
 /// persisted locks + graph (it is derived state; persisting it separately
 /// could only ever drift).
-fn load_plan_state(
+pub(crate) fn load_plan_state(
     tx: &Transaction<'_>,
     plan_id: &PlanId,
 ) -> Result<Option<PlanState>, PlannerError> {
@@ -573,10 +721,62 @@ fn load_plan_state(
     }))
 }
 
+/// Insert the `plans` row for a new plan plus its statuses and locks.
+pub(crate) fn insert_plan(
+    tx: &Transaction<'_>,
+    plan_id: &PlanId,
+    state: &PlanState,
+    now: DateTime<Utc>,
+) -> Result<(), PlannerError> {
+    let graph_json = serde_json::to_string(&state.graph).map_err(backend)?;
+    let result_json = serde_json::to_string(&state.cached_result).map_err(backend)?;
+    tx.execute(
+        "INSERT INTO plans (plan_id, graph, cached_result, created_at_us, cpm_version)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            plan_id.0,
+            graph_json,
+            result_json,
+            now.timestamp_micros(),
+            crate::algorithm::CPM_VERSION
+        ],
+    )
+    .map_err(backend)?;
+    save_plan_state(tx, plan_id, state)
+}
+
+/// Replace a plan's whole runtime state after a revision: the `plans` row's
+/// graph and cached CPM result, and every status, counter and lock (rows of
+/// removed deliverables are deleted).
+pub(crate) fn replace_plan_state(
+    tx: &Transaction<'_>,
+    plan_id: &PlanId,
+    state: &PlanState,
+) -> Result<(), PlannerError> {
+    let graph_json = serde_json::to_string(&state.graph).map_err(backend)?;
+    let result_json = serde_json::to_string(&state.cached_result).map_err(backend)?;
+    tx.execute(
+        "UPDATE plans SET graph = ?1, cached_result = ?2, cpm_version = ?3 WHERE plan_id = ?4",
+        params![
+            graph_json,
+            result_json,
+            crate::algorithm::CPM_VERSION,
+            plan_id.0
+        ],
+    )
+    .map_err(backend)?;
+    tx.execute(
+        "DELETE FROM deliverable_statuses WHERE plan_id = ?1",
+        params![plan_id.0],
+    )
+    .map_err(backend)?;
+    save_plan_state(tx, plan_id, state)
+}
+
 /// Persist the mutable parts of a [`PlanState`] (statuses + locks). The
-/// graph and cached CPM result are immutable after submit and are written
-/// once by [`SqlitePlanStore::submit_or_get`].
-fn save_plan_state(
+/// graph and cached CPM result are written by [`insert_plan`] and only
+/// replaced by a revision ([`replace_plan_state`]).
+pub(crate) fn save_plan_state(
     tx: &Transaction<'_>,
     plan_id: &PlanId,
     state: &PlanState,

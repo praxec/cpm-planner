@@ -123,15 +123,21 @@ pub fn monte_carlo(
     monte_carlo_with_cpm(graph, req, &cpm)
 }
 
-/// Iteration range and work budget.
-fn check_request(graph: &PlanGraph, req: &MonteCarloRequest) -> Result<(), PlannerError> {
-    check_iterations(req.iterations).map_err(|reason| PlannerError::InvalidGraph { reason })?;
-    let size = graph.deliverables.len()
+/// The per-iteration work of `graph`: deliverables plus prerequisite edges.
+/// `iterations × work_size` is what [`MAX_WORK`] bounds.
+pub(crate) fn work_size(graph: &PlanGraph) -> usize {
+    graph.deliverables.len()
         + graph
             .deliverables
             .iter()
             .map(|d| d.prerequisites.len())
-            .sum::<usize>();
+            .sum::<usize>()
+}
+
+/// Iteration range and work budget.
+fn check_request(graph: &PlanGraph, req: &MonteCarloRequest) -> Result<(), PlannerError> {
+    check_iterations(req.iterations).map_err(|reason| PlannerError::InvalidGraph { reason })?;
+    let size = work_size(graph);
     if u64::from(req.iterations).saturating_mul(size as u64) > MAX_WORK {
         return Err(PlannerError::InvalidGraph {
             reason: format!(
