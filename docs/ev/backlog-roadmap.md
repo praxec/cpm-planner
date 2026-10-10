@@ -31,7 +31,7 @@ tracked with cpm-planner's earned-value tools on the 0.1.0 release-candidate bin
   - time before the first commit and after the last is missing;
   - a phase committed in one burst reads short (P0 is 5 minutes).
 
-  The low actuals, and with them the high CPI, mostly reflect this method and
+  The low actuals, and with them the high CPI, likely reflect mostly this method and
   subagent-driven execution against human-sized estimates.
 - **as_of.** `as_of` is the PV status date, here the moment the snapshot was taken
   (2026-10-10T02:24Z). EV and AC are as recorded when the call ran.
@@ -41,6 +41,8 @@ tracked with cpm-planner's earned-value tools on the 0.1.0 release-candidate bin
   roadmap plan.
 
 ## Per-phase actuals
+
+Hours are rounded to two decimals, so the column can differ from `plan.ev`'s AC by 0.01 h.
 
 | Phase | Budget h | Status | Evidence | Commit span (UTC) | AC h |
 |---|---:|---|---|---|---:|
@@ -77,7 +79,8 @@ From the same reading (`plan.ev`):
 | Alerts | none |
 
 The project is ahead of schedule (SPI 1.26) and under budget on the hours recorded
-(CPI 1.61, with the caveats above).
+(CPI 1.61, with the caveats above). The wall-clock baseline starts about 4 h before
+the first commit, which flatters SPI.
 
 ## Forecast
 
