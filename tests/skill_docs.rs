@@ -51,7 +51,10 @@ fn plan_tokens(text: &str) -> BTreeSet<String> {
 
 /// The value of `key` in SKILL.md's YAML frontmatter (single-line values).
 fn frontmatter(key: &str) -> Option<String> {
-    let text = std::fs::read_to_string(skill_dir().join("SKILL.md")).expect("readable SKILL.md");
+    // Windows checkouts may convert the skill to CRLF; parse either ending.
+    let text = std::fs::read_to_string(skill_dir().join("SKILL.md"))
+        .expect("readable SKILL.md")
+        .replace("\r\n", "\n");
     let body = text.strip_prefix("---\n")?;
     let end = body.find("\n---\n")?;
     let prefix = format!("{key}: ");
