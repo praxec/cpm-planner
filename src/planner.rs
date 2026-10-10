@@ -37,7 +37,7 @@ use crate::audit::{AuditEvent, AuditSink, NullAuditSink};
 use crate::plan::{
     AcceptRequest, AcquireRequest, BlockedDeliverable, CallerId, Cohort, CohortRow, Deliverable,
     DeliverableStatus, FINISH_ID, FileMode, ForceReleaseRequest, HeartbeatRequest, LockInfo,
-    MarkStatusRequest, MilestoneRow, OwnedFile, PlanDefinition, PlanGraph, PlanId, PlanStatus,
+    MAX_DELIVERABLES, MarkStatusRequest, OwnedFile, PlanDefinition, PlanGraph, PlanId, PlanStatus,
     PlannerError, START_ID, ScheduleRow,
 };
 use crate::plan_store::SqlitePlanStore;
@@ -48,7 +48,6 @@ use execution_policy::classify::{FailureClass, RetryDecision};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::algorithm::CpmAlgorithm;
 use crate::locks::{FileClaim, PlanState, add_file_claims, modes_conflict, release_file_claims};
 
 /// Default TTL applied to newly acquired locks. Five minutes is the
@@ -140,6 +139,17 @@ impl BasicCpmPlanner {
     /// TTL. The real `Utc::now` is used as the clock.
     pub fn with_audit(audit: Arc<dyn AuditSink>) -> Self {
         Self::with_parts(audit, DEFAULT_TTL, Arc::new(Utc::now))
+    }
+
+    /// Simulate a stored plan's graph read-only: nothing is written and no
+    /// audit events are emitted. See [`crate::simulate::simulate`].
+    pub async fn simulate_plan(
+        &self,
+        plan_id: &PlanId,
+        req: &crate::simulate::SimulateRequest,
+    ) -> Result<crate::simulate::SimulationResult, PlannerError> {
+        let graph = self.get_plan(plan_id).await?.graph;
+        crate::simulate::simulate(&graph, req)
     }
 
     /// Override the lock TTL. Useful for short-lived integration tests.
@@ -267,6 +277,7 @@ fn hash_graph(graph: &PlanGraph) -> String {
                 "prerequisites": prereqs,
                 "estimated_effort_hours": d.estimated_effort_hours,
                 "duration_hours": d.duration_hours,
+                "estimate": d.estimate,
                 "metadata": d.metadata,
                 "milestone": d.milestone,
             })
@@ -293,7 +304,17 @@ fn hash_graph(graph: &PlanGraph) -> String {
 
 /// Reject graphs that fail any structural invariant. Returns
 /// [`PlannerError::InvalidGraph`] with a precise `reason` on first failure.
-fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
+/// Run by submit and by every analysis entry point (`resource_schedule`,
+/// `monte_carlo`, `simulate`).
+pub(crate) fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
+    if graph.deliverables.len() > MAX_DELIVERABLES {
+        return Err(PlannerError::InvalidGraph {
+            reason: format!(
+                "plan has {} deliverables; maximum is {MAX_DELIVERABLES}",
+                graph.deliverables.len()
+            ),
+        });
+    }
     for d in &graph.deliverables {
         if d.id == START_ID || d.id == FINISH_ID {
             return Err(PlannerError::InvalidGraph {
@@ -312,49 +333,17 @@ fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
         }
     }
 
-    // Effort estimates, when present, must be finite and non-negative.
-    for d in &graph.deliverables {
-        if let Some(h) = d.estimated_effort_hours
-            && (h < 0.0 || !h.is_finite())
-        {
-            return Err(PlannerError::InvalidGraph {
-                reason: format!(
-                    "deliverable '{}' has invalid estimated_effort_hours {h}; must be a finite number >= 0",
-                    d.id
-                ),
-            });
-        }
-    }
-
-    // Calendar durations, when present, must be finite and non-negative.
-    for d in &graph.deliverables {
-        if let Some(h) = d.duration_hours
-            && (h < 0.0 || !h.is_finite())
-        {
-            return Err(PlannerError::InvalidGraph {
-                reason: format!(
-                    "deliverable '{}' has invalid duration_hours {h}; must be a finite number >= 0",
-                    d.id
-                ),
-            });
-        }
+    // Effort, duration, estimate and lag hours: finite, within
+    // 0..=MAX_HOURS, and estimates ordered. Same messages as `plan.lint`.
+    if let Some(problem) = crate::graph::value_problems(graph).into_iter().next() {
+        return Err(PlannerError::InvalidGraph {
+            reason: problem.message,
+        });
     }
 
     // Prerequisite references resolve.
     let id_set: HashSet<&str> = graph.deliverables.iter().map(|d| d.id.as_str()).collect();
     for d in &graph.deliverables {
-        for p in &d.prerequisites {
-            let lag = p.lag_hours();
-            if !lag.is_finite() || lag < 0.0 {
-                return Err(PlannerError::InvalidGraph {
-                    reason: format!(
-                        "prerequisite '{}' of deliverable '{}' has invalid lag_hours {lag}; must be a finite number >= 0",
-                        p.id(),
-                        d.id
-                    ),
-                });
-            }
-        }
         for p in crate::graph::prerequisite_ids(d) {
             if !id_set.contains(p) {
                 return Err(PlannerError::InvalidGraph {
@@ -692,13 +681,14 @@ fn make_counters_reset_event(
 // Priority ordering for cohort selection
 // ---------------------------------------------------------------------------
 
-/// Sort key for the ready-set priority pass: least total float first
-/// (critical work leads), then earliest start, then id for determinism.
+/// Sort key for the ready-set priority pass: smallest latest start first
+/// (longest remaining tail leads), then least total float, then id for
+/// determinism.
 fn priority_key(
     deliverable_id: &str,
     sched_by_id: &HashMap<&str, (f32, f32)>,
 ) -> (i64, i64, String) {
-    let (float, es) = match sched_by_id.get(deliverable_id) {
+    let (latest_start, float) = match sched_by_id.get(deliverable_id) {
         Some(&v) => v,
         None => unreachable!(
             "deliverable '{deliverable_id}' is in the ready set but absent from the cached \
@@ -706,7 +696,11 @@ fn priority_key(
         ),
     };
     let scale = |h: f32| (h * 1000.0).round() as i64;
-    (scale(float), scale(es), deliverable_id.to_string())
+    (
+        scale(latest_start),
+        scale(float),
+        deliverable_id.to_string(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -862,12 +856,12 @@ impl Planner for BasicCpmPlanner {
                 })
                 .collect();
 
-            // 3. Build the (float, ES) lookup table.
+            // 3. Build the (latest_start, float) lookup table.
             let sched_by_id: HashMap<&str, (f32, f32)> = state
                 .cached_result
                 .tasks
                 .iter()
-                .map(|t| (t.id.as_str(), (t.float, t.earliest_start)))
+                .map(|t| (t.id.as_str(), (t.latest_start, t.float)))
                 .collect();
 
             // 4. Build the ready set (in scope, non-manual, Ready, unlocked,
@@ -1290,28 +1284,7 @@ impl Planner for BasicCpmPlanner {
                 })
                 .collect();
 
-            let task_of = |id: &str| state.cached_result.tasks.iter().find(|t| t.id == id);
-            let row_of = |t: &crate::task::Task, synthetic: bool| ScheduleRow {
-                id: t.id.clone(),
-                es: t.earliest_start,
-                ef: t.earliest_finish,
-                ls: t.latest_start,
-                lf: t.latest_finish,
-                float: t.float,
-                critical: t.is_critical,
-                synthetic,
-            };
-            let mut schedule: Vec<ScheduleRow> = Vec::new();
-            schedule.extend(task_of(START_ID).map(|t| row_of(t, true)));
-            schedule.extend(
-                state
-                    .graph
-                    .deliverables
-                    .iter()
-                    .filter_map(|d| task_of(&d.id))
-                    .map(|t| row_of(t, false)),
-            );
-            schedule.extend(task_of(FINISH_ID).map(|t| row_of(t, true)));
+            let schedule = crate::schedule::schedule_rows(&state.graph, &state.cached_result);
             let mut ready_rows: Vec<&ScheduleRow> = schedule
                 .iter()
                 .filter(|r| {
@@ -1326,32 +1299,15 @@ impl Planner for BasicCpmPlanner {
                 .cached_result
                 .tasks
                 .iter()
-                .map(|t| (t.id.as_str(), (t.float, t.earliest_start)))
+                .map(|t| (t.id.as_str(), (t.latest_start, t.float)))
                 .collect();
             ready_rows.sort_by_key(|r| priority_key(&r.id, &sched_by_id));
             let ready: Vec<String> = ready_rows.iter().map(|r| r.id.clone()).collect();
 
-            let milestones: Vec<MilestoneRow> = state
-                .graph
-                .deliverables
-                .iter()
-                .filter(|d| d.is_milestone())
-                .filter_map(|d| {
-                    let task = task_of(&d.id)?;
-                    Some(MilestoneRow {
-                        id: d.id.clone(),
-                        critical_path: CpmAlgorithm::trace_path_to(
-                            &state.cached_result.tasks,
-                            &d.id,
-                        ),
-                        hours: task.earliest_finish,
-                        complete: matches!(
-                            state.statuses.get(&d.id),
-                            Some(DeliverableStatus::Complete)
-                        ),
-                    })
-                })
-                .collect();
+            let milestones =
+                crate::schedule::milestone_rows(&state.graph, &state.cached_result, |id| {
+                    matches!(state.statuses.get(id), Some(DeliverableStatus::Complete))
+                });
 
             PlanStatus {
                 plan_id: plan_id.clone(),
@@ -1551,6 +1507,7 @@ mod tests {
             estimated_effort_hours: effort,
             metadata,
             duration_hours: None,
+            estimate: None,
             milestone: false,
         }
     }
@@ -1592,19 +1549,28 @@ mod tests {
     }
 
     fn sched<'a>(entries: &[(&'a str, f32, f32)]) -> HashMap<&'a str, (f32, f32)> {
-        entries.iter().map(|&(id, f, e)| (id, (f, e))).collect()
+        entries
+            .iter()
+            .map(|&(id, latest_start, float)| (id, (latest_start, float)))
+            .collect()
     }
 
     #[test]
-    fn priority_key_orders_lower_float_first() {
-        let s = sched(&[("A", 0.0, 5.0), ("B", 2.0, 0.0)]);
-        assert!(priority_key("A", &s) < priority_key("B", &s));
+    fn priority_key_orders_lower_latest_start_first() {
+        let s = sched(&[("A", 5.0, 0.0), ("B", 0.0, 9.0)]);
+        assert!(priority_key("B", &s) < priority_key("A", &s));
     }
 
     #[test]
-    fn priority_key_breaks_float_ties_by_es() {
+    fn priority_key_breaks_latest_start_ties_by_float() {
         let s = sched(&[("X", 1.0, 3.0), ("Y", 1.0, 1.0)]);
         assert!(priority_key("Y", &s) < priority_key("X", &s));
+    }
+
+    #[test]
+    fn priority_key_breaks_float_ties_by_id() {
+        let s = sched(&[("X", 1.0, 1.0), ("Y", 1.0, 1.0)]);
+        assert!(priority_key("X", &s) < priority_key("Y", &s));
     }
 
     #[test]

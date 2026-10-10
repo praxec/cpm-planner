@@ -32,6 +32,8 @@
 //! - [`planner`] — [`BasicCpmPlanner`], the lock-aware implementation.
 //! - [`plan_store`] — durable SQLite persistence (plans, statuses, cohort
 //!   locks, submit dedup) and the cross-process atomicity mechanism.
+//! - [`schedule`] — [`schedule::compute_cpm`], the CPM run shared by submit,
+//!   status and the analysis tools.
 //! - [`server`] — the MCP tool façade.
 //! - [`audit`] — the lock-lifecycle audit surface.
 //!
@@ -43,22 +45,28 @@ pub mod audit;
 pub mod drag;
 pub mod estimator;
 mod graph;
+pub mod lint;
 mod locks;
+pub mod metrics;
+pub mod monte_carlo;
 pub mod network_health;
 pub mod plan;
 pub mod plan_store;
 pub mod planner;
 pub mod ports;
+pub mod resource_schedule;
 pub mod risk;
-mod schedule;
+pub mod schedule;
 pub mod server;
+pub mod simulate;
 pub mod task;
 
 pub use algorithm::CpmAlgorithm;
 pub use drag::{DragResult, diameter, drag};
 pub use estimator::{EffortEstimator, EstimationConfig};
 pub use plan::{
-    AcceptRequest, AcquireRequest, ForceReleaseRequest, HeartbeatRequest, MarkStatusRequest,
+    AcceptRequest, AcquireRequest, Estimate, ForceReleaseRequest, HeartbeatRequest,
+    MarkStatusRequest,
 };
 pub use plan_store::{DB_PATH_ENV, SqlitePlanStore};
 pub use planner::{

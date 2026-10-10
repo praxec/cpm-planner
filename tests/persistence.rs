@@ -100,6 +100,7 @@ fn deliverable(id: &str, files: &[&str], prereqs: &[&str]) -> Deliverable {
         estimated_effort_hours: Some(1.0),
         metadata: serde_json::Value::Null,
         duration_hours: None,
+        estimate: None,
         milestone: false,
     }
 }

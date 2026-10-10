@@ -28,6 +28,9 @@ async-trait = "0.1"
 # language as the rest of praxec (rather than hand-rolling its own).
 execution-policy = { git = "https://github.com/matt-cochran/execution-policy" }
 chrono = { version = "0.4", features = ["serde"] }
+rand = { version = "0.10.3", default-features = false }
+rand_chacha = { version = "0.10.0", default-features = false }
+rand_distr = { version = "0.6.0", default-features = false, features = ["std"] }
 rmcp = { version = "1.8", default-features = false, features = ["server", "macros", "transport-io"] }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
