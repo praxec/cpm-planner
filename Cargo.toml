@@ -26,7 +26,7 @@ async-trait = "0.1"
 # deliverable-lease circuit breaker classifies + decides through this crate's
 # FailureClass / RetryDecision types so cpm-planner speaks the same reliability
 # language as the rest of praxec (rather than hand-rolling its own).
-execution-policy = { git = "https://github.com/matt-cochran/execution-policy" }
+execution-policy = "0.0.6"
 chrono = { version = "0.4", features = ["serde"] }
 rand = { version = "0.10.3", default-features = false }
 rand_chacha = { version = "0.10.0", default-features = false }
