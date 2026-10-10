@@ -474,6 +474,7 @@ fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
             tx.pragma_update(None, "user_version", version)?;
         }
     }
+    ensure_v4_columns(&tx).context("healing schema v4 columns")?;
     recompute_stale_results(&tx)?;
     tx.commit()?;
     Ok(())
@@ -576,13 +577,9 @@ fn migrate_v3_portfolio(conn: &Connection) -> anyhow::Result<()> {
 /// deliverable later removed from the graph are kept: its baselined budget
 /// and actual cost still count.
 ///
-/// Also adds `deliverable_statuses.lockless`, the lease provenance of an
-/// `in_progress` status: 1 when it came from a lockless `plan.mark_status`
-/// (kept by the startup sweep), 0 otherwise. Rows of a pre-v4 database
-/// default to 0, so an existing `in_progress` row without a lock row is
-/// treated as lease-backed and quarantined exactly as before v4.
+/// `deliverable_statuses.lockless` is added by [`ensure_v4_columns`], which
+/// runs right after this ladder on every open.
 fn migrate_v4_earned_value(conn: &Connection) -> anyhow::Result<()> {
-    migrate_lockless_column(conn)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS baselines (
              plan_id       TEXT NOT NULL REFERENCES plans(plan_id) ON DELETE CASCADE,
@@ -623,26 +620,76 @@ fn migrate_v4_earned_value(conn: &Connection) -> anyhow::Result<()> {
     .context("creating earned-value tables")
 }
 
-/// Add `deliverable_statuses.lockless` (default 0: lease-backed) unless a
-/// `PRAGMA table_info` probe finds it already there.
-fn migrate_lockless_column(conn: &Connection) -> anyhow::Result<()> {
+/// Bring every schema v4 database to the final v4 layout. Runs on EVERY open,
+/// after the migration ladder and in its transaction, and is idempotent
+/// (each column is guarded by a `PRAGMA table_info` probe, each index by
+/// `IF NOT EXISTS`). It heals databases stamped `user_version = 4` by an
+/// unreleased build whose v4 DDL predates these additions (such a database
+/// skips `MIGRATIONS[3]`):
+///
+/// - `deliverable_statuses.lockless`: the lease provenance of an
+///   `in_progress` status, 1 when it came from a lockless
+///   `plan.mark_status` (kept by the startup sweep), else 0. Existing rows,
+///   including every row of a database migrated from v3, default to 0, so
+///   an `in_progress` row without a lock row counts as lease-backed and is
+///   quarantined exactly as before;
+/// - `ev_actuals.removed_at_us` and `ev_actuals.frozen_pct` (NULL: not
+///   removed);
+/// - `ev_snapshots.baseline_number`, backfilled from the stored summary's
+///   `baseline_number`, plus the two snapshot position indexes.
+fn ensure_v4_columns(conn: &Connection) -> anyhow::Result<()> {
+    add_column_if_missing(
+        conn,
+        "deliverable_statuses",
+        "lockless",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(conn, "ev_actuals", "removed_at_us", "INTEGER")?;
+    add_column_if_missing(conn, "ev_actuals", "frozen_pct", "INTEGER")?;
+    if add_column_if_missing(
+        conn,
+        "ev_snapshots",
+        "baseline_number",
+        "INTEGER NOT NULL DEFAULT 0",
+    )? {
+        conn.execute_batch(
+            "UPDATE ev_snapshots
+             SET baseline_number = COALESCE(json_extract(summary, '$.baseline_number'), 0)",
+        )
+        .context("backfilling ev_snapshots.baseline_number")?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS ev_snapshots_by_position
+             ON ev_snapshots(plan_id, baseline_number, as_of_us, taken_at_us);
+         CREATE INDEX IF NOT EXISTS ev_snapshots_by_as_of
+             ON ev_snapshots(plan_id, as_of_us, taken_at_us);",
+    )
+    .context("creating ev_snapshots indexes")
+}
+
+/// Add `table.column` with `decl` unless a `PRAGMA table_info` probe finds
+/// it. Returns whether the column was added.
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    decl: &str,
+) -> anyhow::Result<bool> {
     let mut stmt = conn
-        .prepare("PRAGMA table_info(deliverable_statuses)")
-        .context("probing deliverable_statuses columns")?;
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .with_context(|| format!("probing {table} columns"))?;
     let has_column = stmt
         .query_map([], |row| row.get::<_, String>(1))
-        .context("reading deliverable_statuses column names")?
+        .with_context(|| format!("reading {table} column names"))?
         .collect::<Result<Vec<_>, _>>()
-        .context("reading deliverable_statuses column name")?
+        .with_context(|| format!("reading {table} column name"))?
         .iter()
-        .any(|c| c == "lockless");
+        .any(|c| c == column);
     if !has_column {
-        conn.execute_batch(
-            "ALTER TABLE deliverable_statuses ADD COLUMN lockless INTEGER NOT NULL DEFAULT 0",
-        )
-        .context("adding deliverable_statuses.lockless column")?;
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))
+            .with_context(|| format!("adding {table}.{column} column"))?;
     }
-    Ok(())
+    Ok(!has_column)
 }
 
 /// Recompute `cached_result` for every plan stored by an older CPM kernel.
@@ -1193,6 +1240,37 @@ mod tests {
         )
         .unwrap();
         db
+    }
+
+    /// A database stamped v4 by an unreleased build whose v4 DDL predates
+    /// `lockless`, the ev_actuals removal columns and the snapshot
+    /// baseline column/indexes skips `MIGRATIONS[3]`; opening it heals the
+    /// layout so plans load.
+    #[test]
+    fn store_at_v4_without_lockless_column_heals_on_open() {
+        let db = TempDbFile::new("v4-heal");
+        let store = SqlitePlanStore::open(&db.path).unwrap();
+        store
+            .submit_or_get("hash-1", || {
+                Ok((PlanId("plan_v4".into()), plan_state_with_one_ready()))
+            })
+            .unwrap();
+        drop(store);
+        Connection::open(&db.path)
+            .unwrap()
+            .execute_batch(
+                "DROP INDEX ev_snapshots_by_position; DROP INDEX ev_snapshots_by_as_of;
+                 ALTER TABLE ev_snapshots DROP COLUMN baseline_number;
+                 ALTER TABLE ev_actuals DROP COLUMN removed_at_us;
+                 ALTER TABLE ev_actuals DROP COLUMN frozen_pct;
+                 ALTER TABLE deliverable_statuses DROP COLUMN lockless;",
+            )
+            .unwrap();
+        let store = SqlitePlanStore::open(&db.path).unwrap();
+        let status = store
+            .read_plan(&PlanId("plan_v4".into()), |s| s.statuses.get("d1").cloned())
+            .unwrap();
+        assert_eq!(status, Some(DeliverableStatus::Ready));
     }
 
     /// A v3 database has no lease provenance: its `in_progress` rows
