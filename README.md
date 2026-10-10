@@ -98,7 +98,9 @@ Write a plan as `.cpm-planner/plans/<name>/<variant>.json` (a `PlanGraph`):
 
 ## Quickstart: earned value
 
-Freeze the baseline, record progress, then read the report:
+Freeze the baseline, record progress, then read the report (`earned_pct` earns value
+only for a deliverable with `earning_rule: "weighted"`; the default `zero_hundred`
+earns at completion):
 
 1. `plan.baseline {plan_id}` — freeze the CPM schedule and budgets as baseline 1.
 2. `plan.mark_status {plan_id, deliverable_id, caller_id, status: {"status": "in_progress"}, earned_pct: 50, actual_effort_hours: 4}` — report progress and actual cost.

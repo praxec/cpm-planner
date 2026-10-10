@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Library: `cpm_planner::schedule::compute_cpm` is public.
 - `plan.sync` registers or updates one variant of a named plan line from a plan file (`.cpm-planner/plans/<name>/<variant>.json`) or an inline graph; files are tracked by content hash for drift.
 - `plan.list` lists a project's plan lines and variants (archived hidden unless `include_archived`).
 - `plan.export` writes a plan's head graph to its variant file or a confined path.
@@ -115,7 +116,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Breaking (library API)
 
 - Library API (breaking for library users): `Deliverable` gains the public field `earning_rule` and `MarkStatusRequest` the public fields `earned_pct`, `actual_effort_hours` and `evidence` (struct literals must set them); `PlannerError` gains `InvalidActuals` and `NotBaselined`; the `Planner` trait gains required methods `baseline`, `ev` and `snapshot` (breaks other implementors). New public module `earned_value` (`Baseline`, `BaselineRow`, `Calendar`, `Actuals`, `EvReport`, `EvRow`, `EvRowStatus`, `EvSummary`, `BaselineRequest`, `BaselineOutcome`, `SnapshotRequest`, `SnapshotOutcome`, `SnapshotSummary`, `SnapshotFormat`, `compute_ev`, `build_baseline`, `trend_alerts`, `render_snapshots_markdown`, …) and `plan::EarningRule`. Also new (#26): the `llm` module (`LlmConfig`, `ConfigError`, `JudgmentError` / `JudgmentErrorKind`, the `JudgmentModel` trait, `ApiKey`, `llm::jev::JevJudge`, `llm::openrouter::chat_client`); the `review` module (`review`, `ReviewRequest`, `ReviewReport`, `Judge`, findings, proposals and their constants); `PlanServer::with_judge` / `with_llm_config`; `BasicCpmPlanner::record_audit`; `TOOL_REVIEW` and `server::MAX_CONCURRENT_REVIEWS`.
-- Library: `cpm_planner::schedule::compute_cpm` is public.
 - Library: `Deliverable.prerequisites` is `Vec<Prerequisite>`.
 - Library: `Deliverable` gains public `duration_hours` and `milestone`; `Task` gains `lag_by_dependency` and its `effort_hours` means scheduled length; `PlanStatus` gains `plan_complete` and `milestones`; `ScheduleRow` gains `synthetic`; new public types `Prerequisite`, `PrerequisiteKind`, `OwnedFile`, `FileMode`, `MilestoneRow` and consts `START_ID`, `FINISH_ID`.
 - Library: `Deliverable.owned_files` is `Vec<OwnedFile>`; `Cohort` gains `shared_paths`.
