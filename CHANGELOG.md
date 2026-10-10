@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `plan.review` no longer fails with `review_unavailable` (`decode: ... expected struct Cost`) against OpenRouter: Jev replies are decoded with a reply type whose `usage` accepts `cost` as a bare number (OpenRouter) or an object, ignores unknown fields, and drops malformed accounting instead of failing the judgment. Requests and answer validation are still rig-typesafeai's.
+
 ## [0.1.0] - 2026-10-10
 
 **Release notes: roadmap EV (dogfood).** We tracked cpm-planner's own roadmap with its
