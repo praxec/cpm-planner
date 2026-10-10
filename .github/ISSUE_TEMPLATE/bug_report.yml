@@ -1,0 +1,48 @@
+name: Bug report
+description: Something is wrong or crashes in cpm-planner
+labels: ["bug"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `cpm-planner --version`.
+      placeholder: cpm-planner 0.2.0
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS and architecture
+      placeholder: Windows 11 x64, macOS 15 arm64, Ubuntu 24.04 x86_64
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: MCP client
+      description: The client or agent host that talks to the server, with its version.
+      placeholder: Claude Code 2.x, Cursor, Codex CLI
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: The `plan.submit` payload, plan file, or tool call that reproduces the problem. Remove any secrets.
+      render: json
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead, including any error text.
+    validations:
+      required: true

@@ -56,3 +56,5 @@ libc = "0.2.190"
 [dev-dependencies]
 tempfile = "3.27.0"
 wiremock = "0.6.5"
+# Parses the issue-form YAML in tests/repo_hygiene.rs (maintained serde_yaml fork).
+serde_yaml_ng = "0.10.0"

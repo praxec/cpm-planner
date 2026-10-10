@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/praxec/cpm-planner/security/advisories/new
+    about: Please report security issues privately, not as a public issue.
+  - name: Ask a question
+    url: https://github.com/praxec/cpm-planner/blob/main/SUPPORT.md
+    about: Read SUPPORT.md for where to get help with usage questions.

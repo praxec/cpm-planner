@@ -47,3 +47,26 @@ fn tracked_text_files_are_lf() {
         "tracked text files contain CRLF line endings: {offenders:?}"
     );
 }
+
+#[test]
+fn issue_forms_are_valid_yaml() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/ISSUE_TEMPLATE");
+    let invalid: Vec<String> = ["bug_report.yml", "feature_request.yml", "config.yml"]
+        .iter()
+        .filter(|name| {
+            std::fs::read_to_string(dir.join(name))
+                .map_err(|err| err.to_string())
+                .and_then(|text| {
+                    serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&text)
+                        .map_err(|err| err.to_string())
+                })
+                .is_err()
+        })
+        .map(|name| name.to_string())
+        .collect();
+
+    assert!(
+        invalid.is_empty(),
+        "invalid or missing issue forms: {invalid:?}"
+    );
+}
