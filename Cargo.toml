@@ -90,4 +90,4 @@ wiremock = "0.6.5"
 # Parses the issue-form YAML in tests/repo_hygiene.rs (maintained serde_yaml fork).
 serde_yaml_ng = "0.10.0"
 # Parses the generated Gemini command files in tests/skills_install.rs.
-toml = "0.9"
+toml = "1.1"
