@@ -75,7 +75,9 @@ they reference against the server's tool list.
 - Feature branches open pull requests into `dev`.
 - Releases go `dev` to `main` through a release PR merged with a merge commit.
   `gitflow-guard.yml` only lets `main` accept merges from `dev`.
-- A tag `vX.Y.Z` on `main` runs `.github/workflows/release.yml`.
+- A tag `vX.Y.Z` on `main` runs `.github/workflows/release.yml`. The workflow
+  triggers on any `v*` tag, so tags are pushed only on `main` by convention;
+  see `docs/releasing.md`.
 
 ## Commits and pull requests
 

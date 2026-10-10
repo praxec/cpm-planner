@@ -31,7 +31,8 @@ surface is:
   traversal, or unbounded read is in scope.
 - **Optional LLM calls (`src/llm/`).** `plan.review` can call OpenRouter over
   HTTPS. `https://` is required except for loopback hosts. The API key comes
-  from `OPENROUTER_API_KEY` or a key file with mode 0600, and is scrubbed from
+  from `OPENROUTER_API_KEY` or a key file that is not world-readable (checked on unix; the file is
+  ignored with a warning otherwise), and is scrubbed from
   every error and log line. Error and reported-model text is length-capped.
   Any leak of the key, or a way to send it to a non-HTTPS non-loopback
   endpoint, is in scope.
