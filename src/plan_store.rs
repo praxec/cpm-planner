@@ -746,24 +746,13 @@ fn recompute_stale_results(conn: &Connection) -> anyhow::Result<()> {
 /// telemetry but treated as NEITHER failures NOR lapses, so an existing
 /// deliverable is exactly as far from both breakers as a fresh one.
 fn migrate_counter_columns(conn: &Connection) -> anyhow::Result<()> {
-    let mut stmt = conn
-        .prepare("PRAGMA table_info(deliverable_statuses)")
-        .context("probing deliverable_statuses columns")?;
-    let mut existing: Vec<String> = Vec::new();
-    let names = stmt
-        .query_map([], |row| row.get::<_, String>(1))
-        .context("reading deliverable_statuses column names")?;
-    for name in names {
-        existing.push(name.context("reading deliverable_statuses column name")?);
-    }
     for column in ["attempt_count", "failure_count", "lapse_count"] {
-        if !existing.iter().any(|c| c == column) {
-            conn.execute_batch(&format!(
-                "ALTER TABLE deliverable_statuses
-                 ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
-            ))
-            .with_context(|| format!("adding deliverable_statuses.{column} column"))?;
-        }
+        add_column_if_missing(
+            conn,
+            "deliverable_statuses",
+            column,
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
     }
     Ok(())
 }
@@ -1271,6 +1260,36 @@ mod tests {
             .read_plan(&PlanId("plan_v4".into()), |s| s.statuses.get("d1").cloned())
             .unwrap();
         assert_eq!(status, Some(DeliverableStatus::Ready));
+    }
+
+    /// Healing a pre-release v4 database fills the added
+    /// `ev_snapshots.baseline_number` from each stored summary.
+    #[test]
+    fn heal_backfills_snapshot_baseline_number_from_summary() {
+        let db = TempDbFile::new("v4-backfill");
+        let store = SqlitePlanStore::open(&db.path).unwrap();
+        store
+            .submit_or_get("hash-1", || {
+                Ok((PlanId("plan_v4".into()), plan_state_with_one_ready()))
+            })
+            .unwrap();
+        drop(store);
+        Connection::open(&db.path)
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO ev_snapshots
+                     (plan_id, taken_at_us, as_of_us, baseline_number, summary)
+                 VALUES ('plan_v4', 1, 1, 3, '{\"baseline_number\": 3}');
+                 DROP INDEX ev_snapshots_by_position; DROP INDEX ev_snapshots_by_as_of;
+                 ALTER TABLE ev_snapshots DROP COLUMN baseline_number;",
+            )
+            .unwrap();
+        drop(SqlitePlanStore::open(&db.path).unwrap());
+        let baseline_number: i64 = Connection::open(&db.path)
+            .unwrap()
+            .query_row("SELECT baseline_number FROM ev_snapshots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(baseline_number, 3);
     }
 
     /// A v3 database has no lease provenance: its `in_progress` rows

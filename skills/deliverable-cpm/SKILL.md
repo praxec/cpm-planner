@@ -233,6 +233,9 @@ Execute the selected variant's `plan_id`.
     `evidence` (a link or commit, appended to the list);
   - mark `complete` only when the artifact meets its acceptance criteria, with evidence. A
     report of done is not acceptance. Three explicit failures trip the circuit breaker.
+  - a lockless `in_progress` (owner or manual work, no lease) persists across server
+    restarts and is not leasable. Hand it back with a lockless `{"status": "ready"}` (or
+    another status) mark; `plan.force_release` does not affect it, since there is no lock.
 - **Close owner or manual work** with `plan.accept {plan_id, deliverable_id, accepted_by,
   evidence}`. Evidence is required. `override_lock: true` takes over a live lease, so use it
   only when the holder is gone. `plan.accept` records no hours. To record the actual cost

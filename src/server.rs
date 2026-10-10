@@ -737,7 +737,10 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                  Complete, Ready or InProgress requires all prerequisites \
                  complete (PREREQUISITES_INCOMPLETE) and is audited; other \
                  lockless marks are audited too, and an already-complete deliverable \
-                 cannot be changed (LOCK_NOT_HELD). Optional earned-value progress: \
+                 cannot be changed (LOCK_NOT_HELD). A lockless in_progress persists \
+                 across restarts and is not leasable; hand it back with a lockless \
+                 ready (or other status) mark. plan.force_release does not affect it. \
+                 Optional earned-value progress: \
                  earned_pct (0..100, only with in_progress; ignored with complete), \
                  actual_effort_hours (total so far, 0..1000000; replaces leased hours \
                  as actual cost) and evidence (<= 2048 chars, appended to a list of \

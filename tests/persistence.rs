@@ -1105,7 +1105,7 @@ async fn lease_held_in_progress_without_lock_is_still_quarantined_on_restart() {
 }
 
 #[tokio::test]
-async fn lease_taking_over_lockless_in_progress_is_quarantined_normally_after_expiry() {
+async fn lease_after_lockless_hand_back_is_quarantined_normally_after_expiry() {
     let db = TempDb::new();
     let ancient = Utc
         .with_ymd_and_hms(2020, 1, 1, 0, 0, 0)
@@ -1139,4 +1139,27 @@ async fn lease_taking_over_lockless_in_progress_is_quarantined_normally_after_ex
         status.deliverables[0],
         ("d1".to_string(), DeliverableStatus::Ready, 1, 0, 1)
     );
+}
+
+#[tokio::test]
+async fn revise_keeps_lockless_in_progress_flag() {
+    let db = TempDb::new();
+    let plan_id = lockless_in_progress_d1(&db.path, chain_graph()).await;
+    {
+        // Change only d2, so d1 survives with its status carried over.
+        let mut graph = chain_graph();
+        graph.deliverables[1].estimated_effort_hours = Some(2.0);
+        open_planner(&db.path)
+            .revise_plan(cpm_planner::plan::ReviseRequest::new(
+                plan_id.clone(),
+                graph,
+            ))
+            .await
+            .expect("revise");
+    }
+    let status = open_planner(&db.path)
+        .status(&plan_id)
+        .await
+        .expect("status after reopen");
+    assert_eq!(status.deliverables[0].1, DeliverableStatus::InProgress);
 }
