@@ -85,6 +85,29 @@ cargo install cpm-planner
 docker pull ghcr.io/praxec/cpm-planner
 ```
 
+## Quickstart: plan as code
+
+Write a plan as `.cpm-planner/plans/<name>/<variant>.json` (a `PlanGraph`):
+
+1. `plan.lint {path: ".cpm-planner/plans/checkout/main.json"}` — static checks, no state written.
+2. `plan.sync {path: ".cpm-planner/plans/checkout/main.json"}` — register the variant and return its `plan_id`.
+3. `plan.status {plan_id}` — schedule, critical path, ready set and locks.
+
+`plan.sync` tracks the file by content hash; `plan.status` reports
+`definition_drift` when the tracked file and the stored head graph disagree.
+
+## Quickstart: earned value
+
+Freeze the baseline, record progress, then read the report:
+
+1. `plan.baseline {plan_id}` — freeze the CPM schedule and budgets as baseline 1.
+2. `plan.mark_status {plan_id, deliverable_id, caller_id, status: {"status": "in_progress"}, earned_pct: 50, actual_effort_hours: 4}` — report progress and actual cost.
+3. `plan.ev {plan_id}` — PV, EV, AC, SV, CV, SPI, CPI, EAC and alerts.
+4. `plan.snapshot {plan_id, format: "markdown"}` — append the reading and export a Markdown table.
+
+A ratio with a zero denominator is `null` and explained in `undefined`; alerts
+(`SPI_BELOW_0_9`, `CPI_BELOW_0_9`) compare the two latest stored readings.
+
 ## Register as an MCP server
 
 cpm-planner speaks MCP over stdio. Register the `cpm-planner` command with your client. Every snippet below has an optional `env` block; drop it to use the defaults (see [Environment variables](#environment-variables)). Snippets use the bare command `cpm-planner`; if it is not on your `PATH` (or for any GUI client), use the absolute path the installer printed.
