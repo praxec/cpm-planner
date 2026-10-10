@@ -223,6 +223,40 @@ An agent can install and verify cpm-planner itself:
 
 To check a binary without any MCP client, download `scripts/mcp-smoke.mjs` from the repository and run `node mcp-smoke.mjs /absolute/path/to/cpm-planner`; it performs the MCP `initialize` and `tools/list` handshake and fails if `plan.submit`, `plan.status` or `plan.get` is missing.
 
+## Agent skill
+
+The `deliverable-cpm` skill teaches an agent the plan-as-code method this server is built
+for: deliverables as artifacts, consumption edges, lint, sync, levelling, the
+fork/compare/select improvement loop, leased execution and earned value. It lives in
+[`skills/deliverable-cpm/`](skills/deliverable-cpm/): `SKILL.md` plus a lint-clean example
+plan and a worked improvement loop. Install it by copying that directory into your agent's
+skills directory.
+
+| Agent | Skills directory |
+|---|---|
+| Claude Code, all projects | `~/.claude/skills/deliverable-cpm/` |
+| Claude Code, one project | `<project>/.claude/skills/deliverable-cpm/` |
+| Codex | `<project>/.agents/skills/deliverable-cpm/` |
+
+From the repository:
+
+```bash
+git clone --depth 1 https://github.com/praxec/cpm-planner.git
+mkdir -p ~/.claude/skills
+cp -R cpm-planner/skills/deliverable-cpm ~/.claude/skills/
+```
+
+From a release, use the tag's source archive. The binary archives contain only the binary.
+
+```bash
+curl -fsSL https://github.com/praxec/cpm-planner/archive/refs/tags/v0.1.0.tar.gz | tar -xz
+mkdir -p .agents/skills
+cp -R cpm-planner-0.1.0/skills/deliverable-cpm .agents/skills/
+```
+
+On Windows, use `Copy-Item -Recurse` in place of `cp -R`. Swap the destination for the
+directory from the table. Restart the agent, or start a new session, so it loads the skill.
+
 ## MCP tools
 
 | Tool | Does |
