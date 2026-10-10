@@ -30,16 +30,16 @@ curl -fsSL https://github.com/praxec/cpm-planner/releases/latest/download/instal
 irm https://github.com/praxec/cpm-planner/releases/latest/download/install.ps1 | iex
 ```
 
-Pin a release (shown for v0.0.3):
+Pin a release (shown for v0.1.0):
 
 ```sh
 # Linux / macOS
-curl -fsSL https://github.com/praxec/cpm-planner/releases/latest/download/install.sh | sh -s -- --version v0.0.3
+curl -fsSL https://github.com/praxec/cpm-planner/releases/latest/download/install.sh | sh -s -- --version v0.1.0
 
 # Windows (PowerShell): the piped form cannot take parameters, so use the environment variable...
-$env:PRAXEC_VERSION = 'v0.0.3'; irm https://github.com/praxec/cpm-planner/releases/latest/download/install.ps1 | iex
+$env:PRAXEC_VERSION = 'v0.1.0'; irm https://github.com/praxec/cpm-planner/releases/latest/download/install.ps1 | iex
 # ...or a script block
-& ([scriptblock]::Create((irm https://github.com/praxec/cpm-planner/releases/latest/download/install.ps1))) -Version v0.0.3
+& ([scriptblock]::Create((irm https://github.com/praxec/cpm-planner/releases/latest/download/install.ps1))) -Version v0.1.0
 ```
 
 If you would rather read the script before running it, download, inspect, then run:
@@ -48,14 +48,14 @@ If you would rather read the script before running it, download, inspect, then r
 # Linux / macOS
 curl -fsSLO https://github.com/praxec/cpm-planner/releases/latest/download/install.sh
 less install.sh
-sh install.sh --version v0.0.3
+sh install.sh --version v0.1.0
 ```
 
 ```powershell
 # Windows
 irm https://github.com/praxec/cpm-planner/releases/latest/download/install.ps1 -OutFile install.ps1
 Get-Content install.ps1
-.\install.ps1 -Version v0.0.3
+.\install.ps1 -Version v0.1.0
 ```
 
 The installers print the absolute path they installed to (for example `~/.local/bin/cpm-planner`) and, if that directory is not on your `PATH`, the exact line to add. Pass `--add-to-path` (`-AddToPath` on Windows) to have the installer do it for you (user-level only, never sudo). On Linux/macOS it appends to `~/.zshrc` (zsh), `~/.bash_profile` if it exists else `~/.bashrc` (bash), or `~/.profile` (other shells), only if the line is not already there; for fish it prints `fish_add_path <dir>` for you to run instead of writing a file. They only accept `https://` download URLs. After upgrading, restart your MCP client so it launches the new binary (on Windows the old exe is renamed to `cpm-planner.exe.old` and removed on the next run).
@@ -84,6 +84,32 @@ cargo install cpm-planner
 ```sh
 docker pull ghcr.io/praxec/cpm-planner
 ```
+
+## Quickstart: plan as code
+
+Write a plan as `.cpm-planner/plans/<name>/<variant>.json` (a `PlanGraph`):
+
+1. `plan.lint {path: ".cpm-planner/plans/checkout/main.json"}` — static checks, no state written.
+2. `plan.sync {path: ".cpm-planner/plans/checkout/main.json"}` — register the variant and return its `plan_id`.
+3. `plan.status {plan_id}` — schedule, critical path, ready set and locks.
+
+`plan.sync` tracks the file by content hash; `plan.status` reports
+`definition_drift` when the tracked file and the stored head graph disagree.
+
+## Quickstart: earned value
+
+Freeze the baseline, record progress, then read the report (`earned_pct` is earned in
+proportion under `earning_rule: "weighted"`; `fifty_fifty` credits 50% once a deliverable is in progress or has any
+reported `earned_pct`, and the default `zero_hundred`
+earns at completion):
+
+1. `plan.baseline {plan_id}` — freeze the CPM schedule and budgets as baseline 1.
+2. `plan.mark_status {plan_id, deliverable_id, caller_id, status: {"status": "in_progress"}, earned_pct: 50, actual_effort_hours: 4}` — report progress and actual cost.
+3. `plan.ev {plan_id}` — PV, EV, AC, SV, CV, SPI, CPI, EAC and alerts.
+4. `plan.snapshot {plan_id, format: "markdown"}` — append the reading and export a Markdown table.
+
+A ratio with a zero denominator is `null` and explained in `undefined`; alerts
+(`SPI_BELOW_0_9`, `CPI_BELOW_0_9`) compare the two latest stored readings.
 
 ## Register as an MCP server
 
@@ -223,6 +249,41 @@ An agent can install and verify cpm-planner itself:
 
 To check a binary without any MCP client, download `scripts/mcp-smoke.mjs` from the repository and run `node mcp-smoke.mjs /absolute/path/to/cpm-planner`; it performs the MCP `initialize` and `tools/list` handshake and fails if `plan.submit`, `plan.status` or `plan.get` is missing.
 
+## Agent skill
+
+The `deliverable-cpm` skill teaches an agent the plan-as-code method this server is built
+for: deliverables as artifacts, consumption edges, lint, sync, levelling, the
+fork/compare/select improvement loop, leased execution and earned value. It lives in
+[`skills/deliverable-cpm/`](skills/deliverable-cpm/): `SKILL.md` plus a lint-clean example
+plan and a worked improvement loop. Install it by copying that directory into your agent's
+skills directory.
+
+| Agent | Skills directory |
+|---|---|
+| Claude Code, all projects | `~/.claude/skills/deliverable-cpm/` |
+| Claude Code, one project | `<project>/.claude/skills/deliverable-cpm/` |
+| Codex, all projects | `~/.agents/skills/deliverable-cpm/` |
+| Codex, one project | `<project>/.agents/skills/deliverable-cpm/` |
+
+From the repository:
+
+```bash
+git clone --depth 1 https://github.com/praxec/cpm-planner.git
+mkdir -p ~/.claude/skills
+cp -R cpm-planner/skills/deliverable-cpm ~/.claude/skills/
+```
+
+From a release, use the tag's source archive. The binary archives contain only the binary.
+
+```bash
+curl -fsSL https://github.com/praxec/cpm-planner/archive/refs/tags/v0.1.0.tar.gz | tar -xz
+mkdir -p .agents/skills
+cp -R cpm-planner-0.1.0/skills/deliverable-cpm .agents/skills/
+```
+
+On Windows, use `Copy-Item -Recurse` in place of `cp -R`. Swap the destination for the
+directory from the table. Restart the agent, or start a new session, so it loads the skill.
+
 ## MCP tools
 
 | Tool | Does |
@@ -230,10 +291,10 @@ To check a binary without any MCP client, download `scripts/mcp-smoke.mjs` from 
 | `plan.submit` | Submit a task graph; returns a plan id (idempotent on the graph + caller). A prerequisite is a deliverable id string or an object `{id, consumes?, kind?: artifact\|interface, lag_hours?}`; both forms round-trip through `plan.get`. A deliverable may set `milestone: true` (an acceptance point, zero-length unless given an estimate or duration, reported in `plan.status` `milestones`). An optional `earning_rule` (`zero_hundred`, the default: 100% only when complete; `fifty_fifty`: 50% once in progress or any `earned_pct` is reported; `weighted`: the reported `earned_pct`) sets how earned value credits partial progress and is part of the plan's identity. A deliverable's optional `duration_hours` (calendar time) replaces effort as its scheduled length and a prerequisite's `lag_hours` delays the dependent's start; effort stays the cost basis. An optional `estimate` `{optimistic, likely, pessimistic}` (`0 <= optimistic <= likely <= pessimistic`) is a three-point effort estimate. Scheduled-length precedence: `duration_hours` > `estimated_effort_hours` > `estimate.likely` > 0 for a milestone > the estimator default; Monte Carlo samples the estimate only when neither `duration_hours` nor `estimated_effort_hours` is set. Limits: at most 5000 deliverables, and every hour value (effort, duration, lag, estimate) finite and between 0 and 1000000 (`INVALID_GRAPH`). With `name` (optional `project`/`variant`, variant defaults to `main`) it registers a named variant instead of an unnamed plan. |
 | `plan.acquire_cohort` | Atomically acquire up to N ready deliverables with mutually disjoint file sets (an `owned_files` entry may be `{path, mode: "append"}`; append claims on one path may be co-leased and appear in `shared_paths`; a file may be owned by several deliverables only if they are ordered by prerequisites, or all claims are append); optional `ttl_seconds` sets the lease TTL (clamped to the server maximum); optional `ids` and `filter.metadata` target deliverables; `metadata.kind = "manual"` deliverables are never leased; the response lists unleased candidates in `blocked` (with `blocked_count`, `needs_operator`). |
 | `plan.heartbeat` | Refresh the TTL on a held lock; optional `ttl_seconds` sets the new TTL (clamped to the server maximum). |
-| `plan.mark_status` | Mark a deliverable complete/failed; releases its lock. Without a lock, Complete requires complete prerequisites (`PREREQUISITES_INCOMPLETE`) and every lockless mark is audited. Optional earned-value progress: `earned_pct` (integer 0 to 100, only with `in_progress`; accepted and ignored with `complete`), `actual_effort_hours` (total effort so far, finite, 0 to 1000000; replaces leased hours as actual cost) and `evidence` (at most 2048 characters, appended to the deliverable's evidence list, which keeps at most 100 entries); violations are `INVALID_ACTUALS`, including a negative, fractional or over-100 `earned_pct`. `plan.select` copies the actuals of every deliverable whose Complete status it carries (leased hours add up, the carried deliverable's reported percent and hours win, the newest 100 evidence entries are kept). Every lease that ends (complete, failed, force release, expiry, accept override, forced revise/select/archive) adds its hours to the deliverable's leased hours; a lapsed lease counts up to its expiry. |
+| `plan.mark_status` | Mark a deliverable complete/failed; releases its lock. Without a lock, Complete requires complete prerequisites (`PREREQUISITES_INCOMPLETE`) and every lockless mark is audited. A lockless `in_progress` (owner or manual work) persists across server restarts and is not leasable; hand it back with a lockless `ready` (or any other status) mark. Optional earned-value progress: `earned_pct` (integer 0 to 100, only with `in_progress`; accepted and ignored with `complete`), `actual_effort_hours` (total effort so far, finite, 0 to 1000000; replaces leased hours as actual cost) and `evidence` (at most 2048 characters, appended to the deliverable's evidence list, which keeps at most 100 entries); violations are `INVALID_ACTUALS`, including a negative, fractional or over-100 `earned_pct`. `plan.select` copies the actuals of every deliverable whose Complete status it carries (leased hours add up, the carried deliverable's reported percent and hours win, the newest 100 evidence entries are kept). Every lease that ends (complete, failed, force release, expiry, accept override, forced revise/select/archive) adds its hours to the deliverable's leased hours; a lapsed lease counts up to its expiry. |
 | `plan.status` | Read-only snapshot of the plan and its locks. `critical_path` always runs `__start__` to `__finish__` (synthetic zero-effort endpoints; their `schedule` rows carry `synthetic: true`, and `__start__`/`__finish__` are reserved deliverable ids rejected with `INVALID_GRAPH`). `plan_complete` is true once every deliverable is Complete; the `plan.completed` audit event fires once when that happens. `milestones` has one row per deliverable with `milestone: true` (or legacy `metadata.milestone == true`): `id`, `critical_path` (longest chain from `__start__` to it), `hours` (its earliest finish) and `complete`. For a named variant it also reports `name`, `variant` and `selected`, and `definition_drift`: `null` (unknown) without a project root for the variant's project, without a tracked plan file, or when the file is missing, unreadable or over 8 MiB; otherwise `false` when the file's bytes match the last synced or exported hash or the file's graph equals the head graph (re-formatting is not drift), and `true` when the file's graph differs from the head (or does not parse). An inline `plan.revise`/`plan.sync` of a file-backed variant therefore reports `true` until the file is re-exported or re-synced. |
 | `plan.get` | Return the stored plan graph for a plan_id (read back what was submitted). |
-| `plan.force_release` | Operator escape hatch: release a lock regardless of holder/TTL; `reset_counters: true` also clears lapse/failure counters. |
+| `plan.force_release` | Operator escape hatch: release a lock regardless of holder/TTL; `reset_counters: true` also clears lapse/failure counters. A lockless `in_progress` has no lock, so `plan.force_release` leaves it as is; hand it back with a lockless `plan.mark_status`. |
 | `plan.accept` | Manager/owner acceptance: complete a deliverable without holding its lease (audited, with evidence). |
 | `plan.lint` | Static checks without submitting: cycles (with the loop), redundant edges, edges without rationale, interface edges not targeting a contract, deliverables feeding no milestone, and unordered file overlaps (#20). |
 | `plan.schedule` | Level a graph against resource capacities (`metadata.owner` by default): makespan, per-deliverable start/finish, per-resource load, the driving chain (dependency vs resource waits), and project/feeding buffers (#19). `capacities` is required: every resource carrying work needs at least 1 unit, otherwise `INVALID_CAPACITIES:` lists the missing resources. `project_buffer_pct` is 0 to 100 (default 25). |

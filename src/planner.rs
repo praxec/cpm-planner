@@ -1689,6 +1689,8 @@ impl Planner for BasicCpmPlanner {
                 *state.attempt_counts.entry(d.id.clone()).or_insert(0) += 1;
                 add_file_claims(&mut state.file_claims, &d.id, &d.owned_files);
                 state.locks.insert(d.id.clone(), lock.clone());
+                // In progress by lease from here on: a lost lock row is an orphan.
+                state.lockless.remove(&d.id);
                 audit_buf.push(make_acquired_event(&lock, &d.owned_files));
                 rows.push(CohortRow {
                     deliverable: d,
@@ -1869,6 +1871,17 @@ impl Planner for BasicCpmPlanner {
                     .failure_counts
                     .entry(deliverable_id.to_string())
                     .or_insert(0) += 1;
+            }
+
+            // Lease provenance for the startup sweep: a lockless
+            // in_progress mark is a legitimate persisted state (owner or
+            // manual work), not an orphan of a lost lease. Any other mark,
+            // or one under a held lease, clears it.
+            if status == DeliverableStatus::InProgress && !state.locks.contains_key(deliverable_id)
+            {
+                state.lockless.insert(deliverable_id.to_string());
+            } else {
+                state.lockless.remove(deliverable_id);
             }
 
             if is_complete {

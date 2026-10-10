@@ -7,8 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-10
+
+**Release notes: roadmap EV (dogfood).** We tracked cpm-planner's own roadmap with its
+earned-value tools on this release candidate, using a wall-clock baseline that starts
+2026-10-09T15:00Z. At 2026-10-10T02:24Z the readings are SPI 1.26, CPI 1.61 and EAC 17.08 h
+against a BAC of 27.5 h. Seven of the ten phases are accepted on merged PRs. The
+remaining-work makespan is 6 h (point estimates, so Monte Carlo gives no spread; the stored
+plan's P80 equals its 21 h deterministic makespan). Actual hours are commit-span
+approximations. For the method, caveats and known limitations, see
+[docs/ev/backlog-roadmap.md](docs/ev/backlog-roadmap.md).
+
 ### Added
 
+- Library: `cpm_planner::schedule::compute_cpm` is public.
 - `plan.sync` registers or updates one variant of a named plan line from a plan file (`.cpm-planner/plans/<name>/<variant>.json`) or an inline graph; files are tracked by content hash for drift.
 - `plan.list` lists a project's plan lines and variants (archived hidden unless `include_archived`).
 - `plan.export` writes a plan's head graph to its variant file or a confined path.
@@ -65,6 +77,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A deliverable marked `in_progress` by a lockless `plan.mark_status` (owner or manual work) now survives a server restart: the startup sweep no longer resets it to ready/pending, adds a lapse, or drops its earned percent. Only an `in_progress` that came from a lease and has lost its lock row is quarantined. Lease provenance is stored in the new `deliverable_statuses.lockless` column (schema v4); `in_progress` rows of a database migrated from v3 count as lease-backed, so they are quarantined as before.
 - `JevJudge` owns its HTTP client instead of rig's process-wide one, whose keep-alive connections could be handed to a judge on another tokio runtime and then stall until the timeout or fail at once as a `transport` error ("runtime dropped the dispatch task") (#37).
 - `plan.submit` accepts a file owned by deliverables ordered by prerequisites; only unordered exclusive overlaps are rejected (#12).
 - One lapse-limited deliverable no longer fails `plan.acquire_cohort` for the whole plan; it is reported in the new `blocked` list (#17).
@@ -86,7 +99,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Library API (breaking for library users): `Deliverable` gains the public field `earning_rule` and `MarkStatusRequest` the public fields `earned_pct`, `actual_effort_hours` and `evidence` (struct literals must set them); `PlannerError` gains `InvalidActuals` and `NotBaselined`; the `Planner` trait gains required methods `baseline`, `ev` and `snapshot` (breaks other implementors). New public module `earned_value` (`Baseline`, `BaselineRow`, `Calendar`, `Actuals`, `EvReport`, `EvRow`, `EvRowStatus`, `EvSummary`, `BaselineRequest`, `BaselineOutcome`, `SnapshotRequest`, `SnapshotOutcome`, `SnapshotSummary`, `SnapshotFormat`, `compute_ev`, `build_baseline`, `trend_alerts`, `render_snapshots_markdown`, …) and `plan::EarningRule`. Also new (#26): the `llm` module (`LlmConfig`, `ConfigError`, `JudgmentError` / `JudgmentErrorKind`, the `JudgmentModel` trait, `ApiKey`, `llm::jev::JevJudge`, `llm::openrouter::chat_client`); the `review` module (`review`, `ReviewRequest`, `ReviewReport`, `Judge`, findings, proposals and their constants); `PlanServer::with_judge` / `with_llm_config`; `BasicCpmPlanner::record_audit`; `TOOL_REVIEW` and `server::MAX_CONCURRENT_REVIEWS`.
 - The lease reaper and the startup quarantine re-derive a released deliverable's status with the single rule used by revision (`Ready` when every prerequisite is `Complete`, else `Pending`).
 - `definition_drift` compares the tracked file's graph with the head graph (re-formatting is not drift; an inline revise is drift until re-export or re-sync); an identical inline sync no longer resets the tracked file hash.
 - `plan.sync {path}` rejects a `name`, `variant` or `project` that contradicts the path; project keys reject invisible Unicode format characters (bidi overrides, zero-width, BOM, separators).
@@ -99,7 +111,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Monte Carlo rejects runs where `iterations × (deliverables + prerequisite edges)` exceeds 200000000 (`INVALID_GRAPH: monte carlo budget exceeded ...`).
 - `plan.schedule` / `plan.simulate` reject an out-of-range `project_buffer_pct` or `iterations` as invalid params before doing any work.
 - The CPM kernel, lint, leveling and Monte Carlo no longer do quadratic string-set work or recursion: a 5000-deliverable chain is handled in well under a second.
-- Library: `cpm_planner::schedule::compute_cpm` is public.
 - The scorecard's merge bias and cyclomatic complexity count distinct prerequisite ids; an empty plan scores criticality risk 0.
 - `plan.acquire_cohort` and `ready` order by longest remaining tail (smallest latest start), then float, then id (#19).
 - A lockless `plan.mark_status` to `ready` or `in_progress` now requires the deliverable's prerequisites to be complete (`PREREQUISITES_INCOMPLETE`), so dependency order can't be bypassed.
@@ -107,19 +118,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `critical_path` now includes the synthetic endpoints.
 - Completing a deliverable without a lease now requires its prerequisites to be complete and is audited.
 - `plan.acquire_cohort` no longer returns the `LAPSE_LIMIT` error; lapse-limited deliverables appear in `blocked[]` with code `LAPSE_LIMIT` and the response sets `needs_operator: true` (drivers matching on the error must read `blocked`).
+- A milestone is zero-length unless you give it an estimate or `duration_hours`; it is still an ordinary deliverable someone must complete (or accept).
+- `plan.acquire_cohort` prefers the least-float ready deliverables (then
+  earliest start, then id).
+- `plan.submit` rejects negative `estimated_effort_hours` with `INVALID_GRAPH`.
+
+### Breaking (library API)
+
+- The `Planner` trait gains required methods `sync_plan`, `list_plans`, `revision_graph`, `revise_plan`, `select_variant`, `archive`, `fork_plan`, `compare_plans` and `export_plan` (breaks other implementors); `PlannerError` gains `InvalidPath`, `InvalidCapacities`, `VariantNotSelected` and `ArchiveRefused` (breaks exhaustive matches); `Deliverable` gains the public field `estimate`.
+- `Deliverable` gains the public field `earning_rule` and `MarkStatusRequest` the public fields `earned_pct`, `actual_effort_hours` and `evidence` (struct literals must set them); `PlannerError` gains `InvalidActuals` and `NotBaselined`; the `Planner` trait gains required methods `baseline`, `ev` and `snapshot` (breaks other implementors). New public module `earned_value` (`Baseline`, `BaselineRow`, `Calendar`, `Actuals`, `EvReport`, `EvRow`, `EvRowStatus`, `EvSummary`, `BaselineRequest`, `BaselineOutcome`, `SnapshotRequest`, `SnapshotOutcome`, `SnapshotSummary`, `SnapshotFormat`, `compute_ev`, `build_baseline`, `trend_alerts`, `render_snapshots_markdown`, …) and `plan::EarningRule`. Also new (#26): the `llm` module (`LlmConfig`, `ConfigError`, `JudgmentError` / `JudgmentErrorKind`, the `JudgmentModel` trait, `ApiKey`, `llm::jev::JevJudge`, `llm::openrouter::chat_client`); the `review` module (`review`, `ReviewRequest`, `ReviewReport`, `Judge`, findings, proposals and their constants); `PlanServer::with_judge` / `with_llm_config`; `BasicCpmPlanner::record_audit`; `TOOL_REVIEW` and `server::MAX_CONCURRENT_REVIEWS`.
 - Library: `Deliverable.prerequisites` is `Vec<Prerequisite>`.
 - Library: `Deliverable` gains public `duration_hours` and `milestone`; `Task` gains `lag_by_dependency` and its `effort_hours` means scheduled length; `PlanStatus` gains `plan_complete` and `milestones`; `ScheduleRow` gains `synthetic`; new public types `Prerequisite`, `PrerequisiteKind`, `OwnedFile`, `FileMode`, `MilestoneRow` and consts `START_ID`, `FINISH_ID`.
-- A milestone is zero-length unless you give it an estimate or `duration_hours`; it is still an ordinary deliverable someone must complete (or accept).
 - Library: `Deliverable.owned_files` is `Vec<OwnedFile>`; `Cohort` gains `shared_paths`.
 - Library: `Planner` gains required method `accept`; `Cohort` gains public field `blocked`; `PlannerError` gains `PrerequisitesIncomplete` (breaks exhaustive matches); new `DEFAULT_MAX_TTL` / `BasicCpmPlanner::with_max_ttl`.
 - Library: `Planner` methods `acquire_cohort`, `mark_status`, `heartbeat`,
   `force_release` take request structs (`AcquireRequest`, `MarkStatusRequest`,
   `HeartbeatRequest`, `ForceReleaseRequest`).
-- `plan.acquire_cohort` prefers the least-float ready deliverables (then
-  earliest start, then id).
-- `plan.submit` rejects negative `estimated_effort_hours` with `INVALID_GRAPH`.
 - Library: the `Planner` trait gains the required method `get_plan`;
   `CriticalPathResult` gains the public field `critical_ids`.
+
+## [0.0.2] - 2026-07-22
+
+### Added
+
+- Durable SQLite persistence for plans, statuses and leases, and a retry circuit breaker for repeatedly failing deliverables (#2).
+
+### Fixed
+
+- The circuit breaker counts only explicit failures; environmental lease lapses no longer burn breaker lives (#4).
 
 ## [0.0.1] - 2026-06-17
 
@@ -134,4 +160,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Six-tool MCP surface: `plan.submit`, `plan.acquire_cohort`, `plan.heartbeat`,
   `plan.mark_status`, `plan.status`, and `plan.force_release`.
 
+[Unreleased]: https://github.com/praxec/cpm-planner/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/praxec/cpm-planner/compare/v0.0.2...v0.1.0
+[0.0.2]: https://github.com/praxec/cpm-planner/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/praxec/cpm-planner/releases/tag/v0.0.1
