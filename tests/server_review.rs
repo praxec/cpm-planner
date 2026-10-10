@@ -483,6 +483,7 @@ async fn review_audit_event_omits_the_prompt() {
         vec![
             "code",
             "endpoint",
+            "failure_class",
             "jev_called",
             "model",
             "plan_id",
@@ -596,7 +597,14 @@ async fn misplaced_key_in_config_vars_is_never_logged_or_returned() {
                 .to_string(),
         );
     }
-    assert!(!format!("{}{output}", logs.text()).contains(SENTINEL));
+    let logs = logs.text();
+    assert_eq!(
+        (
+            logs.contains("LLM configuration unusable"),
+            format!("{logs}{output}").contains(SENTINEL)
+        ),
+        (true, false)
+    );
 }
 
 #[tokio::test]
@@ -719,4 +727,124 @@ async fn third_concurrent_review_waits_for_a_slot() {
         r.await.unwrap();
     }
     assert_eq!(entered_while_two_held, 2);
+}
+
+// ---------------------------------------------------------------- final review
+
+fn capture_logs() -> (LogCapture, tracing::subscriber::DefaultGuard) {
+    let logs = LogCapture::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(move || writer.clone())
+        .finish();
+    (logs, tracing::subscriber::set_default(subscriber))
+}
+
+#[tokio::test]
+async fn key_pasted_into_model_var_is_rejected_and_never_logged() {
+    let (logs, _guard) = capture_logs();
+    let config = LlmConfig::from_lookup(|name| match name {
+        "OPENROUTER_API_KEY" | "CPM_JEV_MODEL" => Some(SENTINEL.to_string()),
+        _ => None,
+    });
+    let rejected = matches!(config, Err(ConfigError::InvalidModel { .. }));
+    let server = PlanServer::new(Arc::new(BasicCpmPlanner::new())).with_llm_config(config);
+    let output = review(&server, json!({ "graph": graph() }))
+        .await
+        .to_string();
+    let logs = logs.text();
+    assert_eq!(
+        (
+            rejected,
+            logs.contains("LLM configuration unusable"),
+            format!("{logs}{output}").contains(SENTINEL)
+        ),
+        (true, true, false)
+    );
+}
+
+#[tokio::test]
+async fn review_audit_records_the_failure_class_of_a_judge_failure() {
+    let mock = mock_replying(401).await;
+    let (server, sink) = audited_server(jev_judge(&mock));
+    review(&server, json!({ "graph": graph() })).await;
+    let event = review_events(&sink).pop().unwrap();
+    assert_eq!(event["failure_class"], json!("unauthorized"));
+}
+
+#[tokio::test]
+async fn review_audit_failure_class_is_null_without_a_judge_failure() {
+    let (server, sink) = audited_server(Arc::new(FakeJudge { noul: 0.0 }));
+    review(&server, json!({ "graph": graph() })).await;
+    let event = review_events(&sink).pop().unwrap();
+    assert_eq!(event["failure_class"], Value::Null);
+}
+
+#[tokio::test]
+async fn review_of_unknown_plan_is_audited_with_its_code() {
+    let (server, sink) = audited_server(Arc::new(FakeJudge { noul: 0.0 }));
+    let _ = server
+        .dispatch_call(call_args(TOOL_REVIEW, json!({ "plan_id": "nope" })))
+        .await;
+    let event = review_events(&sink).pop().unwrap();
+    assert_eq!(
+        (event["status"].clone(), event["code"].clone()),
+        (json!("error"), json!("PLAN_NOT_FOUND"))
+    );
+}
+
+#[tokio::test]
+async fn review_of_path_without_root_is_audited_with_its_code() {
+    let (server, sink) = audited_server(Arc::new(FakeJudge { noul: 0.0 }));
+    let _ = server
+        .dispatch_call(call_args(
+            TOOL_REVIEW,
+            json!({ "path": ".cpm-planner/plans/a/main.json" }),
+        ))
+        .await;
+    let event = review_events(&sink).pop().unwrap();
+    assert_eq!(
+        (event["status"].clone(), event["code"].clone()),
+        (json!("error"), json!("INVALID_PATH"))
+    );
+}
+
+#[tokio::test]
+async fn rejected_params_are_not_audited() {
+    let (server, sink) = audited_server(Arc::new(FakeJudge { noul: 0.0 }));
+    let _ = server
+        .dispatch_call(call_args(
+            TOOL_REVIEW,
+            json!({ "graph": graph(), "plan_id": "p" }),
+        ))
+        .await;
+    assert_eq!(review_events(&sink).len(), 0);
+}
+
+#[tokio::test]
+async fn review_without_judge_does_not_wait_for_a_slot() {
+    let judge = Arc::new(SlotJudge::default());
+    let shared: Arc<dyn JudgmentModel> = judge.clone();
+    let server = server_with(Some(shared));
+    let holders: Vec<_> = (0..2)
+        .map(|_| {
+            let server = server.clone();
+            tokio::spawn(async move { review(&server, json!({ "graph": graph() })).await })
+        })
+        .collect();
+    while judge.entered.load(Ordering::SeqCst) < 2 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Lint errors: the judge will not be called, so no slot is needed.
+    let lint_only = tokio::time::timeout(
+        Duration::from_secs(5),
+        review(&server, json!({ "graph": cyclic_graph() })),
+    )
+    .await;
+    judge.release();
+    for h in holders {
+        h.await.unwrap();
+    }
+    assert!(lint_only.is_ok());
 }

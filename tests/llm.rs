@@ -744,3 +744,83 @@ fn invalid_timeout_error_never_echoes_the_value() {
     .unwrap_err();
     assert!(!format!("{err} {err:?}").contains(SENTINEL));
 }
+
+// ---------------------------------------------------------------- final review
+
+#[test]
+fn jev_model_with_a_disallowed_character_is_rejected() {
+    let err = LlmConfig::from_lookup(lookup(&[
+        ("OPENROUTER_API_KEY", SENTINEL),
+        ("CPM_JEV_MODEL", "typesafe/jev 1.13"),
+    ]))
+    .unwrap_err();
+    assert!(matches!(err, ConfigError::InvalidModel { .. }));
+}
+
+#[test]
+fn jev_model_over_128_chars_is_rejected() {
+    let long = "m".repeat(129);
+    let err = LlmConfig::from_lookup(lookup(&[
+        ("OPENROUTER_API_KEY", SENTINEL),
+        ("CPM_JEV_MODEL", &long),
+    ]))
+    .unwrap_err();
+    assert!(matches!(err, ConfigError::InvalidModel { .. }));
+}
+
+#[test]
+fn jev_model_with_namespace_and_version_is_accepted() {
+    let cfg = LlmConfig::from_lookup(lookup(&[
+        ("OPENROUTER_API_KEY", SENTINEL),
+        ("CPM_JEV_MODEL", "typesafe/jev-1.13:beta_2"),
+    ]))
+    .unwrap()
+    .unwrap();
+    assert_eq!(cfg.jev_model(), "typesafe/jev-1.13:beta_2");
+}
+
+#[test]
+fn invalid_model_review_reason_names_the_variable_only() {
+    let err = LlmConfig::from_lookup(lookup(&[
+        ("OPENROUTER_API_KEY", "k"),
+        ("CPM_JEV_MODEL", "bad model!"),
+    ]))
+    .unwrap_err();
+    assert!(
+        err.review_reason().starts_with("CPM_JEV_MODEL invalid: ")
+            && !err.review_reason().contains("bad model")
+    );
+}
+
+#[tokio::test]
+async fn provider_model_echoing_the_key_is_scrubbed() {
+    let body = json!({
+        "model": format!("typesafe/{SENTINEL}"),
+        "answers": { "dep_real": { "type": "noul", "noul": 0.82 } }
+    });
+    let decisions = decide_with(ResponseTemplate::new(200).set_body_json(body))
+        .await
+        .unwrap();
+    assert!(!decisions.model.contains(SENTINEL));
+}
+
+#[tokio::test]
+async fn transport_error_never_echoes_the_endpoint_query() {
+    // A port nothing listens on: the connection is refused (Transport).
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let cfg = config_with_key()
+        .with_timeout(Duration::from_secs(5))
+        .with_jev_endpoint(format!(
+            "http://127.0.0.1:{port}/v1/systemone?token=QUERY-SECRET-91f2#FRAG-SECRET-77"
+        ));
+    let err = JevJudge::new(&cfg)
+        .decide(state(), noul_question())
+        .await
+        .unwrap_err();
+    let text = format!("{err} {err:?}");
+    assert!(!text.contains("-SECRET-"), "{text}");
+}

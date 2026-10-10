@@ -45,6 +45,10 @@ pub const LLM_MODEL_ENV: &str = "CPM_LLM_MODEL";
 pub const DEFAULT_JEV_MODEL: &str = "typesafe/jev-1.13";
 /// Default Jev endpoint: OpenRouter's System One route.
 pub const DEFAULT_JEV_ENDPOINT: &str = "https://openrouter.ai/api/v1/systemone";
+/// Longest accepted [`JEV_MODEL_ENV`] value, in chars.
+pub const MAX_MODEL_ID_CHARS: usize = 128;
+/// Longest provider-reported model id kept in a review, in chars.
+pub const MAX_REPORTED_MODEL_CHARS: usize = 64;
 /// Default per-call timeout, seconds.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// Inclusive bounds for [`LLM_TIMEOUT_ENV`], seconds.
@@ -125,6 +129,11 @@ pub enum ConfigError {
          without credentials: {reason}"
     )]
     InvalidEndpoint { reason: String },
+    /// `CPM_JEV_MODEL` is not a plausible model id (at most
+    /// [`MAX_MODEL_ID_CHARS`] chars of `[A-Za-z0-9._:/-]`), or it contains
+    /// the configured key. The value is not kept.
+    #[error("{JEV_MODEL_ENV} {reason}")]
+    InvalidModel { reason: &'static str },
     /// `CPM_OPENROUTER_KEY_FILE` names something that cannot be used as a
     /// key file (missing, unreadable, not a regular file, too large). The
     /// path is not kept.
@@ -146,6 +155,7 @@ impl ConfigError {
                 "{LLM_TIMEOUT_ENV} invalid: must be an integer number of seconds in 1..=300"
             ),
             Self::InvalidEndpoint { reason } => format!("{JEV_ENDPOINT_ENV} invalid: {reason}"),
+            Self::InvalidModel { reason } => format!("{JEV_MODEL_ENV} invalid: {reason}"),
             Self::KeyFile { reason } => {
                 format!("key file unreadable: {reason} ({OPENROUTER_KEY_FILE_ENV})")
             }
@@ -237,7 +247,7 @@ impl LlmConfig {
             .with_jev_endpoint(jev_endpoint)
             .with_timeout(timeout);
         if let Some(model) = non_blank(JEV_MODEL_ENV) {
-            config.jev_model = model.trim().to_string();
+            config.jev_model = parse_model(model.trim(), &config.api_key)?;
         }
         if let Some(model) = non_blank(LLM_MODEL_ENV) {
             config.llm_model = model.trim().to_string();
@@ -304,6 +314,25 @@ fn parse_timeout(raw: &str) -> Result<Duration, ConfigError> {
         .filter(|secs| TIMEOUT_SECS_RANGE.contains(secs))
         .map(Duration::from_secs)
         .ok_or(ConfigError::InvalidTimeout)
+}
+
+/// A model id: 1..=[`MAX_MODEL_ID_CHARS`] chars of `[A-Za-z0-9._:/-]`, not
+/// containing `key`.
+fn parse_model(raw: &str, key: &ApiKey) -> Result<String, ConfigError> {
+    let invalid = |reason| Err(ConfigError::InvalidModel { reason });
+    if raw.chars().count() > MAX_MODEL_ID_CHARS {
+        return invalid("must be at most 128 characters");
+    }
+    if !raw
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '/' | '-'))
+    {
+        return invalid("may only contain A-Z a-z 0-9 . _ : / -");
+    }
+    if !key.expose().is_empty() && raw.contains(key.expose()) {
+        return invalid("must not contain the OpenRouter key");
+    }
+    Ok(raw.to_string())
 }
 
 fn parse_endpoint(raw: &str) -> Result<String, ConfigError> {

@@ -20,7 +20,8 @@
 //!    **truncation** to the question cap, round-robin across kinds.
 //! 7. **One** [`JudgmentModel::decide`] call with every selected question
 //!    and one shared state. No candidates means no call. A judge failure
-//!    returns `review_unavailable` with `"<class>: <safe message>"`.
+//!    returns `review_unavailable` with `"<class>: <safe message>"` and
+//!    `failure_class` set to the class.
 //! 8. **Findings** from the answers, **proposals** from the confident ones,
 //!    each **verified** by [`apply_edits`] + [`simulate`] and dropped unless
 //!    it lints clean and saves time; then **ranking**.
@@ -302,6 +303,10 @@ pub struct ReviewReport {
     pub status: ReviewStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The judge failure's class ([`crate::llm::JudgmentErrorKind::as_str`],
+    /// e.g. `unauthorized`, `timeout`) when the judge was called and failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<String>,
     pub lint: LintReport,
     pub findings: Vec<ReviewFinding>,
     pub proposals: Vec<Proposal>,
@@ -326,6 +331,7 @@ impl ReviewReport {
         Self {
             status,
             reason,
+            failure_class: None,
             lint,
             findings: Vec::new(),
             proposals: Vec::new(),
@@ -436,6 +442,7 @@ pub async fn review(
         Err(error) => {
             report.status = ReviewStatus::ReviewUnavailable;
             report.reason = Some(error.to_string());
+            report.failure_class = Some(error.kind().as_str().to_string());
             return Ok(report);
         }
     };

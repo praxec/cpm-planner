@@ -70,10 +70,39 @@ impl JevJudge {
         super::endpoint_host(&self.endpoint)
     }
 
-    /// A tool-facing error: scrubbed, then capped at
+    /// A tool-facing error: endpoint query/fragment removed, scrubbed of the
+    /// key, then capped at
     /// [`MAX_ERROR_MESSAGE_CHARS`](super::MAX_ERROR_MESSAGE_CHARS).
     fn error(&self, kind: JudgmentErrorKind, message: impl AsRef<str>) -> JudgmentError {
-        JudgmentError::scrubbed(kind, message, &self.key)
+        JudgmentError::scrubbed(kind, self.redact_endpoint(message.as_ref()), &self.key)
+    }
+
+    /// `text` with the configured endpoint's query string and fragment
+    /// replaced by [`REDACTED`](super::REDACTED): transport errors quote the
+    /// request URL, and a query may carry a token.
+    fn redact_endpoint(&self, text: &str) -> String {
+        let Ok(url) = url::Url::parse(&self.endpoint) else {
+            return text.to_string();
+        };
+        let mut out = text.to_string();
+        for part in [url.query(), url.fragment()].into_iter().flatten() {
+            if !part.is_empty() {
+                out = out.replace(part, super::REDACTED);
+            }
+        }
+        // The raw endpoint may differ from the parsed form (encoding).
+        if let Some((_, rest)) = self.endpoint.split_once(['?', '#']) {
+            for part in rest.split(['?', '#']).filter(|p| !p.is_empty()) {
+                out = out.replace(part, super::REDACTED);
+            }
+        }
+        out
+    }
+
+    /// [`ApiKey::excerpt`] of `text` with the endpoint redacted, for logs.
+    fn log_excerpt(&self, text: &str) -> String {
+        self.key
+            .excerpt(&self.redact_endpoint(text), BODY_LOG_CHARS)
     }
 
     /// The upstream body goes to the debug log only (scrubbed, then cut);
@@ -86,7 +115,7 @@ impl JevJudge {
         let status = reply.status.map(|s| s.as_u16());
         tracing::debug!(
             ?status,
-            body = ?self.key.excerpt(reply.body.trim(), BODY_LOG_CHARS),
+            body = ?self.log_excerpt(reply.body.trim()),
             "jev upstream error reply"
         );
         match status {
@@ -104,7 +133,7 @@ impl JevJudge {
         error: &ProviderError,
     ) -> JudgmentError {
         tracing::debug!(
-            detail = ?self.key.excerpt(&error.to_string(), BODY_LOG_CHARS),
+            detail = ?self.log_excerpt(&error.to_string()),
             "jev provider failure"
         );
         self.error(kind, summary)
@@ -176,7 +205,10 @@ impl JudgmentModel for JevJudge {
             .map_err(|e| self.classify(&e))?;
         Ok(Decisions {
             answers: result.answers,
-            model: result.model,
+            // Provider-authored: scrubbed of the key, then cut.
+            model: self
+                .key
+                .excerpt(&result.model, super::MAX_REPORTED_MODEL_CHARS),
             usage: result.usage,
         })
     }

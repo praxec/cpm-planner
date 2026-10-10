@@ -1733,21 +1733,44 @@ impl PlanServer {
         } = parse_args(args)?;
         let request = review_request(capacities, resource_key, project_buffer_pct, max_questions)?;
         let audited_plan_id = plan_id.clone();
-        let graph = self.resolve_graph(graph, plan_id, path).await?;
-        let _slot = self
-            .review_slots
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| McpError::internal_error("review task failed", None))?;
+        let graph = match self.resolve_graph(graph, plan_id, path).await {
+            Ok(graph) => graph,
+            Err(err) => {
+                // A selector mistake is a rejected param (unaudited); a
+                // missing plan or bad path is a failed review.
+                if err.code != rmcp::model::ErrorCode::INVALID_PARAMS {
+                    let event =
+                        review_audit_event(Err(mcp_error_code(&err)), audited_plan_id, None);
+                    self.planner.record_audit(event).await;
+                }
+                return Err(err);
+            }
+        };
         let judge = self.judge.clone();
         let configured_model = judge.configured_model();
+        let slots = self.review_slots.clone();
         let runtime = tokio::runtime::Handle::current();
         let outcome = spawn_analysis("review", move || {
+            // Wait for a slot only when the judge will be asked: no key, an
+            // unusable config or lint errors end the review before any
+            // call. The permit lives in this closure, so it is held until
+            // the review ends even if the caller's future is dropped.
+            let calls_judge = matches!(judge, ReviewJudge::Model(_))
+                && !crate::lint::lint(&graph)
+                    .findings
+                    .iter()
+                    .any(|f| f.severity == crate::lint::Severity::Error);
+            let _slot = calls_judge
+                .then(|| runtime.block_on(slots.acquire_owned()).ok())
+                .flatten();
             runtime.block_on(crate::review::review(&graph, &request, judge.as_judge()))
         })
         .await?;
-        let event = review_audit_event(&outcome, audited_plan_id, configured_model);
+        let audit_outcome = match &outcome {
+            Ok(report) => Ok(report),
+            Err(err) => Err(Some(error_code(err))),
+        };
+        let event = review_audit_event(audit_outcome, audited_plan_id, configured_model);
         self.planner.record_audit(event).await;
         to_value(&outcome.map_err(planner_error_to_mcp)?)
     }
@@ -1792,10 +1815,11 @@ fn review_request(
 
 /// The `plan.review` audit record: what was asked of whom and the outcome,
 /// never the key or the prompt (only its hash). `model` is the provider's,
-/// else the configured one when the judge was called; an engine error is
-/// status `"error"` with its stable `code` (the `PlannerError` prefix).
+/// else the configured one when the judge was called; a failed review
+/// (`Err`, engine or graph-resolution error) is status `"error"` with its
+/// stable `code` (the error prefix, e.g. `PLAN_NOT_FOUND`).
 fn review_audit_event(
-    outcome: &Result<ReviewReport, PlannerError>,
+    outcome: Result<&ReviewReport, Option<String>>,
     plan_id: Option<String>,
     configured_model: Option<String>,
 ) -> AuditEvent {
@@ -1803,6 +1827,7 @@ fn review_audit_event(
         Ok(report) => json!({
             "status": report.status,
             "code": null,
+            "failure_class": report.failure_class,
             "plan_id": plan_id,
             "question_count": report.question_count,
             "prompt_hash": report.prompt_hash,
@@ -1810,9 +1835,10 @@ fn review_audit_event(
             "endpoint": report.endpoint,
             "jev_called": report.jev_called,
         }),
-        Err(err) => json!({
+        Err(code) => json!({
             "status": "error",
-            "code": error_code(err),
+            "code": code,
+            "failure_class": null,
             "plan_id": plan_id,
             "question_count": 0,
             "prompt_hash": null,
@@ -1822,6 +1848,14 @@ fn review_audit_event(
         }),
     };
     AuditEvent::new("plan.review").with_payload(payload)
+}
+
+/// The stable prefix of an MCP error's message (`PLAN_NOT_FOUND`,
+/// `INVALID_PATH`, …), when it has one.
+fn mcp_error_code(err: &McpError) -> Option<String> {
+    let (prefix, _) = err.message.split_once(':')?;
+    (!prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_uppercase() || c == '_'))
+        .then(|| prefix.to_string())
 }
 
 /// The stable prefix of a [`PlannerError`] (`INVALID_CAPACITIES`, …).
