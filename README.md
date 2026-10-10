@@ -279,11 +279,17 @@ reports `review_unavailable` with a reason naming the setting.
 - **Cost.** Each `plan.review` call that reaches the judge is one billed
   OpenRouter request; Jev costs about $0.042 per million input tokens on
   OpenRouter. Each report carries the provider's `usage` when given. At most 2
-  reviews run at once per server; further calls wait for a slot.
+  reviews that call the judge run at once per server; further calls wait for a
+  slot (reviews that end before the call, such as no key or lint errors, never
+  wait).
 - **Privacy.** This is everything sent to OpenRouter in that one request:
   - a fixed task sentence, the plan makespan and the critical path (ids);
   - the questions: for each, its kind, the deliverable ids it names, and a
-    question sentence that quotes those ids;
+    question sentence that quotes those ids and, depending on the kind, the
+    prerequisite's `consumes` text, the deliverable's scheduled hours, the
+    plan's median scheduled hours, and the heuristic signals that raised a
+    missing-dependency question (a description mentions the other, files in
+    the same or nested directories, a shared `metadata.owner`);
   - for every deliverable a question names: its id, scheduled hours, float
     hours, `critical` and `milestone` flags, owned file paths (sent in full,
     not truncated), prerequisites (id, `consumes`, kind) and its
@@ -294,12 +300,17 @@ reports `review_unavailable` with a reason naming the setting.
   estimates) is sent. Do not review plans whose contents you may not share
   with OpenRouter.
 - **Audit.** The key is never logged or returned, and neither is a misplaced
-  value of any LLM variable. Each review (whatever its outcome, except
-  rejected params) records one `plan.review` audit event with exactly these
-  fields:
+  value of any LLM variable. Every `plan.review` call records one
+  `plan.review` audit event, whatever its outcome (including a missing plan,
+  a bad path or a failed review); the only unaudited case is a call rejected
+  for its params (`invalid_params`). The event has exactly these fields:
   - `status`: `ok`, `review_unavailable`, `invalid_graph`, or `error` (the
-    review failed, e.g. `INVALID_CAPACITIES`);
+    review failed: `PLAN_NOT_FOUND`, `INVALID_PATH`, `INVALID_CAPACITIES`, …);
   - `code`: the error prefix for `error`, else null;
+  - `failure_class`: for a `review_unavailable` caused by a failed judge call,
+    its class (`unauthorized`, `rate_limited`, `timeout`, `upstream`,
+    `decode`, `transport`, `invalid_request`); null otherwise (including no
+    key and an unusable LLM setting);
   - `plan_id`: the stored plan reviewed, null for an inline `graph` or `path`;
   - `question_count`: questions sent (0 when the judge was not called);
   - `jev_called`: whether the judge was called;
@@ -308,7 +319,7 @@ reports `review_unavailable` with a reason naming the setting.
   - `model`: the model the provider reported, else the configured model when
     the call failed; null when the judge was not called;
   - `endpoint`: the judge endpoint's host; null when no judge is configured,
-    lint found errors, or the review failed with `error`.
+    lint found errors, or the review ended in `error`.
 
   The prompt itself is never recorded.
 
@@ -372,7 +383,7 @@ Set these in a client's `env` block (or `-e`/`--env` flag, or `docker run -e`). 
 | `CPM_MAX_TTL_SECS` | `28800` (8h) | Server-side ceiling for `ttl_seconds` on `plan.acquire_cohort` and `plan.heartbeat`; larger requested values are clamped. Must be a positive integer — any other value aborts startup. |
 | `OPENROUTER_API_KEY` | unset | OpenRouter key for `plan.review`. Unset or blank: `plan.review` reports `review_unavailable` ("no OpenRouter key configured"). Never logged or returned. |
 | `CPM_OPENROUTER_KEY_FILE` | unset | File holding the OpenRouter key (contents trimmed; at most 4096 bytes), used when `OPENROUTER_API_KEY` is unset. On unix a world-readable (`o+r`) or empty file is ignored with a warning (`chmod 600` it). |
-| `CPM_JEV_MODEL` | `typesafe/jev-1.13` | Jev model id for `plan.review`. |
+| `CPM_JEV_MODEL` | `typesafe/jev-1.13` | Jev model id for `plan.review`: at most 128 characters of `A-Z a-z 0-9 . _ : / -`, and never containing the key; anything else is logged (naming the variable, not the value) and makes `plan.review` unavailable. |
 | `CPM_JEV_ENDPOINT` | `https://openrouter.ai/api/v1/systemone` | Jev endpoint URL: `https://`, or `http://` only for a loopback host, with no credentials. |
 | `CPM_LLM_TIMEOUT_SECS` | `30` | Bound on each LLM call, integer seconds in 1..=300. |
 | `CPM_LLM_MODEL` | `openai/gpt-5-mini` | Generative (chat) model id; not used by any tool yet. |
