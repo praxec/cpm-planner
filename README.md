@@ -1,20 +1,40 @@
 # cpm-planner
 
 [![CI](https://github.com/praxec/cpm-planner/actions/workflows/ci.yml/badge.svg)](https://github.com/praxec/cpm-planner/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/cpm-planner.svg)](https://crates.io/crates/cpm-planner)
-[![docs.rs](https://docs.rs/cpm-planner/badge.svg)](https://docs.rs/cpm-planner)
+[![Release](https://img.shields.io/github/v/release/praxec/cpm-planner)](https://github.com/praxec/cpm-planner/releases/latest)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-cpm-planner is a Critical Path Method (CPM) planner exposed as an MCP server. You
-submit a task graph; it computes the schedule — earliest/latest start and finish,
-slack, the critical path, and the bottleneck tasks that actually gate completion —
-and it coordinates **lock-aware cohort scheduling** so multiple workers can run
-disjoint deliverables in parallel without colliding. Any MCP client (Claude Code,
-Cursor, a custom orchestrator, or an [praxec](https://github.com/praxec/praxec)
-workflow) drives it over the standard protocol.
+cpm-planner is a Critical Path Method (CPM) planner for agent work, exposed as an
+MCP server. You submit a task graph and it computes the schedule: earliest and
+latest start and finish, slack, the critical path and the bottleneck tasks that
+gate completion. It then leases **lock-aware cohorts** of ready deliverables with
+disjoint file sets, so several workers can run in parallel without colliding.
+Plans can live in the repository as plan-as-code files with forkable, comparable
+variants; read-only tools lint, level against resource capacities and run Monte
+Carlo risk; earned-value tools track PV, EV, AC, SPI and CPI against a frozen
+baseline; and an optional AI review proposes verified schedule improvements. Any
+MCP client (Claude Code, Cursor, VS Code, Codex, a custom orchestrator, or a
+[praxec](https://github.com/praxec/praxec) workflow) drives it over stdio. It is a
+standalone tool with no dependency on praxec.
 
-It is a standalone tool: it has no dependency on praxec and is consumed
-purely over MCP.
+## Contents
+
+- [Install](#install)
+  - [Prebuilt binary (recommended)](#prebuilt-binary-recommended)
+  - [From source](#from-source)
+  - [Docker](#docker)
+  - [For AI agents](#for-ai-agents)
+- [Quickstart: plan as code](#quickstart-plan-as-code)
+- [Quickstart: earned value](#quickstart-earned-value)
+- [Register as an MCP server](#register-as-an-mcp-server)
+- [Agent skill](#agent-skill)
+- [MCP tools](#mcp-tools)
+- [Use as a library](#use-as-a-library)
+- [Use with an MCP client (e.g. praxec)](#use-with-an-mcp-client-eg-praxec)
+- [Using it with Praxec](#using-it-with-praxec)
+- [Environment variables](#environment-variables)
+- [Documentation](#documentation)
+- [License](#license)
 
 ## Install
 
@@ -75,15 +95,27 @@ All assets are at <https://github.com/praxec/cpm-planner/releases/latest>.
 
 ### From source
 
+Build and install a tagged release with Cargo (Rust 1.99 or newer):
+
 ```sh
-cargo install cpm-planner
+cargo install --git https://github.com/praxec/cpm-planner --tag v0.1.1 --locked
 ```
+
+The crates.io listing lags behind the GitHub releases until the next
+`cargo publish`, so `cargo install cpm-planner` does not give you the current
+version yet; install from the tag as above.
 
 ### Docker
 
 ```sh
 docker pull ghcr.io/praxec/cpm-planner
 ```
+
+### For AI agents
+
+An agent can install and register cpm-planner by itself: see
+[Agent self-install](#agent-self-install) below. A dedicated agent install guide,
+`docs/AGENT-INSTALL.md`, is coming in this release.
 
 ## Quickstart: plan as code
 
@@ -408,7 +440,9 @@ println!("critical path: {:?}", result.critical_path); // ["design", "build", "t
 // and per-task .float (slack) / .is_critical on each Task.
 ```
 
-See the [API docs](https://docs.rs/cpm-planner).
+The crate-level docs (`cargo doc --open`, or [docs.rs](https://docs.rs/cpm-planner)
+once a current version is published there) have a runnable example that drives the
+planner through submit, lease and complete.
 
 `llm::jev::JevJudge` (the `plan.review` judge) owns its HTTP client and
 connection pool. A pooled connection is driven by the tokio runtime that
@@ -458,6 +492,13 @@ Set these in a client's `env` block (or `-e`/`--env` flag, or `docker run -e`). 
 | `CPM_LLM_MODEL` | `openai/gpt-5-mini` | Generative (chat) model id; not used by any tool yet. |
 
 Leases default to 5 minutes. For long-running work pass `ttl_seconds` (≤ the server maximum) on acquire/heartbeat, and heartbeat at least every `ttl/3`.
+
+## Documentation
+
+- [docs/README.md](docs/README.md): index of the project documentation.
+- [docs/architecture.md](docs/architecture.md): modules, request flow, store schema and concurrency.
+- [docs/releasing.md](docs/releasing.md): the release runbook.
+- [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), [SUPPORT.md](SUPPORT.md), [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

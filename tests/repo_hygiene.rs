@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 
@@ -103,5 +104,160 @@ fn issue_forms_have_name_description_and_typed_body() {
     assert!(
         offenders.is_empty(),
         "issue forms missing name, description or typed body items: {offenders:?}"
+    );
+}
+
+/// Markdown files whose relative links are checked: README.md plus every
+/// `.md` under `docs/`, except the design history in `docs/superpowers/`.
+fn linked_markdown_files(root: &Path) -> Vec<std::path::PathBuf> {
+    fn walk(dir: &Path, skip: &Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path == skip {
+                continue;
+            }
+            if path.is_dir() {
+                walk(&path, skip, out);
+            } else if path.extension().is_some_and(|ext| ext == "md") {
+                out.push(path);
+            }
+        }
+    }
+    let mut files = vec![root.join("README.md")];
+    walk(
+        &root.join("docs"),
+        &root.join("docs").join("superpowers"),
+        &mut files,
+    );
+    files.sort();
+    files
+}
+
+/// Lines of a Markdown file outside fenced code blocks.
+fn prose_lines(text: &str) -> Vec<&str> {
+    let mut in_fence = false;
+    text.lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+                in_fence = !in_fence;
+                return false;
+            }
+            !in_fence
+        })
+        .collect()
+}
+
+/// `line` with inline code spans removed, so `[a](b)` inside backticks is
+/// not taken for a link.
+fn without_code_spans(line: &str) -> String {
+    line.split('`').step_by(2).collect::<Vec<_>>().join(" ")
+}
+
+/// Every link target `(...)` that follows a `]` on the line.
+fn link_targets(line: &str) -> Vec<String> {
+    let line = without_code_spans(line);
+    line.match_indices("](")
+        .filter_map(|(at, _)| {
+            let rest = &line[at + 2..];
+            let end = rest.find(')')?;
+            let target = rest[..end].split_whitespace().next()?;
+            Some(target.trim_matches(|c| c == '<' || c == '>').to_string())
+        })
+        .collect()
+}
+
+/// GitHub heading anchors of a Markdown file: lowercase, spaces become `-`,
+/// punctuation other than `-` and `_` is dropped, repeats get `-1`, `-2`, ...
+fn heading_anchors(text: &str) -> HashSet<String> {
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut anchors = HashSet::new();
+    for line in prose_lines(text) {
+        let hashes = line.chars().take_while(|c| *c == '#').count();
+        if hashes == 0 || hashes > 6 || !line[hashes..].starts_with(' ') {
+            continue;
+        }
+        let slug: String = line[hashes..]
+            .trim()
+            .to_lowercase()
+            .chars()
+            .filter_map(|c| match c {
+                ' ' => Some('-'),
+                '-' | '_' => Some(c),
+                c if c.is_alphanumeric() => Some(c),
+                _ => None,
+            })
+            .collect();
+        let count = seen.entry(slug.clone()).or_insert(0);
+        let anchor = if *count == 0 {
+            slug.clone()
+        } else {
+            format!("{slug}-{count}")
+        };
+        *count += 1;
+        anchors.insert(anchor);
+    }
+    anchors
+}
+
+/// Why a relative link `target` written in `file` does not resolve, if it
+/// does not.
+fn broken_link_reason(file: &Path, target: &str) -> Option<String> {
+    if target.is_empty() || target.contains("://") || target.starts_with("mailto:") {
+        return None;
+    }
+    let (path_part, anchor) = match target.split_once('#') {
+        Some((path, anchor)) => (path, Some(anchor)),
+        None => (target, None),
+    };
+    let resolved = if path_part.is_empty() {
+        file.to_path_buf()
+    } else {
+        file.parent()?.join(path_part)
+    };
+    if !resolved.exists() {
+        return Some("missing file".to_string());
+    }
+    let anchor = anchor.filter(|a| !a.is_empty())?;
+    if resolved.extension().is_none_or(|ext| ext != "md") {
+        return None;
+    }
+    let text = std::fs::read_to_string(&resolved).ok()?;
+    if heading_anchors(&text).contains(anchor) {
+        None
+    } else {
+        Some(format!("no heading for #{anchor}"))
+    }
+}
+
+#[test]
+fn readme_links_resolve() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let offenders: Vec<String> = linked_markdown_files(root)
+        .iter()
+        .flat_map(|file| {
+            let text = std::fs::read_to_string(file).unwrap_or_default();
+            let shown = file
+                .strip_prefix(root)
+                .unwrap_or(file)
+                .display()
+                .to_string();
+            prose_lines(&text)
+                .into_iter()
+                .flat_map(link_targets)
+                .filter_map(|target| {
+                    broken_link_reason(file, &target)
+                        .map(|why| format!("{shown}: {target} ({why})"))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    assert!(
+        offenders.is_empty(),
+        "broken relative links in Markdown docs: {offenders:#?}"
     );
 }

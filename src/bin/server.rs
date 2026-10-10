@@ -7,7 +7,7 @@
 //! cargo run -p cpm-planner
 //! ```
 //!
-//! After `cargo install cpm-planner` (or from a release bundle) the
+//! After installing it (a release installer, or `cargo install --git` from a tag) the
 //! binary is on your PATH as:
 //!
 //! ```bash
