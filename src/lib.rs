@@ -109,6 +109,7 @@
 //! - [`review`], [`llm`] — the optional `plan.review` and its OpenRouter /
 //!   Jev judge.
 //! - [`server`] — the MCP tool façade.
+//! - [`skills`] — the embedded agent skills and `cpm-planner skills install`.
 //! - [`audit`] — the lock-lifecycle audit surface.
 //!
 //! See `docs/architecture.md` in the repository for the request flow, the
@@ -149,6 +150,7 @@ pub mod risk;
 pub mod schedule;
 pub mod server;
 pub mod simulate;
+pub mod skills;
 pub mod task;
 
 pub use algorithm::CpmAlgorithm;

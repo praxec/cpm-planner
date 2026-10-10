@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `cpm-planner skills install --target <claude|codex|cursor|copilot|gemini|agents-md|all> (--project <dir> | --user) [--dry-run] [--force]` installs the embedded agent skills (`deliverable-cpm` and the `cpm-*` family) where each tool reads them, per `docs/agents/tool-matrix.md`. `gemini` also writes one `.gemini/commands/cpm-*.toml` command per skill; `agents-md` writes a managed `<!-- cpm-planner:begin -->`/`<!-- cpm-planner:end -->` block in `AGENTS.md`; `all` writes `.claude/skills` and `.agents/skills` only, to avoid duplicate listings.
+- A `.cpm-planner-skills.json` manifest (sha256 of each file written) in every skills directory: files the user edited or did not come from cpm-planner are kept and reported as skipped unless `--force`; upgrades update only files that still match the old manifest. Writes are atomic and refuse symlinks that lead out of the target directory. No MCP configuration is written; the registration command is printed instead.
+- `cpm-planner skills uninstall` (removes only files that still match the manifest) and `cpm-planner skills list`.
+- `cpm-planner --version` and `cpm-planner --help`. With no arguments the binary is still the MCP stdio server.
+
 ## [0.1.1] - 2026-10-10
 
 ### Fixed

@@ -173,10 +173,13 @@ claude mcp add cpm-planner --scope user -- docker run -i --rm -v cpm-planner-dat
 
 ### Verify the install
 
-`cpm-planner --version` arrives in this release. Until your binary has it, check
-the binary with the MCP smoke script from the repository. It performs the MCP
-`initialize` and `tools/list` handshake and fails if `plan.submit`, `plan.status` or
-`plan.get` is missing:
+```sh
+cpm-planner --version
+```
+
+It prints `cpm-planner <version>`. To check the MCP side without a client, run the smoke
+script from the repository. It performs the MCP `initialize` and `tools/list` handshake and
+fails if `plan.submit`, `plan.status` or `plan.get` is missing:
 
 ```sh
 node scripts/mcp-smoke.mjs /absolute/path/to/cpm-planner
@@ -338,38 +341,54 @@ To check a binary without any MCP client, use the smoke script from [Verify the 
 
 ## Agent skill
 
-The `deliverable-cpm` skill teaches an agent the plan-as-code method this server is built
-for: deliverables as artifacts, consumption edges, lint, sync, levelling, the
-fork/compare/select improvement loop, leased execution and earned value. It lives in
-[`skills/deliverable-cpm/`](skills/deliverable-cpm/): `SKILL.md` plus a lint-clean example
-plan and a worked improvement loop. Install it by copying that directory into your agent's
-skills directory.
+Six agent skills ship inside the binary. `deliverable-cpm` teaches the plan-as-code method
+this server is built for: deliverables as artifacts, consumption edges, lint, sync,
+levelling, the fork/compare/select improvement loop, leased execution and earned value.
+Five short skills sit on top of it: `cpm-plan`, `cpm-improve`, `cpm-run`, `cpm-ev` and
+`cpm-revise`. The sources are in [`skills/`](skills/).
 
-| Agent | Skills directory |
-|---|---|
-| Claude Code, all projects | `~/.claude/skills/deliverable-cpm/` |
-| Claude Code, one project | `<project>/.claude/skills/deliverable-cpm/` |
-| Codex, all projects | `~/.agents/skills/deliverable-cpm/` |
-| Codex, one project | `<project>/.agents/skills/deliverable-cpm/` |
+Install them for your agent with `cpm-planner skills install`. Pick `--user` for all your
+projects, or `--project <dir>` for one repository:
 
-From the repository:
+| Agent | Command | Writes | You type |
+|---|---|---|---|
+| Claude Code | `cpm-planner skills install --target claude --user` | `~/.claude/skills/` (project: `.claude/skills/`) | `/cpm-plan` |
+| Codex | `cpm-planner skills install --target codex --user` | `~/.agents/skills/` (project: `.agents/skills/`) | `$cpm-plan` |
+| Cursor | `cpm-planner skills install --target cursor --user` | `~/.cursor/skills/` (project: `.cursor/skills/`) | `/cpm-plan` |
+| GitHub Copilot (VS Code) | `cpm-planner skills install --target copilot --user` | `~/.copilot/skills/` (project: `.github/skills/`) | `/cpm-plan` |
+| Gemini CLI | `cpm-planner skills install --target gemini --user` | `~/.agents/skills/` plus one command per skill in `~/.gemini/commands/cpm-*.toml` | `/cpm-plan` (the command) |
+| Any AGENTS.md reader | `cpm-planner skills install --target agents-md --project .` | a managed block in `AGENTS.md`, plus `.agents/skills/` | depends on the tool |
+| Several of the above | `cpm-planner skills install --target all --project .` | `.claude/skills/` and `.agents/skills/` only | as above |
 
-```bash
-git clone --depth 1 https://github.com/praxec/cpm-planner.git
-mkdir -p ~/.claude/skills
-cp -R cpm-planner/skills/deliverable-cpm ~/.claude/skills/
+The same goes for the other skills: `/cpm-improve`, `$cpm-run`, and so on. Agents also load
+a skill by themselves when your request matches its description. `--target all` writes only
+the two shared directories, because Cursor, Copilot and Gemini also read
+`.agents/skills/` (and Cursor and Copilot read `.claude/skills/`), so each skill is listed
+once. The `agents-md` block sits between `<!-- cpm-planner:begin -->` and
+`<!-- cpm-planner:end -->`; the rest of `AGENTS.md` is left byte for byte as it was.
+
+The installer:
+
+- prints one line per file (`created`, `updated`, `unchanged`, `modified, skipped`,
+  `foreign, skipped` or `removed`), then a summary;
+- records what it wrote in `.cpm-planner-skills.json` in each skills directory. A file you
+  edited, or one it did not write, is kept and reported as skipped; `--force` overwrites
+  it. A newer cpm-planner updates the files that still match what the older one wrote;
+- never writes MCP configuration. It prints the registration command for your agent
+  instead (see [Register as an MCP server](#register-as-an-mcp-server));
+- takes `--dry-run` to show what it would do without writing anything.
+
+```sh
+cpm-planner skills list                                   # what is installed, user and current project
+cpm-planner skills uninstall --target claude --user       # removes only files that still match the manifest
 ```
 
-From a release, use the tag's source archive. The binary archives contain only the binary.
+Restart the agent, or start a new session, so it loads the skills. Per-tool paths and
+sources are in [docs/agents/tool-matrix.md](docs/agents/tool-matrix.md).
 
-```bash
-curl -fsSL https://github.com/praxec/cpm-planner/archive/refs/tags/v0.1.1.tar.gz | tar -xz
-mkdir -p .agents/skills
-cp -R cpm-planner-0.1.0/skills/deliverable-cpm .agents/skills/
-```
-
-On Windows, use `Copy-Item -Recurse` in place of `cp -R`. Swap the destination for the
-directory from the table. Restart the agent, or start a new session, so it loads the skill.
+To install by hand instead, copy the directories under `skills/` from the source archive of
+your release tag (`https://github.com/praxec/cpm-planner/archive/refs/tags/<version>.tar.gz`)
+into the agent's skills directory from the table.
 
 ## MCP tools
 
