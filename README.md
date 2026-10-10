@@ -236,7 +236,8 @@ skills directory.
 |---|---|
 | Claude Code, all projects | `~/.claude/skills/deliverable-cpm/` |
 | Claude Code, one project | `<project>/.claude/skills/deliverable-cpm/` |
-| Codex | `<project>/.agents/skills/deliverable-cpm/` |
+| Codex, all projects | `~/.agents/skills/deliverable-cpm/` |
+| Codex, one project | `<project>/.agents/skills/deliverable-cpm/` |
 
 From the repository:
 

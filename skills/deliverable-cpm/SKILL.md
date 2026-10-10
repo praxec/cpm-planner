@@ -1,6 +1,6 @@
 ---
 name: deliverable-cpm
-description: Use when planning or running a multi-step project with the cpm-planner MCP server — work that spans repos, agents or people where the order matters. Authors the plan as a tracked file (.cpm-planner/plans/<name>/<variant>.json) of deliverables joined by consumption edges, lints and syncs it, levels resources, improves it through forked variants that are simulated, compared and selected, executes it with leases, and tracks earned value against a baseline.
+description: Use when the cpm-planner MCP server (plan.* tools) is available and work spans several deliverables, repos, agents or people whose order matters; when asked to plan a project, find its critical path (CPM), level resources, shorten or crash a schedule, compare plan variants, run a plan with leases, or track earned value (EV, SPI, CPI, baseline); or when editing a .cpm-planner/plans/<name>/<variant>.json plan file. Covers deliverables as artifacts, consumption edges, lint, sync, the fork/simulate/compare/select improvement loop, execution and re-baselining.
 ---
 
 # Deliverable-based CPM with cpm-planner
@@ -72,11 +72,14 @@ prerequisite on B:
 ```
 
 - `consumes` says what is handed over. An edge without it is a lint warning.
-- `kind` sets when B can start:
-  - `artifact` (the default) means B needs A's finished output;
-  - `interface` means B builds against a contract A publishes. Its target must set
-    `metadata.contract: true`. Changing a contract reopens the deliverables that hold
-    interface edges to it.
+- `kind` labels what is consumed. Both kinds are finish-to-start: B can't start until A is
+  complete, so an interface edge does not let B overlap A.
+  - `artifact` (the default): B consumes A's finished output.
+  - `interface`: B builds against a contract A defines. Its target must set
+    `metadata.contract: true`; otherwise lint warns `INTERFACE_EDGE_NOT_CONTRACT`. When a
+    revise changes the contract, the deliverables with interface edges to it are reopened.
+  - To let a consumer start early, split the producer: a small contract deliverable the
+    consumer has an interface edge to, and the implementation behind it.
 - `lag_hours` is a minimum wait after A finishes, such as a soak period.
 
 If nothing is consumed, there is no edge.
@@ -107,6 +110,7 @@ If nothing is consumed, there is no edge.
 
 | Code | Severity | Fix |
 |---|---|---|
+| `TOO_MANY_DELIVERABLES` | error | keep the plan to at most 5000 deliverables; split it into several plan lines |
 | `CYCLE` | error | break the loop it lists; one of those edges is not real consumption |
 | `UNKNOWN_PREREQUISITE`, `DUPLICATE_ID`, `RESERVED_ID`, `INVALID_VALUE` | error | fix the id or value (`__start__` and `__finish__` are reserved) |
 | `UNORDERED_FILE_OVERLAP` | error | order the two deliverables, split the file, or make every claim `{path, mode: "append"}` |
@@ -126,8 +130,12 @@ If nothing is consumed, there is no edge.
    - `critical_path_hours` is the longest chain you expect;
    - every acceptance point appears under `milestones`, with the path and `hours` you
      expect;
-   - `definition_drift` is `false`. If it is `true`, the file and the stored plan disagree,
-     so sync again.
+   - `definition_drift` is `false`:
+     - `true` means the file and the stored head disagree. If you edited the file, sync it
+       again. If the head changed inline (`plan.revise` or `plan.sync {graph}`), run
+       `plan.export {plan_id}` to write the head back to the file;
+     - `null` means unknown: no project root for the plan's project, no tracked file, or a
+       file that is missing, unreadable or over 8 MiB. Find out which.
 
 If the critical path surprises you, the graph is usually wrong (a false or missing edge).
 Fix the file, lint it and sync again.
@@ -163,6 +171,9 @@ Design several variants and pick one. Never edit the selected variant to try an 
      know.
    - `proposals` are ready-made `plan.fork` edit lists. Each has been checked by simulation
      (it lints clean and shortens the makespan) and is ranked by `hours_saved / max(cost, 1)`.
+   - An `add_capacity` crash proposal's edits are only `set_duration`. Its `cost` (the
+     added effort) is not in the edits, so `plan.compare` understates `total_effort`.
+     Before you fork it, append `set_effort {id, hours: <current effort + cost>}`.
 2. **Reason.** Choose moves from the review, the levelled schedule and the Monte Carlo
    `sensitivity`. Use one move per variant, so each effect can be measured.
 
@@ -170,9 +181,9 @@ Design several variants and pick one. Never edit the selected variant to try an 
    |---|---|---|
    | Add capacity to the bottleneck | `set_metadata owner`, or more capacity in the schedule | review becomes the next bottleneck |
    | Move work to a cheaper pool | `set_metadata owner`, plus `set_effort` for review time | security- or judgment-heavy work stays put |
-   | Crash a critical deliverable | `set_duration`, plus `set_effort` for the added cost | the cost is real effort: record it |
+   | Crash a critical deliverable | `set_duration`, plus `set_effort` for the added cost | the cost is real effort: record it. Either edit stops Monte Carlo sampling a deliverable that has an `estimate`, so a better P80 can come only from removing its uncertainty. Use `set_estimate` with a shorter range to keep it sampled |
    | Split along file or contract seams | `remove_deliverable`, `add_deliverable`, `add_edge` | each part needs its own artifact |
-   | Contract first | `add_deliverable` with `metadata.contract`, interface edges | the contract must be accepted, not just drafted |
+   | Contract first | `add_deliverable` with `metadata.contract`; then `remove_deliverable` + `add_deliverable` for each consumer, with an `interface` edge (`add_edge` has no `kind`) | the contract must be accepted, not just drafted |
    | Fast-track by removing an edge | `remove_edge` | only if nothing was actually consumed |
    | Split scope into milestones | `add_deliverable` with `"milestone": true` | each milestone needs an acceptance artifact |
 3. **Fork.** Run `plan.fork {plan_id, variant, edits}`. The edit ops are `remove_edge
@@ -183,7 +194,9 @@ Design several variants and pick one. Never edit the selected variant to try an 
 4. **Measure.** Run `plan.simulate {plan_id, schedule: {capacities}, monte_carlo: {}}` on
    any variant, then `plan.compare {plan: "<name>", schedule: {capacities}, monte_carlo: {}}`.
    This scores every live variant on makespan (levelled when `schedule` is given), P80,
-   criticality risk, total effort and peak load. Read `pareto_optimal`, `rank`,
+   criticality risk, total effort and peak load. The capacities must cover every pool of
+   every variant, or the call fails with `INVALID_CAPACITIES`. P80 comes from Monte Carlo
+   on the unlevelled network, so it ignores resource waits. Read `pareto_optimal`, `rank`,
    `rationale` and `recommended`. Change the priorities with `weights`.
 5. **Explain the trade-off** to the user before you select, in numbers: what each candidate
    gains, what it costs (effort, risk band, P80), and which assumption it depends on (for
@@ -222,7 +235,9 @@ Execute the selected variant's `plan_id`.
     report of done is not acceptance. Three explicit failures trip the circuit breaker.
 - **Close owner or manual work** with `plan.accept {plan_id, deliverable_id, accepted_by,
   evidence}`. Evidence is required. `override_lock: true` takes over a live lease, so use it
-  only when the holder is gone.
+  only when the holder is gone. `plan.accept` records no hours. To record the actual cost
+  (AC), follow it with a lockless `plan.mark_status {plan_id, deliverable_id, caller_id,
+  status: {"status": "complete"}, actual_effort_hours}`.
 - `plan.status` shows progress, the ready set, `plan_complete` and the held locks.
 
 ## 8. Baseline and earned value
@@ -232,8 +247,9 @@ Execute the selected variant's `plan_id`.
    default 1) as baseline 1.
    - `calendar` is `{hours_per_day, workdays, utc_offset_minutes}`. Without it, PV uses
      wall-clock hours.
-   - Working hours count from local midnight, so give `start` as the local start of a
-     working day.
+   - The working window opens at local midnight, local time being UTC shifted by
+     `utc_offset_minutes`, and lasts `hours_per_day` hours. Give `start` as 00:00 local
+     on a workday. A 09:00 start with 8 hours per day earns no PV that day.
 2. **Read** with `plan.ev {plan_id, as_of}`. It returns `bac`, `pv`, `ev`, `ac`, `sv`, `cv`,
    `spi`, `cpi`, `eac`, `etc`, `vac`, `tcpi`, per-deliverable rows and
    `critical_float_consumed_hours`. A ratio with a zero denominator is `null`; `undefined`

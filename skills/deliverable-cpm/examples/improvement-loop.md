@@ -67,8 +67,9 @@ plan.review {"path": ".cpm-planner/plans/export/main.json",
 - The levelled makespan is 15 h, against 10 h for CPM. `export-ui` waits 6 h for the only
   agent (`waited_on: "resource"`). The agent pool is the bottleneck, at 100% utilisation.
 - The proposal crashes `export-service` from 6 h to 4.2 h. That shortens the critical chain
-  but leaves the resource wait in place. Its 1.8 h of added effort is real, but the edits
-  don't record it, so add a `set_effort` to keep the cost visible.
+  but leaves the resource wait in place. Its 1.8 h of added effort is real, but an
+  `add_capacity` proposal's edits are only `set_duration`. Append `set_effort` with the
+  current effort plus `cost` (6 + 1.8 = 7.8 h), so `plan.compare` counts it.
 - Moving `export-ui` to the contract worker removes the wait without changing any estimate.
   It depends on the worker being available.
 - The split finding is plausible, but a split needs new artifacts and file seams. Don't try
@@ -128,16 +129,24 @@ From each variant's `scorecard`:
 | crash-service | 13.2 h | 10.3 h | 0.79 high_risk | 17.8 h |
 | ui-worker | 10.0 h | 12.2 h | 0.75 in_target | 16.0 h |
 
-Monte Carlo samples the CPM network without resource limits. So `crash-service`'s better
-P80 doesn't include the 3.2 h it still spends waiting for the agent.
+Read P80 with care, for two reasons:
+- **Crashing removes uncertainty.** `crash-service` sets `duration_hours` and
+  `estimated_effort_hours` on `export-service`, so Monte Carlo no longer samples its
+  4–6–12 h estimate. That deliverable had the highest sensitivity (correlation 0.88), so
+  most of the better P80 comes from removing its uncertainty, not from faster work. To keep
+  a crashed deliverable sampled, use `set_estimate` with a shorter range.
+- **Monte Carlo ignores resource limits.** It samples the CPM network without levelling, so
+  no variant's P80 includes resource waits. In `crash-service`, `export-ui` still waits
+  4.2 h for the agent.
 
 ## 5. Explain the trade-off
 
 > **ui-worker** finishes in 10 h levelled, 5 h sooner than main, at no extra effort and with
 > the same risk band. It depends on the contract worker taking the UI (5 h of their time).
-> **crash-service** gets the best P80 on paper, 10.3 h, but costs 1.8 h of extra effort. It
-> pushes the plan into `high_risk` criticality, and with one agent it still levels to
-> 13.2 h. I recommend ui-worker if the worker is confirmed. If not, crash-service is the
+> **crash-service** shows the best P80, 10.3 h. Most of that comes from no longer sampling
+> the service's uncertain estimate, not from finishing sooner. It costs 1.8 h of extra
+> effort and pushes the plan into `high_risk` criticality. With one agent it still levels
+> to 13.2 h. I recommend ui-worker if the worker is confirmed. If not, crash-service is the
 > fallback.
 
 ## 6. Select

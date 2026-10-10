@@ -49,6 +49,32 @@ fn plan_tokens(text: &str) -> BTreeSet<String> {
     out
 }
 
+/// The value of `key` in SKILL.md's YAML frontmatter (single-line values).
+fn frontmatter(key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(skill_dir().join("SKILL.md")).expect("readable SKILL.md");
+    let body = text.strip_prefix("---\n")?;
+    let end = body.find("\n---\n")?;
+    let prefix = format!("{key}: ");
+    body[..end]
+        .lines()
+        .find_map(|l| l.strip_prefix(&prefix))
+        .map(str::to_string)
+}
+
+#[test]
+fn skill_frontmatter_names_deliverable_cpm() {
+    assert_eq!(frontmatter("name").as_deref(), Some("deliverable-cpm"));
+}
+
+#[test]
+fn skill_description_starts_with_use_when_and_fits_limit() {
+    let description = frontmatter("description").unwrap_or_default();
+    assert!(
+        description.starts_with("Use when") && description.chars().count() < 1024,
+        "description must start with \"Use when\" and be under 1024 chars: {description:?}"
+    );
+}
+
 #[test]
 fn every_plan_tool_named_in_the_skill_exists() {
     let unknown: Vec<String> = skill_docs()
