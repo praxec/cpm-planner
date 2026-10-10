@@ -699,3 +699,39 @@ fn partial_key_cut_by_truncation_boundary_is_dropped() {
     let text = format!("{}{partial}", "x".repeat(190));
     assert!(!contains_key_fragment(&key.excerpt(&text, 200), &key));
 }
+
+// ---------------------------------------------------------------- review reasons
+
+#[test]
+fn ignored_key_file_review_reason_names_the_setting() {
+    let err = ConfigError::KeyFileIgnored {
+        path: "/home/someone/secret-dir/k".into(),
+        reason: KeyFileIgnoredReason::WorldReadable,
+    };
+    assert_eq!(
+        err.review_reason(),
+        "key file ignored: world-readable (CPM_OPENROUTER_KEY_FILE)"
+    );
+}
+
+#[test]
+fn invalid_timeout_review_reason_names_the_variable() {
+    let err = LlmConfig::from_lookup(lookup(&[
+        ("OPENROUTER_API_KEY", SENTINEL),
+        ("CPM_LLM_TIMEOUT_SECS", "0"),
+    ]))
+    .unwrap_err();
+    assert!(
+        err.review_reason()
+            .starts_with("CPM_LLM_TIMEOUT_SECS invalid: ")
+    );
+}
+
+#[test]
+fn unreadable_key_file_review_reason_omits_the_path() {
+    let err = ConfigError::KeyFile {
+        path: "/home/someone/secret-dir/k".into(),
+        reason: "entity not found".to_string(),
+    };
+    assert!(!err.review_reason().contains("secret-dir"));
+}

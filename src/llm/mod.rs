@@ -133,6 +133,26 @@ pub enum ConfigError {
     },
 }
 
+impl ConfigError {
+    /// A short `plan.review` `review_unavailable` reason naming the setting.
+    /// It carries neither the key nor any path or raw value (only the
+    /// variable name and the validation reason).
+    pub fn review_reason(&self) -> String {
+        match self {
+            Self::InvalidTimeout { .. } => format!(
+                "{LLM_TIMEOUT_ENV} invalid: must be an integer number of seconds in 1..=300"
+            ),
+            Self::InvalidEndpoint { reason } => format!("{JEV_ENDPOINT_ENV} invalid: {reason}"),
+            Self::KeyFile { reason, .. } => {
+                format!("key file unreadable: {reason} ({OPENROUTER_KEY_FILE_ENV})")
+            }
+            Self::KeyFileIgnored { reason, .. } => {
+                format!("key file ignored: {reason} ({OPENROUTER_KEY_FILE_ENV})")
+            }
+        }
+    }
+}
+
 /// Why a key file was ignored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyFileIgnoredReason {
