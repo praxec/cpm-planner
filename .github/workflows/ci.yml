@@ -27,7 +27,7 @@ jobs:
         timeout-minutes: 20
         steps:
             - uses: actions/checkout@v4
-            - uses: dtolnay/rust-toolchain@1.99.0
+            - uses: dtolnay/rust-toolchain@1.120.0
             - uses: Swatinem/rust-cache@v2
             - name: Build
               run: cargo build --all-targets
@@ -52,7 +52,7 @@ jobs:
         timeout-minutes: 15
         steps:
             - uses: actions/checkout@v4
-            - uses: dtolnay/rust-toolchain@1.99.0
+            - uses: dtolnay/rust-toolchain@1.120.0
               with:
                   components: rustfmt, clippy
             - uses: Swatinem/rust-cache@v2
@@ -81,7 +81,7 @@ jobs:
             RUSTDOCFLAGS: -D warnings
         steps:
             - uses: actions/checkout@v4
-            - uses: dtolnay/rust-toolchain@1.99.0
+            - uses: dtolnay/rust-toolchain@1.120.0
             - uses: Swatinem/rust-cache@v2
             - name: cargo doc
               run: cargo doc --no-deps --locked
@@ -92,7 +92,7 @@ jobs:
         timeout-minutes: 20
         steps:
             - uses: actions/checkout@v4
-            - uses: dtolnay/rust-toolchain@1.99.0
+            - uses: dtolnay/rust-toolchain@1.120.0
             - uses: Swatinem/rust-cache@v2
             - name: cargo package (list)
               run: cargo package --locked --list
