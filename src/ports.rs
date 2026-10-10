@@ -218,6 +218,10 @@ pub trait Planner: Send + Sync {
     /// of `as_of` (default now). Alerts compare the two latest stored
     /// snapshots (by `as_of`) of that baseline; the current reading is not
     /// one of them. `NOT_BASELINED` before the first baseline. Read-only.
+    ///
+    /// The returned future does its store reads and CPM work synchronously,
+    /// so it blocks whatever polls it; async callers should drive it on a
+    /// blocking thread (the MCP server does).
     async fn ev(
         &self,
         plan_id: &PlanId,
@@ -225,10 +229,13 @@ pub trait Planner: Send + Sync {
     ) -> Result<EvReport, PlannerError>;
 
     /// Compute the earned-value report (as [`Planner::ev`]) and append it as
-    /// a snapshot. Its alerts compare the two latest snapshots by `as_of`,
-    /// this one included, of the current baseline. Returns the summary, the
-    /// stored count and an export of the newest snapshots by `as_of`.
-    /// `NOT_BASELINED` before the first baseline. Gated like the execution
-    /// methods.
+    /// a snapshot. Its alerts consider only readings up to its own
+    /// `(as_of, taken_at)` position: this snapshot and the latest earlier
+    /// one of the current baseline. Returns the summary, the stored count
+    /// and an export of the newest snapshots by `as_of` (an older backfill
+    /// is counted but not listed). `NOT_BASELINED` before the first
+    /// baseline. Gated like the execution methods.
+    ///
+    /// Blocks its poller like [`Planner::ev`].
     async fn snapshot(&self, req: SnapshotRequest) -> Result<SnapshotOutcome, PlannerError>;
 }

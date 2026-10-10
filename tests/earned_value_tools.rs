@@ -602,3 +602,40 @@ async fn snapshot_summary_explains_undefined_cpi() {
         .unwrap();
     assert!(out.summary.undefined.iter().any(|u| u.field == "cpi"));
 }
+
+// ── Fix round 2: backfill-correct alerts, per-baseline window ────────────
+
+async fn snapshot_at(f: &Fixture, plan_id: &PlanId, hours: i64) -> Vec<String> {
+    f.planner
+        .snapshot(SnapshotRequest::new(plan_id.clone()).with_as_of(t0() + Duration::hours(hours)))
+        .await
+        .unwrap()
+        .summary
+        .alerts
+}
+
+#[tokio::test]
+async fn backfilled_snapshot_alerts_use_only_earlier_readings() {
+    let f = Fixture::new();
+    let plan_id = f.baselined().await;
+    snapshot_at(&f, &plan_id, 10).await;
+    snapshot_at(&f, &plan_id, 12).await;
+    let backfill = snapshot_at(&f, &plan_id, 0).await;
+    assert!(backfill.is_empty(), "{backfill:?}");
+}
+
+#[tokio::test]
+async fn alert_window_is_not_crowded_out_by_previous_baseline_history() {
+    let f = Fixture::new();
+    let plan_id = f.baselined().await;
+    for hours in 50..150 {
+        snapshot_at(&f, &plan_id, hours).await;
+    }
+    f.planner
+        .baseline(BaselineRequest::new(plan_id.clone()).with_reason("replan"))
+        .await
+        .unwrap();
+    snapshot_at(&f, &plan_id, 10).await;
+    let alerts = snapshot_at(&f, &plan_id, 12).await;
+    assert!(alerts.contains(&"SPI_BELOW_0_9".to_string()), "{alerts:?}");
+}

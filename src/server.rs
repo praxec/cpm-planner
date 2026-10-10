@@ -1126,9 +1126,10 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
             Cow::Borrowed(TOOL_SNAPSHOT),
             Cow::Borrowed(
                 "Compute the earned-value report (as plan.ev) and append it as a \
-                 snapshot. Returns the snapshot summary (alerts consider the two latest \
-                 snapshots by as_of of the current baseline, this one included) and an \
-                 export of the newest 100 snapshots by as_of, oldest first: a list of \
+                 snapshot. Returns the snapshot summary (alerts consider this snapshot and \
+                 the latest earlier one by as_of of the current baseline) and an export \
+                 of the newest 100 snapshots by as_of, oldest first (an older backfill \
+                 is counted but not listed): a list of \
                  summaries (format json, default) or a Markdown table with columns \
                  date, PV, EV, AC, SPI, CPI, EAC (format markdown). \
                  Execution-side like plan.baseline. NOT_BASELINED before plan.baseline.",
@@ -1975,7 +1976,7 @@ Tools (twenty-two total, all `plan.<verb>`):
   plan.compare         — compare stored plans (plan_ids: 2..16 distinct ids, or plan line name in project, default the discovered root, for every live variant, at most 16) on the scorecard: Pareto front, weighted rank, recommended; weights must be finite and >= 0; the Monte Carlo budget (200000000) is shared across variants
   plan.baseline        — freeze the plan's CPM schedule (es/ef) and budgets (effort basis x metadata.cost_rate, default 1) as its next numbered earned-value baseline; optional start (RFC 3339, default now) and calendar {hours_per_day (0 < h <= 24, default 8), workdays (default mon..fri), utc_offset_minutes (default 0)} (omitted: wall-clock hours); re-baselining needs a non-blank reason (<= 2048 chars, INVALID_GRAPH otherwise) and keeps actuals and snapshots; baselines, actuals and snapshots belong to one variant, so a newly selected variant takes its own baseline 1 with no reason needed; selected, unarchived variant only; audited as plan.ev.baselined
   plan.ev              — earned-value report against the latest baseline as of as_of (RFC 3339, default now): bac, pv, ev, ac, sv, cv, spi, cpi, eac, etc, vac, tcpi, per-deliverable rows, critical_float_consumed_hours, alerts (SPI_BELOW_0_9 / CPI_BELOW_0_9 when below 0.9 on the two latest stored snapshots by as_of of the current baseline; the current reading is not one of them), excluded_unbaselined; a ratio with a zero denominator is null and explained in `undefined` (never NaN); read-only on any variant; NOT_BASELINED before plan.baseline
-  plan.snapshot        — compute the plan.ev report and append it as a snapshot; returns summary (undefined explains each null ratio; alerts consider the two latest snapshots by as_of of the current baseline, this one included), snapshot_count and export of the newest 100 snapshots by as_of (ties by taken_at), oldest first, so a backfilled as_of lands in date order: a list of summaries (format "json", default) or a Markdown table with columns date, PV, EV, AC, SPI, CPI, EAC (format "markdown"); selected, unarchived variant only; NOT_BASELINED before plan.baseline
+  plan.snapshot        — compute the plan.ev report and append it as a snapshot; returns summary (undefined explains each null ratio; alerts consider only readings up to its own position: this snapshot and the latest earlier one by as_of of the current baseline, so a backfill never takes alerts from newer readings), snapshot_count and export of the newest 100 snapshots by as_of (ties by taken_at), oldest first, so a backfilled as_of lands in date order; a backfill older than those 100 is stored and counted but not listed: a list of summaries (format "json", default) or a Markdown table with columns date, PV, EV, AC, SPI, CPI, EAC (format "markdown"); selected, unarchived variant only; NOT_BASELINED before plan.baseline
   plan.submit with a `name` (optional `project`/`variant`, variant defaults to "main") registers a named variant instead of an unnamed plan
   plan.lint, plan.simulate take exactly one of an inline graph, a stored plan_id, or a plan-file path; plan.schedule takes graph or plan_id; plan.schedule and plan.simulate reject what plan.submit rejects, and plan.lint reports it as findings
 

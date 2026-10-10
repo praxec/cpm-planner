@@ -649,8 +649,11 @@ impl SnapshotRequest {
 pub struct SnapshotOutcome {
     pub summary: SnapshotSummary,
     pub format: SnapshotFormat,
-    /// The newest [`SNAPSHOT_EXPORT_LIMIT`] snapshots (this one last): a
-    /// list of summaries for `json`, a Markdown table string for `markdown`.
+    /// The newest [`SNAPSHOT_EXPORT_LIMIT`] snapshots by `as_of` (ties by
+    /// `taken_at`), oldest first: a list of summaries for `json`, a Markdown
+    /// table string for `markdown`. A backfilled snapshot sits at its
+    /// `as_of` position, and one older than all of those is stored and
+    /// counted but not listed.
     pub export: serde_json::Value,
     /// Snapshots stored for the plan, this one included.
     pub snapshot_count: usize,
@@ -700,6 +703,8 @@ pub struct SnapshotSummary {
     pub vac: Option<f32>,
     pub tcpi: Option<f32>,
     /// Why each `null` ratio is undefined (as in [`EvReport::undefined`]).
+    /// Absent in summaries stored before this field existed.
+    #[serde(default)]
     pub undefined: Vec<Undefined>,
     pub alerts: Vec<String>,
 }
@@ -1938,5 +1943,12 @@ mod tests {
     fn snapshot_summary_explains_undefined_ratios() {
         let r = one(EarningRule::ZeroHundred, DeliverableStatus::Pending, None);
         assert_eq!(summary_of(&r).undefined, r.undefined);
+    }
+
+    #[test]
+    fn summary_without_undefined_field_decodes() {
+        let mut v = serde_json::to_value(summary_of(&textbook())).unwrap();
+        v.as_object_mut().unwrap().remove("undefined");
+        assert!(serde_json::from_value::<SnapshotSummary>(v).is_ok());
     }
 }

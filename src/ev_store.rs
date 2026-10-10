@@ -403,16 +403,66 @@ pub(crate) fn snapshots(
         .map_err(backend)?;
     let mut out = Vec::new();
     for row in rows {
-        let (taken, as_of, summary) = row.map_err(backend)?;
-        out.push(EvSnapshot {
-            taken_at: dt(taken, "ev_snapshots.taken_at_us")?,
-            as_of: dt(as_of, "ev_snapshots.as_of_us")?,
-            summary: serde_json::from_str(&summary).map_err(|e| {
-                backend(anyhow::anyhow!(
-                    "plan {plan_id}: stored snapshot summary does not decode: {e}"
+        out.push(decode_snapshot(plan_id, row.map_err(backend)?)?);
+    }
+    out.reverse();
+    Ok(out)
+}
+
+fn decode_snapshot(
+    plan_id: &PlanId,
+    (taken, as_of, summary): (i64, i64, String),
+) -> Result<EvSnapshot, PlannerError> {
+    Ok(EvSnapshot {
+        taken_at: dt(taken, "ev_snapshots.taken_at_us")?,
+        as_of: dt(as_of, "ev_snapshots.as_of_us")?,
+        summary: serde_json::from_str(&summary).map_err(|e| {
+            backend(anyhow::anyhow!(
+                "plan {plan_id}: stored snapshot summary does not decode: {e}"
+            ))
+        })?,
+    })
+}
+
+/// The latest `limit` snapshots of `plan_id` taken against baseline
+/// `baseline_number` at or before the position `(as_of, taken_at)` (no
+/// bound when `None`), oldest first in `(as_of, taken_at)` order. The
+/// baseline filter runs in the query, so snapshots of earlier baselines
+/// never crowd the window out.
+pub(crate) fn alert_window(
+    conn: &Connection,
+    plan_id: &PlanId,
+    baseline_number: u32,
+    position: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    limit: usize,
+) -> Result<Vec<EvSnapshot>, PlannerError> {
+    let as_of = position.map(|(a, _)| a.timestamp_micros());
+    let taken_at = position.map(|(_, t)| t.timestamp_micros());
+    let mut stmt = conn
+        .prepare(
+            "SELECT taken_at_us, as_of_us, summary FROM ev_snapshots
+             WHERE plan_id = ?1
+               AND json_extract(summary, '$.baseline_number') = ?2
+               AND (?3 IS NULL OR as_of_us < ?3 OR (as_of_us = ?3 AND taken_at_us <= ?4))
+             ORDER BY as_of_us DESC, taken_at_us DESC LIMIT ?5",
+        )
+        .map_err(backend)?;
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let rows = stmt
+        .query_map(
+            params![plan_id.0, baseline_number, as_of, taken_at, limit],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
                 ))
-            })?,
-        });
+            },
+        )
+        .map_err(backend)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(decode_snapshot(plan_id, row.map_err(backend)?)?);
     }
     out.reverse();
     Ok(out)

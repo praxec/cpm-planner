@@ -13,9 +13,11 @@
 //! has its own: a newly selected variant takes baseline 1 (no reason
 //! needed) and starts its own snapshot history.
 //!
-//! History is read bounded ([`ev_store::snapshots`]: the newest 100 by
+//! The export is read bounded ([`ev_store::snapshots`]: the newest 100 by
 //! `as_of`, ties by `taken_at`) and kept in that order, so a backfilled
-//! snapshot lands in date order in the export and the alert window.
+//! snapshot lands in date order. Alert windows are their own bounded,
+//! per-baseline query ([`ev_store::alert_window`]): a snapshot's alerts
+//! see only readings at or before its own `(as_of, taken_at)`.
 
 use std::collections::HashMap;
 
@@ -47,11 +49,12 @@ fn not_baselined(plan_id: &PlanId) -> PlannerError {
     }
 }
 
-/// The newest stored snapshot summaries of `plan_id`, in `as_of` order
-/// (ties by `taken_at`).
-fn history(tx: &Transaction<'_>, plan_id: &PlanId) -> Result<Vec<SnapshotSummary>, PlannerError> {
-    ev_store::snapshots(tx, plan_id)?
-        .into_iter()
+/// Decode stored snapshot summaries, keeping their order.
+fn decode(
+    plan_id: &PlanId,
+    rows: Vec<ev_store::EvSnapshot>,
+) -> Result<Vec<SnapshotSummary>, PlannerError> {
+    rows.into_iter()
         .map(|s| {
             serde_json::from_value(s.summary).map_err(|e| {
                 backend(anyhow::anyhow!(
@@ -61,6 +64,28 @@ fn history(tx: &Transaction<'_>, plan_id: &PlanId) -> Result<Vec<SnapshotSummary
             })
         })
         .collect()
+}
+
+/// The newest stored snapshot summaries of `plan_id`, in `as_of` order
+/// (ties by `taken_at`).
+fn history(tx: &Transaction<'_>, plan_id: &PlanId) -> Result<Vec<SnapshotSummary>, PlannerError> {
+    decode(plan_id, ev_store::snapshots(tx, plan_id)?)
+}
+
+/// Ratios of the latest `limit` snapshots of baseline `number` at or
+/// before `position` (unbounded when `None`), oldest first.
+fn alert_ratios(
+    tx: &Transaction<'_>,
+    plan_id: &PlanId,
+    number: u32,
+    position: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    limit: usize,
+) -> Result<Vec<EvSummary>, PlannerError> {
+    let rows = ev_store::alert_window(tx, plan_id, number, position, limit)?;
+    Ok(decode(plan_id, rows)?
+        .iter()
+        .map(SnapshotSummary::ratios)
+        .collect())
 }
 
 fn rules_of(graph: &PlanGraph) -> HashMap<String, EarningRule> {
@@ -176,10 +201,7 @@ impl BasicCpmPlanner {
                 .ok_or_else(|| not_baselined(plan_id))?
                 .baseline;
             let actuals = ev_store::load_actuals(tx, plan_id)?;
-            let ratios: Vec<EvSummary> = history(tx, plan_id)?
-                .iter()
-                .map(SnapshotSummary::ratios)
-                .collect();
+            let ratios = alert_ratios(tx, plan_id, baseline.number, None, 2)?;
             Ok((state.graph, state.statuses, baseline, actuals, ratios))
         })?;
         compute_ev(
@@ -194,8 +216,10 @@ impl BasicCpmPlanner {
     }
 
     /// Compute the report (as for [`Self::ev_report`]) and append it as a
-    /// snapshot (`plan.snapshot`). Its alerts look at the two latest
-    /// snapshots by `as_of`, this one included, of the current baseline.
+    /// snapshot (`plan.snapshot`). Its alerts look only at readings up to
+    /// its own position: this snapshot and the latest earlier one, by
+    /// `(as_of, taken_at)`, of the current baseline, so a backfill never
+    /// takes alerts from newer readings.
     /// `taken_at` is the clock's now, nudged one microsecond past the
     /// latest stored `taken_at` when the clock has not moved past it, so
     /// snapshots stay distinct. Gated like execution. Returns the summary,
@@ -218,8 +242,12 @@ impl BasicCpmPlanner {
                 .ok_or_else(|| not_baselined(plan_id))?
                 .baseline;
             let actuals = ev_store::load_actuals(tx, plan_id)?;
-            let mut history = history(tx, plan_id)?;
-            let previous: Vec<EvSummary> = history.iter().map(SnapshotSummary::ratios).collect();
+            let taken_at = match ev_store::latest_taken_at(tx, plan_id)? {
+                Some(last) if now <= last => last + chrono::Duration::microseconds(1),
+                _ => now,
+            };
+            let mut ratios =
+                alert_ratios(tx, plan_id, baseline.number, Some((as_of, taken_at)), 1)?;
             let report = compute_ev(
                 &baseline,
                 &state.graph,
@@ -227,22 +255,14 @@ impl BasicCpmPlanner {
                 &rules_of(&state.graph),
                 &actuals,
                 as_of,
-                &previous,
+                &ratios,
             )?;
-            let taken_at = match ev_store::latest_taken_at(tx, plan_id)? {
-                Some(last) if now <= last => last + chrono::Duration::microseconds(1),
-                _ => now,
-            };
             let mut summary = SnapshotSummary::from_report(&report, taken_at);
-            history.push(summary.clone());
-            history.sort_by_key(|h| (h.as_of, h.taken_at));
-            let ratios: Vec<EvSummary> = history.iter().map(SnapshotSummary::ratios).collect();
+            ratios.push(summary.ratios());
             summary.alerts = trend_alerts(&ratios, baseline.number);
-            if let Some(this) = history.iter_mut().find(|h| h.taken_at == taken_at) {
-                this.alerts = summary.alerts.clone();
-            }
             let stored = serde_json::to_value(&summary).map_err(backend)?;
             ev_store::insert_snapshot(tx, plan_id, taken_at, as_of, &stored)?;
+            let history = history(tx, plan_id)?;
             let newest = &history[history.len().saturating_sub(SNAPSHOT_EXPORT_LIMIT)..];
             let export = match req.format {
                 SnapshotFormat::Json => serde_json::to_value(newest).map_err(backend)?,
