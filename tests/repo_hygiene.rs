@@ -385,3 +385,18 @@ fn llms_txt_links_name_existing_files() {
         "llms.txt links to files or headings that do not exist: {offenders:#?}"
     );
 }
+
+#[test]
+fn npm_package_legal_files_match_the_repository_copies() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let drifted: Vec<&str> = ["LICENSE", "NOTICE"]
+        .into_iter()
+        .filter(|name| {
+            std::fs::read(root.join(name)).ok() != std::fs::read(root.join("npm").join(name)).ok()
+        })
+        .collect();
+    assert!(
+        drifted.is_empty(),
+        "npm/ copies differ from (or are missing next to) the root files: {drifted:?}; copy them into npm/"
+    );
+}

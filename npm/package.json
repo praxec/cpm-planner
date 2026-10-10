@@ -30,7 +30,8 @@
     "lib/install.js",
     "lib/postinstall.js",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "NOTICE"
   ],
   "scripts": {
     "postinstall": "node lib/postinstall.js",

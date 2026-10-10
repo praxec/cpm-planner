@@ -24,6 +24,7 @@ exclude = [
     "/.github/",
     "/docs/superpowers/",
     "/scripts/",
+    "/npm/",
     "/tests/repo_hygiene.rs",
     "/Dockerfile",
     "/.dockerignore",

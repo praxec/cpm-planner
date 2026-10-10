@@ -16,8 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cpm-planner skills uninstall` (removes only files that still match the manifest) and `cpm-planner skills list`.
 - `cpm-planner --version` and `cpm-planner --help`. With no arguments the binary is still the MCP stdio server.
 - npm launcher `@matthew-cochran/cpm` (`npm/`): `npx -y @matthew-cochran/cpm` downloads the release binary for the platform over HTTPS (redirects only to GitHub hosts), verifies it against `checksums.sha256`, caches it per version and runs it over stdio with arguments, exit code and signals passed through. `CPM_PLANNER_BINARY` uses a local binary instead; `CPM_PLANNER_DOWNLOAD_BASE` sets a mirror. No runtime dependencies. The release workflow attaches `matthew-cochran-cpm-<version>.tgz` to the GitHub release; publishing to npm is a manual step (`docs/releasing.md`).
+- npm launcher cache and install-time pre-fetch: binaries are cached in `<root>/cpm-planner/<version>/`, where `<root>` is `CPM_PLANNER_CACHE_DIR` if set, else `%LOCALAPPDATA%` on Windows, else `$XDG_CACHE_HOME` or `~/.cache`. A `postinstall` script pre-fetches the binary so the first MCP start does not wait for a download; it never fails the install, and is skipped with `--ignore-scripts`, in CI, when `CPM_PLANNER_BINARY` is set, or with `CPM_PLANNER_SKIP_DOWNLOAD=1`.
 - `scripts/check-version-sync.sh` also checks that `npm/package.json` has the `Cargo.toml` version.
 - `docs/AGENT-INSTALL.md`: an end-to-end install guide for agents and people. A "which tool are you?" table leads to numbered steps per tool (Claude Code, Codex, Cursor, Copilot, Gemini CLI, Zed, Windsurf and other AGENTS.md readers, Claude Desktop): install the binary or use npx, register the MCP server (binary and npx forms), `skills install`, verify; plus uninstall and troubleshooting (GUI `PATH`, Windows quoting, a stale launcher cache, offline use with `CPM_PLANNER_BINARY`). The README's MCP registration sections show the npx form next to the binary form.
+- `docs/architecture.md` (layers, module map, request flow, store schema, concurrency, security boundaries), `docs/releasing.md` (the maintainer release runbook), a docs index (`docs/README.md`) and crate-level rustdoc for docs.rs.
 - `llms.txt` (llmstxt.org format) indexing the install guide, README sections, architecture, skills and CHANGELOG for LLMs.
 - `AGENTS.md`: instructions for coding agents contributing to this repository (gates, branch model, conventions, skills, the opt-in live test).
 - CI: a `skills install` smoke on Linux, macOS and Windows (project and user scope, idempotent rerun, `list`, `uninstall`).
@@ -31,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Windows: the server no longer exits when `HOME` is unset (the Windows default). The default database path falls back to `USERPROFILE` and keeps the same layout on every OS, `~/.local/share/praxec/cpm-planner.db` (`%USERPROFILE%\.local\share\praxec\cpm-planner.db`), so data written under Git Bash's `HOME` stays where it is. `skills` uses the same lookup. Startup fails only when neither variable is set.
 - `plan.review` no longer fails with `review_unavailable` (`decode: ... expected struct Cost`) against OpenRouter: Jev replies are decoded with a reply type whose `usage` accepts `cost` as a bare number (OpenRouter) or an object, ignores unknown fields, and drops malformed accounting instead of failing the judgment. Requests and answer validation are still rig-typesafeai's.
 
 ## [0.1.0] - 2026-10-10

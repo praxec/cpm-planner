@@ -3,13 +3,14 @@
 This is the maintainer runbook for cutting a cpm-planner release. A tag
 `vX.Y.Z` on `main` runs [`.github/workflows/release.yml`](../.github/workflows/release.yml),
 which builds and publishes the GitHub release, the container image and the MCP
-registry entry. crates.io and npm are published by hand afterwards.
+registry entry. npm and crates.io are published by hand afterwards; npm comes
+first, right after the GitHub release goes public.
 
 Throughout, `X.Y.Z` is the new version and `vX.Y.Z` its tag.
 
 ## 1. Bump the version
 
-On a branch off `dev`, set the same version in every place that carries it:
+On a branch off `dev`, set the same version in the four files that carry it:
 
 - `Cargo.toml`: `[package] version`.
 - `Cargo.lock`: run `cargo check` (or `cargo update -p cpm-planner`) so the
@@ -28,20 +29,25 @@ scripts/check-version-sync.sh
 It fails when any `server.json` version or OCI tag, or the `npm/package.json`
 version, differs from `Cargo.toml`.
 The release workflow repeats the check against the tag and refuses to build on
-a mismatch. Also update version pins in the README (installer `--version`
-examples and the `cargo install --git ... --tag` line).
+a mismatch. Nothing else needs a version bump: the README writes `<version>`
+for a release tag instead of pinning one.
 
 ## 2. Update the CHANGELOG
 
 In [CHANGELOG.md](../CHANGELOG.md), rename `## [Unreleased]` to
 `## [X.Y.Z] - YYYY-MM-DD` and add a fresh empty `## [Unreleased]` above it.
 Follow Keep a Changelog: group entries under Added, Changed, Fixed and so on.
+The date here is the planned release date; step 3 corrects it on the day.
 
 Open the bump as a pull request into `dev` and merge it once CI is green.
 
 ## 3. Release PR from `dev` to `main`
 
-Open a pull request with base `main` and head `dev`. The gitflow guard
+On release day, first set the `## [X.Y.Z] - YYYY-MM-DD` date in
+`CHANGELOG.md` to today's date (a one-line pull request into `dev`) if it
+differs from the planned one.
+
+Then open a pull request with base `main` and head `dev`. The gitflow guard
 (`gitflow-guard.yml`) rejects any other head branch. Wait for every required
 check, then merge it with a **merge commit**, not squash or rebase, so `main`
 and `dev` keep a shared history.
@@ -58,7 +64,8 @@ git push origin vX.Y.Z
 
 Tag only commits on `main`: the workflow triggers on any `v*` tag. The tag must
 match `vMAJOR.MINOR.PATCH` (an optional pre-release or build suffix is
-allowed) and equal the `Cargo.toml` and `server.json` versions.
+allowed) and equal the `Cargo.toml`, `server.json` and `npm/package.json`
+versions.
 
 The workflow then runs these jobs:
 
@@ -81,7 +88,41 @@ The workflow then runs these jobs:
    is best-effort (`continue-on-error`), so a failure does not fail the
    release; check its log.
 
-## 5. Verify the release
+## 5. Publish to npm (manual, right away)
+
+The workflow packs the npm launcher (`npm/`, package `@matthew-cochran/cpm`)
+and attaches the tarball to the release, but never publishes it. The launcher
+downloads the GitHub release whose version equals its own, so publish as soon
+as the release in step 4 is public: until then the documented
+`npx -y @matthew-cochran/cpm` commands fail with a 404 from the registry. The
+tarball checksum below is the only check that has to come first; the full
+verification follows in step 6.
+
+Publish the tarball the workflow built, not a local `npm pack`, so npm gets
+exactly the file attached to the release. You need to be logged in to npm
+(`npm login`) as an owner of the `@matthew-cochran` scope, with 2FA:
+
+```sh
+mkdir -p /tmp/cpm-npm && cd /tmp/cpm-npm
+gh release download vX.Y.Z --repo praxec/cpm-planner \
+  --pattern 'matthew-cochran-cpm-X.Y.Z.tgz' --pattern npm-package.sha256
+sha256sum -c npm-package.sha256          # must print OK; stop if it does not
+tar -tzf matthew-cochran-cpm-X.Y.Z.tgz   # package/{LICENSE,NOTICE,README.md,package.json,bin/,lib/} only, no tests
+npm publish ./matthew-cochran-cpm-X.Y.Z.tgz --access public   # prompts for the 2FA code
+```
+
+Verify from a clean cache, outside the repository:
+
+```sh
+npx -y @matthew-cochran/cpm@X.Y.Z --version
+node scripts/mcp-smoke.mjs npx -y @matthew-cochran/cpm@X.Y.Z   # from a checkout of vX.Y.Z
+```
+
+The first command prints `cpm-planner X.Y.Z` on stdout after a one-time
+download whose progress goes to stderr. The smoke test checks that the launcher
+keeps stdout clean for MCP (`initialize` and `tools/list`).
+
+## 6. Verify the release
 
 Assets: the release page lists six archives, `checksums.sha256`,
 `release-manifest.json`, `install.sh`, `install.ps1`,
@@ -110,7 +151,7 @@ node scripts/mcp-smoke.mjs docker run -i --rm ghcr.io/praxec/cpm-planner:X.Y.Z
 MCP registry: confirm the registry job succeeded, or look the server up in the
 registry and check that its version is `X.Y.Z`.
 
-## 6. Publish to crates.io (manual)
+## 7. Publish to crates.io (manual)
 
 The workflow does not publish the crate. From the tagged commit, with a
 crates.io token configured (`cargo login`):
@@ -125,37 +166,6 @@ cargo publish --locked
 Until this step runs, crates.io keeps serving the previous version, which is why
 the README installs from the git tag. docs.rs builds the new version on its own
 a few minutes after publishing.
-
-## 7. Publish to npm (manual)
-
-The workflow packs the npm launcher (`npm/`, package `@matthew-cochran/cpm`)
-and attaches the tarball to the release, but never publishes it. The launcher
-downloads the GitHub release whose version equals its own, so publish only
-after the release in step 4 is public and its assets are verified (step 5).
-
-Publish the tarball the workflow built, not a local `npm pack`, so npm gets
-exactly the file attached to the release. You need to be logged in to npm
-(`npm login`) as an owner of the `@matthew-cochran` scope, with 2FA:
-
-```sh
-mkdir -p /tmp/cpm-npm && cd /tmp/cpm-npm
-gh release download vX.Y.Z --repo praxec/cpm-planner \
-  --pattern 'matthew-cochran-cpm-X.Y.Z.tgz' --pattern npm-package.sha256
-sha256sum -c npm-package.sha256          # must print OK; stop if it does not
-tar -tzf matthew-cochran-cpm-X.Y.Z.tgz   # package/{LICENSE,README.md,package.json,bin/,lib/} only, no tests
-npm publish ./matthew-cochran-cpm-X.Y.Z.tgz --access public   # prompts for the 2FA code
-```
-
-Verify from a clean cache, outside the repository:
-
-```sh
-npx -y @matthew-cochran/cpm@X.Y.Z --version
-node scripts/mcp-smoke.mjs npx -y @matthew-cochran/cpm@X.Y.Z   # from a checkout of vX.Y.Z
-```
-
-The first command prints `cpm-planner X.Y.Z` on stdout after a one-time
-download whose progress goes to stderr. The smoke test checks that the launcher
-keeps stdout clean for MCP (`initialize` and `tools/list`).
 
 ## Rollback
 

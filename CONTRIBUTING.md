@@ -27,10 +27,15 @@ scripts/check-version-sync.sh
 node --test "npm/test/*.test.mjs"
 ```
 
-`cargo deny` is [cargo-deny](https://github.com/EmbarkStudios/cargo-deny)
-(`cargo install cargo-deny`). The npm launcher tests need Node 21 or later,
-because `node --test` takes a glob only from Node 21; the published package
-itself supports Node 18 and later.
+Prerequisites beyond the Rust toolchain:
+
+- `cargo deny` is [cargo-deny](https://github.com/EmbarkStudios/cargo-deny)
+  (`cargo install cargo-deny`).
+- `scripts/check-version-sync.sh` needs `bash` and
+  [`jq`](https://jqlang.org/) on `PATH` (on Windows, Git Bash).
+- The npm launcher tests need Node 21 or later, because `node --test` takes a
+  glob only from Node 21; the published package itself supports Node 18 and
+  later.
 
 ## Architecture map
 
@@ -68,7 +73,11 @@ The pure kernel has no I/O; the planner, store, and server layers sit on top.
 - `src/llm/jev.rs`: judgment model over Jev via `rig-typesafeai`.
 - `src/llm/openrouter.rs`: rig-core OpenRouter chat client for future headless use.
 - `src/server.rs`: the MCP tool surface (`PlanServer`).
+- `src/skills.rs`: the `cpm-planner skills install|uninstall|list` subcommand.
 - `src/bin/server.rs`: the `cpm-planner` binary entry point.
+- `build.rs`: embeds `skills/` into the binary at build time.
+- `npm/`: the `@matthew-cochran/cpm` npx launcher (Node, no dependencies),
+  tested by `npm/test/`.
 - `src/lease_hours_tests.rs`, `src/mark_actuals_tests.rs`: in-crate test modules.
 
 Integration tests live in `tests/`.

@@ -26,6 +26,10 @@ src/portfolio.rs       plan lines, variants, revisions (schema v3)
 src/ev_store.rs        baselines, actuals, snapshots (schema v4)
 src/project.rs         confined plan-file I/O under the project root
 src/llm/               OpenRouter / Jev judge for plan.review
+
+src/skills.rs          `cpm-planner skills` subcommand (no MCP; files only)
+build.rs               embeds skills/ into the binary
+npm/                   @matthew-cochran/cpm: npx launcher for the release binary
 ```
 
 The pure engines do no I/O and read no clocks: the planner and the server pass
@@ -114,7 +118,25 @@ them a graph, a state and a time.
   (`CPM_PLANNER_DB`), resolves the lease TTL ceiling (`CPM_MAX_TTL_SECS`),
   discovers the project root (`CPM_PROJECT_ROOT` or the nearest ancestor with
   `.cpm-planner/` or `.git`), reads the LLM settings once, and serves MCP over
-  stdio.
+  stdio. The default database path is `~/.local/share/praxec/cpm-planner.db`
+  on every OS, where `~` is `HOME`, falling back to `USERPROFILE` on Windows.
+  `cpm-planner skills ...` is dispatched to `skills.rs` instead.
+
+### Agent install
+
+- `skills.rs`: `cpm-planner skills install|uninstall|list`. It writes the
+  embedded skills into each agent's user or project skill roots, records what
+  it wrote (path and sha256) in a per-root manifest, and never overwrites or
+  removes a file it did not write or that the user changed, unless `--force`.
+  It prints, but never writes, the MCP registration command.
+- `build.rs` (crate root): embeds every file under `skills/` into the binary
+  and validates each `SKILL.md` front matter, so a malformed skill fails the
+  build.
+- `npm/` (not part of the crate): the `@matthew-cochran/cpm` npx launcher. It
+  downloads the release archive for the platform, verifies its SHA-256 against
+  `checksums.sha256`, extracts it into a per-user cache and runs the binary
+  over stdio. It is published to npm separately (see
+  [releasing.md](releasing.md)).
 
 ## Request flow
 

@@ -12,7 +12,9 @@ repositories; do not add it here.
 ## Build, test and gates
 
 The toolchain is pinned in `rust-toolchain.toml`. Run every gate before you
-push; CI runs the same ones.
+push; CI runs the same ones. Besides Rust you need `cargo-deny`, `bash` and
+`jq` (for `scripts/check-version-sync.sh`), and Node 21+ (for the
+`npm/test/*.test.mjs` glob).
 
 ```sh
 cargo build
