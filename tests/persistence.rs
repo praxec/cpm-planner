@@ -1012,3 +1012,131 @@ async fn startup_reap_with_incomplete_prerequisites_becomes_pending() {
     let status = planner.status(&plan_id).await.expect("status");
     assert_eq!(status.deliverables[1].1, DeliverableStatus::Pending);
 }
+
+// ---------------------------------------------------------------------
+// Lockless in_progress marks across a restart
+// ---------------------------------------------------------------------
+
+/// Submit the chain plan and mark d1 `in_progress` with no lease (owner or
+/// manual work), then drop the planner: one simulated process.
+async fn lockless_in_progress_d1(path: &Path, graph: PlanGraph) -> cpm_planner::plan::PlanId {
+    let planner = open_planner(path);
+    let plan_id = planner.submit_plan(graph).await.expect("submit");
+    planner
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
+            "d1",
+            caller("owner"),
+            DeliverableStatus::InProgress,
+        ))
+        .await
+        .expect("lockless in_progress mark");
+    plan_id
+}
+
+#[tokio::test]
+async fn lockless_in_progress_survives_restart() {
+    let db = TempDb::new();
+    let plan_id = lockless_in_progress_d1(&db.path, chain_graph()).await;
+    let status = open_planner(&db.path)
+        .status(&plan_id)
+        .await
+        .expect("status after reopen");
+    assert_eq!(status.deliverables[0].1, DeliverableStatus::InProgress);
+}
+
+#[tokio::test]
+async fn lockless_in_progress_restart_records_no_lapse() {
+    let db = TempDb::new();
+    let plan_id = lockless_in_progress_d1(&db.path, chain_graph()).await;
+    let status = open_planner(&db.path)
+        .status(&plan_id)
+        .await
+        .expect("status after reopen");
+    assert_eq!(status.deliverables[0].4, 0);
+}
+
+#[tokio::test]
+async fn lockless_earned_pct_survives_restart() {
+    let db = TempDb::new();
+    let mut graph = chain_graph();
+    for d in &mut graph.deliverables {
+        d.earning_rule = Some(cpm_planner::earned_value::EarningRule::FiftyFifty);
+    }
+    let plan_id = lockless_in_progress_d1(&db.path, graph).await;
+    open_planner(&db.path)
+        .baseline(cpm_planner::earned_value::BaselineRequest::new(
+            plan_id.clone(),
+        ))
+        .await
+        .expect("baseline");
+    let report = open_planner(&db.path)
+        .ev(&plan_id, None)
+        .await
+        .expect("ev after reopen");
+    assert_eq!(report.rows[0].earned_pct, 50.0);
+}
+
+#[tokio::test]
+async fn lease_held_in_progress_without_lock_is_still_quarantined_on_restart() {
+    let db = TempDb::new();
+    let plan_id = {
+        let planner = open_planner(&db.path);
+        let plan_id = planner.submit_plan(chain_graph()).await.expect("submit");
+        planner
+            .acquire_cohort(AcquireRequest::new(plan_id.clone(), caller("w"), 1))
+            .await
+            .expect("acquire d1");
+        plan_id
+    };
+    // The lease row is gone while d1 is still in_progress by lease.
+    rusqlite::Connection::open(&db.path)
+        .expect("open")
+        .execute("DELETE FROM locks", [])
+        .expect("delete lock row");
+    let status = open_planner(&db.path)
+        .status(&plan_id)
+        .await
+        .expect("status after reopen");
+    assert_eq!(
+        status.deliverables[0],
+        ("d1".to_string(), DeliverableStatus::Ready, 1, 0, 1)
+    );
+}
+
+#[tokio::test]
+async fn lease_taking_over_lockless_in_progress_is_quarantined_normally_after_expiry() {
+    let db = TempDb::new();
+    let ancient = Utc
+        .with_ymd_and_hms(2020, 1, 1, 0, 0, 0)
+        .single()
+        .expect("valid t0");
+    let plan_id = lockless_in_progress_d1(&db.path, chain_graph()).await;
+    {
+        // The owner hands d1 back, and a worker leases it; the lease has
+        // lapsed by the real clock the startup sweep uses.
+        let planner =
+            open_planner_with_clock(&db.path, Duration::from_secs(60), TestClock::at(ancient));
+        planner
+            .mark_status(MarkStatusRequest::new(
+                plan_id.clone(),
+                "d1",
+                caller("owner"),
+                DeliverableStatus::Ready,
+            ))
+            .await
+            .expect("lockless ready mark");
+        planner
+            .acquire_cohort(AcquireRequest::new(plan_id.clone(), caller("w"), 1))
+            .await
+            .expect("acquire d1");
+    }
+    let status = open_planner(&db.path)
+        .status(&plan_id)
+        .await
+        .expect("status after reopen");
+    assert_eq!(
+        status.deliverables[0],
+        ("d1".to_string(), DeliverableStatus::Ready, 1, 0, 1)
+    );
+}

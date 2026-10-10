@@ -14,7 +14,7 @@
 //! Lifecycle methods drain pending events into a `Vec<AuditEvent>` while
 //! holding the mutex, then flush after dropping it.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::plan::{DeliverableStatus, FileMode, LockInfo, OwnedFile, PlanGraph};
@@ -60,9 +60,20 @@ pub(crate) struct PlanState {
     /// the deliverable and reports it in `blocked` with code `LAPSE_LIMIT`.
     pub(crate) lapse_counts: HashMap<String, u32>,
 
-    /// Currently held locks keyed by deliverable id. A deliverable is
-    /// `InProgress` iff this map contains it.
+    /// Currently held locks keyed by deliverable id. A leased deliverable
+    /// is `InProgress` while this map contains it; an `InProgress`
+    /// deliverable without an entry is either in [`Self::lockless`] or an
+    /// orphan of a lost lease.
     pub(crate) locks: HashMap<String, LockInfo>,
+
+    /// Deliverables marked `InProgress` by a LOCKLESS `mark_status` (owner
+    /// or manual work), persisted as `deliverable_statuses.lockless`. Lease
+    /// provenance for the startup sweep: an `InProgress` deliverable with
+    /// no lock row is an orphan (quarantined) unless it is here. Only
+    /// meaningful while the deliverable is `InProgress` and unlocked
+    /// ([`Self::is_lockless_in_progress`]); the store persists that
+    /// conjunction, so any status change or lease takeover clears it.
+    pub(crate) lockless: HashSet<String>,
 
     /// Inverse index: who currently claims each locked file (one exclusive
     /// holder, or a set of append holders). Maintained in lock-step with
@@ -219,6 +230,7 @@ impl PlanState {
             failure_counts: HashMap::new(),
             lapse_counts: HashMap::new(),
             locks: HashMap::new(),
+            lockless: HashSet::new(),
             file_claims: HashMap::new(),
             cached_result,
             leased_hours: HashMap::new(),
@@ -287,6 +299,15 @@ impl PlanState {
         }
         self.record_lease_end(&lock, end);
         Some(lock)
+    }
+
+    /// Whether `deliverable_id` is `InProgress` from a lockless mark: in
+    /// [`Self::lockless`], `InProgress`, and holding no lock. This is the
+    /// value persisted as `deliverable_statuses.lockless`.
+    pub(crate) fn is_lockless_in_progress(&self, deliverable_id: &str) -> bool {
+        self.lockless.contains(deliverable_id)
+            && self.statuses.get(deliverable_id) == Some(&DeliverableStatus::InProgress)
+            && !self.locks.contains_key(deliverable_id)
     }
 
     /// Lease count for `deliverable_id`. Missing entry = never leased.

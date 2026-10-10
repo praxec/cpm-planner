@@ -280,6 +280,14 @@ pub(crate) fn plan_revision(
         .filter(|(k, _)| survives(k))
         .map(|(k, v)| (k.clone(), *v))
         .collect();
+    // Lockless provenance rides with a carried in_progress status; a
+    // re-derived one drops it when saved (`is_lockless_in_progress`).
+    state.lockless = old
+        .lockless
+        .iter()
+        .filter(|k| survives(k))
+        .cloned()
+        .collect();
     for (id, l) in &old.locks {
         if l.expires_at < now && survives(id) {
             *state.lapse_counts.entry(id.clone()).or_insert(0) += 1;

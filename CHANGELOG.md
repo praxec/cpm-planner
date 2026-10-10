@@ -68,6 +68,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A deliverable marked `in_progress` by a lockless `plan.mark_status` (owner or manual work) now survives a server restart: the startup sweep no longer resets it to ready/pending, adds a lapse, or drops its earned percent. Only an `in_progress` that came from a lease and has lost its lock row is quarantined. Lease provenance is stored in the new `deliverable_statuses.lockless` column (schema v4); `in_progress` rows of a database migrated from v3 count as lease-backed, so they are quarantined as before.
 - `JevJudge` owns its HTTP client instead of rig's process-wide one, whose keep-alive connections could be handed to a judge on another tokio runtime and then stall until the timeout or fail at once as a `transport` error ("runtime dropped the dispatch task") (#37).
 - `plan.submit` accepts a file owned by deliverables ordered by prerequisites; only unordered exclusive overlaps are rejected (#12).
 - One lapse-limited deliverable no longer fails `plan.acquire_cohort` for the whole plan; it is reported in the new `blocked` list (#17).

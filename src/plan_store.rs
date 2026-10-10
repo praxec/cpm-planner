@@ -31,14 +31,17 @@
 //! to `ready` (its prerequisites were complete when it was acquired and
 //! TTL expiry does not unwind upstream work — the same rule as
 //! `PlanState::reap_expired`), and the lease's hours up to expiry are
-//! added to `ev_actuals.leased_hours`. A deliverable left `in_progress` with no
-//! lock row at all (a crash between partial writes on a pre-WAL database,
-//! or manual surgery) is likewise reset to `ready`. Locks that are still
+//! added to `ev_actuals.leased_hours`. A deliverable left `in_progress` BY A
+//! LEASE with no lock row at all (a crash between partial writes on a
+//! pre-WAL database, or manual surgery) is likewise reset to `ready`. A
+//! deliverable marked `in_progress` by a lockless `plan.mark_status` (owner
+//! or manual work, `deliverable_statuses.lockless = 1`) never had a lock
+//! row and is left untouched: status, earned percent, no lapse. Locks that are still
 //! within TTL are preserved: another process may legitimately be working
 //! under them, and clearing them on an unrelated restart would break the
 //! cross-process contract.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -152,7 +155,9 @@ impl SqlitePlanStore {
     /// so it feeds the lapse bound, never the failure circuit-breaker),
     /// and the lock row is deleted. Also resets any orphaned
     /// `in_progress` deliverable that has no lock row, likewise counted
-    /// as a lapse. `attempt_count` and `failure_count` are preserved
+    /// as a lapse — unless it was marked `in_progress` without a lease
+    /// (`lockless = 1`), a legitimate persisted state that is left as is.
+    /// `attempt_count` and `failure_count` are preserved
     /// untouched. Returns the number of expired locks reaped. Public so
     /// operators/tests can force a sweep; `open` runs it automatically.
     pub fn quarantine_expired(&self, now: DateTime<Utc>) -> anyhow::Result<usize> {
@@ -166,9 +171,10 @@ impl SqlitePlanStore {
         let now_us = now.timestamp_micros();
 
         // Targets: deliverables with an expired lock, plus orphaned
-        // in_progress ones with no lock at all (cannot be legitimately held
-        // by anyone). Losing the lease without a terminal mark is an
-        // environmental loss, so each counts as a lapse.
+        // lease-backed in_progress ones with no lock at all (cannot be
+        // legitimately held by anyone). Losing the lease without a terminal
+        // mark is an environmental loss, so each counts as a lapse. A
+        // lockless in_progress mark is not an orphan.
         let expired: Vec<(String, String)> = {
             let mut stmt =
                 tx.prepare("SELECT plan_id, deliverable_id FROM locks WHERE expires_at_us < ?1")?;
@@ -207,6 +213,7 @@ impl SqlitePlanStore {
             let mut stmt = tx.prepare(
                 "SELECT plan_id, deliverable_id FROM deliverable_statuses
                  WHERE status = ?1
+                   AND lockless = 0
                    AND (plan_id, deliverable_id) NOT IN
                        (SELECT plan_id, deliverable_id FROM locks)",
             )?;
@@ -254,7 +261,8 @@ impl SqlitePlanStore {
                 })
                 .unwrap_or(DeliverableStatus::Ready);
             tx.execute(
-                "UPDATE deliverable_statuses SET status = ?1, lapse_count = lapse_count + 1
+                "UPDATE deliverable_statuses
+                 SET status = ?1, lapse_count = lapse_count + 1, lockless = 0
                  WHERE plan_id = ?2 AND deliverable_id = ?3",
                 params![serde_json::to_string(&status)?, plan_id, deliverable_id],
             )?;
@@ -567,7 +575,14 @@ fn migrate_v3_portfolio(conn: &Connection) -> anyhow::Result<()> {
 /// accumulated lease hours, evidence list) and EV snapshots. Rows of a
 /// deliverable later removed from the graph are kept: its baselined budget
 /// and actual cost still count.
+///
+/// Also adds `deliverable_statuses.lockless`, the lease provenance of an
+/// `in_progress` status: 1 when it came from a lockless `plan.mark_status`
+/// (kept by the startup sweep), 0 otherwise. Rows of a pre-v4 database
+/// default to 0, so an existing `in_progress` row without a lock row is
+/// treated as lease-backed and quarantined exactly as before v4.
 fn migrate_v4_earned_value(conn: &Connection) -> anyhow::Result<()> {
+    migrate_lockless_column(conn)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS baselines (
              plan_id       TEXT NOT NULL REFERENCES plans(plan_id) ON DELETE CASCADE,
@@ -606,6 +621,28 @@ fn migrate_v4_earned_value(conn: &Connection) -> anyhow::Result<()> {
              ON ev_snapshots(plan_id, as_of_us, taken_at_us);",
     )
     .context("creating earned-value tables")
+}
+
+/// Add `deliverable_statuses.lockless` (default 0: lease-backed) unless a
+/// `PRAGMA table_info` probe finds it already there.
+fn migrate_lockless_column(conn: &Connection) -> anyhow::Result<()> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(deliverable_statuses)")
+        .context("probing deliverable_statuses columns")?;
+    let has_column = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .context("reading deliverable_statuses column names")?
+        .collect::<Result<Vec<_>, _>>()
+        .context("reading deliverable_statuses column name")?
+        .iter()
+        .any(|c| c == "lockless");
+    if !has_column {
+        conn.execute_batch(
+            "ALTER TABLE deliverable_statuses ADD COLUMN lockless INTEGER NOT NULL DEFAULT 0",
+        )
+        .context("adding deliverable_statuses.lockless column")?;
+    }
+    Ok(())
 }
 
 /// Recompute `cached_result` for every plan stored by an older CPM kernel.
@@ -710,10 +747,12 @@ pub(crate) fn load_plan_state(
     let mut attempt_counts: HashMap<String, u32> = HashMap::new();
     let mut failure_counts: HashMap<String, u32> = HashMap::new();
     let mut lapse_counts: HashMap<String, u32> = HashMap::new();
+    let mut lockless: HashSet<String> = HashSet::new();
     {
         let mut stmt = tx
             .prepare(
-                "SELECT deliverable_id, status, attempt_count, failure_count, lapse_count
+                "SELECT deliverable_id, status, attempt_count, failure_count, lapse_count,
+                        lockless
                  FROM deliverable_statuses WHERE plan_id = ?1",
             )
             .map_err(backend)?;
@@ -725,11 +764,12 @@ pub(crate) fn load_plan_state(
                     row.get::<_, u32>(2)?,
                     row.get::<_, u32>(3)?,
                     row.get::<_, u32>(4)?,
+                    row.get::<_, bool>(5)?,
                 ))
             })
             .map_err(backend)?;
         for row in rows {
-            let (id, status_json, attempt_count, failure_count, lapse_count) =
+            let (id, status_json, attempt_count, failure_count, lapse_count, is_lockless) =
                 row.map_err(backend)?;
             let status: DeliverableStatus = serde_json::from_str(&status_json).map_err(backend)?;
             statuses.insert(id.clone(), status);
@@ -738,6 +778,9 @@ pub(crate) fn load_plan_state(
             }
             if failure_count > 0 {
                 failure_counts.insert(id.clone(), failure_count);
+            }
+            if is_lockless {
+                lockless.insert(id.clone());
             }
             if lapse_count > 0 {
                 lapse_counts.insert(id, lapse_count);
@@ -793,6 +836,7 @@ pub(crate) fn load_plan_state(
         failure_counts,
         lapse_counts,
         locks,
+        lockless,
         file_claims,
         cached_result,
         leased_hours: HashMap::new(),
@@ -867,13 +911,15 @@ pub(crate) fn save_plan_state(
         let mut stmt = tx
             .prepare(
                 "INSERT INTO deliverable_statuses
-                     (plan_id, deliverable_id, status, attempt_count, failure_count, lapse_count)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     (plan_id, deliverable_id, status, attempt_count, failure_count,
+                      lapse_count, lockless)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(plan_id, deliverable_id) DO UPDATE
                      SET status = excluded.status,
                          attempt_count = excluded.attempt_count,
                          failure_count = excluded.failure_count,
-                         lapse_count = excluded.lapse_count",
+                         lapse_count = excluded.lapse_count,
+                         lockless = excluded.lockless",
             )
             .map_err(backend)?;
         for (deliverable_id, status) in &state.statuses {
@@ -884,7 +930,10 @@ pub(crate) fn save_plan_state(
                 status_json,
                 state.attempt_count(deliverable_id),
                 state.failure_count(deliverable_id),
-                state.lapse_count(deliverable_id)
+                state.lapse_count(deliverable_id),
+                // Provenance holds only while in_progress and unlocked, so a
+                // status change or a lease takeover clears it here.
+                state.is_lockless_in_progress(deliverable_id)
             ])
             .map_err(backend)?;
         }
@@ -1125,7 +1174,8 @@ mod tests {
     }
 
     /// A v4 database stripped back to the v3 layout (earned-value tables
-    /// dropped, `user_version` 3) holding one plan.
+    /// and `deliverable_statuses.lockless` dropped, `user_version` 3)
+    /// holding one plan.
     fn v3_database(tag: &str) -> TempDbFile {
         let db = TempDbFile::new(tag);
         let store = SqlitePlanStore::open(&db.path).unwrap();
@@ -1138,10 +1188,31 @@ mod tests {
         let conn = Connection::open(&db.path).unwrap();
         conn.execute_batch(
             "DROP TABLE baselines; DROP TABLE ev_actuals; DROP TABLE ev_snapshots;
+             ALTER TABLE deliverable_statuses DROP COLUMN lockless;
              PRAGMA user_version = 3;",
         )
         .unwrap();
         db
+    }
+
+    /// A v3 database has no lease provenance: its `in_progress` rows
+    /// default to lease-backed, so one without a lock row is still
+    /// quarantined when the store first opens at v4.
+    #[test]
+    fn migrated_v3_in_progress_without_lock_is_quarantined_as_lease_backed() {
+        let db = v3_database("v3-orphan");
+        let conn = Connection::open(&db.path).unwrap();
+        conn.execute(
+            "UPDATE deliverable_statuses SET status = ?1 WHERE deliverable_id = 'd1'",
+            params![serde_json::to_string(&DeliverableStatus::InProgress).unwrap()],
+        )
+        .unwrap();
+        drop(conn);
+        let store = SqlitePlanStore::open(&db.path).unwrap();
+        let status = store
+            .read_plan(&PlanId("plan_v3".into()), |s| s.statuses.get("d1").cloned())
+            .unwrap();
+        assert_eq!(status, Some(DeliverableStatus::Ready));
     }
 
     #[test]
