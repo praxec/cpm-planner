@@ -159,7 +159,17 @@ impl JevJudge {
             | ProviderError::MismatchedDimensions { .. } => {
                 self.error(K::Decode, error.to_string())
             }
-            ProviderError::Http(_) => self.error(K::Transport, error.to_string()),
+            ProviderError::Http(inner) => {
+                // TEMP-DIAG: full source chain for the Windows CI failure.
+                let mut chain = format!("TEMP-DIAG {inner:?}");
+                let mut src = std::error::Error::source(&**inner);
+                while let Some(c) = src {
+                    chain.push_str(&format!(" | caused by: {c} [{c:?}]"));
+                    src = c.source();
+                }
+                eprintln!("{chain}");
+                self.error(K::Transport, error.to_string())
+            }
             ProviderError::Url(_)
             | ProviderError::Request(_)
             | ProviderError::UnsupportedOption(_) => {
