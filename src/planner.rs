@@ -356,7 +356,7 @@ impl BasicCpmPlanner {
         self.flush_audit(vec![event]).await;
     }
 
-    /// Flush buffered audit events. Called after the mutex is dropped so a
+    /// Flush buffered audit events. Called after the transaction commits so a
     /// slow sink never blocks concurrent planner callers.
     async fn flush_audit(&self, events: Vec<AuditEvent>) {
         for ev in events {

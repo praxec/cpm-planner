@@ -109,31 +109,44 @@ fn issue_forms_have_name_description_and_typed_body() {
 
 /// Markdown files whose relative links are checked: README.md plus every
 /// `.md` under `docs/`, except the design history in `docs/superpowers/`.
-fn linked_markdown_files(root: &Path) -> Vec<std::path::PathBuf> {
-    fn walk(dir: &Path, skip: &Path, out: &mut Vec<std::path::PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
+/// Directories that cannot be listed are returned as errors.
+fn linked_markdown_files(root: &Path) -> (Vec<std::path::PathBuf>, Vec<String>) {
+    fn walk(dir: &Path, skip: &Path, out: &mut Vec<std::path::PathBuf>, errors: &mut Vec<String>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(err) => {
+                errors.push(format!("{}: cannot list directory ({err})", dir.display()));
+                return;
+            }
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
+        for entry in entries {
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(err) => {
+                    errors.push(format!("{}: cannot read entry ({err})", dir.display()));
+                    continue;
+                }
+            };
             if path == skip {
                 continue;
             }
             if path.is_dir() {
-                walk(&path, skip, out);
+                walk(&path, skip, out, errors);
             } else if path.extension().is_some_and(|ext| ext == "md") {
                 out.push(path);
             }
         }
     }
     let mut files = vec![root.join("README.md")];
+    let mut errors = Vec::new();
     walk(
         &root.join("docs"),
         &root.join("docs").join("superpowers"),
         &mut files,
+        &mut errors,
     );
     files.sort();
-    files
+    (files, errors)
 }
 
 /// Lines of a Markdown file outside fenced code blocks.
@@ -225,7 +238,10 @@ fn broken_link_reason(file: &Path, target: &str) -> Option<String> {
     if resolved.extension().is_none_or(|ext| ext != "md") {
         return None;
     }
-    let text = std::fs::read_to_string(&resolved).ok()?;
+    let text = match std::fs::read_to_string(&resolved) {
+        Ok(text) => text,
+        Err(err) => return Some(format!("cannot read target ({err})")),
+    };
     if heading_anchors(&text).contains(anchor) {
         None
     } else {
@@ -236,25 +252,30 @@ fn broken_link_reason(file: &Path, target: &str) -> Option<String> {
 #[test]
 fn readme_links_resolve() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let offenders: Vec<String> = linked_markdown_files(root)
-        .iter()
-        .flat_map(|file| {
-            let text = std::fs::read_to_string(file).unwrap_or_default();
-            let shown = file
-                .strip_prefix(root)
-                .unwrap_or(file)
-                .display()
-                .to_string();
+    let (files, mut offenders) = linked_markdown_files(root);
+    for file in &files {
+        let shown = file
+            .strip_prefix(root)
+            .unwrap_or(file)
+            .display()
+            .to_string();
+        let text = match std::fs::read_to_string(file) {
+            Ok(text) => text,
+            Err(err) => {
+                offenders.push(format!("{shown}: cannot read file ({err})"));
+                continue;
+            }
+        };
+        offenders.extend(
             prose_lines(&text)
                 .into_iter()
                 .flat_map(link_targets)
                 .filter_map(|target| {
                     broken_link_reason(file, &target)
                         .map(|why| format!("{shown}: {target} ({why})"))
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect();
+                }),
+        );
+    }
 
     assert!(
         offenders.is_empty(),
