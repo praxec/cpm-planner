@@ -6,6 +6,12 @@ on:
     pull_request:
         branches: [main, dev]
 
+# Cancel superseded runs of the same ref so a stale run cannot hold a scarce
+# macOS runner while its replacement queues behind it.
+concurrency:
+    group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+    cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
     CARGO_TERM_COLOR: always
     RUSTFLAGS: "-Dwarnings"
@@ -38,6 +44,8 @@ jobs:
               with:
                   components: rustfmt, clippy
             - uses: Swatinem/rust-cache@v2
+            - name: server.json version matches Cargo.toml
+              run: scripts/check-version-sync.sh
             - name: rustfmt
               run: cargo fmt --all --check
             - name: clippy
