@@ -83,7 +83,7 @@ jobs:
           - { target: aarch64-pc-windows-msvc,    os: windows-11-arm,   ext: zip }
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.120.0
         with:
           targets: ${{ matrix.target }}
       - name: build (locked, current sources)
