@@ -210,14 +210,21 @@ pub trait Planner: Send + Sync {
     /// numbered earned-value baseline. Baselines belong to one plan (one
     /// variant): the first is number 1 and needs no reason; a re-baseline
     /// needs a non-blank `reason` (`INVALID_GRAPH` otherwise) and keeps
-    /// actuals and snapshots. `start` defaults to now. Gated like the
-    /// execution methods. Audited as `plan.ev.baselined`.
+    /// actuals and snapshots. `start` defaults to now; `calendar` defaults
+    /// to wall-clock hours on the first baseline and to the previous
+    /// baseline's calendar on a re-baseline. Gated like the execution
+    /// methods. Audited as `plan.ev.baselined`.
     async fn baseline(&self, req: BaselineRequest) -> Result<BaselineOutcome, PlannerError>;
 
     /// The earned-value report of `plan_id` against its latest baseline as
-    /// of `as_of` (default now). Alerts compare the two latest stored
-    /// snapshots (by `as_of`) of that baseline; the current reading is not
-    /// one of them. `NOT_BASELINED` before the first baseline. Read-only.
+    /// of `as_of` (default now). `as_of` is the PV status date; EV and AC
+    /// reflect progress and actuals recorded up to the moment the call
+    /// runs. AC includes the spend of removed and unbaselined deliverables;
+    /// a removed baselined deliverable reports status `removed` and earns
+    /// its frozen percent. Alerts compare the two latest stored
+    /// non-backfilled snapshots (by `as_of`) of that baseline; the current
+    /// reading is not one of them. `NOT_BASELINED` before the first
+    /// baseline. Read-only.
     ///
     /// The returned future does its store reads and CPM work synchronously,
     /// so it blocks whatever polls it; async callers should drive it on a
@@ -231,7 +238,10 @@ pub trait Planner: Send + Sync {
     /// Compute the earned-value report (as [`Planner::ev`]) and append it as
     /// a snapshot. Its alerts consider only readings up to its own
     /// `(as_of, taken_at)` position: this snapshot and the latest earlier
-    /// one of the current baseline. Returns the summary, the stored count
+    /// one of the current baseline, skipping backfilled snapshots (`as_of`
+    /// more than an hour before `taken_at`; flagged `backfilled`, and a
+    /// backfilled snapshot raises no alerts itself, since its EV and AC are
+    /// today's). Returns the summary, the stored count
     /// and an export of the newest snapshots by `as_of` (an older backfill
     /// is counted but not listed). `NOT_BASELINED` before the first
     /// baseline. Gated like the execution methods.

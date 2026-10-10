@@ -1085,7 +1085,8 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                  (effort basis x metadata.cost_rate) as its next numbered baseline for earned \
                  value. The first baseline is number 1; re-baselining needs a non-blank \
                  `reason` (INVALID_GRAPH otherwise) and keeps actuals and snapshots. \
-                 Execution-side: the plan must be its line's selected, unarchived variant \
+                 Without `calendar`, a re-baseline keeps the previous baseline's calendar \
+                 (the first baseline counts wall-clock hours). Execution-side: the plan must be its line's selected, unarchived variant \
                  (VARIANT_NOT_SELECTED / ARCHIVE_REFUSED). Audited as plan.ev.baselined.",
             ),
             schema_object(json!({
@@ -1104,10 +1105,16 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
             Cow::Borrowed(TOOL_EV),
             Cow::Borrowed(
                 "Earned-value report against the plan's latest baseline as of `as_of` \
-                 (default now): BAC, PV, EV, AC, SV, CV, SPI, CPI, EAC, ETC, VAC, TCPI, \
-                 per-deliverable rows, critical float consumed, SPI_BELOW_0_9 / \
-                 CPI_BELOW_0_9 alerts from the two latest stored snapshots (by as_of) of \
-                 the current baseline, and deliverables added since the baseline. A \
+                 (default now). `as_of` is the PV status date; EV and AC reflect progress \
+                 and actuals recorded up to the moment the call runs. Returns BAC, PV, EV, \
+                 AC, SV, CV, SPI, CPI, EAC, ETC, VAC, TCPI, per-deliverable rows (a \
+                 baselined deliverable later removed by plan.revise has status `removed` \
+                 and keeps the percent it had earned: 100 if complete), critical float \
+                 consumed, SPI_BELOW_0_9 / CPI_BELOW_0_9 alerts from the two latest \
+                 stored non-backfilled snapshots (by as_of) of the current baseline, and \
+                 deliverables added since the baseline. AC counts every recorded hour of \
+                 the plan, including removed and unbaselined deliverables (rate 1 when the \
+                 baseline has no row). A \
                  ratio whose denominator is 0 is null and explained in `undefined`. \
                  Read-only; works on any variant. \
                  NOT_BASELINED before plan.baseline.",
@@ -1116,7 +1123,7 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                 "type": "object",
                 "properties": {
                     "plan_id": { "type": "string" },
-                    "as_of": { "type": "string", "format": "date-time", "description": "RFC 3339 status date; defaults to now." }
+                    "as_of": { "type": "string", "format": "date-time", "description": "RFC 3339 PV status date; defaults to now. EV and AC are always as recorded when the call runs." }
                 },
                 "required": ["plan_id"],
                 "additionalProperties": false
@@ -1126,8 +1133,12 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
             Cow::Borrowed(TOOL_SNAPSHOT),
             Cow::Borrowed(
                 "Compute the earned-value report (as plan.ev) and append it as a \
-                 snapshot. Returns the snapshot summary (alerts consider this snapshot and \
-                 the latest earlier one by as_of of the current baseline) and an export \
+                 snapshot. `as_of` is the PV status date; EV and AC are the progress \
+                 recorded when the call runs, so a snapshot whose as_of is more than an \
+                 hour before its taken_at is marked `backfilled: true` and ignored by \
+                 alerts. Returns the snapshot summary (alerts consider this snapshot and \
+                 the latest earlier non-backfilled one by as_of of the current baseline) \
+                 and an export \
                  of the newest 100 snapshots by as_of, oldest first (an older backfill \
                  is counted but not listed): a list of \
                  summaries (format json, default) or a Markdown table with columns \
@@ -1138,7 +1149,7 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                 "type": "object",
                 "properties": {
                     "plan_id": { "type": "string" },
-                    "as_of": { "type": "string", "format": "date-time", "description": "RFC 3339 status date; defaults to now." },
+                    "as_of": { "type": "string", "format": "date-time", "description": "RFC 3339 PV status date; defaults to now. EV and AC are always as recorded when the call runs." },
                     "format": { "type": "string", "enum": ["json", "markdown"], "description": "Export format (default json)." }
                 },
                 "required": ["plan_id"],
@@ -1974,9 +1985,9 @@ Tools (twenty-two total, all `plan.<verb>`):
   plan.select          — make a variant its line's selected (only executable) variant, carrying progress over (Complete statuses of identically defined deliverables, with their earned-value actuals); force releases locks on the previous variant
   plan.archive         — archive (archived defaults true) or unarchive a whole line or one variant; archived variants stay readable but refuse sync/select/execute
   plan.compare         — compare stored plans (plan_ids: 2..16 distinct ids, or plan line name in project, default the discovered root, for every live variant, at most 16) on the scorecard: Pareto front, weighted rank, recommended; weights must be finite and >= 0; the Monte Carlo budget (200000000) is shared across variants
-  plan.baseline        — freeze the plan's CPM schedule (es/ef) and budgets (effort basis x metadata.cost_rate, default 1) as its next numbered earned-value baseline; optional start (RFC 3339, default now) and calendar {hours_per_day (0 < h <= 24, default 8), workdays (default mon..fri), utc_offset_minutes (default 0)} (omitted: wall-clock hours); re-baselining needs a non-blank reason (<= 2048 chars, INVALID_GRAPH otherwise) and keeps actuals and snapshots; baselines, actuals and snapshots belong to one variant, so a newly selected variant takes its own baseline 1 with no reason needed; selected, unarchived variant only; audited as plan.ev.baselined
-  plan.ev              — earned-value report against the latest baseline as of as_of (RFC 3339, default now): bac, pv, ev, ac, sv, cv, spi, cpi, eac, etc, vac, tcpi, per-deliverable rows, critical_float_consumed_hours, alerts (SPI_BELOW_0_9 / CPI_BELOW_0_9 when below 0.9 on the two latest stored snapshots by as_of of the current baseline; the current reading is not one of them), excluded_unbaselined; a ratio with a zero denominator is null and explained in `undefined` (never NaN); read-only on any variant; NOT_BASELINED before plan.baseline
-  plan.snapshot        — compute the plan.ev report and append it as a snapshot; returns summary (undefined explains each null ratio; alerts consider only readings up to its own position: this snapshot and the latest earlier one by as_of of the current baseline, so a backfill never takes alerts from newer readings), snapshot_count and export of the newest 100 snapshots by as_of (ties by taken_at), oldest first, so a backfilled as_of lands in date order; a backfill older than those 100 is stored and counted but not listed: a list of summaries (format "json", default) or a Markdown table with columns date, PV, EV, AC, SPI, CPI, EAC (format "markdown"); selected, unarchived variant only; NOT_BASELINED before plan.baseline
+  plan.baseline        — freeze the plan's CPM schedule (es/ef) and budgets (effort basis x metadata.cost_rate, default 1) as its next numbered earned-value baseline; optional start (RFC 3339, default now) and calendar {hours_per_day (0 < h <= 24, default 8), workdays (default mon..fri), utc_offset_minutes (default 0)} (omitted: wall-clock hours on the first baseline, the previous baseline's calendar on a re-baseline); re-baselining needs a non-blank reason (<= 2048 chars, INVALID_GRAPH otherwise) and keeps actuals and snapshots; baselines, actuals and snapshots belong to one variant, so a newly selected variant takes its own baseline 1 with no reason needed; selected, unarchived variant only; audited as plan.ev.baselined
+  plan.ev              — earned-value report against the latest baseline as of as_of (RFC 3339, default now; as_of is the PV status date, while EV and AC reflect progress and actuals recorded up to the moment the call runs): bac, pv, ev, ac, sv, cv, spi, cpi, eac, etc, vac, tcpi, per-deliverable rows, critical_float_consumed_hours, alerts (SPI_BELOW_0_9 / CPI_BELOW_0_9 when below 0.9 on the two latest stored non-backfilled snapshots by as_of of the current baseline; the current reading is not one of them), excluded_unbaselined; AC sums every recorded hour of the plan (removed and unbaselined deliverables included, at rate 1 when the baseline has no row); a baselined deliverable removed by plan.revise reports status "removed" and keeps its earned percent at removal (100 if complete), and re-adding it restarts its earned percent (hours keep accumulating); a ratio with a zero denominator is null and explained in `undefined` (never NaN); read-only on any variant; NOT_BASELINED before plan.baseline
+  plan.snapshot        — compute the plan.ev report and append it as a snapshot (as_of is the PV status date; EV and AC are as recorded when the call runs, so a snapshot whose as_of is more than an hour before taken_at is marked backfilled: true, raises no alerts and is skipped by later alerts); returns summary (undefined explains each null ratio; alerts consider only readings up to its own position: this snapshot and the latest earlier one by as_of of the current baseline, so a backfill never takes alerts from newer readings), snapshot_count and export of the newest 100 snapshots by as_of (ties by taken_at), oldest first, so a backfilled as_of lands in date order; a backfill older than those 100 is stored and counted but not listed: a list of summaries (format "json", default) or a Markdown table with columns date, PV, EV, AC, SPI, CPI, EAC (format "markdown"); selected, unarchived variant only; NOT_BASELINED before plan.baseline
   plan.submit with a `name` (optional `project`/`variant`, variant defaults to "main") registers a named variant instead of an unnamed plan
   plan.lint, plan.simulate take exactly one of an inline graph, a stored plan_id, or a plan-file path; plan.schedule takes graph or plan_id; plan.schedule and plan.simulate reject what plan.submit rejects, and plan.lint reports it as findings
 
