@@ -20,9 +20,9 @@ within 7 days. A fix or mitigation is coordinated before public disclosure.
 
 ## Scope
 
-cpm-planner is an MCP server that speaks over stdio. It executes no
-user-supplied code and never shells out to another process. The security-relevant
-surface is:
+cpm-planner is an MCP server that speaks over stdio. The server itself
+executes no user-supplied code and never shells out to another process. Every
+component below ships in 0.2.0 and is in scope:
 
 - **Plan-file I/O (`src/project.rs`).** Plan files under
   `<root>/.cpm-planner/plans/` are read and written through `cap-std`
@@ -37,11 +37,36 @@ surface is:
   Any leak of the key, or a way to send it to a non-HTTPS non-loopback
   endpoint, is in scope.
 - **SQLite store.** Plan, lock, and earned-value state is kept in a local
-  SQLite database at `CPM_PLANNER_DB` (default under the user data directory).
+  SQLite database at `CPM_PLANNER_DB`, by default
+  `~/.local/share/praxec/cpm-planner.db` on every OS (`~` is `HOME`, falling
+  back to `USERPROFILE`, so `%USERPROFILE%\.local\share\praxec\` on Windows).
   Crafted inputs that corrupt it or let two callers hold the same deliverable
   lock are in scope.
-- **`skills install` (coming in 0.2.0).** It writes only under the user or
-  project skill directories and never overwrites files it did not write.
+- **`cpm-planner skills install` / `uninstall` (`src/skills.rs`).** It writes
+  only inside the user or project skill roots of the selected agents. Paths in
+  the embedded manifest are validated before use and never resolve outside
+  those roots. It never overwrites or removes a file it did not write, or one
+  the user changed since it was written, unless `--force` is given. A way to
+  write or delete outside the skill roots, or to clobber user files without
+  `--force`, is in scope.
+- **npm launcher (`npm/`, `@matthew-cochran/cpm`).** It downloads the release
+  binary over HTTPS only, following redirects only to an allowlist of hosts,
+  and verifies the archive's SHA-256 against the release `checksums.sha256`
+  before extracting it. Extraction uses the system `tar` (or `Expand-Archive`
+  on Windows) after every entry is checked: absolute paths, `..` segments and
+  links (plus, for tar, special files) are refused. The cached binary's hash
+  is re-verified on every start, and on unix the cache directory must be owned
+  by the current user and not group- or world-writable. Concurrent installs are serialised by
+  a pid-aware lock that recovers from a crashed holder. Two overrides exist:
+  `PRAXEC_ALLOW_INSECURE=1` permits plain `http://` (local testing only), and
+  `CPM_PLANNER_BINARY` runs a local binary you supply instead of downloading
+  one. A way to run an unverified binary without those overrides, to escape
+  the cache directory during extraction, or to redirect a download to an
+  unlisted host is in scope.
+- **Install scripts (`scripts/install.sh`, `scripts/install.ps1`).** They
+  download over HTTPS only (unless `PRAXEC_ALLOW_INSECURE=1`) and verify the
+  archive's SHA-256 against the release `checksums.sha256` before extracting
+  and installing it. A bypass of either check is in scope.
 - **Task graphs and tool arguments.** A crafted `plan.submit` graph or lock
   sequence that causes a panic, a hang, or incorrect lock arbitration is in
   scope.

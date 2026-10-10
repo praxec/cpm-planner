@@ -351,18 +351,25 @@ fn codex_project_install_prints_the_config_toml_snippet() {
 fn gemini_install_prints_npx_and_binary_commands() {
     let dir = TempDir::new().unwrap();
     let out = stdout(&install(dir.path(), "gemini", &[]));
-    let exe = env!("CARGO_BIN_EXE_cpm-planner");
+    // Canonicalise both sides: the printed path comes from current_exe(),
+    // which may differ from CARGO_BIN_EXE_* in form (symlinks, 8.3 names,
+    // `\\?\` prefixes) while naming the same file.
+    let canonical = |p: &str| std::fs::canonicalize(p).ok();
+    let exe = canonical(env!("CARGO_BIN_EXE_cpm-planner"));
+    assert!(exe.is_some(), "test binary path must exist");
     let prefix = "gemini mcp add -s project cpm-planner ";
     let commands: Vec<&str> = out
         .lines()
         .filter_map(|l| l.trim().strip_prefix(prefix))
         .collect();
+    let unquote = |c: &str| c.trim_matches(|ch| ch == '"' || ch == '\'').to_string();
     assert_eq!(
         (
             commands.contains(&"npx -y @matthew-cochran/cpm"),
-            commands.iter().any(|c| c.contains(exe))
+            commands.iter().any(|c| canonical(&unquote(c)) == exe)
         ),
-        (true, true)
+        (true, true),
+        "{out}"
     );
 }
 

@@ -68,6 +68,7 @@ Targets:
   cursor     Cursor           .cursor/skills/          (user: ~/.cursor/skills/)
   copilot    GitHub Copilot   .github/skills/          (user: ~/.copilot/skills/)
   gemini     Gemini CLI       .agents/skills/ + .gemini/commands/cpm-*.toml
+                              (user: ~/.agents/skills/ + ~/.gemini/commands/cpm-*.toml)
   agents-md  AGENTS.md block + .agents/skills/         (project only; for user scope use codex)
   all        .claude/skills/ + .agents/skills/
 
@@ -248,17 +249,12 @@ fn io_err(context: impl std::fmt::Display, err: io::Error) -> CliError {
     CliError::Io(format!("{context}: {err}"))
 }
 
-/// The user's home: `HOME`, then (on Windows) `USERPROFILE`.
+/// The user's home: `HOME`, then `USERPROFILE` (shared with the
+/// database path resolution).
 fn home_dir() -> Result<PathBuf, CliError> {
-    let from = |name: &str| {
-        std::env::var_os(name)
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-    };
-    let home = from("HOME");
-    #[cfg(windows)]
-    let home = home.or_else(|| from("USERPROFILE"));
-    home.ok_or_else(|| CliError::Io("cannot find your home directory: HOME is not set".into()))
+    crate::plan_store::home_dir().ok_or_else(|| {
+        CliError::Io("cannot find your home directory: neither HOME nor USERPROFILE is set".into())
+    })
 }
 
 fn agents_root(base: &Path) -> Root {
@@ -1705,7 +1701,9 @@ fn registration(target: Target, scope: &Scope) -> String {
              quotes instead. For JSON arguments in PowerShell, prefer the JSON snippet.\n",
         );
     }
-    text.push_str("See docs/agents/tool-matrix.md for every client.");
+    text.push_str(
+        "See https://github.com/praxec/cpm-planner/blob/main/docs/agents/tool-matrix.md for every client.",
+    );
     text
 }
 

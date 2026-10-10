@@ -33,6 +33,18 @@ jobs:
               run: cargo build --all-targets
             - name: Test
               run: cargo test
+            # Windows normally has no HOME: the server must fall back to
+            # USERPROFILE for its default database path and still start.
+            - name: MCP smoke without HOME (Windows)
+              if: runner.os == 'Windows'
+              shell: pwsh
+              run: |
+                  Remove-Item Env:HOME -ErrorAction SilentlyContinue
+                  Remove-Item Env:CPM_PLANNER_DB -ErrorAction SilentlyContinue
+                  node scripts/mcp-smoke.mjs target/debug/cpm-planner.exe
+                  if ($LASTEXITCODE -ne 0) { throw "mcp-smoke failed without HOME" }
+                  $db = Join-Path $env:USERPROFILE '.local\share\praxec\cpm-planner.db'
+                  if (-not (Test-Path $db)) { throw "database not created at $db" }
 
     lint:
         name: fmt + clippy
