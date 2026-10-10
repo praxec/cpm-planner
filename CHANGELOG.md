@@ -46,6 +46,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `duration_hours` (calendar time) per deliverable and `lag_hours` per prerequisite edge drive the schedule; effort stays the cost basis (#27).
 - `milestone: true` deliverables; `plan.status` reports per-milestone critical path and hours (#22).
 - `owned_files` entries may be `{path, mode: "append"}`; append claims may be co-leased and are reported in the cohort's `shared_paths` (#28).
+- `plan.review` (optional, read-only): lint plus one batched call to Jev (`typesafe/jev-1.13`) on OpenRouter about likely false and missing dependencies, split and interface-split candidates and crash options, returning advisory findings and `plan.fork`-ready proposals each verified by simulate and ranked by `hours_saved / max(cost, 1)`. At most 64 questions (`max_questions`, default 64; out of range is `invalid_params`); lint errors return `invalid_graph` with no call; no key, an unusable LLM setting or a provider failure returns `review_unavailable` with a reason. Each review records a `plan.review` audit event (`prompt_hash`, model, endpoint host, status, question count; never the key or prompt). The plan graph is sent to OpenRouter (#26).
+- LLM settings `OPENROUTER_API_KEY`, `CPM_OPENROUTER_KEY_FILE` (ignored when world-readable or empty), `CPM_JEV_MODEL`, `CPM_JEV_ENDPOINT`, `CPM_LLM_TIMEOUT_SECS` and `CPM_LLM_MODEL`, read once at startup; an invalid one is logged and disables only `plan.review`. The key is redacted from `Debug`, errors, logs, audit records and tool output (#26).
+- Dependencies: `rig-core` and `rig-typesafeai` (with `reqwest`), built with rustls only (no native TLS / OpenSSL), plus `url`; together about 49 more crates in the normal dependency graph (191 vs 142 unique). `wiremock` for tests only (#26).
 
 ### Fixed
 

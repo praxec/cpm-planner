@@ -66,8 +66,9 @@ any other MCP server:
 | `plan.select` | Make a named variant its line's selected (only executable) variant, carrying progress over; `force` releases locks on the previously selected variant. |
 | `plan.archive` | Archive (`archived` defaults `true`) or unarchive a whole line or one `variant`. Archived variants stay readable but refuse sync, selection and execution (`ARCHIVE_REFUSED`). |
 | `plan.compare` | Compare stored plans on the scorecard (`plan_ids`, 2 to 16 distinct ids, or `plan` line name in `project` (default: the discovered root) for every non-archived variant, at most 16): Pareto front, weighted rank and recommended plan. Weights must be finite and `>= 0`. With `monte_carlo`, `iterations × (deliverables + prerequisite edges)` summed over all variants must not exceed 200000000 (`INVALID_GRAPH`). Read-only; scoring runs off the async runtime. |
+| `plan.review` | Optional AI review of a graph, stored plan or plan file (read-only; exactly one of `graph`, `plan_id`, `path`; optional `capacities` / `resource_key` / `project_buffer_pct` to level makespans, and `max_questions` 1 to 64, default 64). Lint always runs; lint errors return `status: "invalid_graph"` without calling the judge. Otherwise one batched call to Jev asks about likely false and missing dependencies, split and interface-split candidates and crash options, and returns advisory `findings` plus `proposals`: `plan.fork` edit lists, each verified by simulate (lints clean, shortens the makespan) and ranked by `hours_saved / max(cost, 1)`. Without a key, or with an unusable LLM setting, `status` is `review_unavailable` with a `reason`, plus lint. See [Plan review (optional)](#plan-review-optional). |
 
-`plan.lint` and `plan.simulate` take exactly one of an inline `graph`, a stored
+`plan.lint`, `plan.simulate` and `plan.review` take exactly one of an inline `graph`, a stored
 `plan_id`, or a plan-file `path`; `plan.schedule` takes `graph` or `plan_id`;
 `plan.schedule` and `plan.simulate` reject what `plan.submit` rejects, and `plan.lint` reports it as findings. Monte Carlo output is reproducible for a given seed on the same platform
 and toolchain; bit-identical results across targets or compiler versions are
@@ -81,6 +82,30 @@ returned `plan_id`. A named line has many variants but exactly one selected:
 `plan.fork` creates a draft from structured edits, `plan.compare` scores the
 variants, and `plan.select` makes one executable. Keep definitions in tracked
 files — never keep untracked scratch graphs.
+
+### Plan review (optional)
+
+`plan.review` asks Jev (`typesafe/jev-1.13`), TypeSafe's
+calibrated-judgment model, about a lint-clean plan through OpenRouter: one
+batched call of at most 64 questions per review. It is off until you set
+`OPENROUTER_API_KEY` (or `CPM_OPENROUTER_KEY_FILE`); without a key the tool
+still answers, with `review_unavailable` and the lint report. An invalid LLM
+setting never stops the server: it is logged at startup and `plan.review`
+reports `review_unavailable` with a reason naming the setting.
+
+- **Probabilities are advisory.** Treat findings as a second opinion. Proposals
+  are verified mechanically (the edited plan must lint clean and simulate to a
+  shorter makespan); apply one with `plan.fork {edits}`, then `plan.compare`.
+- **Cost.** One call per review; Jev costs about $0.042 per million input
+  tokens on OpenRouter. Each report carries the provider's `usage` when given.
+- **Privacy.** The plan graph is sent to OpenRouter: the makespan, the
+  critical path, and for every deliverable a question names its id, scheduled
+  hours and float, owned file paths, prerequisites (ids, `consumes`, kind) and
+  its `description`, `artifact` and `owner` metadata (each cut to 500
+  characters). Do not review plans whose contents you may not share with
+  OpenRouter. The key is never logged or returned; each review
+  records a `plan.review` audit event with the `prompt_hash`, model, endpoint
+  host, status and question count, never the key or the prompt.
 
 ## Use as a library
 
@@ -138,6 +163,12 @@ See the [pack registry](https://github.com/praxec/packs) for this tool's provide
 | `CPM_PLANNER_DB` | OS data dir (`~/.local/share/praxec/cpm-planner.db`) | SQLite path for durable, cross-process planner state; `:memory:` gives ephemeral state. |
 | `CPM_PROJECT_ROOT` | nearest ancestor of cwd with `.cpm-planner/` or `.git` | Repo root for plan-as-code files (`.cpm-planner/plans/<name>/<variant>.json`). Tools that need a root report `INVALID_PATH: no project root (set CPM_PROJECT_ROOT or run inside a repo)` when none is found. |
 | `CPM_MAX_TTL_SECS` | `28800` (8h) | Server-side ceiling for `ttl_seconds` on `plan.acquire_cohort` and `plan.heartbeat`; larger requested values are clamped. Must be a positive integer — any other value aborts startup. |
+| `OPENROUTER_API_KEY` | unset | OpenRouter key for `plan.review`. Unset or blank: `plan.review` reports `review_unavailable` ("no OpenRouter key configured"). Never logged or returned. |
+| `CPM_OPENROUTER_KEY_FILE` | unset | File holding the OpenRouter key (contents trimmed; at most 4096 bytes), used when `OPENROUTER_API_KEY` is unset. On unix a world-readable (`o+r`) or empty file is ignored with a warning (`chmod 600` it). |
+| `CPM_JEV_MODEL` | `typesafe/jev-1.13` | Jev model id for `plan.review`. |
+| `CPM_JEV_ENDPOINT` | `https://openrouter.ai/api/v1/systemone` | Jev endpoint URL: `https://`, or `http://` only for a loopback host, with no credentials. |
+| `CPM_LLM_TIMEOUT_SECS` | `30` | Bound on each LLM call, integer seconds in 1..=300. |
+| `CPM_LLM_MODEL` | `openai/gpt-5-mini` | Generative (chat) model id; not used by any tool yet. |
 
 Leases default to 5 minutes. For long-running work pass `ttl_seconds` (≤ the server maximum) on acquire/heartbeat, and heartbeat at least every `ttl/3`.
 
