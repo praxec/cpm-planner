@@ -7,7 +7,7 @@
 //! Tables (created by the v4 migration in [`crate::plan_store`]):
 //! - `baselines(plan_id, number, start_us, calendar, rows, bac, reason, created_at_us)`
 //! - `ev_actuals(plan_id, deliverable_id, earned_pct, actual_hours, leased_hours, evidence, updated_at_us)`
-//! - `ev_snapshots(plan_id, taken_at_us, as_of_us, summary)`; reads are bounded
+//! - `ev_snapshots(plan_id, taken_at_us, as_of_us, baseline_number, summary)`; reads are bounded
 //!   to the newest [`SNAPSHOT_HISTORY_LIMIT`] by `as_of`
 
 use std::collections::HashMap;
@@ -359,14 +359,23 @@ pub(crate) fn insert_snapshot(
     as_of: DateTime<Utc>,
     summary: &serde_json::Value,
 ) -> Result<(), PlannerError> {
+    let baseline_number = summary
+        .get("baseline_number")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| {
+            backend(anyhow::anyhow!(
+                "plan {plan_id}: snapshot summary has no integer baseline_number"
+            ))
+        })?;
     let summary = serde_json::to_string(summary).map_err(backend)?;
     conn.execute(
-        "INSERT INTO ev_snapshots (plan_id, taken_at_us, as_of_us, summary)
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO ev_snapshots (plan_id, taken_at_us, as_of_us, baseline_number, summary)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
             plan_id.0,
             taken_at.timestamp_micros(),
             as_of.timestamp_micros(),
+            baseline_number,
             summary
         ],
     )
@@ -424,6 +433,12 @@ fn decode_snapshot(
     })
 }
 
+const ALERT_WINDOW_SQL: &str = "SELECT taken_at_us, as_of_us, summary FROM ev_snapshots
+     WHERE plan_id = ?1
+       AND baseline_number = ?2
+       AND (?3 IS NULL OR as_of_us < ?3 OR (as_of_us = ?3 AND taken_at_us <= ?4))
+     ORDER BY as_of_us DESC, taken_at_us DESC LIMIT ?5";
+
 /// The latest `limit` snapshots of `plan_id` taken against baseline
 /// `baseline_number` at or before the position `(as_of, taken_at)` (no
 /// bound when `None`), oldest first in `(as_of, taken_at)` order. The
@@ -438,15 +453,7 @@ pub(crate) fn alert_window(
 ) -> Result<Vec<EvSnapshot>, PlannerError> {
     let as_of = position.map(|(a, _)| a.timestamp_micros());
     let taken_at = position.map(|(_, t)| t.timestamp_micros());
-    let mut stmt = conn
-        .prepare(
-            "SELECT taken_at_us, as_of_us, summary FROM ev_snapshots
-             WHERE plan_id = ?1
-               AND json_extract(summary, '$.baseline_number') = ?2
-               AND (?3 IS NULL OR as_of_us < ?3 OR (as_of_us = ?3 AND taken_at_us <= ?4))
-             ORDER BY as_of_us DESC, taken_at_us DESC LIMIT ?5",
-        )
-        .map_err(backend)?;
+    let mut stmt = conn.prepare(ALERT_WINDOW_SQL).map_err(backend)?;
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
     let rows = stmt
         .query_map(
@@ -853,8 +860,20 @@ mod tests {
         let (store, plan_id) = store_with_plan();
         store
             .write_tx(|tx| {
-                insert_snapshot(tx, &plan_id, at(1), at(3), &serde_json::json!({"n": 2}))?;
-                insert_snapshot(tx, &plan_id, at(3), at(1), &serde_json::json!({"n": 1}))
+                insert_snapshot(
+                    tx,
+                    &plan_id,
+                    at(1),
+                    at(3),
+                    &serde_json::json!({"n": 2, "baseline_number": 1}),
+                )?;
+                insert_snapshot(
+                    tx,
+                    &plan_id,
+                    at(3),
+                    at(1),
+                    &serde_json::json!({"n": 1, "baseline_number": 1}),
+                )
             })
             .unwrap();
         let got = store.read_tx(|tx| snapshots(tx, &plan_id)).unwrap();
@@ -867,8 +886,20 @@ mod tests {
         let (store, plan_id) = store_with_plan();
         store
             .write_tx(|tx| {
-                insert_snapshot(tx, &plan_id, at(3), at(1), &serde_json::json!({"n": 2}))?;
-                insert_snapshot(tx, &plan_id, at(2), at(1), &serde_json::json!({"n": 1}))
+                insert_snapshot(
+                    tx,
+                    &plan_id,
+                    at(3),
+                    at(1),
+                    &serde_json::json!({"n": 2, "baseline_number": 1}),
+                )?;
+                insert_snapshot(
+                    tx,
+                    &plan_id,
+                    at(2),
+                    at(1),
+                    &serde_json::json!({"n": 1, "baseline_number": 1}),
+                )
             })
             .unwrap();
         let got = store.read_tx(|tx| snapshots(tx, &plan_id)).unwrap();
@@ -882,7 +913,13 @@ mod tests {
             .write_tx(|tx| {
                 for i in 0..101 {
                     let t = at(0) + chrono::Duration::minutes(i);
-                    insert_snapshot(tx, &plan_id, t, t, &serde_json::json!({"n": i}))?;
+                    insert_snapshot(
+                        tx,
+                        &plan_id,
+                        t,
+                        t,
+                        &serde_json::json!({"n": i, "baseline_number": 1}),
+                    )?;
                 }
                 Ok(())
             })
@@ -911,9 +948,41 @@ mod tests {
     fn a_second_snapshot_at_the_same_instant_is_refused() {
         let (store, plan_id) = store_with_plan();
         let err = store.write_tx(|tx| {
-            insert_snapshot(tx, &plan_id, at(1), at(1), &serde_json::json!({}))?;
-            insert_snapshot(tx, &plan_id, at(1), at(2), &serde_json::json!({}))
+            insert_snapshot(
+                tx,
+                &plan_id,
+                at(1),
+                at(1),
+                &serde_json::json!({"baseline_number": 1}),
+            )?;
+            insert_snapshot(
+                tx,
+                &plan_id,
+                at(1),
+                at(2),
+                &serde_json::json!({"baseline_number": 1}),
+            )
         });
         assert!(matches!(err, Err(PlannerError::BackendError(_))));
+    }
+
+    #[test]
+    fn alert_window_query_uses_the_position_index() {
+        let (store, _) = store_with_plan();
+        let plan: Vec<String> = store
+            .read_tx(|tx| {
+                let mut stmt = tx
+                    .prepare(&format!("EXPLAIN QUERY PLAN {ALERT_WINDOW_SQL}"))
+                    .map_err(backend)?;
+                let rows = stmt
+                    .query_map(params!["p", 1, 0, 0, 10], |r| r.get::<_, String>(3))
+                    .map_err(backend)?;
+                rows.collect::<Result<_, _>>().map_err(backend)
+            })
+            .unwrap();
+        assert!(
+            plan.iter().any(|d| d.contains("ev_snapshots_by_position")),
+            "plan was {plan:?}"
+        );
     }
 }

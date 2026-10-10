@@ -594,9 +594,14 @@ fn migrate_v4_earned_value(conn: &Connection) -> anyhow::Result<()> {
              plan_id     TEXT NOT NULL REFERENCES plans(plan_id) ON DELETE CASCADE,
              taken_at_us INTEGER NOT NULL,
              as_of_us    INTEGER NOT NULL,
+             baseline_number INTEGER NOT NULL,
              summary     TEXT NOT NULL,
              PRIMARY KEY (plan_id, taken_at_us)
-         );",
+         );
+         CREATE INDEX IF NOT EXISTS ev_snapshots_by_position
+             ON ev_snapshots(plan_id, baseline_number, as_of_us, taken_at_us);
+         CREATE INDEX IF NOT EXISTS ev_snapshots_by_as_of
+             ON ev_snapshots(plan_id, as_of_us, taken_at_us);",
     )
     .context("creating earned-value tables")
 }
