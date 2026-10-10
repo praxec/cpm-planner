@@ -367,6 +367,24 @@ fn gemini_install_prints_npx_and_binary_commands() {
 }
 
 #[test]
+fn all_project_install_prints_an_untyped_gemini_snippet() {
+    let dir = TempDir::new().unwrap();
+    let out = stdout(&install(dir.path(), "all", &[]));
+    let gemini_snippet = out
+        .lines()
+        .skip_while(|l| l.trim() != "Gemini (.gemini/settings.json):")
+        .nth(1)
+        .map(str::trim)
+        .map(str::to_string);
+    assert_eq!(
+        gemini_snippet.as_deref(),
+        Some(
+            r#"{"mcpServers":{"cpm-planner":{"command":"npx","args":["-y","@matthew-cochran/cpm"]}}}"#
+        )
+    );
+}
+
+#[test]
 fn second_install_reports_all_unchanged() {
     let dir = TempDir::new().unwrap();
     install(dir.path(), "gemini", &[]);

@@ -1691,8 +1691,9 @@ fn registration(target: Target, scope: &Scope) -> String {
             text.push_str(&codex);
             let _ = writeln!(
                 text,
-                "  Cursor (.cursor/mcp.json), Gemini (.gemini/settings.json):\n{}\n  VS Code Copilot (.vscode/mcp.json):\n{}",
+                "  Cursor (.cursor/mcp.json):\n{}\n  Gemini (.gemini/settings.json):\n{}\n  VS Code Copilot (.vscode/mcp.json):\n{}",
                 json("mcpServers", true),
+                json("mcpServers", false),
                 json("servers", true)
             );
         }

@@ -10,8 +10,9 @@ There are four steps:
 3. Install the agent skills.
 4. Verify.
 
-Every path, command and invocation below comes from
-[the agent tool matrix](agents/tool-matrix.md), which cites the vendor docs.
+Per-tool skill paths, invocations and MCP snippets come from the
+[agent tool matrix](agents/tool-matrix.md); other commands come from each
+tool's docs, cited where they are used.
 The `skills` subcommand and the `npx` launcher need **cpm-planner 0.2.0 or
 later**. The npm package `@matthew-cochran/cpm` is available from 0.2.0.
 
@@ -54,8 +55,9 @@ themselves when your request matches its description.
 installs them into one repository, so they can be committed and shared.
 
 **One target per tool.** Cursor and Copilot read both `.claude/skills/` and
-`.agents/skills/`. If you also install `--target claude`, `--target codex` or
-`--target all`, they may list each skill twice. For Cursor and Copilot, install
+`.agents/skills/`. If you also install `--target claude`, `--target codex`,
+`--target gemini` (which writes `.agents/skills/` too) or `--target all`, they
+may list each skill twice. For Cursor and Copilot, install
 only their own target.
 
 ## Step 1: install the program
@@ -86,7 +88,8 @@ curl -fsSL https://github.com/praxec/cpm-planner/releases/latest/download/instal
 $env:PRAXEC_VERSION = 'v0.2.0'; irm https://github.com/praxec/cpm-planner/releases/latest/download/install.ps1 | iex
 ```
 
-The installer prints the absolute path it installed to. **Write it down**: GUI
+The default install directories are those of `scripts/install.sh` and
+`scripts/install.ps1`. The installer prints the absolute path it installed to. **Write it down**: GUI
 clients need it (see [PATH for GUI clients](#path-for-gui-clients)). If the
 directory is not on your `PATH`, the installer prints the line to add, or pass
 `--add-to-path` (`-AddToPath` on Windows). More options are in the
@@ -119,6 +122,15 @@ into the npx cache. Register the `npx` form instead.
 
    For one repository, use `--scope project`, which writes a shared `.mcp.json`:
 
+   ```sh
+   # binary
+   claude mcp add --transport stdio --scope project cpm-planner -- cpm-planner
+   # npx
+   claude mcp add --transport stdio --scope project cpm-planner -- npx -y @matthew-cochran/cpm
+   ```
+
+   The resulting `.mcp.json` (npx form):
+
    ```json
    { "mcpServers": { "cpm-planner": { "type": "stdio", "command": "npx", "args": ["-y", "@matthew-cochran/cpm"] } } }
    ```
@@ -134,7 +146,9 @@ into the npx cache. Register the `npx` form instead.
    which writes `.claude/skills/`.
 4. Start a new Claude Code session.
 5. [Verify](#verify). Check registration with `claude mcp list` or
-   `claude mcp get cpm-planner`. Then type `/cpm-plan`; it should autocomplete.
+   `claude mcp get cpm-planner`
+   ([Claude Code MCP docs](https://code.claude.com/docs/en/mcp)). Then type
+   `/cpm-plan`; it should autocomplete.
 
 Project `.mcp.json` servers ask for approval the first time.
 
@@ -320,7 +334,8 @@ To install for Claude Code and every `.agents/skills/` reader in one go, use
 Claude Desktop takes the MCP server but has no skills target.
 
 1. Install the binary ([step 1](#step-1-install-the-program), form A).
-2. Edit `claude_desktop_config.json` (Settings, Developer, Edit Config):
+2. Edit `claude_desktop_config.json` (Settings, Developer, Edit Config; paths
+   from the [README's Claude Desktop section](../README.md#claude-desktop)):
    - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
    - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
 
@@ -354,7 +369,9 @@ Run all four checks. If one fails, see [Troubleshooting](#troubleshooting).
    open a new session if it is not.
 4. **The skills are installed.** `cpm-planner skills list` prints one line per
    skills directory, user and current project, with the targets and file
-   counts. `0 modified, 0 missing` means the files are as installed.
+   counts. `0 modified, 0 missing` means the files are as installed. Run from
+   your home directory, the same directory is listed twice, once as `(user)`
+   and once as `(project)`, because the current project is your home then.
 
 Without any MCP client, `node scripts/mcp-smoke.mjs /absolute/path/to/cpm-planner`
 from a checkout of this repository runs the MCP handshake and fails if
@@ -373,14 +390,17 @@ from a checkout of this repository runs the MCP handshake and fails if
    uninstalled. Add `--dry-run` to preview. `cpm-planner skills list` should
    then no longer list that directory.
 2. Remove the MCP registration: for Claude Code,
-   `claude mcp remove cpm-planner --scope user`; for the others, delete the
-   `cpm-planner` entry from the config file you edited.
+   `claude mcp remove cpm-planner --scope user`
+   ([Claude Code MCP docs](https://code.claude.com/docs/en/mcp)); for the
+   others, delete the `cpm-planner` entry from the config file you edited.
 3. Remove the program:
    - binary: delete `~/.local/bin/cpm-planner`, or on Windows the
-     `%LOCALAPPDATA%\Programs\cpm-planner\` directory;
+     `%LOCALAPPDATA%\Programs\cpm-planner\` directory (the installers'
+     default install directories, from `scripts/install.sh` and
+     `scripts/install.ps1`);
    - npx: delete the launcher cache, `~/.cache/cpm-planner/` (or
      `$XDG_CACHE_HOME/cpm-planner/`), or `%LOCALAPPDATA%\cpm-planner\` on
-     Windows.
+     Windows (see the [npm launcher README](../npm/README.md#what-it-does)).
 4. Optional: plan state lives in the SQLite file `CPM_PLANNER_DB` names
    (default `~/.local/share/praxec/cpm-planner.db`). Delete it only if you
    want to lose your plans.
@@ -410,14 +430,18 @@ the line it printed.
   form in "MCP: Open User Configuration" instead.
 - Inside JSON, write each backslash twice.
 - If a client cannot start `npx` on Windows, register the binary form with the
-  absolute `.exe` path instead.
+  absolute `.exe` path instead: the installer's default is
+  `%LOCALAPPDATA%\Programs\cpm-planner\cpm-planner.exe` (`scripts/install.ps1`),
+  and the [README's Claude Desktop section](../README.md#claude-desktop) shows
+  it in JSON.
 
 ### A stale npm cache
 
 The launcher caches the binary per version, in `~/.cache/cpm-planner/<version>/`
 (`%LOCALAPPDATA%\cpm-planner\<version>\` on Windows). It checks the cached
 binary's SHA-256 on every start and refuses a directory that other users can
-write. To force a fresh download, delete that version directory, or point the
+write (see the [npm launcher README](../npm/README.md#what-it-does)). To force
+a fresh download, delete that version directory, or point the
 cache somewhere new:
 
 ```sh

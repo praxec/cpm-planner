@@ -320,10 +320,10 @@ fn agent_install_names_only_existing_targets() {
             .arg(project.path())
             .arg("--dry-run")
             .output()
-            .map(|out| out.status.code());
+            .map(|out| out.status);
         match status {
-            Ok(Some(2)) => offenders.push(format!("--target {target}: rejected as a usage error")),
-            Ok(_) => {}
+            Ok(status) if status.success() => {}
+            Ok(status) => offenders.push(format!("--target {target}: dry run failed ({status})")),
             Err(err) => offenders.push(format!("--target {target}: cannot run binary ({err})")),
         }
     }
@@ -334,19 +334,23 @@ fn agent_install_names_only_existing_targets() {
     );
 }
 
-/// Links in `llms.txt` to this repository's `main` branch, as paths relative
-/// to the repository root (with any `#anchor`).
-fn llms_txt_repo_paths(text: &str) -> Vec<String> {
+/// Links in `llms.txt` to this repository: `Ok` with the path relative to the
+/// repository root (with any `#anchor`) for a `blob/main` or `tree/main`
+/// link, `Err` with the link for any other link into the repository.
+fn llms_txt_repo_paths(text: &str) -> Vec<Result<String, String>> {
+    const REPO: &str = "https://github.com/praxec/cpm-planner";
     const PREFIXES: [&str; 2] = [
         "https://github.com/praxec/cpm-planner/blob/main/",
         "https://github.com/praxec/cpm-planner/tree/main/",
     ];
     link_targets(text)
         .into_iter()
-        .filter_map(|target| {
+        .filter(|target| target.starts_with(REPO))
+        .map(|target| {
             PREFIXES
                 .iter()
                 .find_map(|prefix| target.strip_prefix(prefix).map(str::to_string))
+                .ok_or(target)
         })
         .collect()
 }
@@ -357,14 +361,18 @@ fn llms_txt_links_name_existing_files() {
     let llms = root.join("llms.txt");
     let offenders: Vec<String> = match std::fs::read_to_string(&llms) {
         Ok(text) => {
-            let paths: Vec<String> = text.lines().flat_map(llms_txt_repo_paths).collect();
-            if paths.is_empty() {
+            let links: Vec<Result<String, String>> =
+                text.lines().flat_map(llms_txt_repo_paths).collect();
+            if links.is_empty() {
                 vec!["no links to the main branch found in llms.txt".to_string()]
             } else {
-                paths
+                links
                     .iter()
-                    .filter_map(|path| {
-                        broken_link_reason(&llms, path).map(|why| format!("{path} ({why})"))
+                    .filter_map(|link| match link {
+                        Ok(path) => {
+                            broken_link_reason(&llms, path).map(|why| format!("{path} ({why})"))
+                        }
+                        Err(url) => Some(format!("{url} (not a blob/main or tree/main link)")),
                     })
                     .collect()
             }

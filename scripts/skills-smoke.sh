@@ -29,14 +29,25 @@ expect_skills() {
   done
 }
 
-# No file the installer writes is left under the given directory.
-expect_no_skill_files() {
-  left="$(find "$1" \( -name SKILL.md -o -name 'cpm-*.toml' \) -print)"
+# No file at all is left under the given directory. The last uninstall of a
+# skills root also removes its manifest and its lock file (src/skills.rs,
+# RootLock), so even those must be gone.
+expect_no_files() {
+  left="$(find "$1" -type f -print)"
   [ -z "$left" ] || fail "files left after uninstall: $left"
 }
 
 # Lines that report one file: "<status>  <path>".
 file_lines() { grep -E '^(created|updated|unchanged|modified, skipped|foreign, skipped|removed)  ' "$1" || true; }
+
+# Every file line in the given logs says `unchanged`, and there is at least one.
+expect_all_unchanged() {
+  total="$(cat "$@" | file_lines /dev/stdin | wc -l | tr -d ' ')"
+  changed="$(cat "$@" | file_lines /dev/stdin | grep -v '^unchanged  ' || true)"
+  [ "$total" -gt 0 ] || fail "rerun printed no file lines"
+  [ -z "$changed" ] || fail "rerun changed files: $changed"
+  echo "all $total file lines unchanged"
+}
 
 echo "== project scope"
 proj="$scratch/proj"
@@ -47,11 +58,7 @@ expect_skills "$proj/.claude/skills" "$proj/.agents/skills"
 
 echo "== rerun is a no-op"
 "$exe" skills install --target all --project "$(native "$proj")" > "$scratch/second.log"
-total="$(file_lines "$scratch/second.log" | wc -l | tr -d ' ')"
-changed="$(file_lines "$scratch/second.log" | grep -v '^unchanged  ' || true)"
-[ "$total" -gt 0 ] || fail "rerun printed no file lines"
-[ -z "$changed" ] || fail "rerun changed files: $changed"
-echo "all $total file lines unchanged"
+expect_all_unchanged "$scratch/second.log"
 
 echo "== project list"
 "$exe" skills list --project "$(native "$proj")" | tee "$scratch/list-project.log"
@@ -69,6 +76,12 @@ for c in $commands; do
   [ -f "$uhome/.gemini/commands/$c.toml" ] || fail "missing $uhome/.gemini/commands/$c.toml"
 done
 
+echo "== user rerun is a no-op"
+for t in claude codex cursor copilot gemini; do
+  "${user_env[@]}" "$exe" skills install --target "$t" --user > "$scratch/user-rerun-$t.log"
+done
+expect_all_unchanged "$scratch"/user-rerun-*.log
+
 echo "== user list"
 "${user_env[@]}" "$exe" skills list --user | tee "$scratch/list-user.log"
 [ "$(grep -c '(user)' "$scratch/list-user.log" || true)" -eq 5 ] || fail "expected 5 user installs"
@@ -79,14 +92,16 @@ if [ "${RUNNER_OS:-}" = "Windows" ] || [ "${OS:-}" = "Windows_NT" ]; then
   rm -rf "$wprofile" && mkdir -p "$wprofile"
   env -u HOME "USERPROFILE=$(native "$wprofile")" "$exe" skills install --target claude --user > "$scratch/profile.log"
   expect_skills "$wprofile/.claude/skills"
+  env -u HOME "USERPROFILE=$(native "$wprofile")" "$exe" skills uninstall --target claude --user > "$scratch/profile-uninstall.log"
+  expect_no_files "$wprofile"
 fi
 
 echo "== uninstall"
 "$exe" skills uninstall --target all --project "$(native "$proj")"
-expect_no_skill_files "$proj"
+expect_no_files "$proj"
 for t in claude codex cursor copilot gemini; do
   "${user_env[@]}" "$exe" skills uninstall --target "$t" --user > "$scratch/uninstall-$t.log"
 done
-expect_no_skill_files "$uhome"
+expect_no_files "$uhome"
 
 echo "skills smoke: OK"

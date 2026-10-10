@@ -21,8 +21,16 @@ cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+cargo publish --dry-run --locked
+cargo deny check
 scripts/check-version-sync.sh
+node --test "npm/test/*.test.mjs"
 ```
+
+`cargo deny` is [cargo-deny](https://github.com/EmbarkStudios/cargo-deny)
+(`cargo install cargo-deny`). The npm launcher tests need Node 21 or later,
+because `node --test` takes a glob only from Node 21; the published package
+itself supports Node 18 and later.
 
 ## Architecture map
 

@@ -23,7 +23,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 cargo publish --dry-run --locked
 cargo deny check
 scripts/check-version-sync.sh
-node --test "npm/test/*.test.mjs"
+node --test "npm/test/*.test.mjs"   # Node 21+ for the glob; the package supports 18+
 ```
 
 The binary is `cpm-planner`. With no arguments it is the MCP stdio server;
@@ -41,8 +41,9 @@ The binary is `cpm-planner`. With no arguments it is the MCP stdio server;
 - Conventional Commits: `feat(scope): ...`, `fix(scope): ...`, `docs: ...`.
 - Every behaviour change has a test. Tests have declarative names and one
   behavioural assertion each, and default tests never use the network.
-- Text files are LF (`.gitattributes`); `tests/repo_hygiene.rs` checks this and
-  that relative links in `README.md` and `docs/` resolve.
+- Text files are LF (`.gitattributes`). `tests/repo_hygiene.rs` checks this,
+  that relative links in `README.md`, `AGENTS.md` and `docs/` resolve, and
+  that the `main`-branch links in `llms.txt` name existing files and headings.
 - Add a line under `[Unreleased]` in [CHANGELOG.md](CHANGELOG.md).
 - Update the README and `docs/` when behaviour they describe changes.
 
