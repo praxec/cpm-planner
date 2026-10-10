@@ -30,16 +30,16 @@ curl -fsSL https://github.com/praxec/cpm-planner/releases/latest/download/instal
 irm https://github.com/praxec/cpm-planner/releases/latest/download/install.ps1 | iex
 ```
 
-Pin a release (shown for v0.0.3):
+Pin a release (shown for v0.1.0):
 
 ```sh
 # Linux / macOS
-curl -fsSL https://github.com/praxec/cpm-planner/releases/latest/download/install.sh | sh -s -- --version v0.0.3
+curl -fsSL https://github.com/praxec/cpm-planner/releases/latest/download/install.sh | sh -s -- --version v0.1.0
 
 # Windows (PowerShell): the piped form cannot take parameters, so use the environment variable...
-$env:PRAXEC_VERSION = 'v0.0.3'; irm https://github.com/praxec/cpm-planner/releases/latest/download/install.ps1 | iex
+$env:PRAXEC_VERSION = 'v0.1.0'; irm https://github.com/praxec/cpm-planner/releases/latest/download/install.ps1 | iex
 # ...or a script block
-& ([scriptblock]::Create((irm https://github.com/praxec/cpm-planner/releases/latest/download/install.ps1))) -Version v0.0.3
+& ([scriptblock]::Create((irm https://github.com/praxec/cpm-planner/releases/latest/download/install.ps1))) -Version v0.1.0
 ```
 
 If you would rather read the script before running it, download, inspect, then run:
@@ -48,14 +48,14 @@ If you would rather read the script before running it, download, inspect, then r
 # Linux / macOS
 curl -fsSLO https://github.com/praxec/cpm-planner/releases/latest/download/install.sh
 less install.sh
-sh install.sh --version v0.0.3
+sh install.sh --version v0.1.0
 ```
 
 ```powershell
 # Windows
 irm https://github.com/praxec/cpm-planner/releases/latest/download/install.ps1 -OutFile install.ps1
 Get-Content install.ps1
-.\install.ps1 -Version v0.0.3
+.\install.ps1 -Version v0.1.0
 ```
 
 The installers print the absolute path they installed to (for example `~/.local/bin/cpm-planner`) and, if that directory is not on your `PATH`, the exact line to add. Pass `--add-to-path` (`-AddToPath` on Windows) to have the installer do it for you (user-level only, never sudo). On Linux/macOS it appends to `~/.zshrc` (zsh), `~/.bash_profile` if it exists else `~/.bashrc` (bash), or `~/.profile` (other shells), only if the line is not already there; for fish it prints `fish_add_path <dir>` for you to run instead of writing a file. They only accept `https://` download URLs. After upgrading, restart your MCP client so it launches the new binary (on Windows the old exe is renamed to `cpm-planner.exe.old` and removed on the next run).
@@ -98,8 +98,9 @@ Write a plan as `.cpm-planner/plans/<name>/<variant>.json` (a `PlanGraph`):
 
 ## Quickstart: earned value
 
-Freeze the baseline, record progress, then read the report (`earned_pct` earns value
-only for a deliverable with `earning_rule: "weighted"`; the default `zero_hundred`
+Freeze the baseline, record progress, then read the report (`earned_pct` is earned in
+proportion under `earning_rule: "weighted"`; `fifty_fifty` credits 50% once a deliverable is in progress or has any
+reported `earned_pct`, and the default `zero_hundred`
 earns at completion):
 
 1. `plan.baseline {plan_id}` — freeze the CPM schedule and budgets as baseline 1.

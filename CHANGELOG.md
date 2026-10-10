@@ -125,7 +125,8 @@ approximations. For the method, caveats and known limitations, see
 
 ### Breaking (library API)
 
-- Library API (breaking for library users): `Deliverable` gains the public field `earning_rule` and `MarkStatusRequest` the public fields `earned_pct`, `actual_effort_hours` and `evidence` (struct literals must set them); `PlannerError` gains `InvalidActuals` and `NotBaselined`; the `Planner` trait gains required methods `baseline`, `ev` and `snapshot` (breaks other implementors). New public module `earned_value` (`Baseline`, `BaselineRow`, `Calendar`, `Actuals`, `EvReport`, `EvRow`, `EvRowStatus`, `EvSummary`, `BaselineRequest`, `BaselineOutcome`, `SnapshotRequest`, `SnapshotOutcome`, `SnapshotSummary`, `SnapshotFormat`, `compute_ev`, `build_baseline`, `trend_alerts`, `render_snapshots_markdown`, …) and `plan::EarningRule`. Also new (#26): the `llm` module (`LlmConfig`, `ConfigError`, `JudgmentError` / `JudgmentErrorKind`, the `JudgmentModel` trait, `ApiKey`, `llm::jev::JevJudge`, `llm::openrouter::chat_client`); the `review` module (`review`, `ReviewRequest`, `ReviewReport`, `Judge`, findings, proposals and their constants); `PlanServer::with_judge` / `with_llm_config`; `BasicCpmPlanner::record_audit`; `TOOL_REVIEW` and `server::MAX_CONCURRENT_REVIEWS`.
+- The `Planner` trait gains required methods `sync_plan`, `list_plans`, `revision_graph`, `revise_plan`, `select_variant`, `archive`, `fork_plan`, `compare_plans` and `export_plan` (breaks other implementors); `PlannerError` gains `InvalidPath`, `InvalidCapacities`, `VariantNotSelected` and `ArchiveRefused` (breaks exhaustive matches); `Deliverable` gains the public field `estimate`.
+- `Deliverable` gains the public field `earning_rule` and `MarkStatusRequest` the public fields `earned_pct`, `actual_effort_hours` and `evidence` (struct literals must set them); `PlannerError` gains `InvalidActuals` and `NotBaselined`; the `Planner` trait gains required methods `baseline`, `ev` and `snapshot` (breaks other implementors). New public module `earned_value` (`Baseline`, `BaselineRow`, `Calendar`, `Actuals`, `EvReport`, `EvRow`, `EvRowStatus`, `EvSummary`, `BaselineRequest`, `BaselineOutcome`, `SnapshotRequest`, `SnapshotOutcome`, `SnapshotSummary`, `SnapshotFormat`, `compute_ev`, `build_baseline`, `trend_alerts`, `render_snapshots_markdown`, …) and `plan::EarningRule`. Also new (#26): the `llm` module (`LlmConfig`, `ConfigError`, `JudgmentError` / `JudgmentErrorKind`, the `JudgmentModel` trait, `ApiKey`, `llm::jev::JevJudge`, `llm::openrouter::chat_client`); the `review` module (`review`, `ReviewRequest`, `ReviewReport`, `Judge`, findings, proposals and their constants); `PlanServer::with_judge` / `with_llm_config`; `BasicCpmPlanner::record_audit`; `TOOL_REVIEW` and `server::MAX_CONCURRENT_REVIEWS`.
 - Library: `Deliverable.prerequisites` is `Vec<Prerequisite>`.
 - Library: `Deliverable` gains public `duration_hours` and `milestone`; `Task` gains `lag_by_dependency` and its `effort_hours` means scheduled length; `PlanStatus` gains `plan_complete` and `milestones`; `ScheduleRow` gains `synthetic`; new public types `Prerequisite`, `PrerequisiteKind`, `OwnedFile`, `FileMode`, `MilestoneRow` and consts `START_ID`, `FINISH_ID`.
 - Library: `Deliverable.owned_files` is `Vec<OwnedFile>`; `Cohort` gains `shared_paths`.
@@ -135,6 +136,16 @@ approximations. For the method, caveats and known limitations, see
   `HeartbeatRequest`, `ForceReleaseRequest`).
 - Library: the `Planner` trait gains the required method `get_plan`;
   `CriticalPathResult` gains the public field `critical_ids`.
+
+## [0.0.2] - 2026-07-22
+
+### Added
+
+- Durable SQLite persistence for plans, statuses and leases, and a retry circuit breaker for repeatedly failing deliverables (#2).
+
+### Fixed
+
+- The circuit breaker counts only explicit failures; environmental lease lapses no longer burn breaker lives (#4).
 
 ## [0.0.1] - 2026-06-17
 
@@ -151,4 +162,5 @@ approximations. For the method, caveats and known limitations, see
 
 [Unreleased]: https://github.com/praxec/cpm-planner/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/praxec/cpm-planner/compare/v0.0.2...v0.1.0
+[0.0.2]: https://github.com/praxec/cpm-planner/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/praxec/cpm-planner/releases/tag/v0.0.1
