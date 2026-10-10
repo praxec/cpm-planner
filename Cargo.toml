@@ -1,8 +1,8 @@
 [package]
 name = "cpm-planner"
-version = "0.0.2"
+version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.99"
 license = "Apache-2.0"
 repository = "https://github.com/praxec/cpm-planner"
 description = "Critical Path Method (CPM) planner exposed as an MCP server: schedules a task graph (earliest/latest start, slack, critical path, bottlenecks) and coordinates lock-aware parallel execution over MCP."
@@ -28,7 +28,10 @@ async-trait = "0.1"
 # language as the rest of praxec (rather than hand-rolling its own).
 execution-policy = { git = "https://github.com/matt-cochran/execution-policy" }
 chrono = { version = "0.4", features = ["serde"] }
-rmcp = { version = "1.7", default-features = false, features = ["server", "macros", "transport-io"] }
+rand = { version = "0.10.3", default-features = false }
+rand_chacha = { version = "0.10.0", default-features = false }
+rand_distr = { version = "0.6.0", default-features = false, features = ["std"] }
+rmcp = { version = "1.8", default-features = false, features = ["server", "macros", "transport-io"] }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -38,3 +41,18 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+cap-std = "4.0.3"
+cap-fs-ext = "4.0.3"
+rig-core = { version = "0.44", default-features = false, features = ["reqwest", "rustls"] }
+rig-typesafeai = { version = "0.44", default-features = false, features = ["reqwest", "rustls"] }
+# Each JevJudge owns its reqwest client (see src/llm/jev.rs); same features as rig's.
+rig-reqwest = { version = "0.44", default-features = false, features = ["rustls"] }
+url = "2.5"
+
+[target.'cfg(unix)'.dependencies]
+# errno constants for classifying unsupported hard links (write_new_graph).
+libc = "0.2.190"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+wiremock = "0.6.5"

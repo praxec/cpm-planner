@@ -31,7 +31,10 @@
 //!   doesn't need to expose).
 //! - [`planner`] — [`BasicCpmPlanner`], the lock-aware implementation.
 //! - [`plan_store`] — durable SQLite persistence (plans, statuses, cohort
-//!   locks, submit dedup) and the cross-process atomicity mechanism.
+//!   locks, submit dedup, portfolio lines/variants/revisions) and the
+//!   cross-process atomicity mechanism.
+//! - [`schedule`] — [`schedule::compute_cpm`], the CPM run shared by submit,
+//!   status and the analysis tools.
 //! - [`server`] — the MCP tool façade.
 //! - [`audit`] — the lock-lifecycle audit surface.
 //!
@@ -40,27 +43,52 @@
 
 pub mod algorithm;
 pub mod audit;
+pub mod compare;
 pub mod drag;
+pub mod earned_value;
+pub mod edits;
 pub mod estimator;
+pub(crate) mod ev_store;
+mod graph;
+#[cfg(test)]
+mod lease_hours_tests;
+pub mod lint;
+pub mod llm;
 mod locks;
+#[cfg(test)]
+mod mark_actuals_tests;
+pub mod metrics;
+pub mod monte_carlo;
 pub mod network_health;
 pub mod plan;
 pub mod plan_store;
 pub mod planner;
+mod portfolio;
 pub mod ports;
+pub mod project;
+pub mod resource_schedule;
+pub mod review;
+pub mod revise;
 pub mod risk;
+pub mod schedule;
 pub mod server;
+pub mod simulate;
 pub mod task;
 
 pub use algorithm::CpmAlgorithm;
 pub use drag::{DragResult, diameter, drag};
 pub use estimator::{EffortEstimator, EstimationConfig};
+pub use plan::{
+    AcceptRequest, AcquireRequest, Estimate, ForceReleaseRequest, HeartbeatRequest,
+    MarkStatusRequest,
+};
 pub use plan_store::{DB_PATH_ENV, SqlitePlanStore};
 pub use planner::{
-    BasicCpmPlanner, ClockFn, DEFAULT_EFFORT_HOURS, DEFAULT_TTL, MAX_ATTEMPTS, MAX_LAPSES,
+    BasicCpmPlanner, ClockFn, DEFAULT_EFFORT_HOURS, DEFAULT_MAX_TTL, DEFAULT_TTL, MAX_ATTEMPTS,
+    MAX_LAPSES,
 };
 pub use server::{
-    PLAN_TOOL_NAMES, PlanServer, TOOL_ACQUIRE_COHORT, TOOL_FORCE_RELEASE, TOOL_HEARTBEAT,
-    TOOL_MARK_STATUS, TOOL_STATUS, TOOL_SUBMIT, plan_tool_definitions,
+    PLAN_TOOL_NAMES, PlanServer, TOOL_ACCEPT, TOOL_ACQUIRE_COHORT, TOOL_FORCE_RELEASE,
+    TOOL_HEARTBEAT, TOOL_MARK_STATUS, TOOL_REVIEW, TOOL_STATUS, TOOL_SUBMIT, plan_tool_definitions,
 };
 pub use task::{Bottleneck, CriticalPathResult, Task, TaskBatch, TaskKind, TaskStatus};

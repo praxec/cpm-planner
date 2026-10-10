@@ -1,6 +1,6 @@
 //! SPEC §33 PA1 — `Planner` data model.
 //!
-//! This module defines the *types* the [`Planner`] trait
+//! This module defines the *types* the [`Planner`](crate::ports::Planner) trait
 //! (see [`crate::ports::Planner`]) carries across the IP boundary. The trait
 //! itself lives in `ports.rs` next to the other runtime ports; everything an
 //! implementer needs to construct, mutate, or report on a plan is here.
@@ -24,8 +24,9 @@
 //!   are idempotent.
 //! - [`crate::ports::Planner::acquire_cohort`] returns a [`Cohort`]: a batch
 //!   of deliverables whose prerequisites are all [`DeliverableStatus::Complete`]
-//!   and whose owned-file sets are mutually disjoint *and* disjoint from every
-//!   currently held lock. The batch is locked atomically (PA3 guarantees this).
+//!   and whose owned-file claims do not conflict with each other or with any
+//!   currently held lock (exclusive conflicts with anything; append/append
+//!   may share). The batch is locked atomically (PA3 guarantees this).
 //! - [`crate::ports::Planner::mark_status`] with `Complete` or `Failed`
 //!   releases the lock. A caller-id mismatch on the held lock yields
 //!   [`PlannerError::LockNotHeld`].
@@ -34,7 +35,8 @@
 //! - [`crate::ports::Planner::force_release`] is the operator escape hatch.
 //!   Implementations MUST emit an audit event carrying the supplied `reason`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -103,43 +105,276 @@ pub struct PlanGraph {
     pub max_chained_dispatch: Option<u32>,
 }
 
+/// What a prerequisite edge hands over: a finished artifact or an interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrerequisiteKind {
+    Artifact,
+    Interface,
+}
+
+/// A prerequisite edge. Wire: a bare id string, or an object.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum Prerequisite {
+    Id(String),
+    Edge {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        consumes: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<PrerequisiteKind>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lag_hours: Option<f32>,
+    },
+}
+
+impl Prerequisite {
+    /// Id of the deliverable this edge points at.
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Id(id) | Self::Edge { id, .. } => id,
+        }
+    }
+
+    /// What the dependent consumes from the prerequisite, if stated.
+    pub fn consumes(&self) -> Option<&str> {
+        match self {
+            Self::Id(_) => None,
+            Self::Edge { consumes, .. } => consumes.as_deref(),
+        }
+    }
+
+    /// Edge kind, if stated.
+    pub fn kind(&self) -> Option<PrerequisiteKind> {
+        match self {
+            Self::Id(_) => None,
+            Self::Edge { kind, .. } => *kind,
+        }
+    }
+
+    /// Hours between the prerequisite finishing and the dependent starting;
+    /// `0.0` when absent.
+    pub fn lag_hours(&self) -> f32 {
+        match self {
+            Self::Id(_) => 0.0,
+            Self::Edge { lag_hours, .. } => lag_hours.unwrap_or(0.0),
+        }
+    }
+}
+
+impl From<&str> for Prerequisite {
+    fn from(id: &str) -> Self {
+        Self::Id(id.to_string())
+    }
+}
+
+impl From<String> for Prerequisite {
+    fn from(id: String) -> Self {
+        Self::Id(id)
+    }
+}
+
+/// How a deliverable claims a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FileMode {
+    /// Sole writer; conflicts with every other claim on the path.
+    #[default]
+    Exclusive,
+    /// Append-only; may be co-leased with other append claims.
+    Append,
+}
+
+/// One entry of `owned_files`: a bare path (exclusive) or `{path, mode}`.
+/// A bare path round-trips as a plain string.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(untagged, from = "OwnedFileWire")]
+pub enum OwnedFile {
+    Path(PathBuf),
+    Claim {
+        path: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<FileMode>,
+    },
+}
+
+/// Strict wire form of [`OwnedFile`]: the object form rejects unknown keys.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OwnedFileWire {
+    Path(PathBuf),
+    Claim(OwnedClaimWire),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnedClaimWire {
+    path: PathBuf,
+    #[serde(default)]
+    mode: Option<FileMode>,
+}
+
+impl From<OwnedFileWire> for OwnedFile {
+    fn from(w: OwnedFileWire) -> Self {
+        match w {
+            OwnedFileWire::Path(p) => Self::Path(p),
+            OwnedFileWire::Claim(c) => Self::Claim {
+                path: c.path,
+                mode: c.mode,
+            },
+        }
+    }
+}
+
+impl OwnedFile {
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Path(p) | Self::Claim { path: p, .. } => p,
+        }
+    }
+
+    pub fn mode(&self) -> FileMode {
+        match self {
+            Self::Path(_) => FileMode::Exclusive,
+            Self::Claim { mode, .. } => mode.unwrap_or_default(),
+        }
+    }
+}
+
+impl From<&str> for OwnedFile {
+    fn from(s: &str) -> Self {
+        Self::Path(PathBuf::from(s))
+    }
+}
+
+impl From<PathBuf> for OwnedFile {
+    fn from(p: PathBuf) -> Self {
+        Self::Path(p)
+    }
+}
+
+/// Optional three-point effort estimate for a [`Deliverable`].
+///
+/// The three points must satisfy `0 <= optimistic <= likely <= pessimistic`
+/// and all be finite and at most [`MAX_HOURS`]; [`crate::planner`] rejects
+/// violations as [`PlannerError::InvalidGraph`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Estimate {
+    /// Best-case effort in hours.
+    pub optimistic: f32,
+    /// Most-likely effort in hours; used as the scheduled length when no
+    /// explicit effort or duration is set.
+    pub likely: f32,
+    /// Worst-case effort in hours.
+    pub pessimistic: f32,
+}
+
+/// How partial progress on a deliverable converts to earned percent for
+/// earned value ([`Deliverable::earning_rule`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EarningRule {
+    /// 100% only when Complete.
+    #[default]
+    ZeroHundred,
+    /// 50% once started (or any percent reported), 100% when Complete.
+    FiftyFifty,
+    /// The reported percent, 100% when Complete.
+    Weighted,
+}
+
 /// A single unit of work scheduled by the Planner.
 ///
 /// `owned_files` is the load-bearing field for concurrent dispatch: the
-/// Planner guarantees that two deliverables with overlapping `owned_files`
-/// will never be returned in the same [`Cohort`] and will never both hold
-/// active locks. This is the only mechanism the Planner uses to prevent
+/// Planner guarantees that two deliverables with conflicting `owned_files`
+/// claims (exclusive conflicts with anything; append/append may share) will
+/// never be returned in the same [`Cohort`] and will never both hold active
+/// locks. This is the only mechanism the Planner uses to prevent
 /// write-write conflicts; implementations of [`crate::ports::Planner`]
 /// must therefore reject any plan that contains a deliverable whose
 /// `owned_files` are not specified up front.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Deliverable {
     /// Unique identifier within the plan. The Planner rejects duplicate
     /// ids at submit time with [`PlannerError::InvalidGraph`].
     pub id: String,
 
     /// Exact file paths the implementer is going to write while completing
-    /// this deliverable. Disjointness across this set is the lock-contention
-    /// invariant; see [`crate::ports::Planner::acquire_cohort`] semantics.
-    pub owned_files: Vec<PathBuf>,
+    /// this deliverable. The absence of conflicting claims across deliverables
+    /// is the lock-contention invariant; see [`crate::ports::Planner::acquire_cohort`] semantics.
+    pub owned_files: Vec<OwnedFile>,
 
     /// Ids of other deliverables in the same plan that must reach
     /// [`DeliverableStatus::Complete`] before this one becomes eligible
     /// for acquisition.
-    pub prerequisites: Vec<String>,
+    pub prerequisites: Vec<Prerequisite>,
 
     /// Estimated wall-clock effort, used by critical-path math in
-    /// [`PlanStatus::critical_path`]. `None` means the implementation
-    /// should treat the duration as one unit when computing the longest
-    /// chain.
+    /// [`PlanStatus::critical_path`]. `None` means the planner derives an
+    /// estimate with `EffortEstimator`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_effort_hours: Option<f32>,
+
+    /// Calendar time the deliverable occupies on the schedule, in hours.
+    /// When set it replaces the effort estimate as the scheduled length;
+    /// effort stays the cost basis. Must be finite and >= 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_hours: Option<f32>,
+
+    /// Optional three-point effort estimate. Scheduled-length precedence is
+    /// `duration_hours` > `estimated_effort_hours` > `estimate.likely` >
+    /// `0` for a milestone > the estimator's default. So only when neither
+    /// `duration_hours` nor `estimated_effort_hours` is set is `likely` the
+    /// scheduled length and the basis for cost and DRAG, and only then does
+    /// Monte Carlo sample the estimate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate: Option<Estimate>,
 
     /// Free-form metadata. Conventionally carries model hints, human
     /// descriptions, links to specs, etc. The Planner does not interpret
     /// this field.
     #[serde(default)]
     pub metadata: serde_json::Value,
+
+    /// True for a milestone: a zero-effort marker whose schedule and
+    /// critical path `plan.status` reports in `milestones`. A deliverable
+    /// with `metadata.milestone == true` is treated the same way.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub milestone: bool,
+
+    /// How earned value credits partial progress. `None` means
+    /// [`EarningRule::ZeroHundred`]; an explicit `zero_hundred` deserializes
+    /// as `None` and hashes like it. Part of the plan's identity (hashed).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_earning_rule"
+    )]
+    pub earning_rule: Option<EarningRule>,
+}
+
+/// The default rule is normalised to `None`, so `"zero_hundred"` and an
+/// absent rule describe the same deliverable.
+fn deserialize_earning_rule<'de, D>(d: D) -> Result<Option<EarningRule>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<EarningRule>::deserialize(d)?.filter(|r| *r != EarningRule::ZeroHundred))
+}
+
+impl Deliverable {
+    /// Whether this deliverable is a milestone, via the `milestone` field or
+    /// the legacy `metadata.milestone == true` convention.
+    pub fn is_milestone(&self) -> bool {
+        self.milestone
+            || self
+                .metadata
+                .get("milestone")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+    }
 }
 
 /// Lifecycle state of a single [`Deliverable`].
@@ -168,8 +403,445 @@ pub enum DeliverableStatus {
     },
 }
 
+/// Request bundle for [`crate::ports::Planner::acquire_cohort`].
+///
+/// Public fields mirror the historical positional arguments so callers can
+/// construct it directly or via [`AcquireRequest::new`].
+#[derive(Debug, Clone)]
+pub struct AcquireRequest {
+    pub plan_id: PlanId,
+    pub caller_id: CallerId,
+    pub max_count: usize,
+    /// When set, only these deliverables are considered; each one that is
+    /// not leased is reported in `Cohort.blocked` with a reason code.
+    pub ids: Option<Vec<String>>,
+    /// When set, only deliverables whose `metadata` has every `(key, value)`
+    /// pair (JSON equality) are considered. Non-matches are silently skipped.
+    pub metadata_filter: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Requested lease TTL for this call. `None` uses the planner
+    /// default; the planner clamps the value to its configured maximum.
+    pub ttl: Option<Duration>,
+}
+
+impl AcquireRequest {
+    pub fn new(plan_id: PlanId, caller_id: CallerId, max_count: usize) -> Self {
+        Self {
+            plan_id,
+            caller_id,
+            max_count,
+            ids: None,
+            metadata_filter: None,
+            ttl: None,
+        }
+    }
+
+    /// Restrict the acquire to these deliverable ids.
+    pub fn with_ids(mut self, ids: Vec<String>) -> Self {
+        self.ids = Some(ids);
+        self
+    }
+
+    /// Restrict the acquire to deliverables matching these metadata pairs.
+    pub fn with_metadata_filter(
+        mut self,
+        filter: serde_json::Map<String, serde_json::Value>,
+    ) -> Self {
+        self.metadata_filter = Some(filter);
+        self
+    }
+
+    /// Request a lease TTL for this acquire. `None` (the default) uses
+    /// the planner default TTL; the planner clamps the value to its
+    /// configured maximum.
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = Some(ttl);
+        self
+    }
+}
+
+/// Request bundle for [`crate::ports::Planner::mark_status`].
+///
+/// The optional progress fields feed earned value and are validated as
+/// `INVALID_ACTUALS`: `earned_pct` is 0..=100 and only accepted with
+/// `InProgress` (with `Complete` it is accepted and ignored),
+/// `actual_effort_hours` is finite and in `0..=`[`MAX_HOURS`], and
+/// `evidence` is at most [`MAX_EVIDENCE_CHARS`] characters, with at most
+/// [`MAX_EVIDENCE_ENTRIES`] kept per deliverable.
+#[derive(Debug, Clone)]
+pub struct MarkStatusRequest {
+    pub plan_id: PlanId,
+    pub deliverable_id: String,
+    pub caller_id: CallerId,
+    pub status: DeliverableStatus,
+    /// Reported percent complete; replaces the stored value.
+    pub earned_pct: Option<u8>,
+    /// Reported total effort so far, in hours; replaces the stored value and
+    /// takes precedence over leased hours for actual cost.
+    pub actual_effort_hours: Option<f32>,
+    /// One evidence note, appended to the deliverable's evidence list.
+    pub evidence: Option<String>,
+}
+
+impl MarkStatusRequest {
+    pub fn new(
+        plan_id: PlanId,
+        deliverable_id: impl Into<String>,
+        caller_id: CallerId,
+        status: DeliverableStatus,
+    ) -> Self {
+        Self {
+            plan_id,
+            deliverable_id: deliverable_id.into(),
+            caller_id,
+            status,
+            earned_pct: None,
+            actual_effort_hours: None,
+            evidence: None,
+        }
+    }
+
+    /// Report the percent complete (0..=100).
+    pub fn with_earned_pct(mut self, pct: u8) -> Self {
+        self.earned_pct = Some(pct);
+        self
+    }
+
+    /// Report the total effort spent so far, in hours.
+    pub fn with_actual_effort_hours(mut self, hours: f32) -> Self {
+        self.actual_effort_hours = Some(hours);
+        self
+    }
+
+    /// Append one evidence note.
+    pub fn with_evidence(mut self, evidence: impl Into<String>) -> Self {
+        self.evidence = Some(evidence.into());
+        self
+    }
+}
+
+/// Request bundle for [`crate::ports::Planner::heartbeat`].
+#[derive(Debug, Clone)]
+pub struct HeartbeatRequest {
+    pub plan_id: PlanId,
+    pub deliverable_id: String,
+    pub caller_id: CallerId,
+    /// Requested lease TTL for this heartbeat. `None` uses the planner
+    /// default; the planner clamps the value to its configured maximum.
+    pub ttl: Option<Duration>,
+}
+
+impl HeartbeatRequest {
+    pub fn new(plan_id: PlanId, deliverable_id: impl Into<String>, caller_id: CallerId) -> Self {
+        Self {
+            plan_id,
+            deliverable_id: deliverable_id.into(),
+            caller_id,
+            ttl: None,
+        }
+    }
+
+    /// Request a lease TTL for this heartbeat. `None` (the default)
+    /// uses the planner default TTL; the planner clamps the value to
+    /// its configured maximum.
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = Some(ttl);
+        self
+    }
+}
+
+/// Request bundle for [`crate::ports::Planner::force_release`].
+#[derive(Debug, Clone)]
+pub struct ForceReleaseRequest {
+    pub plan_id: PlanId,
+    pub deliverable_id: String,
+    pub reason: String,
+    /// Also clear the deliverable's lapse and failure counters (revives a
+    /// lapse-limited or circuit-broken deliverable). Defaults to `false`.
+    pub reset_counters: bool,
+}
+
+impl ForceReleaseRequest {
+    pub fn new(
+        plan_id: PlanId,
+        deliverable_id: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            plan_id,
+            deliverable_id: deliverable_id.into(),
+            reason: reason.into(),
+            reset_counters: false,
+        }
+    }
+
+    /// Set whether the lapse and failure counters are cleared too.
+    pub fn reset_counters(mut self, yes: bool) -> Self {
+        self.reset_counters = yes;
+        self
+    }
+}
+
+/// Request bundle for [`crate::ports::Planner::accept`].
+#[derive(Debug, Clone)]
+pub struct AcceptRequest {
+    pub plan_id: PlanId,
+    pub deliverable_id: String,
+    pub accepted_by: String,
+    pub evidence: String,
+    /// Take over a live lease held by someone else. Defaults to `false`.
+    pub override_lock: bool,
+}
+
+impl AcceptRequest {
+    pub fn new(
+        plan_id: PlanId,
+        deliverable_id: impl Into<String>,
+        accepted_by: impl Into<String>,
+        evidence: impl Into<String>,
+    ) -> Self {
+        Self {
+            plan_id,
+            deliverable_id: deliverable_id.into(),
+            accepted_by: accepted_by.into(),
+            evidence: evidence.into(),
+            override_lock: false,
+        }
+    }
+
+    /// Set whether a live lease held by another caller may be taken over.
+    pub fn override_lock(mut self, yes: bool) -> Self {
+        self.override_lock = yes;
+        self
+    }
+}
+
+/// Request bundle for [`crate::ports::Planner::sync_plan`]: register or
+/// update the variant `variant` of the plan line `(project, name)`.
+#[derive(Debug, Clone)]
+pub struct SyncRequest {
+    pub project: String,
+    pub name: String,
+    pub variant: String,
+    pub graph: PlanGraph,
+    /// Where the graph was read from (relative to the project root), if it
+    /// came from a plan file. `None` for an inline graph.
+    pub source_path: Option<String>,
+    /// Hash of the source file's bytes. `None` for an inline graph, which is
+    /// then identified by its canonical graph hash.
+    pub content_hash: Option<String>,
+    /// Passed to the revision when the content changed: release live locks
+    /// of removed deliverables instead of refusing. Defaults to `false`.
+    pub force: bool,
+}
+
+impl SyncRequest {
+    pub fn new(
+        project: impl Into<String>,
+        name: impl Into<String>,
+        variant: impl Into<String>,
+        graph: PlanGraph,
+    ) -> Self {
+        Self {
+            project: project.into(),
+            name: name.into(),
+            variant: variant.into(),
+            graph,
+            source_path: None,
+            content_hash: None,
+            force: false,
+        }
+    }
+
+    /// Record the plan file the graph was read from.
+    pub fn with_source_path(mut self, path: impl Into<String>) -> Self {
+        self.source_path = Some(path.into());
+        self
+    }
+
+    /// Record the hash of the plan file's bytes.
+    pub fn with_content_hash(mut self, hash: impl Into<String>) -> Self {
+        self.content_hash = Some(hash.into());
+        self
+    }
+
+    /// Set whether a changed graph may force-release live locks.
+    pub fn force(mut self, yes: bool) -> Self {
+        self.force = yes;
+        self
+    }
+}
+
+/// Request bundle for [`crate::ports::Planner::revise_plan`].
+#[derive(Debug, Clone)]
+pub struct ReviseRequest {
+    pub plan_id: PlanId,
+    pub graph: PlanGraph,
+    /// Release live locks of removed (or claim-conflicting) deliverables
+    /// instead of refusing with `LOCK_HELD`. Defaults to `false`.
+    pub force: bool,
+}
+
+impl ReviseRequest {
+    pub fn new(plan_id: PlanId, graph: PlanGraph) -> Self {
+        Self {
+            plan_id,
+            graph,
+            force: false,
+        }
+    }
+
+    /// Set whether live locks may be force-released.
+    pub fn force(mut self, yes: bool) -> Self {
+        self.force = yes;
+        self
+    }
+}
+
+/// Request bundle for [`crate::ports::Planner::fork_plan`]: copy the head
+/// graph of the named variant `plan_id`, apply `edits`, and register the
+/// result as the new draft variant `variant` of the same plan line.
+#[derive(Debug, Clone)]
+pub struct ForkRequest {
+    pub plan_id: PlanId,
+    pub variant: String,
+    /// Applied in order with [`crate::edits::apply_edits`].
+    pub edits: Vec<crate::edits::GraphEdit>,
+    /// Where to write the new variant's plan file. Falls back to the
+    /// planner's own root; with neither, the variant is registered inline.
+    pub project_root: Option<crate::project::ProjectRoot>,
+}
+
+impl ForkRequest {
+    pub fn new(plan_id: PlanId, variant: impl Into<String>) -> Self {
+        Self {
+            plan_id,
+            variant: variant.into(),
+            edits: Vec::new(),
+            project_root: None,
+        }
+    }
+
+    /// Set the edits applied to the copied graph.
+    pub fn with_edits(mut self, edits: Vec<crate::edits::GraphEdit>) -> Self {
+        self.edits = edits;
+        self
+    }
+
+    /// Write the new variant's file under `root`.
+    pub fn with_project_root(mut self, root: crate::project::ProjectRoot) -> Self {
+        self.project_root = Some(root);
+        self
+    }
+}
+
+/// Request bundle for [`crate::ports::Planner::compare_plans`]. Exactly one
+/// of `plan_ids` (two or more plans, any variants or unnamed plans) or
+/// `plan` (`(project, name)`: every non-archived variant of that line) is
+/// given.
+#[derive(Debug, Clone)]
+pub struct ComparePlansRequest {
+    pub plan_ids: Option<Vec<PlanId>>,
+    pub plan: Option<(String, String)>,
+    pub request: crate::compare::CompareRequest,
+}
+
+impl ComparePlansRequest {
+    /// Compare the given plans, in this order.
+    pub fn by_ids(plan_ids: Vec<PlanId>, request: crate::compare::CompareRequest) -> Self {
+        Self {
+            plan_ids: Some(plan_ids),
+            plan: None,
+            request,
+        }
+    }
+
+    /// Compare every non-archived variant of the line `(project, name)`.
+    pub fn by_plan(
+        project: impl Into<String>,
+        name: impl Into<String>,
+        request: crate::compare::CompareRequest,
+    ) -> Self {
+        Self {
+            plan_ids: None,
+            plan: Some((project.into(), name.into())),
+            request,
+        }
+    }
+}
+
+/// One variant of a plan line, as reported by
+/// [`crate::ports::Planner::list_plans`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VariantSummary {
+    pub variant: String,
+    pub plan_id: PlanId,
+    /// True for the line's one executable variant.
+    pub selected: bool,
+    pub archived: bool,
+    pub head_revision: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    /// Deliverables `Complete`.
+    pub complete: usize,
+    /// Deliverables in the head graph.
+    pub total: usize,
+    /// True when every deliverable is `Complete` (vacuously for none).
+    pub plan_complete: bool,
+    /// Head graph's CPM makespan in hours.
+    pub makespan: f32,
+}
+
+/// A named plan line and its variants, sorted by variant name.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanLineSummary {
+    pub project: String,
+    pub name: String,
+    pub selected_variant: Option<String>,
+    pub archived: bool,
+    pub variants: Vec<VariantSummary>,
+}
+
+/// Result of [`crate::ports::Planner::sync_plan`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SyncOutcome {
+    pub plan_id: PlanId,
+    pub name: String,
+    pub variant: String,
+    /// The variant's head revision after the sync.
+    pub revision: u32,
+    /// True when this sync registered the variant.
+    pub created: bool,
+    /// True when this sync created the variant or a new revision.
+    pub changed: bool,
+    /// What the revision changed; `None` unless a new revision was made.
+    #[serde(default)]
+    pub diff: Option<crate::revise::RevisionDiff>,
+}
+
+/// Result of [`crate::ports::Planner::select_variant`]. Selection does not
+/// change any graph, so this is a dedicated summary rather than a
+/// [`crate::revise::RevisionDiff`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SelectOutcome {
+    pub plan_id: PlanId,
+    pub project: String,
+    pub name: String,
+    /// The variant now selected (the one `plan_id` belongs to).
+    pub variant: String,
+    /// The previously selected variant; `None` when the line had none.
+    pub previous: Option<String>,
+    /// False when `variant` was already selected (a no-op).
+    pub changed: bool,
+    /// Sorted ids whose `Complete` status was copied from the previously
+    /// selected variant (identical canonical definition in both).
+    pub carried: Vec<String>,
+    /// Sorted ids of the previous variant's live locks released by a forced
+    /// selection.
+    pub released_locks: Vec<String>,
+}
+
 /// Snapshot of a held lock. The Planner records one [`LockInfo`] per
-/// acquired deliverable and surfaces them in [`Cohort::locks`] and
+/// acquired deliverable and surfaces them in `Cohort::locks` and
 /// [`PlanStatus::locks_held`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LockInfo {
@@ -215,9 +887,25 @@ pub struct CohortRow {
 pub struct Cohort {
     pub plan_id: PlanId,
     pub rows: Vec<CohortRow>,
+    /// Deliverables the acquire considered but did not lease, and why.
+    pub blocked: Vec<BlockedDeliverable>,
+    /// Paths in this cohort claimed in append mode by two or more
+    /// deliverables (in the cohort or against held locks).
+    pub shared_paths: Vec<PathBuf>,
 }
 
-/// Error returned when a [`FlatCohort`] wire payload cannot be decoded into a
+/// A deliverable the acquire considered but did not lease, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockedDeliverable {
+    pub id: String,
+    /// Stable code; the authoritative list is "MANUAL", "NOT_READY",
+    /// "LOCKED", "LAPSE_LIMIT", "FILE_CONFLICT" and "MAX_COUNT" (see the
+    /// server `instructions()` for when each applies).
+    pub code: String,
+    pub reason: String,
+}
+
+/// Error returned when a `FlatCohort` wire payload cannot be decoded into a
 /// [`Cohort`] — currently only the deliverables/locks length mismatch
 /// (CMP-032). Carries both lengths for triage and implements `Display` so it
 /// satisfies serde's `try_from` error bound.
@@ -249,6 +937,10 @@ struct FlatCohort {
     plan_id: PlanId,
     deliverables: Vec<Deliverable>,
     locks: Vec<LockInfo>,
+    #[serde(default)]
+    blocked: Vec<BlockedDeliverable>,
+    #[serde(default)]
+    shared_paths: Vec<PathBuf>,
 }
 
 impl From<Cohort> for FlatCohort {
@@ -263,6 +955,8 @@ impl From<Cohort> for FlatCohort {
             plan_id: cohort.plan_id,
             deliverables,
             locks,
+            blocked: cohort.blocked,
+            shared_paths: cohort.shared_paths,
         }
     }
 }
@@ -290,6 +984,8 @@ impl TryFrom<FlatCohort> for Cohort {
         Ok(Cohort {
             plan_id: flat.plan_id,
             rows,
+            blocked: flat.blocked,
+            shared_paths: flat.shared_paths,
         })
     }
 }
@@ -315,14 +1011,109 @@ pub struct PlanStatus {
     ///   terminal mark); pressure against the lapse bound
     ///   ([`crate::planner::MAX_LAPSES`]), never the failure breaker.
     pub deliverables: Vec<(String, DeliverableStatus, u32, u32, u32)>,
-    /// Ids on the longest dependency chain, in execution order. Empty
-    /// when the plan has no deliverables.
+    /// Ids on the longest dependency chain, in execution order. Always
+    /// begins with `__start__` and ends with `__finish__` (synthetic
+    /// endpoints; an empty plan is just those two).
     pub critical_path: Vec<String>,
-    /// Sum of `estimated_effort_hours` along `critical_path`. Deliverables
-    /// without an estimate contribute zero.
+    /// Scheduled length plus lags along `critical_path` (= `__finish__`
+    /// earliest finish).
     pub critical_path_hours: f32,
     /// Every lock currently active across the plan.
     pub locks_held: Vec<LockInfo>,
+    /// Every zero-float deliverable (synthetic endpoints excluded), sorted by `(es, id)`.
+    #[serde(default)]
+    pub critical_ids: Vec<String>,
+    /// Per-deliverable CPM schedule, in graph insertion order.
+    #[serde(default)]
+    pub schedule: Vec<ScheduleRow>,
+    /// Deliverables with status `Ready` and no live lock, sorted by
+    /// `(latest_start, float, id)` ascending (smallest latest start first,
+    /// i.e. longest remaining tail; same order as
+    /// [`crate::ports::Planner::acquire_cohort`] via the shared `priority_key`);
+    /// membership is a superset: acquire may still skip deliverables at the
+    /// failure or lapse cap, manual deliverables, or whose files overlap a
+    /// held lock.
+    #[serde(default)]
+    pub ready: Vec<String>,
+    /// True when every deliverable is `Complete` (vacuously true for an
+    /// empty plan).
+    #[serde(default)]
+    pub plan_complete: bool,
+    /// One row per milestone deliverable, in graph order.
+    #[serde(default)]
+    pub milestones: Vec<MilestoneRow>,
+    /// Plan line name of a named variant; `None` for an unnamed plan.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Variant name of a named variant; `None` for an unnamed plan.
+    #[serde(default)]
+    pub variant: Option<String>,
+    /// Whether this variant is its line's selected (executable) variant;
+    /// `None` for an unnamed plan.
+    #[serde(default)]
+    pub selected: Option<bool>,
+    /// `Some(true)` when the variant's plan file no longer matches what was
+    /// last synced (by content hash), `Some(false)` when it matches. `None`
+    /// (unknown) when the variant has no source file, the planner has no
+    /// project root for the variant's project, or the file is unreadable.
+    #[serde(default)]
+    pub definition_drift: Option<bool>,
+}
+
+/// A milestone's schedule summary, reported by [`PlanStatus::milestones`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MilestoneRow {
+    pub id: String,
+    /// Longest chain from `__start__` to this milestone (ends at `id`).
+    pub critical_path: Vec<String>,
+    /// The milestone's earliest finish, in hours from plan start.
+    pub hours: f32,
+    /// True once the milestone deliverable is `Complete`.
+    pub complete: bool,
+}
+
+/// Largest plan accepted by submit and the analysis tools. Bounds the
+/// quadratic parts of validation, lint and leveling.
+pub const MAX_DELIVERABLES: usize = 5000;
+
+/// Upper bound, in hours, for every effort, duration, lag and estimate
+/// value (about 114 years). Keeps schedule arithmetic far from `f32`
+/// overflow.
+pub const MAX_HOURS: f32 = 1_000_000.0;
+
+/// Longest `evidence` note `mark_status` accepts, in characters.
+pub const MAX_EVIDENCE_CHARS: usize = 2048;
+
+/// Most evidence entries one deliverable keeps; appending beyond it is
+/// `INVALID_ACTUALS`.
+pub const MAX_EVIDENCE_ENTRIES: usize = 100;
+
+/// Reserved id of the synthetic zero-effort source node in every plan's CPM.
+pub const START_ID: &str = "__start__";
+/// Reserved id of the synthetic zero-effort sink node in every plan's CPM.
+pub const FINISH_ID: &str = "__finish__";
+
+/// The stored definition of a plan: the [`PlanGraph`] exactly as submitted,
+/// returned by [`crate::ports::Planner::get_plan`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanDefinition {
+    pub plan_id: PlanId,
+    pub graph: PlanGraph,
+}
+
+/// One deliverable's CPM schedule, in hours from plan start.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScheduleRow {
+    pub id: String,
+    pub es: f32,
+    pub ef: f32,
+    pub ls: f32,
+    pub lf: f32,
+    pub float: f32,
+    pub critical: bool,
+    /// True for the synthetic [`START_ID`] / [`FINISH_ID`] endpoint rows.
+    #[serde(default)]
+    pub synthetic: bool,
 }
 
 /// Errors returned by [`crate::ports::Planner`] methods.
@@ -404,14 +1195,15 @@ pub enum PlannerError {
     /// driving process was killed or timed out) more times than the
     /// runaway bound allows. These are ENVIRONMENTAL losses, not
     /// implementation failures, so the deliverable is NOT auto-failed;
-    /// instead `acquire_cohort` refuses to re-lease until an operator
-    /// intervenes (fix the environment, then `mark_status` or
-    /// `force_release`).
+    /// instead `acquire_cohort` skips it and reports it in
+    /// [`Cohort::blocked`] until an operator intervenes (fix the
+    /// environment, then `force_release` with `reset_counters`). No longer
+    /// returned by `acquire_cohort`; kept for wire compatibility.
     #[error(
         "LAPSE_LIMIT: deliverable {deliverable_id} lost {lapse_count} leases to environmental \
          lapses (TTL expiry with no terminal mark — killed/timed-out drivers, NOT implementation \
          failures; bound {max_lapses}); fix the environment, then mark_status the deliverable to \
-         proceed"
+         proceed; clear it with plan.force_release {{reset_counters: true}}"
     )]
     LapseLimit {
         deliverable_id: String,
@@ -419,11 +1211,70 @@ pub enum PlannerError {
         max_lapses: u32,
     },
 
+    /// A deliverable cannot be completed without a lease (or accepted)
+    /// while some of its prerequisites are not yet `Complete`.
+    #[error(
+        "PREREQUISITES_INCOMPLETE: {deliverable_id} in plan {plan_id} has incomplete \
+         prerequisites [{}]",
+        missing.join(", ")
+    )]
+    PrerequisitesIncomplete {
+        plan_id: String,
+        deliverable_id: String,
+        missing: Vec<String>,
+    },
+
     /// The submitted graph fails a structural invariant: duplicate ids,
     /// unknown prerequisite reference, cycle, empty `owned_files`, etc.
     /// The `reason` is the precise failure message.
     #[error("INVALID_GRAPH: {reason}")]
     InvalidGraph { reason: String },
+
+    /// A project/plan-file path failed validation: not a valid slug, not of the
+    /// form `.cpm-planner/plans/<name>/<variant>.json`, absolute, contains `..`,
+    /// or resolves (e.g. via a symlink) outside the plans directory.
+    #[error("INVALID_PATH: {reason}")]
+    InvalidPath { reason: String },
+
+    /// `plan.schedule` was given no usable capacity (missing or zero) for
+    /// one or more resources that scheduled work needs. `missing` is sorted.
+    #[error("INVALID_CAPACITIES: no capacity for resources [{}]", missing.join(", "))]
+    InvalidCapacities { missing: Vec<String> },
+
+    /// An execution operation (`acquire_cohort`, `heartbeat`, `mark_status`,
+    /// `accept`, `force_release`) targeted a named plan variant that is not
+    /// its line's selected variant. Read and analysis tools are never gated.
+    #[error(
+        "VARIANT_NOT_SELECTED: plan {plan_id} is variant '{variant}' of '{name}'; selected is \
+         '{selected}'"
+    )]
+    VariantNotSelected {
+        plan_id: String,
+        name: String,
+        variant: String,
+        selected: String,
+    },
+
+    /// An operation was refused because of archiving: archiving the selected
+    /// variant alone, syncing into / selecting an archived variant or line,
+    /// unarchiving a variant of an archived line, or an execution operation
+    /// on any variant of an archived line.
+    #[error("ARCHIVE_REFUSED: {reason}")]
+    ArchiveRefused { reason: String },
+
+    /// `mark_status` progress fields failed validation: `earned_pct` above
+    /// 100 or given with a status other than `in_progress`/`complete`,
+    /// `actual_effort_hours` not finite or outside `0..=1000000`, or
+    /// `evidence` longer than [`MAX_EVIDENCE_CHARS`] characters or beyond
+    /// [`MAX_EVIDENCE_ENTRIES`] entries for the deliverable.
+    #[error("INVALID_ACTUALS: {reason}")]
+    InvalidActuals { reason: String },
+
+    /// An earned-value read or snapshot (`plan.ev`, `plan.snapshot`)
+    /// targeted a plan that has no baseline yet; take one with
+    /// `plan.baseline` first.
+    #[error("NOT_BASELINED: plan {plan_id} has no baseline; take one with plan.baseline")]
+    NotBaselined { plan_id: String },
 
     /// Catch-all for backend failures (DB unavailable, serialization
     /// errors against the persistence layer, etc.). Wraps the underlying
@@ -445,10 +1296,14 @@ mod tests {
         let graph = PlanGraph {
             deliverables: vec![Deliverable {
                 id: "d1".to_string(),
-                owned_files: vec![PathBuf::from("src/foo.rs"), PathBuf::from("src/bar.rs")],
-                prerequisites: vec!["d0".to_string()],
+                owned_files: vec!["src/foo.rs".into(), "src/bar.rs".into()],
+                prerequisites: vec!["d0".into()],
                 estimated_effort_hours: Some(1.5),
                 metadata: serde_json::json!({"description": "smoke test"}),
+                duration_hours: None,
+                estimate: None,
+                milestone: false,
+                earning_rule: None,
             }],
             max_chained_dispatch: Some(8),
         };
@@ -461,13 +1316,25 @@ mod tests {
         assert_eq!(d.id, "d1");
         assert_eq!(
             d.owned_files,
-            vec![PathBuf::from("src/foo.rs"), PathBuf::from("src/bar.rs")]
+            vec![OwnedFile::from("src/foo.rs"), OwnedFile::from("src/bar.rs")]
         );
-        assert_eq!(d.prerequisites, vec!["d0".to_string()]);
+        assert_eq!(d.prerequisites, vec![Prerequisite::from("d0")]);
         assert_eq!(d.estimated_effort_hours, Some(1.5));
         assert_eq!(d.metadata, serde_json::json!({"description": "smoke test"}));
         assert_eq!(back.max_chained_dispatch, Some(8));
         Ok(())
+    }
+
+    #[test]
+    fn explicit_default_earning_rule_deserializes_as_absent() {
+        let d: Deliverable = serde_json::from_value(serde_json::json!({
+            "id": "a",
+            "owned_files": [],
+            "prerequisites": [],
+            "earning_rule": "zero_hundred"
+        }))
+        .unwrap();
+        assert_eq!(d.earning_rule, None);
     }
 
     /// `DeliverableStatus` uses an internally-tagged enum representation
@@ -498,14 +1365,20 @@ mod tests {
         let now = chrono::Utc::now();
         let cohort = Cohort {
             plan_id: plan_id.clone(),
+            blocked: vec![],
+            shared_paths: vec![],
             rows: vec![
                 CohortRow {
                     deliverable: Deliverable {
                         id: "d1".to_string(),
-                        owned_files: vec![PathBuf::from("a.rs")],
+                        owned_files: vec!["a.rs".into()],
                         prerequisites: vec![],
                         estimated_effort_hours: Some(1.0),
                         metadata: serde_json::Value::Null,
+                        duration_hours: None,
+                        estimate: None,
+                        milestone: false,
+                        earning_rule: None,
                     },
                     lock: LockInfo {
                         plan_id: plan_id.clone(),
@@ -518,10 +1391,14 @@ mod tests {
                 CohortRow {
                     deliverable: Deliverable {
                         id: "d2".to_string(),
-                        owned_files: vec![PathBuf::from("b.rs")],
+                        owned_files: vec!["b.rs".into()],
                         prerequisites: vec![],
                         estimated_effort_hours: Some(2.0),
                         metadata: serde_json::Value::Null,
+                        duration_hours: None,
+                        estimate: None,
+                        milestone: false,
+                        earning_rule: None,
                     },
                     lock: LockInfo {
                         plan_id: plan_id.clone(),

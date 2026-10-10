@@ -22,13 +22,14 @@
 //! - Locks are atomically acquired with the cohort and released by
 //!   `mark_status(Complete)`.
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use cpm_planner::BasicCpmPlanner;
 use cpm_planner::audit::{AuditEvent, AuditSink};
-use cpm_planner::plan::{CallerId, Deliverable, DeliverableStatus, PlanGraph};
+use cpm_planner::plan::{
+    AcquireRequest, CallerId, Deliverable, DeliverableStatus, MarkStatusRequest, PlanGraph,
+};
 use cpm_planner::ports::Planner;
 
 /// A trivial audit sink that buffers every event for inspection.
@@ -57,10 +58,14 @@ fn deliverable(
 ) -> Deliverable {
     Deliverable {
         id: id.to_string(),
-        owned_files: owned_files.iter().map(PathBuf::from).collect(),
-        prerequisites: prerequisites.iter().map(|s| s.to_string()).collect(),
+        owned_files: owned_files.iter().map(|f| (*f).into()).collect(),
+        prerequisites: prerequisites.iter().map(|s| (*s).into()).collect(),
         estimated_effort_hours: Some(estimated_effort_hours),
         metadata: serde_json::Value::Null,
+        duration_hours: None,
+        estimate: None,
+        milestone: false,
+        earning_rule: None,
     }
 }
 
@@ -105,7 +110,9 @@ async fn main() -> anyhow::Result<()> {
         // Acquire up to 4 deliverables. The planner returns only those
         // whose prerequisites are Complete AND whose files don't overlap
         // with anything currently locked.
-        let cohort = planner.acquire_cohort(&plan_id, &caller, 4).await?;
+        let cohort = planner
+            .acquire_cohort(AcquireRequest::new(plan_id.clone(), caller.clone(), 4))
+            .await?;
         if cohort.rows.is_empty() {
             // Two cases for empty: terminal (everything Complete) or
             // blocked (locks held by someone else, or no Ready work).
@@ -122,12 +129,12 @@ async fn main() -> anyhow::Result<()> {
 
         for row in &cohort.rows {
             planner
-                .mark_status(
-                    &plan_id,
-                    &row.deliverable.id,
-                    &caller,
+                .mark_status(MarkStatusRequest::new(
+                    plan_id.clone(),
+                    row.deliverable.id.clone(),
+                    caller.clone(),
                     DeliverableStatus::Complete,
-                )
+                ))
                 .await?;
             println!("  marked {} complete", row.deliverable.id);
         }

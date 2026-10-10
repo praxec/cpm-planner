@@ -1,0 +1,79 @@
+{
+  "deliverables": [
+    {
+      "id": "export-api-contract",
+      "owned_files": ["docs/export-api.md"],
+      "prerequisites": [],
+      "estimated_effort_hours": 2.0,
+      "metadata": {
+        "artifact": "docs/export-api.md: request/response schema and error codes, signed off by the UI and service owners",
+        "owner": "agent",
+        "contract": true
+      }
+    },
+    {
+      "id": "masking-decision",
+      "owned_files": ["docs/decisions/0007-export-masking.md"],
+      "prerequisites": [],
+      "estimated_effort_hours": 1.0,
+      "metadata": {
+        "artifact": "decision record 0007: which fields are masked in exports, and for whom",
+        "owner": "owner",
+        "kind": "manual"
+      }
+    },
+    {
+      "id": "export-service",
+      "owned_files": ["src/export/service.rs", "tests/export_service.rs"],
+      "prerequisites": [
+        { "id": "export-api-contract", "consumes": "request/response schema", "kind": "interface" },
+        { "id": "masking-decision", "consumes": "masked field list" }
+      ],
+      "estimate": { "optimistic": 4.0, "likely": 6.0, "pessimistic": 12.0 },
+      "earning_rule": "fifty_fifty",
+      "metadata": {
+        "artifact": "src/export/service.rs with passing tests in tests/export_service.rs",
+        "owner": "agent"
+      }
+    },
+    {
+      "id": "export-ui",
+      "owned_files": ["web/src/export/ExportDialog.tsx", "web/src/export/ExportDialog.test.tsx"],
+      "prerequisites": [
+        { "id": "export-api-contract", "consumes": "request/response schema", "kind": "interface" }
+      ],
+      "estimate": { "optimistic": 3.0, "likely": 5.0, "pessimistic": 8.0 },
+      "earning_rule": "fifty_fifty",
+      "metadata": {
+        "artifact": "ExportDialog component with passing tests, built against a fake of the contract",
+        "owner": "agent"
+      }
+    },
+    {
+      "id": "export-e2e-evidence",
+      "owned_files": ["docs/evidence/export-e2e.md"],
+      "prerequisites": [
+        { "id": "export-service", "consumes": "running export endpoint" },
+        { "id": "export-ui", "consumes": "export dialog build" }
+      ],
+      "estimate": { "optimistic": 1.0, "likely": 2.0, "pessimistic": 4.0 },
+      "metadata": {
+        "artifact": "docs/evidence/export-e2e.md: end-to-end run log with masked and unmasked samples",
+        "owner": "agent"
+      }
+    },
+    {
+      "id": "export-release",
+      "owned_files": [],
+      "prerequisites": [
+        { "id": "export-e2e-evidence", "consumes": "accepted evidence report" }
+      ],
+      "milestone": true,
+      "metadata": {
+        "artifact": "export feature released behind its flag",
+        "owner": "owner",
+        "kind": "manual"
+      }
+    }
+  ]
+}

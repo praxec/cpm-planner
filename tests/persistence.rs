@@ -14,7 +14,10 @@ use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
 use cpm_planner::audit::NullAuditSink;
-use cpm_planner::plan::{CallerId, Deliverable, DeliverableStatus, PlanGraph, PlannerError};
+use cpm_planner::plan::{
+    AcquireRequest, CallerId, Deliverable, DeliverableStatus, ForceReleaseRequest,
+    HeartbeatRequest, MarkStatusRequest, PlanGraph, PlannerError,
+};
 use cpm_planner::ports::Planner;
 use cpm_planner::{BasicCpmPlanner, SqlitePlanStore};
 
@@ -89,10 +92,17 @@ impl TestClock {
 fn deliverable(id: &str, files: &[&str], prereqs: &[&str]) -> Deliverable {
     Deliverable {
         id: id.to_string(),
-        owned_files: files.iter().map(PathBuf::from).collect(),
-        prerequisites: prereqs.iter().map(|s| s.to_string()).collect(),
+        owned_files: files
+            .iter()
+            .map(|f| cpm_planner::plan::OwnedFile::from(*f))
+            .collect(),
+        prerequisites: prereqs.iter().map(|s| (*s).into()).collect(),
         estimated_effort_hours: Some(1.0),
         metadata: serde_json::Value::Null,
+        duration_hours: None,
+        estimate: None,
+        milestone: false,
+        earning_rule: None,
     }
 }
 
@@ -141,7 +151,12 @@ async fn plan_and_statuses_survive_reopen() {
     assert!(status.locks_held.is_empty());
     assert_eq!(
         status.critical_path,
-        vec!["d1".to_string(), "d2".to_string()]
+        vec![
+            "__start__".to_string(),
+            "d1".to_string(),
+            "d2".to_string(),
+            "__finish__".to_string()
+        ]
     );
 }
 
@@ -178,7 +193,11 @@ async fn two_connections_cannot_double_acquire_the_same_deliverable() {
     let plan_id = planner_a.submit_plan(chain_graph()).await.expect("submit");
 
     let cohort_a = planner_a
-        .acquire_cohort(&plan_id, &caller("proc-a"), 10)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("proc-a").clone(),
+            10,
+        ))
         .await
         .expect("first acquire");
     assert_eq!(cohort_a.rows.len(), 1);
@@ -187,7 +206,11 @@ async fn two_connections_cannot_double_acquire_the_same_deliverable() {
     // The plan was submitted by A's connection but must be fully visible
     // to B; and d1, locked by A, must NOT be acquirable by B.
     let cohort_b = planner_b
-        .acquire_cohort(&plan_id, &caller("proc-b"), 10)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("proc-b").clone(),
+            10,
+        ))
         .await
         .expect("second acquire (different connection)");
     assert!(
@@ -225,7 +248,11 @@ async fn concurrent_acquires_across_connections_never_overlap() {
         handles.push(tokio::spawn(async move {
             let planner = open_planner(&path);
             planner
-                .acquire_cohort(&plan_id_c, &caller(&format!("proc-{c}")), 2)
+                .acquire_cohort(AcquireRequest::new(
+                    plan_id_c.clone(),
+                    caller(&format!("proc-{c}")).clone(),
+                    2,
+                ))
                 .await
                 .expect("acquire_cohort should not error")
         }));
@@ -245,7 +272,7 @@ async fn concurrent_acquires_across_connections_never_overlap() {
             );
             for f in &row.deliverable.owned_files {
                 assert!(
-                    seen_files.insert(f.clone()),
+                    seen_files.insert(f.path().to_path_buf()),
                     "file {f:?} granted to two connections"
                 );
             }
@@ -266,18 +293,22 @@ async fn nonholder_rejected_and_holder_release_unblocks_dependent() {
 
     let plan_id = planner_a.submit_plan(chain_graph()).await.expect("submit");
     planner_a
-        .acquire_cohort(&plan_id, &caller("holder"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("holder").clone(),
+            1,
+        ))
         .await
         .expect("acquire d1");
 
     // A different caller_id (via a different connection) cannot complete it.
     let err = planner_b
-        .mark_status(
-            &plan_id,
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
             "d1",
-            &caller("intruder"),
+            caller("intruder").clone(),
             DeliverableStatus::Complete,
-        )
+        ))
         .await
         .expect_err("non-holder must be rejected");
     assert!(
@@ -288,17 +319,21 @@ async fn nonholder_rejected_and_holder_release_unblocks_dependent() {
     // The holder (same caller_id, either connection) releases it; the
     // dependent becomes ready and is acquirable from the other connection.
     planner_b
-        .mark_status(
-            &plan_id,
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
             "d1",
-            &caller("holder"),
+            caller("holder").clone(),
             DeliverableStatus::Complete,
-        )
+        ))
         .await
         .expect("holder completes d1");
 
     let cohort = planner_b
-        .acquire_cohort(&plan_id, &caller("proc-b"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("proc-b").clone(),
+            1,
+        ))
         .await
         .expect("acquire dependent");
     assert_eq!(cohort.rows.len(), 1);
@@ -323,7 +358,11 @@ async fn expired_lock_is_reclaimable_by_another_connection() {
     let planner_a = open_planner_with_clock(&db.path, Duration::from_secs(60), TestClock::at(t0));
     let plan_id = planner_a.submit_plan(chain_graph()).await.expect("submit");
     planner_a
-        .acquire_cohort(&plan_id, &caller("stale-holder"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("stale-holder").clone(),
+            1,
+        ))
         .await
         .expect("acquire d1");
 
@@ -331,7 +370,11 @@ async fn expired_lock_is_reclaimable_by_another_connection() {
     let late = TestClock::at(t0 + chrono::Duration::minutes(10));
     let planner_b = open_planner_with_clock(&db.path, Duration::from_secs(60), late);
     let cohort = planner_b
-        .acquire_cohort(&plan_id, &caller("reclaimer"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("reclaimer").clone(),
+            1,
+        ))
         .await
         .expect("acquire after expiry");
     assert_eq!(cohort.rows.len(), 1);
@@ -354,7 +397,11 @@ async fn expired_lock_is_quarantined_on_reopen() {
             open_planner_with_clock(&db.path, Duration::from_secs(60), TestClock::at(ancient));
         let plan_id = planner.submit_plan(chain_graph()).await.expect("submit");
         planner
-            .acquire_cohort(&plan_id, &caller("crashed-proc"), 1)
+            .acquire_cohort(AcquireRequest::new(
+                plan_id.clone(),
+                caller("crashed-proc").clone(),
+                1,
+            ))
             .await
             .expect("acquire d1");
         plan_id
@@ -381,7 +428,11 @@ async fn expired_lock_is_quarantined_on_reopen() {
 
     // And it is immediately re-acquirable.
     let cohort = planner2
-        .acquire_cohort(&plan_id, &caller("fresh-proc"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("fresh-proc").clone(),
+            1,
+        ))
         .await
         .expect("reacquire");
     assert_eq!(cohort.rows.len(), 1);
@@ -403,14 +454,22 @@ async fn heartbeat_ttl_refresh_is_persisted_across_connections() {
     let planner_a = open_planner_with_clock(&db.path, ttl, clock_a.clone());
     let plan_id = planner_a.submit_plan(chain_graph()).await.expect("submit");
     planner_a
-        .acquire_cohort(&plan_id, &caller("worker"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("worker").clone(),
+            1,
+        ))
         .await
         .expect("acquire d1"); // expires t0+60
 
     // Heartbeat at t0+30 pushes expiry to t0+90 — persisted, not in-memory.
     clock_a.set(t0 + chrono::Duration::seconds(30));
     planner_a
-        .heartbeat(&plan_id, "d1", &caller("worker"))
+        .heartbeat(HeartbeatRequest::new(
+            plan_id.clone(),
+            "d1",
+            caller("worker").clone(),
+        ))
         .await
         .expect("heartbeat");
 
@@ -422,7 +481,11 @@ async fn heartbeat_ttl_refresh_is_persisted_across_connections() {
         TestClock::at(t0 + chrono::Duration::seconds(70)),
     );
     let cohort = planner_b
-        .acquire_cohort(&plan_id, &caller("poacher"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("poacher").clone(),
+            1,
+        ))
         .await
         .expect("acquire attempt");
     assert!(
@@ -437,7 +500,11 @@ async fn heartbeat_ttl_refresh_is_persisted_across_connections() {
         TestClock::at(t0 + chrono::Duration::seconds(120)),
     );
     let cohort = planner_c
-        .acquire_cohort(&plan_id, &caller("reclaimer"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("reclaimer").clone(),
+            1,
+        ))
         .await
         .expect("acquire after refreshed expiry");
     assert_eq!(cohort.rows.len(), 1);
@@ -475,7 +542,11 @@ async fn lapse_count_survives_reopen_and_never_trips_the_failure_breaker() {
         let planner = open_planner_with_clock(&db.path, ttl, TestClock::at(now));
         let id = planner.submit_plan(chain_graph()).await.expect("submit");
         let cohort = planner
-            .acquire_cohort(&id, &caller(&format!("killed-{lease}")), 1)
+            .acquire_cohort(AcquireRequest::new(
+                id.clone(),
+                caller(&format!("killed-{lease}")).clone(),
+                1,
+            ))
             .await
             .expect("acquire");
         assert_eq!(cohort.rows.len(), 1, "lease {lease} must be granted");
@@ -499,7 +570,11 @@ async fn lapse_count_survives_reopen_and_never_trips_the_failure_breaker() {
         TestClock::at(t0 + chrono::Duration::hours(10)),
     );
     let cohort = planner
-        .acquire_cohort(&plan_id, &caller("fresh"), 10)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("fresh").clone(),
+            10,
+        ))
         .await
         .expect("acquire after lapses");
     assert_eq!(
@@ -525,23 +600,31 @@ async fn failure_count_survives_reopen_and_circuit_breaks_across_processes() {
         let planner = open_planner(&db.path);
         let id = planner.submit_plan(chain_graph()).await.expect("submit");
         let who = caller(&format!("builder-{attempt}"));
-        let cohort = planner.acquire_cohort(&id, &who, 1).await.expect("acquire");
+        let cohort = planner
+            .acquire_cohort(AcquireRequest::new(id.clone(), who.clone(), 1))
+            .await
+            .expect("acquire");
         assert_eq!(cohort.rows.len(), 1, "attempt {attempt} must lease d1");
         assert_eq!(cohort.rows[0].deliverable.id, "d1");
         planner
-            .mark_status(
-                &id,
+            .mark_status(MarkStatusRequest::new(
+                id.clone(),
                 "d1",
-                &who,
+                who.clone(),
                 DeliverableStatus::Failed {
                     reason: format!("build attempt {attempt} broke"),
                 },
-            )
+            ))
             .await
             .expect("mark failed");
         // Orchestrator retry: back into the pool.
         planner
-            .mark_status(&id, "d1", &who, DeliverableStatus::Ready)
+            .mark_status(MarkStatusRequest::new(
+                id.clone(),
+                "d1",
+                who.clone(),
+                DeliverableStatus::Ready,
+            ))
             .await
             .expect("re-mark ready");
 
@@ -557,7 +640,11 @@ async fn failure_count_survives_reopen_and_circuit_breaks_across_processes() {
     // plan converges (empty cohort).
     let planner = open_planner(&db.path);
     let cohort = planner
-        .acquire_cohort(&plan_id, &caller("fresh"), 10)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("fresh").clone(),
+            10,
+        ))
         .await
         .expect("acquire after circuit-break");
     assert!(
@@ -586,19 +673,493 @@ async fn force_release_from_another_connection_frees_the_lock() {
 
     let plan_id = planner_a.submit_plan(chain_graph()).await.expect("submit");
     planner_a
-        .acquire_cohort(&plan_id, &caller("wedged"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("wedged").clone(),
+            1,
+        ))
         .await
         .expect("acquire d1");
 
     planner_b
-        .force_release(&plan_id, "d1", "operator: wedged process")
+        .force_release(ForceReleaseRequest::new(
+            plan_id.clone(),
+            "d1",
+            "operator: wedged process",
+        ))
         .await
         .expect("force release");
 
     let cohort = planner_b
-        .acquire_cohort(&plan_id, &caller("fresh"), 1)
+        .acquire_cohort(AcquireRequest::new(
+            plan_id.clone(),
+            caller("fresh").clone(),
+            1,
+        ))
         .await
         .expect("reacquire");
     assert_eq!(cohort.rows.len(), 1);
     assert_eq!(cohort.rows[0].deliverable.id, "d1");
+}
+
+// ---------------------------------------------------------------------
+// Schema versioning + stale CPM result repair
+// ---------------------------------------------------------------------
+
+fn effort_deliverable(id: &str, prereqs: &[&str], hours: f32) -> Deliverable {
+    let mut d = deliverable(id, &[], prereqs);
+    d.estimated_effort_hours = Some(hours);
+    d
+}
+
+/// Two independent chains: `P0a(2)->P0b(3)` and `P1a(2)->P1b(3)`.
+async fn submit_parallel_chains(path: &Path) -> cpm_planner::plan::PlanId {
+    let planner = open_planner(path);
+    planner
+        .submit_plan(PlanGraph {
+            deliverables: vec![
+                effort_deliverable("P0a", &[], 2.0),
+                effort_deliverable("P0b", &["P0a"], 3.0),
+                effort_deliverable("P1a", &[], 2.0),
+                effort_deliverable("P1b", &["P1a"], 3.0),
+            ],
+            max_chained_dispatch: None,
+        })
+        .await
+        .expect("submit")
+}
+
+#[tokio::test]
+async fn reopening_store_repairs_stale_cached_critical_path() {
+    let db = TempDb::new();
+    let plan_id = submit_parallel_chains(&db.path).await;
+    // Simulate a row written by an older kernel: buggy path + version 0.
+    {
+        let conn = rusqlite::Connection::open(&db.path).unwrap();
+        let mut result: serde_json::Value = serde_json::from_str(
+            &conn
+                .query_row(
+                    "SELECT cached_result FROM plans WHERE plan_id = ?1",
+                    [&plan_id.0],
+                    |r| r.get::<_, String>(0),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        result["critical_path"] = serde_json::json!(["P0a", "P1a", "P0b", "P1b"]);
+        conn.execute(
+            "UPDATE plans SET cached_result = ?1, cpm_version = 0 WHERE plan_id = ?2",
+            rusqlite::params![result.to_string(), plan_id.0],
+        )
+        .unwrap();
+    }
+    let planner = open_planner(&db.path);
+    let status = planner.status(&plan_id).await.unwrap();
+    assert_eq!(
+        status.critical_path,
+        vec!["__start__", "P0a", "P0b", "__finish__"]
+    );
+}
+
+#[test]
+fn opened_store_reports_schema_version_4() {
+    let db = TempDb::new();
+    drop(SqlitePlanStore::open(&db.path).unwrap());
+    assert_eq!(user_version(&db.path), 4);
+}
+
+fn user_version(path: &Path) -> i64 {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap()
+}
+
+/// A v2 database (no portfolio tables) holding one legacy plan.
+async fn v2_database_with_legacy_plan(path: &Path) -> cpm_planner::plan::PlanId {
+    let plan_id = submit_parallel_chains(path).await;
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .execute_batch(
+            "DROP TABLE revisions;
+             DROP TABLE variants;
+             DROP TABLE plan_lines;
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+    plan_id
+}
+
+#[tokio::test]
+async fn migration_from_v2_database_reaches_v4() {
+    let db = TempDb::new();
+    v2_database_with_legacy_plan(&db.path).await;
+    drop(SqlitePlanStore::open(&db.path).unwrap());
+    assert_eq!(user_version(&db.path), 4);
+}
+
+#[tokio::test]
+async fn legacy_plan_survives_v3_migration() {
+    let db = TempDb::new();
+    let plan_id = v2_database_with_legacy_plan(&db.path).await;
+    let status = open_planner(&db.path).status(&plan_id).await.unwrap();
+    assert_eq!(status.deliverables.len(), 4);
+}
+
+#[tokio::test]
+async fn migrated_v2_database_accepts_named_sync() {
+    let db = TempDb::new();
+    v2_database_with_legacy_plan(&db.path).await;
+    let out = open_planner(&db.path)
+        .sync_plan(cpm_planner::plan::SyncRequest::new(
+            "proj",
+            "web",
+            "main",
+            chain_graph(),
+        ))
+        .await;
+    assert!(out.is_ok());
+}
+
+#[test]
+fn newer_schema_rejection_names_supported_version_4() {
+    let db = TempDb::new();
+    drop(SqlitePlanStore::open(&db.path).unwrap());
+    rusqlite::Connection::open(&db.path)
+        .unwrap()
+        .pragma_update(None, "user_version", 5)
+        .unwrap();
+    let err = SqlitePlanStore::open(&db.path).err().unwrap();
+    assert!(format!("{err:#}").contains("(4)"));
+}
+
+#[tokio::test]
+async fn newly_submitted_plan_is_stamped_with_current_cpm_version() {
+    let db = TempDb::new();
+    let plan_id = submit_parallel_chains(&db.path).await;
+    let conn = rusqlite::Connection::open(&db.path).unwrap();
+    let v: i64 = conn
+        .query_row(
+            "SELECT cpm_version FROM plans WHERE plan_id = ?1",
+            [&plan_id.0],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(v, cpm_planner::algorithm::CPM_VERSION);
+}
+
+#[tokio::test]
+async fn store_opens_when_a_stored_graph_is_undecodable() {
+    let db = TempDb::new();
+    let broken = submit_parallel_chains(&db.path).await;
+    let healthy = open_planner(&db.path)
+        .submit_plan(chain_graph())
+        .await
+        .expect("submit healthy");
+    {
+        let conn = rusqlite::Connection::open(&db.path).unwrap();
+        conn.execute(
+            "UPDATE plans SET graph = 'not json', cpm_version = 0 WHERE plan_id = ?1",
+            [&broken.0],
+        )
+        .unwrap();
+    }
+    let planner = open_planner(&db.path);
+    let status = planner.status(&healthy).await.unwrap();
+    assert_eq!(status.deliverables.len(), 2);
+}
+
+#[tokio::test]
+async fn pre_versioning_database_is_upgraded_and_repaired() {
+    let db = TempDb::new();
+    let plan_id = submit_parallel_chains(&db.path).await;
+    {
+        let conn = rusqlite::Connection::open(&db.path).unwrap();
+        let mut result: serde_json::Value = serde_json::from_str(
+            &conn
+                .query_row("SELECT cached_result FROM plans", [], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap(),
+        )
+        .unwrap();
+        result["critical_path"] = serde_json::json!(["P0a", "P1a", "P0b", "P1b"]);
+        conn.execute("UPDATE plans SET cached_result = ?1", [result.to_string()])
+            .unwrap();
+        // Strip cpm_version and reset to the unversioned layout.
+        conn.execute_batch(
+            "ALTER TABLE plans DROP COLUMN cpm_version;
+             PRAGMA user_version = 0;",
+        )
+        .unwrap();
+    }
+    let status = open_planner(&db.path).status(&plan_id).await.unwrap();
+    assert_eq!(
+        status.critical_path,
+        vec!["__start__", "P0a", "P0b", "__finish__"]
+    );
+}
+
+#[test]
+fn newer_schema_version_is_rejected() {
+    let db = TempDb::new();
+    drop(SqlitePlanStore::open(&db.path).unwrap());
+    rusqlite::Connection::open(&db.path)
+        .unwrap()
+        .pragma_update(None, "user_version", 99)
+        .unwrap();
+    assert!(SqlitePlanStore::open(&db.path).is_err());
+}
+
+#[tokio::test]
+async fn stored_p2_plan_gains_endpoints_after_reopen() {
+    let db = TempDb::new();
+    let plan_id = submit_parallel_chains(&db.path).await;
+    {
+        let conn = rusqlite::Connection::open(&db.path).unwrap();
+        conn.execute("UPDATE plans SET cpm_version = 1", [])
+            .unwrap();
+    }
+    let status = open_planner(&db.path).status(&plan_id).await.unwrap();
+    assert_eq!(
+        status.critical_path,
+        vec!["__start__", "P0a", "P0b", "__finish__"]
+    );
+}
+
+#[tokio::test]
+async fn append_holders_survive_reopen() {
+    let db = TempDb::new();
+    let append = |id: &str| {
+        let mut d = effort_deliverable(id, &[], 1.0);
+        d.owned_files = vec![cpm_planner::plan::OwnedFile::Claim {
+            path: PathBuf::from("REGISTRY.md"),
+            mode: Some(cpm_planner::plan::FileMode::Append),
+        }];
+        d
+    };
+    let mut exclusive = effort_deliverable("c", &["a", "b"], 1.0);
+    exclusive.owned_files = vec!["REGISTRY.md".into()];
+    let plan_id = {
+        let planner = open_planner(&db.path);
+        let plan_id = planner
+            .submit_plan(PlanGraph {
+                deliverables: vec![append("a"), append("b"), exclusive],
+                max_chained_dispatch: None,
+            })
+            .await
+            .unwrap();
+        let cohort = planner
+            .acquire_cohort(AcquireRequest::new(plan_id.clone(), caller("c1"), 3))
+            .await
+            .unwrap();
+        assert_eq!(cohort.rows.len(), 2);
+        plan_id
+    };
+    let status = open_planner(&db.path).status(&plan_id).await.unwrap();
+    assert_eq!(status.locks_held.len(), 2);
+}
+
+#[tokio::test]
+async fn stored_graph_with_reserved_endpoint_id_is_left_unrecomputed() {
+    let db = TempDb::new();
+    let plan_id = submit_parallel_chains(&db.path).await;
+    {
+        let conn = rusqlite::Connection::open(&db.path).unwrap();
+        conn.execute(
+            "UPDATE plans SET graph = replace(graph, '\"P0b\"', '\"__finish__\"'), cpm_version = 0",
+            [],
+        )
+        .unwrap();
+    }
+    drop(open_planner(&db.path));
+    let v: i64 = rusqlite::Connection::open(&db.path)
+        .unwrap()
+        .query_row(
+            "SELECT cpm_version FROM plans WHERE plan_id = ?1",
+            [&plan_id.0],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(v, 0);
+}
+
+#[tokio::test]
+async fn startup_reap_with_incomplete_prerequisites_becomes_pending() {
+    let db = TempDb::new();
+    let plan_id = {
+        let planner = open_planner(&db.path);
+        planner.submit_plan(chain_graph()).await.expect("submit")
+    };
+    {
+        // d2 holds an expired lease while its prerequisite d1 is not complete
+        // (as after a revision): in_progress + an expired lock row.
+        let conn = rusqlite::Connection::open(&db.path).expect("open");
+        let in_progress = serde_json::to_string(&DeliverableStatus::InProgress).expect("json");
+        conn.execute(
+            "UPDATE deliverable_statuses SET status = ?1 WHERE deliverable_id = 'd2'",
+            rusqlite::params![in_progress],
+        )
+        .expect("set status");
+        conn.execute(
+            "INSERT INTO locks (plan_id, deliverable_id, caller_id, acquired_at_us, expires_at_us)
+             VALUES (?1, 'd2', 'w', 0, 1)",
+            rusqlite::params![plan_id.0],
+        )
+        .expect("insert lock");
+    }
+    let planner = open_planner(&db.path);
+    let status = planner.status(&plan_id).await.expect("status");
+    assert_eq!(status.deliverables[1].1, DeliverableStatus::Pending);
+}
+
+// ---------------------------------------------------------------------
+// Lockless in_progress marks across a restart
+// ---------------------------------------------------------------------
+
+/// Submit the chain plan and mark d1 `in_progress` with no lease (owner or
+/// manual work), then drop the planner: one simulated process.
+async fn lockless_in_progress_d1(path: &Path, graph: PlanGraph) -> cpm_planner::plan::PlanId {
+    let planner = open_planner(path);
+    let plan_id = planner.submit_plan(graph).await.expect("submit");
+    planner
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
+            "d1",
+            caller("owner"),
+            DeliverableStatus::InProgress,
+        ))
+        .await
+        .expect("lockless in_progress mark");
+    plan_id
+}
+
+#[tokio::test]
+async fn lockless_in_progress_survives_restart() {
+    let db = TempDb::new();
+    let plan_id = lockless_in_progress_d1(&db.path, chain_graph()).await;
+    let status = open_planner(&db.path)
+        .status(&plan_id)
+        .await
+        .expect("status after reopen");
+    assert_eq!(status.deliverables[0].1, DeliverableStatus::InProgress);
+}
+
+#[tokio::test]
+async fn lockless_in_progress_restart_records_no_lapse() {
+    let db = TempDb::new();
+    let plan_id = lockless_in_progress_d1(&db.path, chain_graph()).await;
+    let status = open_planner(&db.path)
+        .status(&plan_id)
+        .await
+        .expect("status after reopen");
+    assert_eq!(status.deliverables[0].4, 0);
+}
+
+#[tokio::test]
+async fn lockless_earned_pct_survives_restart() {
+    let db = TempDb::new();
+    let mut graph = chain_graph();
+    for d in &mut graph.deliverables {
+        d.earning_rule = Some(cpm_planner::earned_value::EarningRule::FiftyFifty);
+    }
+    let plan_id = lockless_in_progress_d1(&db.path, graph).await;
+    open_planner(&db.path)
+        .baseline(cpm_planner::earned_value::BaselineRequest::new(
+            plan_id.clone(),
+        ))
+        .await
+        .expect("baseline");
+    let report = open_planner(&db.path)
+        .ev(&plan_id, None)
+        .await
+        .expect("ev after reopen");
+    assert_eq!(report.rows[0].earned_pct, 50.0);
+}
+
+#[tokio::test]
+async fn lease_held_in_progress_without_lock_is_still_quarantined_on_restart() {
+    let db = TempDb::new();
+    let plan_id = {
+        let planner = open_planner(&db.path);
+        let plan_id = planner.submit_plan(chain_graph()).await.expect("submit");
+        planner
+            .acquire_cohort(AcquireRequest::new(plan_id.clone(), caller("w"), 1))
+            .await
+            .expect("acquire d1");
+        plan_id
+    };
+    // The lease row is gone while d1 is still in_progress by lease.
+    rusqlite::Connection::open(&db.path)
+        .expect("open")
+        .execute("DELETE FROM locks", [])
+        .expect("delete lock row");
+    let status = open_planner(&db.path)
+        .status(&plan_id)
+        .await
+        .expect("status after reopen");
+    assert_eq!(
+        status.deliverables[0],
+        ("d1".to_string(), DeliverableStatus::Ready, 1, 0, 1)
+    );
+}
+
+#[tokio::test]
+async fn lease_after_lockless_hand_back_is_quarantined_normally_after_expiry() {
+    let db = TempDb::new();
+    let ancient = Utc
+        .with_ymd_and_hms(2020, 1, 1, 0, 0, 0)
+        .single()
+        .expect("valid t0");
+    let plan_id = lockless_in_progress_d1(&db.path, chain_graph()).await;
+    {
+        // The owner hands d1 back, and a worker leases it; the lease has
+        // lapsed by the real clock the startup sweep uses.
+        let planner =
+            open_planner_with_clock(&db.path, Duration::from_secs(60), TestClock::at(ancient));
+        planner
+            .mark_status(MarkStatusRequest::new(
+                plan_id.clone(),
+                "d1",
+                caller("owner"),
+                DeliverableStatus::Ready,
+            ))
+            .await
+            .expect("lockless ready mark");
+        planner
+            .acquire_cohort(AcquireRequest::new(plan_id.clone(), caller("w"), 1))
+            .await
+            .expect("acquire d1");
+    }
+    let status = open_planner(&db.path)
+        .status(&plan_id)
+        .await
+        .expect("status after reopen");
+    assert_eq!(
+        status.deliverables[0],
+        ("d1".to_string(), DeliverableStatus::Ready, 1, 0, 1)
+    );
+}
+
+#[tokio::test]
+async fn revise_keeps_lockless_in_progress_flag() {
+    let db = TempDb::new();
+    let plan_id = lockless_in_progress_d1(&db.path, chain_graph()).await;
+    {
+        // Change only d2, so d1 survives with its status carried over.
+        let mut graph = chain_graph();
+        graph.deliverables[1].estimated_effort_hours = Some(2.0);
+        open_planner(&db.path)
+            .revise_plan(cpm_planner::plan::ReviseRequest::new(
+                plan_id.clone(),
+                graph,
+            ))
+            .await
+            .expect("revise");
+    }
+    let status = open_planner(&db.path)
+        .status(&plan_id)
+        .await
+        .expect("status after reopen");
+    assert_eq!(status.deliverables[0].1, DeliverableStatus::InProgress);
 }

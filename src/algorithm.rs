@@ -4,12 +4,25 @@
 //! 1. Forward pass: Calculate earliest start/finish times (ES/EF)
 //! 2. Backward pass: Calculate latest start/finish times (LS/LF)
 //! 3. Float calculation: slack = LS - ES
-//! 4. Critical path: Tasks where float = 0
+//! 4. Critical path: `critical_path` is one longest prerequisite chain in
+//!    execution order; `critical_ids` lists every zero-float (critical) task.
 //! 5. Batch identification: Group tasks by earliest start time
 //! 6. Bottleneck analysis: Identify tasks that block the most work
 
 use crate::task::{Bottleneck, CriticalPathResult, Task, TaskBatch};
 use std::collections::{HashMap, HashSet, VecDeque};
+
+/// Version of the CPM kernel's output semantics. Bump whenever a change
+/// alters any field of [`CriticalPathResult`] for the same input, so stored
+/// plans are recomputed on open (see `plan_store`). Bump also when
+/// `EffortEstimator` defaults change, since stored plans are recomputed with
+/// the current estimator.
+///
+/// - v2: synthetic `__start__`/`__finish__` endpoints
+/// - v3: calendar `duration_hours` and per-edge `lag_hours`
+pub const CPM_VERSION: i64 = 3;
+
+const TIGHT_EPS: f32 = 1e-3;
 
 /// CPM Algorithm calculator
 pub struct CpmAlgorithm;
@@ -27,13 +40,29 @@ impl CpmAlgorithm {
             return CriticalPathResult::default();
         }
 
+        // Duplicate ids make the id-keyed passes ill-defined (and the
+        // forward pass could requeue a shared id forever). Bail out with
+        // every task unscheduled so callers reject the result.
+        let mut ids: HashSet<&str> = HashSet::with_capacity(tasks.len());
+        if !tasks.iter().all(|t| ids.insert(t.id.as_str())) {
+            let mut unscheduled: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
+            unscheduled.sort_unstable();
+            unscheduled.dedup();
+            return CriticalPathResult {
+                total_tasks: tasks.len(),
+                tasks: tasks.to_vec(),
+                unscheduled,
+                ..CriticalPathResult::default()
+            };
+        }
+
         // Build dependency graphs
-        let (successors, predecessors) = Self::build_dependency_graphs(tasks);
+        let (successors, _predecessors) = Self::build_dependency_graphs(tasks);
 
         // Forward pass: calculate ES/EF. This is the authoritative cycle
         // detector: an id here is a task whose dependencies could not be
         // topologically ordered.
-        let mut unscheduled = Self::forward_pass(tasks, &predecessors);
+        let (mut unscheduled, order) = Self::forward_pass(tasks);
 
         // Backward pass: calculate LS/LF. It returns any task whose
         // latest-finish never relaxed off the sentinel. In a well-formed
@@ -47,7 +76,7 @@ impl CpmAlgorithm {
         // scheduled by the forward pass. We only fold the backward findings
         // in as a defence-in-depth net for the "forward saw nothing wrong but
         // a task still never relaxed" case, which should not occur.
-        let backward_unscheduled = Self::backward_pass(tasks, &successors);
+        let backward_unscheduled = Self::backward_pass(tasks, &successors, &order);
         if unscheduled.is_empty() {
             unscheduled = backward_unscheduled;
         }
@@ -61,7 +90,7 @@ impl CpmAlgorithm {
         let batches = Self::identify_parallel_batches(tasks);
 
         // Identify bottlenecks
-        let bottlenecks = Self::identify_bottlenecks(tasks, &successors);
+        let bottlenecks = Self::identify_bottlenecks(tasks);
 
         // Build result
         Self::build_result(tasks, batches, bottlenecks, unscheduled)
@@ -102,126 +131,121 @@ impl CpmAlgorithm {
 
     /// Forward pass: Calculate earliest start (ES) and earliest finish (EF)
     ///
-    /// ES = max(EF of all predecessors), or 0 if no predecessors
-    /// EF = ES + effort
+    /// ES = max(EF of each predecessor + edge lag), or 0 if no predecessors
+    /// EF = ES + scheduled length (`duration_hours` when set, else effort)
     ///
     /// Returns the ids of any tasks that could not be scheduled because
-    /// they (or their predecessors) sit on a dependency cycle. An empty
-    /// return means the whole graph was schedulable.
-    fn forward_pass(
-        tasks: &mut [Task],
-        _predecessors: &HashMap<String, Vec<String>>,
-    ) -> Vec<String> {
+    /// they (or their predecessors) sit on a dependency cycle (an empty list
+    /// means the whole graph was schedulable), plus the task indices in the
+    /// order they were scheduled. Ids are unique here (`calculate` bails out
+    /// on duplicates first).
+    fn forward_pass(tasks: &mut [Task]) -> (Vec<String>, Vec<usize>) {
+        // Passes only ever raise ES, so clear stale values from earlier runs.
+        for task in tasks.iter_mut() {
+            task.earliest_start = 0.0;
+            task.earliest_finish = 0.0;
+        }
         let task_count = tasks.len();
-        let task_map: HashMap<String, usize> = tasks
+        let ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
+        let task_map: HashMap<&str, usize> = ids
             .iter()
             .enumerate()
-            .map(|(i, t)| (t.id.clone(), i))
+            .map(|(i, id)| (id.as_str(), i))
             .collect();
 
-        // Use Kahn's algorithm (topological sort) for forward pass
-        let mut in_degree: HashMap<String, usize> = HashMap::new();
-        for task in tasks.iter() {
-            in_degree.insert(task.id.clone(), task.dependencies.len());
-        }
-
-        // Start with tasks that have no dependencies
-        let mut queue: VecDeque<String> = tasks
-            .iter()
-            .filter(|t| t.dependencies.is_empty())
-            .map(|t| t.id.clone())
-            .collect();
-
-        // Initialize ES/EF for starting tasks
-        for task in tasks.iter_mut() {
-            if task.dependencies.is_empty() {
-                task.earliest_start = 0.0;
-                task.earliest_finish = task.effort_hours;
+        // Dependents of each task, each listed once, in task order; and the
+        // number of distinct dependencies (unknown ids included, so a task
+        // depending on a missing id is never scheduled).
+        let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); task_count];
+        let mut in_degree: Vec<usize> = Vec::with_capacity(task_count);
+        for (i, task) in tasks.iter().enumerate() {
+            let distinct: HashSet<&str> = task.dependencies.iter().map(String::as_str).collect();
+            in_degree.push(distinct.len());
+            for dep in distinct {
+                if let Some(&d) = task_map.get(dep) {
+                    dependents[d].push(i);
+                }
             }
         }
+        for list in &mut dependents {
+            list.sort_unstable();
+        }
 
-        // Track which ids actually drained out of the topo queue. Any task
-        // that never reaches in-degree 0 sits on (or downstream of) a cycle
-        // and keeps its default ES/EF — i.e. it was not scheduled.
-        let mut scheduled: HashSet<String> = HashSet::with_capacity(task_count);
-        let mut processed = 0;
-        while let Some(current_id) = queue.pop_front() {
-            processed += 1;
-            scheduled.insert(current_id.clone());
+        // Kahn's algorithm, starting with tasks that have no dependencies.
+        let mut queue: VecDeque<usize> = (0..task_count)
+            .filter(|&i| tasks[i].dependencies.is_empty())
+            .collect();
+        for &i in &queue {
+            tasks[i].earliest_finish = tasks[i].effort_hours;
+        }
 
-            // Get current task's EF. The queue only ever carries ids that
-            // came from `tasks` (initialized from `tasks.iter()` and pushed
-            // from successor walks), and `task_map` was populated from the
-            // same iterator above. The `None` branch is unreachable; assert
-            // it loudly so a future refactor that breaks the invariant
-            // doesn't degrade into silent skipping.
-            let current_ef = match task_map.get(&current_id) {
-                Some(&idx) => tasks[idx].earliest_finish,
-                None => unreachable!(
-                    "task_map missing id {current_id} that was queued from the same tasks slice"
-                ),
-            };
-
-            // Find successors by scanning all tasks
-            for task in tasks.iter_mut() {
-                if task.dependencies.contains(&current_id) {
-                    // Update ES if this predecessor has later EF
-                    if current_ef > task.earliest_start {
-                        task.earliest_start = current_ef;
-                        task.earliest_finish = task.earliest_start + task.effort_hours;
-                    }
-
-                    // Decrement in-degree and add to queue if ready
-                    if let Some(deg) = in_degree.get_mut(&task.id) {
-                        *deg = deg.saturating_sub(1);
-                        if *deg == 0 {
-                            // All predecessors have been processed; lock in
-                            // the final EF.  Without this, when every
-                            // predecessor finishes at time 0 (e.g. a zero-
-                            // effort "start" milestone) the condition
-                            // `current_ef > task.earliest_start` above is
-                            // false and EF stays at the default 0 instead
-                            // of ES + effort_hours.
-                            task.earliest_finish = task.earliest_start + task.effort_hours;
-                            queue.push_back(task.id.clone());
-                            // EF finalised when all predecessors are in
-                        }
-                    }
+        let mut order: Vec<usize> = Vec::with_capacity(task_count);
+        while let Some(current) = queue.pop_front() {
+            order.push(current);
+            let current_ef = tasks[current].earliest_finish;
+            for &i in &dependents[current] {
+                let task = &mut tasks[i];
+                // Update ES if this predecessor (plus edge lag) is later.
+                let lag = task
+                    .lag_by_dependency
+                    .get(&ids[current])
+                    .copied()
+                    .unwrap_or(0.0);
+                if current_ef + lag > task.earliest_start {
+                    task.earliest_start = current_ef + lag;
+                    task.earliest_finish = task.earliest_start + task.effort_hours;
+                }
+                in_degree[i] -= 1;
+                if in_degree[i] == 0 {
+                    // All predecessors processed: lock in the final EF.
+                    task.earliest_finish = task.earliest_start + task.effort_hours;
+                    queue.push_back(i);
                 }
             }
         }
 
-        // Handle case where not all tasks were processed (cycle in deps).
-        // Collect the unschedulable ids so callers can detect and reject
-        // the otherwise confidently-wrong result instead of only seeing a
-        // log line.
-        if processed < task_count {
-            let mut unscheduled: Vec<String> = tasks
-                .iter()
-                .filter(|t| !scheduled.contains(&t.id))
-                .map(|t| t.id.clone())
+        // Tasks never drained from the queue sit on (or downstream of) a
+        // cycle, or depend on an unknown id: report them so callers reject
+        // the otherwise confidently-wrong result.
+        if order.len() < task_count {
+            let mut scheduled = vec![false; task_count];
+            for &i in &order {
+                scheduled[i] = true;
+            }
+            let mut unscheduled: Vec<String> = (0..task_count)
+                .filter(|&i| !scheduled[i])
+                .map(|i| tasks[i].id.clone())
                 .collect();
             unscheduled.sort_unstable();
             tracing::warn!(
                 unscheduled = unscheduled.len(),
                 "CPM forward pass could not schedule all tasks (possible dependency cycle)"
             );
-            return unscheduled;
+            return (unscheduled, order);
         }
 
-        Vec::new()
+        (Vec::new(), order)
     }
 
     /// Backward pass: Calculate latest start (LS) and latest finish (LF)
     ///
-    /// LF = min(LS of all successors), or `project_end` if no successors
-    /// LS = LF - effort
+    /// LF = min(LS of each successor - edge lag), or `project_end` if no
+    /// successors
+    /// LS = LF - scheduled length
     ///
     /// Returns the ids of any tasks whose `latest_finish` never relaxed off
     /// the `f32::MAX` sentinel. In a well-formed graph this is empty; a
     /// non-empty return means those tasks are unschedulable (the same cycle
     /// signal the forward pass surfaces) and the result must not be trusted.
-    fn backward_pass(tasks: &mut [Task], successors: &HashMap<String, Vec<String>>) -> Vec<String> {
+    ///
+    /// Tasks are relaxed in reverse `order` (the forward pass's topological
+    /// order), then any task it never scheduled, so an acyclic graph settles
+    /// in one sweep plus a confirming one.
+    fn backward_pass(
+        tasks: &mut [Task],
+        successors: &HashMap<String, Vec<String>>,
+        order: &[usize],
+    ) -> Vec<String> {
         // Find project duration (max EF)
         let project_duration = tasks
             .iter()
@@ -250,6 +274,14 @@ impl CpmAlgorithm {
 
         // Reverse topological order processing
         // We iterate until no changes (simpler than proper reverse topo sort)
+        let mut visit: Vec<usize> = order.iter().rev().copied().collect();
+        if visit.len() < tasks.len() {
+            let mut in_order = vec![false; tasks.len()];
+            for &i in order {
+                in_order[i] = true;
+            }
+            visit.extend((0..tasks.len()).filter(|&i| !in_order[i]));
+        }
         let mut changed = true;
         let mut iterations = 0;
         let max_iterations = tasks.len() * 2;
@@ -258,24 +290,37 @@ impl CpmAlgorithm {
             changed = false;
             iterations += 1;
 
-            for i in 0..tasks.len() {
+            for &i in &visit {
                 let task_id = tasks[i].id.clone();
                 let task_effort = tasks[i].effort_hours;
 
                 // Find minimum LS of all successors
-                if let Some(succ_ids) = successors.get(&task_id) {
-                    if !succ_ids.is_empty() {
-                        let min_succ_ls = succ_ids
-                            .iter()
-                            .filter_map(|sid| task_map.get(sid).map(|&idx| tasks[idx].latest_start))
-                            .filter(|&ls| ls < f32::MAX)
-                            .fold(f32::MAX, f32::min);
+                if let Some(succ_ids) = successors.get(&task_id)
+                    && !succ_ids.is_empty()
+                {
+                    let min_succ_ls = succ_ids
+                        .iter()
+                        .filter_map(|sid| {
+                            task_map.get(sid).map(|&idx| {
+                                let lag = tasks[idx]
+                                    .lag_by_dependency
+                                    .get(&task_id)
+                                    .copied()
+                                    .unwrap_or(0.0);
+                                if tasks[idx].latest_start < f32::MAX {
+                                    tasks[idx].latest_start - lag
+                                } else {
+                                    f32::MAX
+                                }
+                            })
+                        })
+                        .filter(|&ls| ls < f32::MAX)
+                        .fold(f32::MAX, f32::min);
 
-                        if min_succ_ls < f32::MAX && min_succ_ls < tasks[i].latest_finish {
-                            tasks[i].latest_finish = min_succ_ls;
-                            tasks[i].latest_start = min_succ_ls - task_effort;
-                            changed = true;
-                        }
+                    if min_succ_ls < f32::MAX && min_succ_ls < tasks[i].latest_finish {
+                        tasks[i].latest_finish = min_succ_ls;
+                        tasks[i].latest_start = min_succ_ls - task_effort;
+                        changed = true;
                     }
                 }
             }
@@ -350,29 +395,48 @@ impl CpmAlgorithm {
         batches
     }
 
-    /// Identify bottleneck tasks based on transitive impact
-    fn identify_bottlenecks(
-        tasks: &[Task],
-        successors: &HashMap<String, Vec<String>>,
-    ) -> Vec<Bottleneck> {
-        let task_map: HashMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+    /// Identify bottleneck tasks based on transitive impact. Each task's
+    /// transitive successors are found by an index-based walk with a
+    /// visit stamp, so no per-task sets are allocated.
+    fn identify_bottlenecks(tasks: &[Task]) -> Vec<Bottleneck> {
+        let task_map: HashMap<&str, usize> = tasks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.id.as_str(), i))
+            .collect();
+        let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); tasks.len()];
+        for (i, task) in tasks.iter().enumerate() {
+            for dep in &task.dependencies {
+                if let Some(&d) = task_map.get(dep.as_str()) {
+                    dependents[d].push(i);
+                }
+            }
+        }
 
         let mut bottlenecks = Vec::new();
+        let mut stamp: Vec<usize> = vec![usize::MAX; tasks.len()];
+        let mut stack: Vec<usize> = Vec::new();
 
-        for task in tasks {
-            // Count transitively blocked tasks
-            let blocked_ids = Self::get_transitive_successors(&task.id, successors);
-            let blocks_count = blocked_ids.len();
+        for (root, task) in tasks.iter().enumerate() {
+            // Count transitively blocked tasks and their hours.
+            let mut blocks_count = 0;
+            let mut blocked_hours = 0.0_f32;
+            stack.clear();
+            stack.push(root);
+            while let Some(current) = stack.pop() {
+                for &succ in &dependents[current] {
+                    if stamp[succ] != root {
+                        stamp[succ] = root;
+                        blocks_count += 1;
+                        blocked_hours += tasks[succ].effort_hours;
+                        stack.push(succ);
+                    }
+                }
+            }
 
             if blocks_count == 0 {
                 continue;
             }
-
-            // Calculate total blocked hours
-            let blocked_hours: f32 = blocked_ids
-                .iter()
-                .filter_map(|id| task_map.get(id.as_str()).map(|t| t.effort_hours))
-                .sum();
 
             // Calculate ROI
             let roi = if task.effort_hours > 0.0 {
@@ -401,26 +465,63 @@ impl CpmAlgorithm {
         bottlenecks
     }
 
-    /// Get all tasks transitively blocked by the given task
-    fn get_transitive_successors(
-        task_id: &str,
-        successors: &HashMap<String, Vec<String>>,
-    ) -> HashSet<String> {
-        let mut visited = HashSet::new();
-        let mut stack = vec![task_id.to_string()];
+    /// Trace one longest chain backwards from the task with the maximum
+    /// earliest finish, following predecessors whose EF equals the
+    /// successor's ES. Sink ties resolve to the later earliest start, then the
+    /// smallest id; predecessor ties resolve to the smallest id. Bounded by the
+    /// task count so malformed (cyclic) input cannot loop.
+    fn trace_critical_path(tasks: &[Task]) -> Vec<String> {
+        let Some(sink) = tasks.iter().max_by(|a, b| {
+            a.earliest_finish
+                .partial_cmp(&b.earliest_finish)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    a.earliest_start
+                        .partial_cmp(&b.earliest_start)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| b.id.cmp(&a.id))
+        }) else {
+            return Vec::new();
+        };
+        Self::trace_back(tasks, sink)
+    }
 
-        while let Some(current) = stack.pop() {
-            if let Some(succs) = successors.get(&current) {
-                for succ in succs {
-                    if !visited.contains(succ) {
-                        visited.insert(succ.clone());
-                        stack.push(succ.clone());
-                    }
-                }
-            }
+    /// Trace the longest chain ending at the task `end_id` (same tie rules as
+    /// [`Self::trace_critical_path`]), restricted to that task's ancestors.
+    /// Empty when `end_id` is unknown.
+    pub(crate) fn trace_path_to(tasks: &[Task], end_id: &str) -> Vec<String> {
+        tasks
+            .iter()
+            .find(|t| t.id == end_id)
+            .map_or_else(Vec::new, |end| Self::trace_back(tasks, end))
+    }
+
+    /// Walk backwards from `sink` along tight edges (EF + lag == ES),
+    /// smallest id on ties. Lengths are scheduled lengths, not effort.
+    fn trace_back(tasks: &[Task], sink: &Task) -> Vec<String> {
+        let by_id: HashMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+        let mut path = vec![sink.id.clone()];
+        let mut current = sink;
+        let mut seen: HashSet<&str> = HashSet::from([sink.id.as_str()]);
+        while path.len() <= tasks.len() {
+            let next = current
+                .dependencies
+                .iter()
+                .filter_map(|d| by_id.get(d.as_str()).copied())
+                .filter(|p| {
+                    let lag = current.lag_by_dependency.get(&p.id).copied().unwrap_or(0.0);
+                    (p.earliest_finish + lag - current.earliest_start).abs() < TIGHT_EPS
+                })
+                .filter(|p| !seen.contains(p.id.as_str()))
+                .min_by(|a, b| a.id.cmp(&b.id));
+            let Some(pred) = next else { break };
+            seen.insert(pred.id.as_str());
+            path.push(pred.id.clone());
+            current = pred;
         }
-
-        visited
+        path.reverse();
+        path
     }
 
     /// Build the final result
@@ -430,22 +531,23 @@ impl CpmAlgorithm {
         bottlenecks: Vec<Bottleneck>,
         unscheduled: Vec<String>,
     ) -> CriticalPathResult {
-        // Extract critical path (sorted by ES)
+        let critical_path = Self::trace_critical_path(tasks);
+        let project_length = tasks
+            .iter()
+            .map(|t| t.earliest_finish)
+            .fold(0.0_f32, f32::max);
+
         let mut critical_tasks: Vec<&Task> = tasks.iter().filter(|t| t.is_critical).collect();
         critical_tasks.sort_by(|a, b| {
             a.earliest_start
                 .partial_cmp(&b.earliest_start)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.id.cmp(&b.id))
         });
-
-        let critical_path: Vec<String> = critical_tasks.iter().map(|t| t.id.clone()).collect();
-
-        let critical_path_duration: f32 = critical_tasks.iter().map(|t| t.effort_hours).sum();
+        let critical_ids: Vec<String> = critical_tasks.iter().map(|t| t.id.clone()).collect();
 
         let total_duration_sequential: f32 = tasks.iter().map(|t| t.effort_hours).sum();
-
-        // Parallel duration is the sum of batch durations
-        let optimal_duration_parallel: f32 = batches.iter().map(|b| b.duration_hours).sum();
+        let optimal_duration_parallel = project_length;
 
         let speedup_factor = if optimal_duration_parallel > 0.0 {
             total_duration_sequential / optimal_duration_parallel
@@ -456,7 +558,8 @@ impl CpmAlgorithm {
         CriticalPathResult {
             total_tasks: tasks.len(),
             critical_path,
-            critical_path_duration,
+            critical_ids,
+            critical_path_duration: project_length,
             total_duration_sequential,
             optimal_duration_parallel,
             speedup_factor,
@@ -481,6 +584,18 @@ mod tests {
             dependencies: deps.into_iter().map(String::from).collect(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn calculate_terminates_on_duplicate_ids() {
+        // The second "a" closes a loop through "b" while the first is a root.
+        let mut tasks = vec![
+            make_task("a", 1.0, vec![]),
+            make_task("a", 1.0, vec!["b"]),
+            make_task("b", 1.0, vec!["a"]),
+        ];
+        let result = CpmAlgorithm::calculate(&mut tasks);
+        assert_eq!(result.unscheduled, vec!["a".to_string(), "b".to_string()]);
     }
 
     #[test]
