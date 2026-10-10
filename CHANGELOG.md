@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cpm-planner --version` and `cpm-planner --help`. With no arguments the binary is still the MCP stdio server.
 - npm launcher `@matthew-cochran/cpm` (`npm/`): `npx -y @matthew-cochran/cpm` downloads the release binary for the platform over HTTPS (redirects only to GitHub hosts), verifies it against `checksums.sha256`, caches it per version and runs it over stdio with arguments, exit code and signals passed through. `CPM_PLANNER_BINARY` uses a local binary instead; `CPM_PLANNER_DOWNLOAD_BASE` sets a mirror. No runtime dependencies. The release workflow attaches `matthew-cochran-cpm-<version>.tgz` to the GitHub release; publishing to npm is a manual step (`docs/releasing.md`).
 - `scripts/check-version-sync.sh` also checks that `npm/package.json` has the `Cargo.toml` version.
+- `docs/AGENT-INSTALL.md`: an end-to-end install guide for agents and people. A "which tool are you?" table leads to numbered steps per tool (Claude Code, Codex, Cursor, Copilot, Gemini CLI, Zed, Windsurf and other AGENTS.md readers, Claude Desktop): install the binary or use npx, register the MCP server (binary and npx forms), `skills install`, verify; plus uninstall and troubleshooting (GUI `PATH`, Windows quoting, a stale launcher cache, offline use with `CPM_PLANNER_BINARY`). The README's MCP registration sections show the npx form next to the binary form.
+- `llms.txt` (llmstxt.org format) indexing the install guide, README sections, architecture, skills and CHANGELOG for LLMs.
+- `AGENTS.md`: instructions for coding agents contributing to this repository (gates, branch model, conventions, skills, the opt-in live test).
+- CI: a `skills install` smoke on Linux, macOS and Windows (project and user scope, idempotent rerun, `list`, `uninstall`).
 
 ## [0.1.1] - 2026-10-10
 

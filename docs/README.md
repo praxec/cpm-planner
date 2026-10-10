@@ -5,6 +5,8 @@ registration and the full MCP tool reference.
 
 ## Guides
 
+- [Agent install guide](AGENT-INSTALL.md): install cpm-planner, register
+  the MCP server, install the skills and verify, per AI coding tool.
 - [Architecture](architecture.md): the modules in `src/`, the request flow from
   submit to review, the SQLite schema versions, the concurrency model and the
   security boundaries.

@@ -187,9 +187,11 @@ node scripts/mcp-smoke.mjs /absolute/path/to/cpm-planner
 
 ### For AI agents
 
-An agent can install and register cpm-planner by itself: see
-[Agent self-install](#agent-self-install) below. A dedicated agent install guide,
-`docs/AGENT-INSTALL.md`, is coming in this release.
+[docs/AGENT-INSTALL.md](docs/AGENT-INSTALL.md) takes an agent (or you) from
+"which tool am I?" to a verified install: the program, MCP registration, the
+skills and the checks, for Claude Code, Codex, Cursor, Copilot, Gemini CLI and
+other tools. [llms.txt](llms.txt) indexes the docs for LLMs. The short version
+is [Agent self-install](#agent-self-install) below.
 
 ## Quickstart: plan as code
 
@@ -221,12 +223,20 @@ A ratio with a zero denominator is `null` and explained in `undefined`; alerts
 
 cpm-planner speaks MCP over stdio. Register the `cpm-planner` command with your client. Every snippet below has an optional `env` block; drop it to use the defaults (see [Environment variables](#environment-variables)). Snippets use the bare command `cpm-planner`; if it is not on your `PATH` (or for any GUI client), use the absolute path the installer printed.
 
+Each client also has an **npx** form, which needs only Node 18 or later: the
+command is `npx` and the arguments are `-y` and `@matthew-cochran/cpm`. The
+launcher downloads the release binary on first run, verifies its checksum and
+caches it. The npm package is available from 0.2.0. For per-client steps and
+troubleshooting, see [docs/AGENT-INSTALL.md](docs/AGENT-INSTALL.md).
+
 To run the container image instead of a local binary, see [Docker](#docker). For praxec workflows, see [Praxec](#praxec).
 
 ### Claude Code
 
 ```sh
 claude mcp add cpm-planner --scope user -- cpm-planner
+# npx
+claude mcp add --transport stdio --scope user cpm-planner -- npx -y @matthew-cochran/cpm
 # with environment variables (put another option between --env and the name)
 claude mcp add --env CPM_PLANNER_DB=/path/to/cpm-planner.db --env CPM_MAX_TTL_SECS=28800 --transport stdio --scope user cpm-planner -- cpm-planner
 ```
@@ -268,6 +278,12 @@ Edit `claude_desktop_config.json` (Settings, Developer, Edit Config) and restart
 
 On Windows use an absolute command path with escaped backslashes, e.g. `C:\\Users\\you\\AppData\\Local\\Programs\\cpm-planner\\cpm-planner.exe`.
 
+npx form:
+
+```json
+{ "mcpServers": { "cpm-planner": { "command": "npx", "args": ["-y", "@matthew-cochran/cpm"] } } }
+```
+
 ### Cursor
 
 Use the absolute path the installer printed as `command` (GUI apps do not inherit your shell `PATH`).
@@ -285,6 +301,12 @@ Use the absolute path the installer printed as `command` (GUI apps do not inheri
     }
   }
 }
+```
+
+npx form:
+
+```json
+{ "mcpServers": { "cpm-planner": { "type": "stdio", "command": "npx", "args": ["-y", "@matthew-cochran/cpm"] } } }
 ```
 
 ### VS Code
@@ -306,10 +328,22 @@ Use the absolute path the installer printed as `command` (GUI apps do not inheri
 }
 ```
 
+npx form, in `.vscode/mcp.json` or from the command line for your user profile:
+
+```json
+{ "servers": { "cpm-planner": { "type": "stdio", "command": "npx", "args": ["-y", "@matthew-cochran/cpm"] } } }
+```
+
+```sh
+code --add-mcp '{"name":"cpm-planner","command":"npx","args":["-y","@matthew-cochran/cpm"]}'
+```
+
 ### Codex CLI
 
 ```sh
 codex mcp add cpm-planner --env CPM_PLANNER_DB=/path/to/cpm-planner.db -- cpm-planner
+# npx
+codex mcp add cpm-planner -- npx -y @matthew-cochran/cpm
 ```
 
 or in `~/.codex/config.toml`:
@@ -322,6 +356,8 @@ args = []
 [mcp_servers.cpm-planner.env]
 CPM_PLANNER_DB = "/path/to/cpm-planner.db"
 ```
+
+npx form: `command = "npx"` and `args = ["-y", "@matthew-cochran/cpm"]`.
 
 ### Agent self-install
 
@@ -392,7 +428,8 @@ cpm-planner skills uninstall --target claude --user       # removes only files t
 ```
 
 Restart the agent, or start a new session, so it loads the skills. Per-tool paths and
-sources are in [docs/agents/tool-matrix.md](docs/agents/tool-matrix.md).
+sources are in [docs/agents/tool-matrix.md](docs/agents/tool-matrix.md); step-by-step setup
+per tool is in [docs/AGENT-INSTALL.md](docs/AGENT-INSTALL.md).
 
 To install by hand instead, download the source archive of your release,
 `https://github.com/praxec/cpm-planner/archive/refs/tags/v<version>.tar.gz` (here `<version>`
@@ -577,6 +614,7 @@ Leases default to 5 minutes. For long-running work pass `ttl_seconds` (≤ the s
 ## Documentation
 
 - [docs/README.md](docs/README.md): index of the project documentation.
+- [docs/AGENT-INSTALL.md](docs/AGENT-INSTALL.md): install, register and verify cpm-planner for your AI coding tool.
 - [docs/architecture.md](docs/architecture.md): modules, request flow, store schema and concurrency.
 - [docs/releasing.md](docs/releasing.md): the release runbook.
 - [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), [SUPPORT.md](SUPPORT.md), [CHANGELOG.md](CHANGELOG.md).

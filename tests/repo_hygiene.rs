@@ -107,8 +107,8 @@ fn issue_forms_have_name_description_and_typed_body() {
     );
 }
 
-/// Markdown files whose relative links are checked: README.md plus every
-/// `.md` under `docs/`, except the design history in `docs/superpowers/`.
+/// Markdown files whose relative links are checked: README.md, AGENTS.md and
+/// every `.md` under `docs/`, except the design history in `docs/superpowers/`.
 /// Directories that cannot be listed are returned as errors.
 fn linked_markdown_files(root: &Path) -> (Vec<std::path::PathBuf>, Vec<String>) {
     fn walk(dir: &Path, skip: &Path, out: &mut Vec<std::path::PathBuf>, errors: &mut Vec<String>) {
@@ -137,7 +137,7 @@ fn linked_markdown_files(root: &Path) -> (Vec<std::path::PathBuf>, Vec<String>) 
             }
         }
     }
-    let mut files = vec![root.join("README.md")];
+    let mut files = vec![root.join("README.md"), root.join("AGENTS.md")];
     let mut errors = Vec::new();
     walk(
         &root.join("docs"),
@@ -280,5 +280,100 @@ fn readme_links_resolve() {
     assert!(
         offenders.is_empty(),
         "broken relative links in Markdown docs: {offenders:#?}"
+    );
+}
+
+/// Every literal `--target <value>` written in `text`. Placeholders such as
+/// `--target <tool>` are skipped.
+fn documented_targets(text: &str) -> std::collections::BTreeSet<String> {
+    text.match_indices("--target")
+        .filter_map(|(at, flag)| {
+            let rest = text[at + flag.len()..].trim_start_matches([' ', '=']);
+            let value: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .collect();
+            (!value.is_empty()).then_some(value)
+        })
+        .collect()
+}
+
+#[test]
+fn agent_install_names_only_existing_targets() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let guide = root.join("docs").join("AGENT-INSTALL.md");
+    let mut offenders = Vec::new();
+    let targets = match std::fs::read_to_string(&guide) {
+        Ok(text) => documented_targets(&text),
+        Err(err) => {
+            offenders.push(format!("cannot read {} ({err})", guide.display()));
+            Default::default()
+        }
+    };
+    if targets.is_empty() {
+        offenders.push("no --target values found in docs/AGENT-INSTALL.md".to_string());
+    }
+    let project = tempfile::tempdir().expect("temp project dir");
+    for target in &targets {
+        let status = Command::new(env!("CARGO_BIN_EXE_cpm-planner"))
+            .args(["skills", "install", "--target", target, "--project"])
+            .arg(project.path())
+            .arg("--dry-run")
+            .output()
+            .map(|out| out.status.code());
+        match status {
+            Ok(Some(2)) => offenders.push(format!("--target {target}: rejected as a usage error")),
+            Ok(_) => {}
+            Err(err) => offenders.push(format!("--target {target}: cannot run binary ({err})")),
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "docs/AGENT-INSTALL.md names targets the CLI does not accept: {offenders:#?}"
+    );
+}
+
+/// Links in `llms.txt` to this repository's `main` branch, as paths relative
+/// to the repository root (with any `#anchor`).
+fn llms_txt_repo_paths(text: &str) -> Vec<String> {
+    const PREFIXES: [&str; 2] = [
+        "https://github.com/praxec/cpm-planner/blob/main/",
+        "https://github.com/praxec/cpm-planner/tree/main/",
+    ];
+    link_targets(text)
+        .into_iter()
+        .filter_map(|target| {
+            PREFIXES
+                .iter()
+                .find_map(|prefix| target.strip_prefix(prefix).map(str::to_string))
+        })
+        .collect()
+}
+
+#[test]
+fn llms_txt_links_name_existing_files() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let llms = root.join("llms.txt");
+    let offenders: Vec<String> = match std::fs::read_to_string(&llms) {
+        Ok(text) => {
+            let paths: Vec<String> = text.lines().flat_map(llms_txt_repo_paths).collect();
+            if paths.is_empty() {
+                vec!["no links to the main branch found in llms.txt".to_string()]
+            } else {
+                paths
+                    .iter()
+                    .filter_map(|path| {
+                        broken_link_reason(&llms, path).map(|why| format!("{path} ({why})"))
+                    })
+                    .collect()
+            }
+        }
+        Err(err) => vec![format!("cannot read llms.txt ({err})")],
+    };
+
+    assert!(
+        offenders.is_empty(),
+        "llms.txt links to files or headings that do not exist: {offenders:#?}"
     );
 }
