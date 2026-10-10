@@ -358,6 +358,39 @@ async fn jev_500_is_upstream() {
     assert_eq!(err.kind(), JudgmentErrorKind::Upstream);
 }
 
+/// Each judge owns its HTTP client. rig's process-wide shared client pooled
+/// keep-alive connections across judges, and a connection's driver task runs
+/// on the runtime that opened it: a judge on another runtime could check out
+/// a connection whose runtime was idle (the request stalled) or shutting
+/// down (an immediate transport error, "runtime dropped the dispatch task").
+#[test]
+fn jev_judges_on_separate_runtimes_do_not_share_connections() {
+    let runtime = || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    };
+    let host = runtime();
+    let server = host.block_on(async {
+        let server = MockServer::builder().start().await;
+        mount(&server, ResponseTemplate::new(200).set_body_json(ok_body())).await;
+        server
+    });
+    let cfg = config_with_key()
+        .with_jev_endpoint(format!("{}/v1/systemone", server.uri()))
+        .with_timeout(Duration::from_secs(2));
+    // The first runtime opens a connection, then stays alive but idle.
+    let first = runtime();
+    first
+        .block_on(JevJudge::new(&cfg).decide(state(), noul_question()))
+        .expect("first judge");
+    let second = runtime().block_on(JevJudge::new(&cfg).decide(state(), noul_question()));
+    assert!(second.is_ok(), "second judge: {:?}", second.err());
+    drop(first);
+    drop(server);
+}
+
 #[tokio::test]
 async fn jev_slow_response_is_timeout() {
     let server = MockServer::start().await;
@@ -375,79 +408,7 @@ async fn jev_slow_response_is_timeout() {
         .decide(state(), noul_question())
         .await
         .unwrap_err();
-    eprintln!(
-        "TEMP-DIAG pooled server {}: {:?} {}",
-        server.uri(),
-        err.kind(),
-        err
-    );
     assert_eq!(err.kind(), JudgmentErrorKind::Timeout);
-}
-
-// TEMP-DIAG: same scenario on a fresh (non-pooled) wiremock server.
-#[tokio::test]
-async fn temp_diag_slow_fresh_server() {
-    let server = MockServer::builder().start().await;
-    mount(
-        &server,
-        ResponseTemplate::new(200)
-            .set_body_json(ok_body())
-            .set_delay(Duration::from_secs(5)),
-    )
-    .await;
-    let cfg = config_with_key()
-        .with_jev_endpoint(format!("{}/v1/systemone", server.uri()))
-        .with_timeout(Duration::from_millis(100));
-    let started = std::time::Instant::now();
-    let err = JevJudge::new(&cfg)
-        .decide(state(), noul_question())
-        .await
-        .unwrap_err();
-    eprintln!(
-        "TEMP-DIAG fresh server {}: {:?} after {:?}: {}",
-        server.uri(),
-        err.kind(),
-        started.elapsed(),
-        err
-    );
-    panic!("TEMP-DIAG: show captured output");
-}
-
-// TEMP-DIAG: dump proxy settings visible to reqwest's system-proxy lookup.
-#[test]
-fn temp_diag_proxy_settings() {
-    for k in [
-        "HTTP_PROXY",
-        "http_proxy",
-        "HTTPS_PROXY",
-        "https_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-        "NO_PROXY",
-        "no_proxy",
-    ] {
-        eprintln!("TEMP-DIAG env {k}={:?}", std::env::var(k).ok());
-    }
-    let cmd: Option<(&str, Vec<&str>)> = if cfg!(windows) {
-        Some((
-            "reg",
-            vec![
-                "query",
-                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-            ],
-        ))
-    } else if cfg!(target_os = "macos") {
-        Some(("scutil", vec!["--proxy"]))
-    } else {
-        None
-    };
-    if let Some((c, args)) = cmd {
-        match std::process::Command::new(c).args(&args).output() {
-            Ok(o) => eprintln!("TEMP-DIAG {c}: {}", String::from_utf8_lossy(&o.stdout)),
-            Err(e) => eprintln!("TEMP-DIAG {c} failed: {e}"),
-        }
-    }
-    panic!("TEMP-DIAG: show captured output");
 }
 
 #[tokio::test]

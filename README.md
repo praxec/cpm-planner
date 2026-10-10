@@ -346,6 +346,11 @@ println!("critical path: {:?}", result.critical_path); // ["design", "build", "t
 
 See the [API docs](https://docs.rs/cpm-planner).
 
+`llm::jev::JevJudge` (the `plan.review` judge) owns its HTTP client and
+connection pool. A pooled connection is driven by the tokio runtime that
+opened it, so use a judge (and its clones) from one runtime, and build a new
+judge for another runtime.
+
 ## Use with an MCP client (e.g. praxec)
 
 cpm-planner is fully standalone — it speaks plain MCP and has no code dependency

@@ -28,8 +28,27 @@ use super::{
 /// Longest slice of a provider error body written to the debug log.
 const BODY_LOG_CHARS: usize = 200;
 
+/// A reqwest client for one judge, configured like rig's shared client.
+///
+/// rig's `.client()` sends through one process-wide client whose pool hands
+/// keep-alive connections to every caller, while each connection's driver
+/// task runs on the tokio runtime that opened it. A judge on another runtime
+/// could then check out a connection whose runtime was idle (the request
+/// stalled until the timeout) or shutting down (an immediate transport error,
+/// "runtime dropped the dispatch task"). A client per judge keeps a judge's
+/// connections to itself. If reqwest cannot build a client (TLS setup), the
+/// shared one is used: it reports that build error on every send.
+fn own_http_client() -> rig_reqwest::ReqwestClient {
+    match rig_reqwest::reqwest::Client::builder().build() {
+        Ok(client) => rig_reqwest::ReqwestClient::from(client),
+        Err(_) => rig_reqwest::ReqwestClient::default(),
+    }
+}
+
 /// Jev on OpenRouter's System One endpoint. Every call is bounded by the
-/// configured timeout.
+/// configured timeout. Each judge owns its HTTP client and connection pool;
+/// pooled connections are driven by the runtime that opened them, so use a
+/// judge from one tokio runtime (clones share the pool).
 #[derive(Clone)]
 pub struct JevJudge {
     model: Model<JevConfig>,
@@ -45,7 +64,7 @@ impl JevJudge {
         let jev = JevConfig::new(config.api_key().expose())
             .model(config.jev_model())
             .with_endpoint(config.jev_endpoint())
-            .client();
+            .connect(own_http_client());
         Self {
             model: jev.evaluation(),
             model_id: config.jev_model().to_string(),
@@ -159,17 +178,7 @@ impl JevJudge {
             | ProviderError::MismatchedDimensions { .. } => {
                 self.error(K::Decode, error.to_string())
             }
-            ProviderError::Http(inner) => {
-                // TEMP-DIAG: full source chain for the Windows CI failure.
-                let mut chain = format!("TEMP-DIAG {inner:?}");
-                let mut src = std::error::Error::source(&**inner);
-                while let Some(c) = src {
-                    chain.push_str(&format!(" | caused by: {c} [{c:?}]"));
-                    src = c.source();
-                }
-                eprintln!("{chain}");
-                self.error(K::Transport, error.to_string())
-            }
+            ProviderError::Http(_) => self.error(K::Transport, error.to_string()),
             ProviderError::Url(_)
             | ProviderError::Request(_)
             | ProviderError::UnsupportedOption(_) => {
