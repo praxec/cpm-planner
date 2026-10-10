@@ -43,6 +43,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 cap-std = "4.0.3"
 cap-fs-ext = "4.0.3"
+rig-core = { version = "0.44", default-features = false, features = ["reqwest", "rustls"] }
+rig-typesafeai = { version = "0.44", default-features = false, features = ["reqwest", "rustls"] }
+# Each JevJudge owns its reqwest client (see src/llm/jev.rs); same features as rig's.
+rig-reqwest = { version = "0.44", default-features = false, features = ["rustls"] }
+url = "2.5"
 
 [target.'cfg(unix)'.dependencies]
 # errno constants for classifying unsupported hard links (write_new_graph).
@@ -50,3 +55,4 @@ libc = "0.2.190"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+wiremock = "0.6.5"

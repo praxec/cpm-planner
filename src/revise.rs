@@ -1,7 +1,7 @@
 //! Pure plan revision: derive the runtime state of a revised graph from the
 //! state of the plan it replaces, carrying progress over.
 //!
-//! No store and no I/O: [`plan_revision`] maps `(old state, new graph)` to
+//! No store and no I/O: `plan_revision` maps `(old state, new graph)` to
 //! `(new state, diff)`. The store wiring and audit events live elsewhere.
 //!
 //! Carry-over rules:

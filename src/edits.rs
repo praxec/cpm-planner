@@ -4,7 +4,7 @@
 //! operator (or an agent) may apply to a submitted graph. [`apply_edits`]
 //! applies a batch in order to a clone of the input, then enforces the same
 //! structural invariants `plan.submit` enforces via
-//! [`crate::planner::validate_graph`]. It never touches the persisted plan;
+//! `crate::planner::validate_graph`. It never touches the persisted plan;
 //! callers decide whether to resubmit the result.
 
 use serde::{Deserialize, Serialize};

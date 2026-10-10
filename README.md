@@ -249,8 +249,9 @@ To check a binary without any MCP client, download `scripts/mcp-smoke.mjs` from 
 | `plan.baseline` | Freeze the plan's current CPM schedule (earliest start/finish per deliverable) and budgets (effort basis × `metadata.cost_rate`, default 1) as its next numbered earned-value baseline. Optional `start` (RFC 3339, default now) and `calendar` `{hours_per_day (0 < h ≤ 24, default 8), workdays (default mon–fri), utc_offset_minutes (default 0)}` (omitted: wall-clock hours on the first baseline; a re-baseline keeps the previous baseline's calendar). The first baseline is number 1; re-baselining needs a non-blank `reason` (at most 2048 characters, `INVALID_GRAPH` otherwise) and keeps actuals and snapshots. Baselines, actuals and snapshots belong to one variant: a newly selected variant takes its own baseline 1, with no reason needed. Execution-side: only the selected, unarchived variant (`VARIANT_NOT_SELECTED` / `ARCHIVE_REFUSED`). Audited as `plan.ev.baselined`. |
 | `plan.ev` | Earned-value report against the latest baseline as of `as_of` (RFC 3339, default now). `as_of` is the PV status date; EV and AC reflect progress and actuals recorded up to the moment the call runs. Returns BAC, PV, EV, AC, SV, CV, SPI, CPI, EAC, ETC, VAC, TCPI, per-deliverable rows, critical float consumed, `SPI_BELOW_0_9` / `CPI_BELOW_0_9` alerts (metric below 0.9 on the two latest *stored*, non-backfilled snapshots by `as_of` of the current baseline; the current reading is not one of them) and `excluded_unbaselined` (deliverables added since the baseline). AC sums every recorded hour of the plan, removed and unbaselined deliverables included (at the baseline row's cost rate, or 1 without one), so spend never disappears, even after a re-baseline. A baselined deliverable that `plan.revise` removes keeps the percent it had earned at removal (100 if complete, else its earning rule's percent) and reports row status `removed`; adding it back restarts its earned percent while its hours keep accumulating. A ratio with a zero denominator is `null` and explained in `undefined`; output never contains NaN or infinity. Read-only on any variant; `NOT_BASELINED` before `plan.baseline`. |
 | `plan.snapshot` | Compute the `plan.ev` report and append it as a snapshot (`as_of` is the PV status date; EV and AC are the progress recorded when the call runs). A snapshot whose `as_of` is more than an hour before its `taken_at` is marked `backfilled: true`: it raises no alerts and later alerts skip it. Returns its `summary` (with `undefined` explaining each null ratio; alerts consider only readings up to its own position: this snapshot and the latest earlier non-backfilled one by `as_of` of the current baseline, so a backfill never takes alerts from newer readings), `snapshot_count`, and `export` of the newest 100 snapshots by `as_of` (ties by when they were taken), oldest first, so a backfilled `as_of` lands in date order; a backfill older than those 100 is stored and counted but not listed: a list of summaries (`format: "json"`, default) or a Markdown table with columns date, PV, EV, AC, SPI, CPI, EAC (`format: "markdown"`, undefined ratios shown as `n/a`). Execution-side like `plan.baseline`; `NOT_BASELINED` before it. |
+| `plan.review` | Optional AI review of a graph, stored plan or plan file (read-only; exactly one of `graph`, `plan_id`, `path`; optional `capacities` / `resource_key` / `project_buffer_pct` to level makespans, and `max_questions` 1 to 64, default 64). Lint always runs; lint errors return `status: "invalid_graph"` without calling the judge. Otherwise one batched call to Jev asks about likely false and missing dependencies, split and interface-split candidates and crash options, and returns advisory `findings` plus `proposals`: `plan.fork` edit lists, each verified by simulate (lints clean, shortens the makespan) and ranked by `hours_saved / max(cost, 1)`. Without a key, or with an unusable LLM setting, `status` is `review_unavailable` with a `reason`, plus lint. See [Plan review (optional)](#plan-review-optional). |
 
-`plan.lint` and `plan.simulate` take exactly one of an inline `graph`, a stored
+`plan.lint`, `plan.simulate` and `plan.review` take exactly one of an inline `graph`, a stored
 `plan_id`, or a plan-file `path`; `plan.schedule` takes `graph` or `plan_id`;
 `plan.schedule` and `plan.simulate` reject what `plan.submit` rejects, and `plan.lint` reports it as findings. Monte Carlo output is reproducible for a given seed on the same platform
 and toolchain; bit-identical results across targets or compiler versions are
@@ -264,6 +265,66 @@ returned `plan_id`. A named line has many variants but exactly one selected:
 `plan.fork` creates a draft from structured edits, `plan.compare` scores the
 variants, and `plan.select` makes one executable. Keep definitions in tracked
 files — never keep untracked scratch graphs.
+
+### Plan review (optional)
+
+`plan.review` asks Jev (`typesafe/jev-1.13`), TypeSafe's
+calibrated-judgment model, about a lint-clean plan through OpenRouter: one
+batched call of at most 64 questions per review. It is off until you set
+`OPENROUTER_API_KEY` (or `CPM_OPENROUTER_KEY_FILE`); without a key the tool
+still answers, with `review_unavailable` and the lint report. An invalid LLM
+setting never stops the server: it is logged at startup and `plan.review`
+reports `review_unavailable` with a reason naming the setting.
+
+- **Probabilities are advisory.** Treat findings as a second opinion. Proposals
+  are verified mechanically (the edited plan must lint clean and simulate to a
+  shorter makespan); apply one with `plan.fork {edits}`, then `plan.compare`.
+- **Cost.** Each `plan.review` call that reaches the judge is one billed
+  OpenRouter request; Jev costs about $0.042 per million input tokens on
+  OpenRouter. Each report carries the provider's `usage` when given. At most 2
+  reviews that call the judge run at once per server; further calls wait for a
+  slot (reviews that end before the call, such as no key or lint errors, never
+  wait).
+- **Privacy.** This is everything sent to OpenRouter in that one request:
+  - a fixed task sentence, the plan makespan and the critical path (ids);
+  - the questions: for each, its kind, the deliverable ids it names, and a
+    question sentence that quotes those ids and, depending on the kind, the
+    prerequisite's `consumes` text, the deliverable's scheduled hours, the
+    plan's median scheduled hours, and the heuristic signals that raised a
+    missing-dependency question (a description mentions the other, files in
+    the same or nested directories, a shared `metadata.owner`);
+  - for every deliverable a question names: its id, scheduled hours, float
+    hours, `critical` and `milestone` flags, owned file paths (sent in full,
+    not truncated), prerequisites (id, `consumes`, kind) and its
+    `description`, `artifact` and `owner` metadata. `description`,
+    `artifact`, `owner` and `consumes` are cut to 500 characters each.
+
+  Nothing else in the graph (other deliverables, other metadata keys,
+  estimates) is sent. Do not review plans whose contents you may not share
+  with OpenRouter.
+- **Audit.** The key is never logged or returned, and neither is a misplaced
+  value of any LLM variable. Every `plan.review` call records one
+  `plan.review` audit event, whatever its outcome (including a missing plan,
+  a bad path or a failed review); the only unaudited case is a call rejected
+  for its params (`invalid_params`). The event has exactly these fields:
+  - `status`: `ok`, `review_unavailable`, `invalid_graph`, or `error` (the
+    review failed: `PLAN_NOT_FOUND`, `INVALID_PATH`, `INVALID_CAPACITIES`, …);
+  - `code`: the error prefix for `error`, else null;
+  - `failure_class`: for a `review_unavailable` caused by a failed judge call,
+    its class (`unauthorized`, `rate_limited`, `timeout`, `upstream`,
+    `decode`, `transport`, `invalid_request`); null otherwise (including no
+    key and an unusable LLM setting);
+  - `plan_id`: the stored plan reviewed, null for an inline `graph` or `path`;
+  - `question_count`: questions sent (0 when the judge was not called);
+  - `jev_called`: whether the judge was called;
+  - `prompt_hash`: sha256 of the canonical request, null when the judge was
+    not called;
+  - `model`: the model the provider reported, else the configured model when
+    the call failed; null when the judge was not called;
+  - `endpoint`: the judge endpoint's host; null when no judge is configured,
+    lint found errors, or the review ended in `error`.
+
+  The prompt itself is never recorded.
 
 ## Use as a library
 
@@ -287,6 +348,11 @@ println!("critical path: {:?}", result.critical_path); // ["design", "build", "t
 ```
 
 See the [API docs](https://docs.rs/cpm-planner).
+
+`llm::jev::JevJudge` (the `plan.review` judge) owns its HTTP client and
+connection pool. A pooled connection is driven by the tokio runtime that
+opened it, so use a judge (and its clones) from one runtime, and build a new
+judge for another runtime.
 
 ## Use with an MCP client (e.g. praxec)
 
@@ -323,7 +389,12 @@ Set these in a client's `env` block (or `-e`/`--env` flag, or `docker run -e`). 
 | `CPM_PLANNER_DB` | OS data dir (`~/.local/share/praxec/cpm-planner.db`); `/data/cpm-planner.db` in the Docker image | SQLite path for durable, cross-process planner state; `:memory:` gives ephemeral state. |
 | `CPM_PROJECT_ROOT` | nearest ancestor of cwd with `.cpm-planner/` or `.git` | Repo root for plan-as-code files (`.cpm-planner/plans/<name>/<variant>.json`). Tools that need a root report `INVALID_PATH: no project root (set CPM_PROJECT_ROOT or run inside a repo)` when none is found. |
 | `CPM_MAX_TTL_SECS` | `28800` (8h) | Server-side ceiling for `ttl_seconds` on `plan.acquire_cohort` and `plan.heartbeat`; larger requested values are clamped. Must be a positive integer — any other value aborts startup. |
-| `OPENROUTER_API_KEY` | none | Optional; will enable `plan.review` (P6, planned); not yet used. |
+| `OPENROUTER_API_KEY` | unset | OpenRouter key for `plan.review`. Unset or blank: `plan.review` reports `review_unavailable` ("no OpenRouter key configured"). Never logged or returned. |
+| `CPM_OPENROUTER_KEY_FILE` | unset | File holding the OpenRouter key (contents trimmed; at most 4096 bytes), used when `OPENROUTER_API_KEY` is unset. On unix a world-readable (`o+r`) or empty file is ignored with a warning (`chmod 600` it). |
+| `CPM_JEV_MODEL` | `typesafe/jev-1.13` | Jev model id for `plan.review`: at most 128 characters of `A-Z a-z 0-9 . _ : / -`, and never containing the key; anything else is logged (naming the variable, not the value) and makes `plan.review` unavailable. |
+| `CPM_JEV_ENDPOINT` | `https://openrouter.ai/api/v1/systemone` | Jev endpoint URL: `https://`, or `http://` only for a loopback host, with no credentials. |
+| `CPM_LLM_TIMEOUT_SECS` | `30` | Bound on each LLM call, integer seconds in 1..=300. |
+| `CPM_LLM_MODEL` | `openai/gpt-5-mini` | Generative (chat) model id; not used by any tool yet. |
 
 Leases default to 5 minutes. For long-running work pass `ttl_seconds` (≤ the server maximum) on acquire/heartbeat, and heartbeat at least every `ttl/3`.
 

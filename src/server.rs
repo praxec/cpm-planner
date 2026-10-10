@@ -38,6 +38,20 @@
 //! | `plan.baseline`          | [`Planner::baseline`]         |
 //! | `plan.ev`                | [`Planner::ev`]               |
 //! | `plan.snapshot`          | [`Planner::snapshot`]         |
+//! | `plan.review`            | [`crate::review::review`]     |
+//!
+//! # Plan review
+//!
+//! `plan.review`'s judge is fixed when the server is built:
+//! [`PlanServer::with_llm_config`] takes the result of
+//! [`LlmConfig::from_env`] (read once, at startup) and
+//! [`PlanServer::with_judge`] injects any [`JudgmentModel`] (tests). With no
+//! key, or an unusable configuration, the server still starts and the tool
+//! reports `review_unavailable` with a reason naming the setting. Each
+//! review runs on the blocking pool (it simulates the plan once per
+//! proposal) and records a `plan.review` audit event carrying the
+//! `prompt_hash`, model, endpoint host, status and question count — never
+//! the key or the prompt.
 //!
 //! # Error mapping
 //!
@@ -62,9 +76,12 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::audit::AuditEvent;
 use crate::compare::{CompareRequest, CompareWeights};
 use crate::earned_value::{BaselineRequest, Calendar, SnapshotFormat, SnapshotRequest};
 use crate::edits::GraphEdit;
+use crate::llm::jev::JevJudge;
+use crate::llm::{ConfigError, JudgmentModel, LlmConfig};
 use crate::monte_carlo::MonteCarloRequest;
 use crate::plan::{
     AcceptRequest, AcquireRequest, CallerId, Cohort, ComparePlansRequest, DeliverableStatus,
@@ -74,6 +91,7 @@ use crate::plan::{
 use crate::ports::Planner;
 use crate::project::ProjectRoot;
 use crate::resource_schedule::{ScheduleRequest, resource_schedule};
+use crate::review::{Judge, ReviewReport, ReviewRequest};
 use crate::simulate::SimulateRequest;
 use chrono::{DateTime, Utc};
 use rmcp::ErrorData as McpError;
@@ -115,8 +133,13 @@ pub const TOOL_COMPARE: &str = "plan.compare";
 pub const TOOL_BASELINE: &str = "plan.baseline";
 pub const TOOL_EV: &str = "plan.ev";
 pub const TOOL_SNAPSHOT: &str = "plan.snapshot";
+pub const TOOL_REVIEW: &str = "plan.review";
 
-/// All twenty-two MCP tool names exposed by [`PlanServer`], in declaration order.
+/// Most `plan.review` calls running at once; further calls wait for a slot.
+/// Each review is one billed OpenRouter request plus up to 65 simulates.
+pub const MAX_CONCURRENT_REVIEWS: usize = 2;
+
+/// All twenty-three MCP tool names exposed by [`PlanServer`], in declaration order.
 pub const PLAN_TOOL_NAMES: &[&str] = &[
     TOOL_SUBMIT,
     TOOL_ACQUIRE_COHORT,
@@ -140,6 +163,7 @@ pub const PLAN_TOOL_NAMES: &[&str] = &[
     TOOL_BASELINE,
     TOOL_EV,
     TOOL_SNAPSHOT,
+    TOOL_REVIEW,
 ];
 
 // ---------------------------------------------------------------------------
@@ -432,6 +456,27 @@ struct SnapshotArgs {
     as_of: Option<DateTime<Utc>>,
     #[serde(default)]
     format: SnapshotFormat,
+}
+
+/// `plan.review`: the graph/plan selector, optional leveling inputs (flat,
+/// as in `plan.schedule`, but `capacities` optional) and the question cap.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewToolArgs {
+    #[serde(default)]
+    graph: Option<PlanGraph>,
+    #[serde(default)]
+    plan_id: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    capacities: Option<std::collections::BTreeMap<String, u32>>,
+    #[serde(default)]
+    resource_key: Option<String>,
+    #[serde(default)]
+    project_buffer_pct: Option<f32>,
+    #[serde(default)]
+    max_questions: Option<u16>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1156,6 +1201,40 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                 "additionalProperties": false
             })),
         ),
+        Tool::new(
+            Cow::Borrowed(TOOL_REVIEW),
+            Cow::Borrowed(
+                "Optional AI review of a graph, stored plan, or plan file (read-only; \
+                 provide exactly one of graph, plan_id, or path). Lint always runs; \
+                 lint errors return status invalid_graph without calling the judge. \
+                 Otherwise one batched call to Jev (calibrated judgments, via \
+                 OpenRouter) asks up to max_questions (1..64, default 64) questions \
+                 about likely false or missing dependencies, split and interface-split \
+                 candidates and crash options; findings carry advisory probabilities. \
+                 Proposals are plan.fork edit lists, each verified by simulate (lint \
+                 clean, makespan shorter) and ranked by hours_saved / max(cost, 1). \
+                 Without an OpenRouter key (or with an unusable LLM configuration) \
+                 status is review_unavailable with a reason, plus lint. The plan graph \
+                 (ids, descriptions, metadata) is sent to OpenRouter.",
+            ),
+            schema_object(json!({
+                "type": "object",
+                "properties": {
+                    "graph": graph_selector_schema(),
+                    "plan_id": plan_id_schema(),
+                    "path": path_schema(),
+                    "capacities": {
+                        "type": "object",
+                        "description": "Optional: level the plan so makespans account for resources (same rules as plan.schedule capacities).",
+                        "additionalProperties": { "type": "integer", "minimum": 0 }
+                    },
+                    "resource_key": { "type": "string", "description": "Metadata key naming a deliverable's resource (default \"owner\"); requires capacities." },
+                    "project_buffer_pct": { "type": "number", "minimum": 0, "maximum": 100, "description": "Project buffer percentage (default 25); requires capacities." },
+                    "max_questions": { "type": "integer", "minimum": 1, "maximum": 64, "description": "Question cap for the single Jev call (default 64); extra candidates are dropped and truncated is true." }
+                },
+                "additionalProperties": false
+            })),
+        ),
     ]
 }
 
@@ -1181,12 +1260,41 @@ fn schema_object(value: Value) -> Arc<rmcp::model::JsonObject> {
 // PlanServer
 // ---------------------------------------------------------------------------
 
-/// MCP server façade exposing a [`BasicCpmPlanner`] over twenty-two tools.
+/// What `plan.review` judges with, fixed when the server is built.
+#[derive(Clone)]
+enum ReviewJudge {
+    Model(Arc<dyn JudgmentModel>),
+    NotConfigured,
+    /// Unusable configuration; the key-free reason to report.
+    Unusable(String),
+}
+
+impl ReviewJudge {
+    fn as_judge(&self) -> Judge<'_> {
+        match self {
+            Self::Model(model) => Judge::Model(model.as_ref()),
+            Self::NotConfigured => Judge::NotConfigured,
+            Self::Unusable(reason) => Judge::ConfigError(reason),
+        }
+    }
+
+    fn configured_model(&self) -> Option<String> {
+        match self {
+            Self::Model(model) => model.model_id(),
+            Self::NotConfigured | Self::Unusable(_) => None,
+        }
+    }
+}
+
+/// MCP server façade exposing a [`BasicCpmPlanner`] over twenty-three tools.
 #[derive(Clone)]
 pub struct PlanServer {
     planner: Arc<BasicCpmPlanner>,
     server_name: String,
     server_version: String,
+    judge: ReviewJudge,
+    /// [`MAX_CONCURRENT_REVIEWS`] permits, shared by every clone.
+    review_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl PlanServer {
@@ -1196,7 +1304,46 @@ impl PlanServer {
             planner,
             server_name: "cpm-planner".to_string(),
             server_version: env!("CARGO_PKG_VERSION").to_string(),
+            judge: ReviewJudge::NotConfigured,
+            review_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REVIEWS)),
         }
+    }
+
+    /// Set `plan.review`'s judge: `None` means no key is configured (the
+    /// default). Tests inject a fake here.
+    pub fn with_judge(mut self, judge: Option<Arc<dyn JudgmentModel>>) -> Self {
+        self.judge = judge.map_or(ReviewJudge::NotConfigured, ReviewJudge::Model);
+        self
+    }
+
+    /// Set `plan.review`'s judge from [`LlmConfig::from_env`]'s result, read
+    /// once at startup: a key builds a [`JevJudge`]; no key leaves review
+    /// unavailable; a [`ConfigError`] is logged (it never carries the key)
+    /// and review reports [`ConfigError::review_reason`]. Never fails, so an
+    /// LLM misconfiguration cannot stop the server.
+    pub fn with_llm_config(mut self, config: Result<Option<LlmConfig>, ConfigError>) -> Self {
+        self.judge = match config {
+            Ok(Some(config)) => {
+                tracing::info!(
+                    model = config.jev_model(),
+                    endpoint = ?config.jev_endpoint_host(),
+                    "plan.review enabled"
+                );
+                ReviewJudge::Model(Arc::new(JevJudge::new(&config)))
+            }
+            Ok(None) => {
+                tracing::info!("no OpenRouter key configured; plan.review is unavailable");
+                ReviewJudge::NotConfigured
+            }
+            Err(err) => {
+                // Only the key-free reason: it names the variable, never
+                // its value or the key-file path.
+                let reason = err.review_reason();
+                tracing::warn!(%reason, "LLM configuration unusable; plan.review is unavailable");
+                ReviewJudge::Unusable(reason)
+            }
+        };
+        self
     }
 
     /// Override the advertised server identity. Defaults to
@@ -1324,6 +1471,7 @@ impl PlanServer {
             TOOL_BASELINE => self.handle_baseline(args).await,
             TOOL_EV => self.handle_ev(args).await,
             TOOL_SNAPSHOT => self.handle_snapshot(args).await,
+            TOOL_REVIEW => self.handle_review(args).await,
             other => Err(McpError::invalid_params(
                 format!(
                     "Unknown tool '{other}'. Available: {}.",
@@ -1776,11 +1924,10 @@ impl PlanServer {
         let parsed: EvArgs = parse_args(args)?;
         let planner = Arc::clone(&self.planner);
         let plan_id = PlanId(parsed.plan_id);
-        let report =
-            run_blocking_planner(
-                async move { Planner::ev(&*planner, &plan_id, parsed.as_of).await },
-            )
-            .await?;
+        let report = run_blocking_planner("ev", async move {
+            Planner::ev(&*planner, &plan_id, parsed.as_of).await
+        })
+        .await?;
         to_value(&report)
     }
 
@@ -1789,11 +1936,166 @@ impl PlanServer {
         let mut request = SnapshotRequest::new(PlanId(parsed.plan_id)).with_format(parsed.format);
         request.as_of = parsed.as_of;
         let planner = Arc::clone(&self.planner);
-        let outcome =
-            run_blocking_planner(async move { Planner::snapshot(&*planner, request).await })
-                .await?;
+        let outcome = run_blocking_planner("snapshot", async move {
+            Planner::snapshot(&*planner, request).await
+        })
+        .await?;
         to_value(&outcome)
     }
+
+    /// `plan.review`. Params are range-checked first (`invalid_params`).
+    /// At most [`MAX_CONCURRENT_REVIEWS`] run at once (later calls wait).
+    /// The whole review runs on the blocking pool, with the runtime handle
+    /// driving its single judge call from there: the engine simulates the
+    /// plan up to once per proposal, which must not stall the async
+    /// workers. The store is not held: the graph is resolved (and any lock
+    /// released) before the review starts. Every outcome but a panic or bad
+    /// params is audited; an engine error keeps its [`PlannerError`] prefix.
+    async fn handle_review(&self, args: Value) -> Result<Value, McpError> {
+        let ReviewToolArgs {
+            graph,
+            plan_id,
+            path,
+            capacities,
+            resource_key,
+            project_buffer_pct,
+            max_questions,
+        } = parse_args(args)?;
+        let request = review_request(capacities, resource_key, project_buffer_pct, max_questions)?;
+        let audited_plan_id = plan_id.clone();
+        let graph = match self.resolve_graph(graph, plan_id, path).await {
+            Ok(graph) => graph,
+            Err(err) => {
+                // A selector mistake is a rejected param (unaudited); a
+                // missing plan or bad path is a failed review.
+                if err.code != rmcp::model::ErrorCode::INVALID_PARAMS {
+                    let event =
+                        review_audit_event(Err(mcp_error_code(&err)), audited_plan_id, None);
+                    self.planner.record_audit(event).await;
+                }
+                return Err(err);
+            }
+        };
+        let judge = self.judge.clone();
+        let configured_model = judge.configured_model();
+        let slots = self.review_slots.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let outcome = spawn_analysis("review", move || {
+            // Wait for a slot only when the judge will be asked: no key, an
+            // unusable config or lint errors end the review before any
+            // call. The permit lives in this closure, so it is held until
+            // the review ends even if the caller's future is dropped.
+            let calls_judge = matches!(judge, ReviewJudge::Model(_))
+                && !crate::lint::lint(&graph)
+                    .findings
+                    .iter()
+                    .any(|f| f.severity == crate::lint::Severity::Error);
+            let _slot = calls_judge
+                .then(|| runtime.block_on(slots.acquire_owned()).ok())
+                .flatten();
+            runtime.block_on(crate::review::review(&graph, &request, judge.as_judge()))
+        })
+        .await?;
+        let audit_outcome = match &outcome {
+            Ok(report) => Ok(report),
+            Err(err) => Err(Some(error_code(err))),
+        };
+        let event = review_audit_event(audit_outcome, audited_plan_id, configured_model);
+        self.planner.record_audit(event).await;
+        to_value(&outcome.map_err(planner_error_to_mcp)?)
+    }
+}
+
+/// Build and range-check `plan.review`'s request (`invalid_params`).
+fn review_request(
+    capacities: Option<std::collections::BTreeMap<String, u32>>,
+    resource_key: Option<String>,
+    project_buffer_pct: Option<f32>,
+    max_questions: Option<u16>,
+) -> Result<ReviewRequest, McpError> {
+    if let Some(cap) = max_questions {
+        crate::review::check_max_questions(cap)
+            .map_err(|reason| McpError::invalid_params(reason, None))?;
+    }
+    let capacities = match capacities {
+        Some(capacities) => {
+            let schedule = ScheduleRequest {
+                capacities,
+                resource_key: resource_key
+                    .unwrap_or_else(crate::resource_schedule::default_resource_key),
+                project_buffer_pct: project_buffer_pct
+                    .unwrap_or_else(crate::resource_schedule::default_buffer_pct),
+            };
+            check_schedule_params(&schedule)?;
+            Some(schedule)
+        }
+        None if resource_key.is_some() || project_buffer_pct.is_some() => {
+            return Err(McpError::invalid_params(
+                "resource_key and project_buffer_pct require capacities",
+                None,
+            ));
+        }
+        None => None,
+    };
+    Ok(ReviewRequest {
+        capacities,
+        max_questions,
+    })
+}
+
+/// The `plan.review` audit record: what was asked of whom and the outcome,
+/// never the key or the prompt (only its hash). `model` is the provider's,
+/// else the configured one when the judge was called; a failed review
+/// (`Err`, engine or graph-resolution error) is status `"error"` with its
+/// stable `code` (the error prefix, e.g. `PLAN_NOT_FOUND`).
+fn review_audit_event(
+    outcome: Result<&ReviewReport, Option<String>>,
+    plan_id: Option<String>,
+    configured_model: Option<String>,
+) -> AuditEvent {
+    let payload = match outcome {
+        Ok(report) => json!({
+            "status": report.status,
+            "code": null,
+            "failure_class": report.failure_class,
+            "plan_id": plan_id,
+            "question_count": report.question_count,
+            "prompt_hash": report.prompt_hash,
+            "model": report.model.clone().or(if report.jev_called { configured_model } else { None }),
+            "endpoint": report.endpoint,
+            "jev_called": report.jev_called,
+        }),
+        Err(code) => json!({
+            "status": "error",
+            "code": code,
+            "failure_class": null,
+            "plan_id": plan_id,
+            "question_count": 0,
+            "prompt_hash": null,
+            "model": null,
+            "endpoint": null,
+            "jev_called": false,
+        }),
+    };
+    AuditEvent::new("plan.review").with_payload(payload)
+}
+
+/// The stable prefix of an MCP error's message (`PLAN_NOT_FOUND`,
+/// `INVALID_PATH`, …), when it has one.
+fn mcp_error_code(err: &McpError) -> Option<String> {
+    let (prefix, _) = err.message.split_once(':')?;
+    (!prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_uppercase() || c == '_'))
+        .then(|| prefix.to_string())
+}
+
+/// The stable prefix of a [`PlannerError`] (`INVALID_CAPACITIES`, …).
+fn error_code(err: &PlannerError) -> String {
+    let text = err.to_string();
+    text.split(':')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string()
 }
 
 /// Range checks the analysis tools apply before any work, as
@@ -1824,14 +2126,20 @@ fn check_compare_weights(weights: &CompareWeights) -> Result<(), McpError> {
 }
 
 /// Run a [`Planner`] call whose future does synchronous store and CPM work
-/// (`plan.ev`, `plan.snapshot`) on a blocking thread, driven to completion
-/// there, so it never stalls the runtime's worker threads.
-async fn run_blocking_planner<T, Fut>(call: Fut) -> Result<T, McpError>
+/// (`plan.ev`, `plan.snapshot`) on the blocking pool via [`spawn_analysis`],
+/// driven to completion there by the runtime handle (as `plan.review`'s
+/// judge call is), so it never stalls the runtime's worker threads. A panic
+/// is the generic "`<what>` task failed"; an engine error keeps its
+/// [`PlannerError`] prefix.
+async fn run_blocking_planner<T, Fut>(what: &'static str, call: Fut) -> Result<T, McpError>
 where
     T: Send + 'static,
     Fut: std::future::Future<Output = Result<T, PlannerError>> + Send + 'static,
 {
-    run_blocking(move || tokio::runtime::Handle::current().block_on(call)).await
+    let runtime = tokio::runtime::Handle::current();
+    spawn_analysis(what, move || runtime.block_on(call))
+        .await?
+        .map_err(planner_error_to_mcp)
 }
 
 /// Run CPU-bound analysis off the async runtime's worker threads.
@@ -1840,10 +2148,23 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T, PlannerError> + Send + 'static,
 {
-    tokio::task::spawn_blocking(work)
-        .await
-        .map_err(|e| McpError::internal_error(format!("analysis task failed: {e}"), None))?
+    spawn_analysis("analysis", work)
+        .await?
         .map_err(planner_error_to_mcp)
+}
+
+/// Run `work` on the blocking pool. A panic or cancellation becomes the
+/// generic `internal_error` "`<what>` task failed"; the detail (which may
+/// quote data) goes to the log only.
+async fn spawn_analysis<T, F>(what: &'static str, work: F) -> Result<T, McpError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(work).await.map_err(|e| {
+        tracing::error!(error = %e, "{what} task failed");
+        McpError::internal_error(format!("{what} task failed"), None)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1856,7 +2177,7 @@ impl ServerHandler for PlanServer {
             Implementation::new(self.server_name.clone(), self.server_version.clone());
         server_info.title = Some("cpm-planner".to_string());
         server_info.description = Some(
-            "MCP server exposing the open-source Praxec CPM planner via twenty-two tools."
+            "MCP server exposing the open-source Praxec CPM planner via twenty-three tools."
                 .to_string(),
         );
 
@@ -1958,7 +2279,7 @@ fn planner_error_to_mcp(err: PlannerError) -> McpError {
 fn instructions() -> &'static str {
     r#"This is the cpm-planner MCP server — the open-source CPM planner.
 
-Tools (twenty-two total, all `plan.<verb>`):
+Tools (twenty-three total, all `plan.<verb>`):
   plan.submit          — submit a PlanGraph, get a plan_id (idempotent on identical graphs)
                         a prerequisite is an id string or {id, consumes?, kind?: artifact|interface, lag_hours?}; a deliverable's duration_hours (calendar time; when absent the default is the effort estimate, explicit or estimator-derived) and lag_hours (minimum wait after a prerequisite finishes) drive the schedule
                         a milestone (milestone: true) is zero-length unless you give it an estimate or duration; it is still an ordinary deliverable someone must complete (accept or mark Complete), and it is not leased if metadata.kind=manual
@@ -1988,6 +2309,7 @@ Tools (twenty-two total, all `plan.<verb>`):
   plan.baseline        — freeze the plan's CPM schedule (es/ef) and budgets (effort basis x metadata.cost_rate, default 1) as its next numbered earned-value baseline; optional start (RFC 3339, default now) and calendar {hours_per_day (0 < h <= 24, default 8), workdays (default mon..fri), utc_offset_minutes (default 0)} (omitted: wall-clock hours on the first baseline, the previous baseline's calendar on a re-baseline); re-baselining needs a non-blank reason (<= 2048 chars, INVALID_GRAPH otherwise) and keeps actuals and snapshots; baselines, actuals and snapshots belong to one variant, so a newly selected variant takes its own baseline 1 with no reason needed; selected, unarchived variant only; audited as plan.ev.baselined
   plan.ev              — earned-value report against the latest baseline as of as_of (RFC 3339, default now; as_of is the PV status date, while EV and AC reflect progress and actuals recorded up to the moment the call runs): bac, pv, ev, ac, sv, cv, spi, cpi, eac, etc, vac, tcpi, per-deliverable rows, critical_float_consumed_hours, alerts (SPI_BELOW_0_9 / CPI_BELOW_0_9 when below 0.9 on the two latest stored non-backfilled snapshots by as_of of the current baseline; the current reading is not one of them), excluded_unbaselined; AC sums every recorded hour of the plan (removed and unbaselined deliverables included, at rate 1 when the baseline has no row); a baselined deliverable removed by plan.revise reports status "removed" and keeps its earned percent at removal (100 if complete), and re-adding it restarts its earned percent (hours keep accumulating); a ratio with a zero denominator is null and explained in `undefined` (never NaN); read-only on any variant; NOT_BASELINED before plan.baseline
   plan.snapshot        — compute the plan.ev report and append it as a snapshot (as_of is the PV status date; EV and AC are as recorded when the call runs, so a snapshot whose as_of is more than an hour before taken_at is marked backfilled: true, raises no alerts and is skipped by later alerts); returns summary (undefined explains each null ratio; alerts consider only readings up to its own position: this snapshot and the latest earlier one by as_of of the current baseline, so a backfill never takes alerts from newer readings), snapshot_count and export of the newest 100 snapshots by as_of (ties by taken_at), oldest first, so a backfilled as_of lands in date order; a backfill older than those 100 is stored and counted but not listed: a list of summaries (format "json", default) or a Markdown table with columns date, PV, EV, AC, SPI, CPI, EAC (format "markdown"); selected, unarchived variant only; NOT_BASELINED before plan.baseline
+  plan.review          — optional AI review (read-only; graph, plan_id or path; optional capacities/resource_key/project_buffer_pct and max_questions 1..64, default 64): lint always runs and lint errors return status invalid_graph with no judge call; otherwise ONE batched call to Jev (TypeSafe's calibrated-judgment model, via OpenRouter) scores likely false dependencies, missing dependencies, split and interface-split candidates and crash options. Probabilities are advisory, not facts. proposals are plan.fork edit lists, each verified by simulate (lints clean, shortens the makespan) and ranked by hours_saved / max(cost, 1). Without an OpenRouter key, or with an unusable LLM setting, status is review_unavailable with a reason, plus lint; a provider failure is review_unavailable with "<class>: <message>". The plan graph is sent to OpenRouter
   plan.submit with a `name` (optional `project`/`variant`, variant defaults to "main") registers a named variant instead of an unnamed plan
   plan.lint, plan.simulate take exactly one of an inline graph, a stored plan_id, or a plan-file path; plan.schedule takes graph or plan_id; plan.schedule and plan.simulate reject what plan.submit rejects, and plan.lint reports it as findings
 
@@ -1998,6 +2320,11 @@ variants and pick one: plan.fork creates a draft variant from edits,
 plan.compare scores every live variant, and plan.select makes exactly one
 executable. Never keep untracked scratch graphs — the files under
 .cpm-planner/plans/ are the source of truth for definitions.
+
+Review workflow: plan.review {path} on a lint-clean plan; read findings as
+advisory judgments (check them against what you know), apply a proposal you
+agree with via plan.fork {edits} (or design the edits for split and
+missing-dependency findings yourself), then plan.compare and plan.select.
 
 Leases default to 5 minutes. Pass ttl_seconds (≤ server max, default 8h)
 on acquire/heartbeat for long-running work, and heartbeat at least every

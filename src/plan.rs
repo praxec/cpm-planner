@@ -1,6 +1,6 @@
 //! SPEC §33 PA1 — `Planner` data model.
 //!
-//! This module defines the *types* the [`Planner`] trait
+//! This module defines the *types* the [`Planner`](crate::ports::Planner) trait
 //! (see [`crate::ports::Planner`]) carries across the IP boundary. The trait
 //! itself lives in `ports.rs` next to the other runtime ports; everything an
 //! implementer needs to construct, mutate, or report on a plan is here.
@@ -841,7 +841,7 @@ pub struct SelectOutcome {
 }
 
 /// Snapshot of a held lock. The Planner records one [`LockInfo`] per
-/// acquired deliverable and surfaces them in [`Cohort::locks`] and
+/// acquired deliverable and surfaces them in `Cohort::locks` and
 /// [`PlanStatus::locks_held`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LockInfo {
@@ -905,7 +905,7 @@ pub struct BlockedDeliverable {
     pub reason: String,
 }
 
-/// Error returned when a [`FlatCohort`] wire payload cannot be decoded into a
+/// Error returned when a `FlatCohort` wire payload cannot be decoded into a
 /// [`Cohort`] — currently only the deliverables/locks length mismatch
 /// (CMP-032). Carries both lengths for triage and implements `Display` so it
 /// satisfies serde's `try_from` error bound.

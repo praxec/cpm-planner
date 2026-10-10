@@ -1070,7 +1070,7 @@ fn tool_definitions_match_tool_names() {
         .iter()
         .map(|s| (*s).to_string())
         .collect();
-    assert_eq!((names, expected.len()), (expected, 22));
+    assert_eq!((names, expected.len()), (expected, 23));
 }
 
 #[test]
