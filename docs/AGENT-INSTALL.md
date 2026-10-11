@@ -14,8 +14,7 @@ Per-tool skill paths, invocations and MCP snippets come from the
 [agent tool matrix](agents/tool-matrix.md); other commands come from each
 tool's docs, cited where they are used.
 The `skills` subcommand and the `npx` launcher need **cpm-planner 0.2.0 or
-later**. The `npx` commands work once `@matthew-cochran/cpm` is published to
-npm (from 0.2.0); until then use the installed binary.
+later**.
 
 ## Contents
 

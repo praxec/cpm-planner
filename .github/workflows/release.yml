@@ -177,9 +177,8 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 22
-      # Packs the npm launcher (npm/) for the maintainer to publish by hand
-      # (docs/releasing.md). CI never publishes to npm and holds no
-      # npm token: this step only builds the tarball and attaches it.
+      # Packs the npm launcher (npm/) and attaches the tarball with its digest.
+      # The `npm` job publishes exactly this file once the release is public.
       - name: pack npm launcher and attach the tarball
         shell: bash
         env:
@@ -205,6 +204,69 @@ jobs:
         run: |
           set -euo pipefail
           gh release edit "$TAG" --draft=false
+
+  npm:
+    name: npm publish
+    needs: [create-release, finalize]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    # npm trusted publishing: npm authenticates this job over GitHub OIDC (the
+    # trusted publisher on npmjs.com names praxec/cpm-planner, release.yml and
+    # the `npm` environment). There is no npm token; the environment requires a
+    # maintainer's approval before the job starts. Provenance is attached.
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PKG: "@matthew-cochran/cpm"
+      VERSION: ${{ needs.create-release.outputs.version }}
+    steps:
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm 11.5.1 or later; Node 22 ships npm 10.
+      - name: install npm with trusted publishing support
+        run: npm install -g npm@11.6.2
+      - name: download the release tarball and verify its digest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir npm-dist \
+            --pattern "matthew-cochran-cpm-${VERSION}.tgz" --pattern npm-package.sha256
+          (cd npm-dist && sha256sum -c npm-package.sha256)
+      - name: publish (skipped if this version is already on npm)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$(npm view "${PKG}@${VERSION}" version 2>/dev/null || true)" = "$VERSION" ]; then
+            echo "${PKG}@${VERSION} is already on npm; nothing to publish."
+            exit 0
+          fi
+          # Pre-releases (X.Y.Z-rc.N) go to the `next` dist-tag, never `latest`.
+          dist_tag=latest
+          case "$VERSION" in *-*) dist_tag=next ;; esac
+          npm publish "npm-dist/matthew-cochran-cpm-${VERSION}.tgz" \
+            --access public --provenance --tag "$dist_tag"
+      - name: verify the published launcher runs the release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The registry can take a moment to serve a new version.
+          for _ in 1 2 3 4 5 6; do
+            if out=$(npx -y "${PKG}@${VERSION}" --version 2>/dev/null) \
+              && [ "$out" = "cpm-planner ${VERSION}" ]; then
+              echo "$out"
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "::error::npx ${PKG}@${VERSION} --version did not print cpm-planner ${VERSION}"
+          exit 1
 
   image:
     name: container image

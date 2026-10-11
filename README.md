@@ -137,6 +137,21 @@ $env:PRAXEC_VERSION = '<version>'; irm https://github.com/praxec/cpm-planner/rel
 & ([scriptblock]::Create((irm https://github.com/praxec/cpm-planner/releases/latest/download/install.ps1))) -Version <version>
 ```
 
+### npm
+
+With Node 18 or later, install the `cpm-planner` command from npm:
+
+```sh
+npm install -g @matthew-cochran/cpm
+cpm-planner --version
+```
+
+The package is a small launcher. During install it downloads the release
+binary for your platform, verifies its checksum and caches it. The package
+version is the release version, so `npm install -g @matthew-cochran/cpm@0.2.0`
+pins one. To run it without installing, use `npx -y @matthew-cochran/cpm`.
+For details and environment variables, see [npm/README.md](npm/README.md).
+
 ### From source
 
 Build and install a tagged release with Cargo (Rust 1.99 or newer):
@@ -226,8 +241,7 @@ cpm-planner speaks MCP over stdio. Register the `cpm-planner` command with your 
 Each client also has an **npx** form, which needs only Node 18 or later: the
 command is `npx` and the arguments are `-y` and `@matthew-cochran/cpm`. The
 launcher downloads the release binary on first run, verifies its checksum and
-caches it. The npx form works once `@matthew-cochran/cpm` is published to npm
-(from 0.2.0); until then use the installed binary. For per-client steps and
+caches it. For per-client steps and
 troubleshooting, see [docs/AGENT-INSTALL.md](docs/AGENT-INSTALL.md).
 
 To run the container image instead of a local binary, see [Docker](#docker). For praxec workflows, see [Praxec](#praxec).
