@@ -498,12 +498,14 @@ test('install.ps1 Get-LocationFromHeaders reads a string[] value and tolerates a
 // ---------------------------------------------------------------------------
 // check-version-sync.sh: Cargo.toml, server.json and npm/package.json agree
 // ---------------------------------------------------------------------------
-function versionSync(t, { cargo = '1.2.3', server = '1.2.3', npm = '1.2.3' } = {}) {
+function versionSync(t, { cargo = '1.2.3', server = '1.2.3', npm = '1.2.3', ociTag = server, ociVersion } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'praxec-version-sync-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const files = ['Cargo.toml', 'server.json', 'package.json'].map((f) => path.join(dir, f));
   fs.writeFileSync(files[0], `[package]\nname = "cpm-planner"\nversion = "${cargo}"\n`);
-  fs.writeFileSync(files[1], JSON.stringify({ version: server, packages: [{ registryType: 'oci', identifier: `ghcr.io/praxec/cpm-planner:${server}`, version: server }] }));
+  const oci = { registryType: 'oci', identifier: `ghcr.io/praxec/cpm-planner:${ociTag}` };
+  if (ociVersion !== undefined) oci.version = ociVersion;
+  fs.writeFileSync(files[1], JSON.stringify({ version: server, packages: [oci] }));
   fs.writeFileSync(files[2], JSON.stringify({ name: '@matthew-cochran/cpm', version: npm }));
   return run('bash', [path.join(ROOT, 'check-version-sync.sh'), ...files]);
 }
@@ -514,4 +516,12 @@ test('check-version-sync.sh passes when Cargo.toml, server.json and npm/package.
 
 test('check-version-sync.sh fails when npm/package.json differs from Cargo.toml', (t) => {
   assert.equal(versionSync(t, { npm: '1.2.4' }).status, 1);
+});
+
+test('check-version-sync.sh fails when an OCI package has a version field', (t) => {
+  assert.equal(versionSync(t, { ociVersion: '1.2.3' }).status, 1);
+});
+
+test('check-version-sync.sh fails when the OCI identifier tag differs from Cargo.toml', (t) => {
+  assert.equal(versionSync(t, { ociTag: '1.2.4' }).status, 1);
 });

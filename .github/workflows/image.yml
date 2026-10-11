@@ -111,10 +111,20 @@ jobs:
     permissions:
       id-token: write
       contents: read
+    env:
+      TAG: ${{ inputs.tag }}
     steps:
+      # server.json comes from the commit running this workflow (the tag itself
+      # on a release), so a fixed server.json can republish an older release;
+      # it must still name exactly the tag's version.
       - uses: actions/checkout@v7
-        with:
-          ref: ${{ inputs.tag }}
+      - name: server.json matches the release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "$(jq -r .version server.json)" = "${TAG#v}" ] \
+            || { echo "::error::server.json version $(jq -r .version server.json) is not ${TAG#v}"; exit 1; }
+          bash scripts/check-version-sync.sh
       - name: publish to MCP registry (best-effort)
         continue-on-error: true
         env:
