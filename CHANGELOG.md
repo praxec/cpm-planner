@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `server.json` no longer sets `version` on the OCI package, which the MCP registry rejects; the version is the identifier tag. `scripts/check-version-sync.sh` enforces this.
+
 ### Changed
 
 - The release container image is built from the checksum-verified Linux release binaries (`Dockerfile.release`) instead of compiling inside Docker, where the arm64 build under QEMU emulation timed out and left 0.2.0 without an image. The image and MCP registry steps live in `.github/workflows/image.yml`, which `release.yml` calls and which can be run by hand for an existing release.
