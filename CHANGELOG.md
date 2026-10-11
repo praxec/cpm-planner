@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-11
+
 ### Fixed
 
 - The release workflow's npm publish passed the tarball as `npm-dist/<file>.tgz`, which npm read as a GitHub `owner/repo` shorthand, so 0.2.1 was not published to npm. Publishing now goes through `scripts/npm-publish.sh`, which always passes a path, checks the tarball holds the release version, and is dry-run in CI on every PR.
@@ -206,7 +208,8 @@ approximations. For the method, caveats and known limitations, see
 - Six-tool MCP surface: `plan.submit`, `plan.acquire_cohort`, `plan.heartbeat`,
   `plan.mark_status`, `plan.status`, and `plan.force_release`.
 
-[Unreleased]: https://github.com/praxec/cpm-planner/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/praxec/cpm-planner/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/praxec/cpm-planner/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/praxec/cpm-planner/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/praxec/cpm-planner/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/praxec/cpm-planner/compare/v0.0.2...v0.1.0
