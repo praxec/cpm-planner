@@ -57,7 +57,6 @@ use cap_fs_ext::OpenOptionsSyncExt as _;
 use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
-use sha2::{Digest, Sha256};
 
 use crate::plan::{PlanGraph, PlannerError};
 
@@ -550,7 +549,7 @@ pub fn content_hash(bytes: &[u8]) -> String {
 }
 
 fn hash_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    crate::skills::sha256_hex(bytes)
 }
 
 #[cfg(test)]

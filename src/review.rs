@@ -122,7 +122,6 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 use crate::edits::{GraphEdit, apply_edits};
 use crate::lint::{LintReport, Severity, lint};
@@ -1297,7 +1296,7 @@ fn prompt_hash(state: &Value, questions: &BTreeMap<String, Question>) -> String 
     let request = json!({ "state": state, "questions": questions });
     let mut canonical = String::new();
     write_canonical(&request, &mut canonical);
-    format!("{:x}", Sha256::digest(canonical.as_bytes()))
+    crate::skills::sha256_hex(canonical.as_bytes())
 }
 
 fn write_canonical(value: &Value, out: &mut String) {

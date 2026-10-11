@@ -96,9 +96,9 @@ use crate::simulate::SimulateRequest;
 use chrono::{DateTime, Utc};
 use rmcp::ErrorData as McpError;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Implementation, InitializeRequestParams,
-    InitializeResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities,
-    ServerInfo, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, Implementation,
+    InitializeRequestParams, InitializeResult, ListToolsResult, PaginatedRequestParams,
+    ProtocolVersion, ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::{NotificationContext, RequestContext, RoleServer};
 use rmcp::transport::stdio;
@@ -2175,7 +2175,7 @@ where
 // ---------------------------------------------------------------------------
 
 impl ServerHandler for PlanServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         let mut server_info =
             Implementation::new(self.server_name.clone(), self.server_version.clone());
         server_info.title = Some("cpm-planner".to_string());
@@ -2215,10 +2215,10 @@ impl ServerHandler for PlanServer {
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         self.dispatch_call(request)
             .await
-            .map(CallToolResult::structured)
+            .map(|value| CallToolResult::structured(value).into())
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {

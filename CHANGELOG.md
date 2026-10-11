@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-10-10
+## [0.2.0] - 2026-10-11
 
 ### Added
 
@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `execution-policy` is now a crates.io dependency (0.0.6, identical source to the previously pinned git revision), so the crate can be published.
 - New community and supply-chain files: `CODE_OF_CONDUCT.md`, `SUPPORT.md`, issue forms, a PR template, `CODEOWNERS`, Dependabot, `cargo-deny` and CI jobs for docs, packaging and the npm launcher; `CONTRIBUTING.md` and `SECURITY.md` rewritten.
 - Five focused agent skills (`cpm-plan`, `cpm-improve`, `cpm-run`, `cpm-ev`, `cpm-revise`) alongside the `deliverable-cpm` method reference.
+- Dependencies: `rmcp` 3.5 (MCP SDK), `sha2` 0.11, `toml` 1.1; release and CI actions updated. No change to tool behaviour.
 
 ### Fixed
 

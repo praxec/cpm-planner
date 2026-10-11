@@ -62,11 +62,11 @@ chrono = { version = "0.4", features = ["serde"] }
 rand = { version = "0.10.3", default-features = false }
 rand_chacha = { version = "0.10.0", default-features = false }
 rand_distr = { version = "0.6.0", default-features = false, features = ["std"] }
-rmcp = { version = "1.8", default-features = false, features = ["server", "macros", "transport-io"] }
+rmcp = { version = "3.5", default-features = false, features = ["server", "macros", "transport-io"] }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
@@ -90,4 +90,4 @@ wiremock = "0.6.5"
 # Parses the issue-form YAML in tests/repo_hygiene.rs (maintained serde_yaml fork).
 serde_yaml_ng = "0.10.0"
 # Parses the generated Gemini command files in tests/skills_install.rs.
-toml = "0.9"
+toml = "1.1"
