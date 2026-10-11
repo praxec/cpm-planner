@@ -50,7 +50,6 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use execution_policy::classify::{FailureClass, RetryDecision};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 
 use crate::locks::{FileClaim, PlanState, add_file_claims, modes_conflict};
 
@@ -505,9 +504,7 @@ pub(crate) fn hash_graph(graph: &PlanGraph) -> String {
     // a future refactor breaks it.
     let serialised = serde_json::to_vec(&payload)
         .expect("INVARIANT: plan-graph hash payload is JSON-serialisable");
-    let mut hasher = Sha256::new();
-    hasher.update(&serialised);
-    format!("{:x}", hasher.finalize())
+    crate::skills::sha256_hex(&serialised)
 }
 
 /// Reject graphs that fail any structural invariant. Returns
