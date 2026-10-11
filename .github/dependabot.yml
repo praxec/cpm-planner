@@ -15,6 +15,10 @@ updates:
           interval: weekly
       target-branch: dev
       open-pull-requests-limit: 5
+      # dtolnay/rust-toolchain's tag is the Rust version CI installs; it is
+      # pinned to rust-toolchain.toml and bumped deliberately, never here.
+      ignore:
+          - dependency-name: dtolnay/rust-toolchain
       groups:
           actions-minor-patch:
               update-types: [minor, patch]
