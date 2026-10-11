@@ -1,0 +1,128 @@
+name: image
+# Builds and pushes the container image from a published GitHub release, then
+# publishes server.json to the MCP registry. release.yml calls it for every
+# tag; run it by hand (Actions → image → Run workflow) to rebuild the image
+# for an existing release.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag, for example v0.2.0
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, for example v0.2.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    name: container image
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+      - name: download the Linux release binaries and verify them
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          case "$TAG" in v[0-9]*) ;; *) echo "::error::tag must look like vX.Y.Z, got '$TAG'"; exit 1 ;; esac
+          mkdir -p release
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir release \
+            --pattern 'cpm-planner-x86_64-unknown-linux-gnu.tar.gz' \
+            --pattern 'cpm-planner-aarch64-unknown-linux-gnu.tar.gz' \
+            --pattern checksums.sha256
+          (cd release && sha256sum -c --ignore-missing --strict checksums.sha256)
+          for pair in amd64:x86_64 arm64:aarch64; do
+            arch=${pair%%:*}; triple=${pair#*:}
+            archive="release/cpm-planner-${triple}-unknown-linux-gnu.tar.gz"
+            # Each archive must hold exactly the one binary.
+            [ "$(tar -tzf "$archive")" = "cpm-planner" ] \
+              || { echo "::error::unexpected contents in $archive"; exit 1; }
+            mkdir -p "dist/linux-${arch}"
+            tar -xzf "$archive" -C "dist/linux-${arch}" cpm-planner
+          done
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/praxec/cpm-planner
+          tags: |
+            type=semver,pattern={{version}},value=${{ inputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.tag }}
+            type=raw,value=latest,enable=${{ !contains(inputs.tag, '-') }}
+      - name: build amd64 image for smoke test
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.release
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: cpm-planner:smoke
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: MCP protocol smoke on the container image (before push)
+        run: node scripts/mcp-smoke.mjs docker run -i --rm cpm-planner:smoke
+      - name: version check on the container image
+        shell: bash
+        run: |
+          set -euo pipefail
+          out=$(docker run --rm cpm-planner:smoke --version)
+          [ "$out" = "cpm-planner ${TAG#v}" ] || { echo "::error::image reports '$out', expected cpm-planner ${TAG#v}"; exit 1; }
+      - name: push multi-arch image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.release
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  registry:
+    name: MCP registry
+    needs: image
+    runs-on: ubuntu-22.04
+    # Publishes server.json to the MCP registry under io.github.praxec/* via GitHub
+    # OIDC. Non-blocking: the CLI is young, so a failure here must not red the release.
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+      - name: publish to MCP registry (best-effort)
+        continue-on-error: true
+        env:
+          # Pinned release + checksum (from the release's published asset digest).
+          MCP_PUBLISHER_VERSION: v1.8.1
+          MCP_PUBLISHER_SHA256: a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/mcp-publisher_linux_amd64.tar.gz" -o mcp-publisher.tgz
+          echo "${MCP_PUBLISHER_SHA256}  mcp-publisher.tgz" | sha256sum -c -
+          tar xzf mcp-publisher.tgz mcp-publisher
+          ./mcp-publisher login github-oidc && ./mcp-publisher publish

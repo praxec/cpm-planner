@@ -79,7 +79,11 @@ The workflow then runs these jobs:
    with `install.sh` and `install.ps1`, runs `npm pack` in `npm/` and attaches
    `matthew-cochran-cpm-X.Y.Z.tgz` with its digest in `npm-package.sha256`,
    and publishes the release.
-4. **container image**: builds the image, smoke-tests it, then pushes
+4. **container image** (`.github/workflows/image.yml`): downloads the two
+   Linux release archives, checks them against `checksums.sha256` and builds
+   the image from those binaries with `Dockerfile.release`, so nothing is
+   compiled under emulation. It smoke-tests the amd64 image and checks its
+   `--version`, then pushes
    `ghcr.io/praxec/cpm-planner` for linux/amd64 and linux/arm64 with the tags
    `X.Y.Z`, `X.Y` and `latest`.
 5. **npm publish**: waits for approval in the `npm` environment, then
@@ -209,6 +213,10 @@ a few minutes after publishing.
   # undo: cargo yank --version X.Y.Z --undo cpm-planner
   ```
 
+- **The image job failed or timed out.** The GitHub release and npm are not
+  affected. Rebuild the image for the existing release with
+  `gh workflow run image.yml --ref main -f tag=vX.Y.Z`, which also runs the
+  MCP registry step.
 - **A bad image was pushed.** Push the fixed release, which moves `latest` and
   `X.Y`. Delete the bad `X.Y.Z` tag from the GHCR package settings only if it is
   harmful to keep.
