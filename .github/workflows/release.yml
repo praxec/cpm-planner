@@ -232,7 +232,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest
       - name: build amd64 image for smoke test
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64
@@ -245,7 +245,7 @@ jobs:
       - name: MCP protocol smoke on the container image (before push)
         run: node scripts/mcp-smoke.mjs docker run -i --rm cpm-planner:smoke
       - name: push multi-arch image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
