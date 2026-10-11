@@ -287,7 +287,11 @@ fn hash_is_sha256_hex_of_file_bytes() {
     let f = r.plan_file("p", "v").unwrap();
     let w = r.write_graph(&f, &graph()).unwrap();
     let bytes = std::fs::read(d.join(&f.rel_path)).unwrap();
-    assert_eq!(w, format!("{:x}", Sha256::digest(&bytes)));
+    let expected: String = Sha256::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(w, expected);
 }
 
 #[test]
