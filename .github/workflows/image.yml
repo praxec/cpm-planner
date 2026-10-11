@@ -31,9 +31,10 @@ jobs:
     env:
       TAG: ${{ inputs.tag }}
     steps:
+      # Build files (Dockerfile.release, the smoke script) come from the commit
+      # running this workflow, so an older tag can be rebuilt with today's
+      # tooling; the binaries always come from the tag's GitHub release.
       - uses: actions/checkout@v7
-        with:
-          ref: ${{ inputs.tag }}
       - name: download the Linux release binaries and verify them
         shell: bash
         env:
