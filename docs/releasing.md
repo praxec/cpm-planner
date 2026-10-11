@@ -15,8 +15,9 @@ On a branch off `dev`, set the same version in the four files that carry it:
 - `Cargo.toml`: `[package] version`.
 - `Cargo.lock`: run `cargo check` (or `cargo update -p cpm-planner`) so the
   lock file records the new version.
-- `server.json`: the top-level `version`, `packages[].version`, and the tag of
-  the OCI identifier (`ghcr.io/praxec/cpm-planner:X.Y.Z`).
+- `server.json`: the top-level `version` and the tag of the OCI identifier
+  (`ghcr.io/praxec/cpm-planner:X.Y.Z`). The OCI package has no `version`
+  field: the MCP registry rejects one.
 - `npm/package.json`: `version` (the npm launcher downloads the release with
   this version, so it must match).
 
