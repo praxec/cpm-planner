@@ -1,7 +1,8 @@
 # cpm-planner documentation
 
-Start with the [project README](../README.md) for installation, client
-registration and the full MCP tool reference.
+Start with the [project README](../README.md) for installation and the full
+MCP tool reference, and the [agent install guide](AGENT-INSTALL.md) for MCP
+client registration and the agent skills.
 
 ## Guides
 
