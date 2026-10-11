@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The release workflow's npm publish passed the tarball as `npm-dist/<file>.tgz`, which npm read as a GitHub `owner/repo` shorthand, so 0.2.1 was not published to npm. Publishing now goes through `scripts/npm-publish.sh`, which always passes a path, checks the tarball holds the release version, and is dry-run in CI on every PR.
+
 ## [0.2.1] - 2026-10-11
 
 ### Fixed
