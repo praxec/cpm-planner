@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The release container image is built from the checksum-verified Linux release binaries (`Dockerfile.release`) instead of compiling inside Docker, where the arm64 build under QEMU emulation timed out and left 0.2.0 without an image. The image and MCP registry steps live in `.github/workflows/image.yml`, which `release.yml` calls and which can be run by hand for an existing release.
+- The release workflow publishes `@matthew-cochran/cpm` to npm with trusted publishing (GitHub OIDC, no npm token, provenance attached) after a maintainer approves the `npm` environment. It publishes the tarball attached to the release after verifying its digest. The README documents `npm install -g @matthew-cochran/cpm`.
+- Agent and MCP-client setup moved from the README to `docs/AGENT-INSTALL.md`; the README keeps a short pointer.
+
 ## [0.2.0] - 2026-10-11
 
 ### Added

@@ -3,8 +3,8 @@
 This is the maintainer runbook for cutting a cpm-planner release. A tag
 `vX.Y.Z` on `main` runs [`.github/workflows/release.yml`](../.github/workflows/release.yml),
 which builds and publishes the GitHub release, the container image and the MCP
-registry entry. npm and crates.io are published by hand afterwards; npm comes
-first, right after the GitHub release goes public.
+registry entry, and publishes the npm launcher after you approve it. crates.io
+is published by hand afterwards.
 
 Throughout, `X.Y.Z` is the new version and `vX.Y.Z` its tag.
 
@@ -78,28 +78,48 @@ The workflow then runs these jobs:
    `release-manifest.json` (it fails if the matrix is incomplete), uploads them
    with `install.sh` and `install.ps1`, runs `npm pack` in `npm/` and attaches
    `matthew-cochran-cpm-X.Y.Z.tgz` with its digest in `npm-package.sha256`,
-   and publishes the release. It does not run
-   `npm publish` and has no npm token.
-4. **container image**: builds the image, smoke-tests it, then pushes
+   and publishes the release.
+4. **container image** (`.github/workflows/image.yml`): downloads the two
+   Linux release archives, checks them against `checksums.sha256` and builds
+   the image from those binaries with `Dockerfile.release`, so nothing is
+   compiled under emulation. It smoke-tests the amd64 image and checks its
+   `--version`, then pushes
    `ghcr.io/praxec/cpm-planner` for linux/amd64 and linux/arm64 with the tags
    `X.Y.Z`, `X.Y` and `latest`.
-5. **MCP registry**: publishes `server.json` as `io.github.praxec/cpm-planner`
+5. **npm publish**: waits for approval in the `npm` environment, then
+   publishes that same tarball as `@matthew-cochran/cpm` (see step 5).
+6. **MCP registry**: publishes `server.json` as `io.github.praxec/cpm-planner`
    with a pinned, checksum-verified `mcp-publisher` over GitHub OIDC. This job
    is best-effort (`continue-on-error`), so a failure does not fail the
    release; check its log.
 
-## 5. Publish to npm (manual, right away)
+## 5. Approve the npm publish
 
-The workflow packs the npm launcher (`npm/`, package `@matthew-cochran/cpm`)
-and attaches the tarball to the release, but never publishes it. The launcher
-downloads the GitHub release whose version equals its own, so publish as soon
-as the release in step 4 is public: until then the documented
-`npx -y @matthew-cochran/cpm` commands fail with a 404 from the registry. The
-tarball checksum below is the only check that has to come first; the full
-verification follows in step 6.
+The `npm publish` job publishes the npm launcher (`npm/`, package
+`@matthew-cochran/cpm`) with npm trusted publishing: npm authenticates the job
+over GitHub OIDC, so the repository holds no npm token, and the package gets a
+provenance attestation. The job runs in the `npm` environment, which waits for
+a maintainer's approval. Approve it from the run page (**Review deployments**)
+as soon as the release is public. The launcher downloads the GitHub release
+whose version equals its own, and until the publish the documented
+`npx -y @matthew-cochran/cpm` and `npm install -g @matthew-cochran/cpm`
+commands fail with a 404 from the registry.
 
-Publish the tarball the workflow built, not a local `npm pack`, so npm gets
-exactly the file attached to the release. You need to be logged in to npm
+The job publishes the tarball attached to the release after checking it against
+`npm-package.sha256`, so npm gets exactly that file. A version that is already
+on npm is skipped, so re-running the job is safe. Pre-release versions
+(`X.Y.Z-rc.N`) go to the `next` dist-tag. The job ends by running
+`npx -y @matthew-cochran/cpm@X.Y.Z --version`.
+
+One-time setup: on npmjs.com, the package's
+**Settings → Trusted publishing** names GitHub Actions, the repository
+`praxec/cpm-planner`, the workflow `release.yml` and the environment `npm`; on
+GitHub, the `npm` environment has required reviewers and allows only `v*` tags.
+npm can only set up trusted publishing for a package that already exists, so
+the first version was published by hand.
+
+If the job cannot publish (for example, trusted publishing is misconfigured),
+publish the same tarball by hand. You need to be logged in to npm
 (`npm login`) as an owner of the `@matthew-cochran` scope, with 2FA:
 
 ```sh
@@ -193,6 +213,10 @@ a few minutes after publishing.
   # undo: cargo yank --version X.Y.Z --undo cpm-planner
   ```
 
+- **The image job failed or timed out.** The GitHub release and npm are not
+  affected. Rebuild the image for the existing release with
+  `gh workflow run image.yml --ref main -f tag=vX.Y.Z`, which also runs the
+  MCP registry step.
 - **A bad image was pushed.** Push the fixed release, which moves `latest` and
   `X.Y`. Delete the bad `X.Y.Z` tag from the GHCR package settings only if it is
   harmful to keep.

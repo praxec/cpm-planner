@@ -22,20 +22,13 @@ standalone tool with no dependency on praxec.
 - [Install](#install)
   - [Prebuilt binary (recommended)](#prebuilt-binary-recommended)
   - [Pin a version](#pin-a-version)
+  - [npm](#npm)
   - [From source](#from-source)
   - [Docker](#docker)
   - [Verify the install](#verify-the-install)
-  - [For AI agents](#for-ai-agents)
 - [Quickstart: plan as code](#quickstart-plan-as-code)
 - [Quickstart: earned value](#quickstart-earned-value)
-- [Register as an MCP server](#register-as-an-mcp-server)
-  - [Claude Code](#claude-code)
-  - [Claude Desktop](#claude-desktop)
-  - [Cursor](#cursor)
-  - [VS Code](#vs-code)
-  - [Codex CLI](#codex-cli)
-  - [Agent self-install](#agent-self-install)
-- [Agent skill](#agent-skill)
+- [Use with AI agents](#use-with-ai-agents)
 - [MCP tools](#mcp-tools)
   - [Plan-as-code workflow](#plan-as-code-workflow)
   - [Plan review (optional)](#plan-review-optional)
@@ -137,6 +130,22 @@ $env:PRAXEC_VERSION = '<version>'; irm https://github.com/praxec/cpm-planner/rel
 & ([scriptblock]::Create((irm https://github.com/praxec/cpm-planner/releases/latest/download/install.ps1))) -Version <version>
 ```
 
+### npm
+
+With Node 18 or later, install the `cpm-planner` command from npm:
+
+```sh
+npm install -g @matthew-cochran/cpm
+cpm-planner --version
+```
+
+The package is a small launcher. It downloads the release binary for your
+platform, verifies its checksum and caches it, during install or, where npm
+skips install scripts, on first run. The package
+version is the release version, so `npm install -g @matthew-cochran/cpm@0.2.0`
+pins one. To run it without installing, use `npx -y @matthew-cochran/cpm`.
+For details and environment variables, see [npm/README.md](npm/README.md).
+
 ### From source
 
 Build and install a tagged release with Cargo (Rust 1.99 or newer):
@@ -185,14 +194,6 @@ fails if `plan.submit`, `plan.status` or `plan.get` is missing:
 node scripts/mcp-smoke.mjs /absolute/path/to/cpm-planner
 ```
 
-### For AI agents
-
-[docs/AGENT-INSTALL.md](docs/AGENT-INSTALL.md) takes an agent (or you) from
-"which tool am I?" to a verified install: the program, MCP registration, the
-skills and the checks, for Claude Code, Codex, Cursor, Copilot, Gemini CLI and
-other tools. [llms.txt](llms.txt) indexes the docs for LLMs. The short version
-is [Agent self-install](#agent-self-install) below.
-
 ## Quickstart: plan as code
 
 Write a plan as `.cpm-planner/plans/<name>/<variant>.json` (a `PlanGraph`):
@@ -219,223 +220,21 @@ earns at completion):
 A ratio with a zero denominator is `null` and explained in `undefined`; alerts
 (`SPI_BELOW_0_9`, `CPI_BELOW_0_9`) compare the two latest stored readings.
 
-## Register as an MCP server
+## Use with AI agents
 
-cpm-planner speaks MCP over stdio. Register the `cpm-planner` command with your client. Every snippet below has an optional `env` block; drop it to use the defaults (see [Environment variables](#environment-variables)). Snippets use the bare command `cpm-planner`; if it is not on your `PATH` (or for any GUI client), use the absolute path the installer printed.
+Any MCP client can run cpm-planner over stdio: register the `cpm-planner`
+binary as the command, or, with Node 18 or later, `npx -y @matthew-cochran/cpm`.
+For a GUI client, use the absolute path the installer printed.
 
-Each client also has an **npx** form, which needs only Node 18 or later: the
-command is `npx` and the arguments are `-y` and `@matthew-cochran/cpm`. The
-launcher downloads the release binary on first run, verifies its checksum and
-caches it. The npx form works once `@matthew-cochran/cpm` is published to npm
-(from 0.2.0); until then use the installed binary. For per-client steps and
-troubleshooting, see [docs/AGENT-INSTALL.md](docs/AGENT-INSTALL.md).
+Install the agent skills (`/cpm-plan` and friends) with
+`cpm-planner skills install --target <tool> --user` (or `--project <dir>`), where
+`<tool>` is `claude`, `codex`, `cursor`, `copilot`, `gemini`, `all`, or
+`agents-md` (project only).
 
-To run the container image instead of a local binary, see [Docker](#docker). For praxec workflows, see [Praxec](#praxec).
-
-### Claude Code
-
-```sh
-claude mcp add cpm-planner --scope user -- cpm-planner
-# npx
-claude mcp add --transport stdio --scope user cpm-planner -- npx -y @matthew-cochran/cpm
-# with environment variables (put another option between --env and the name)
-claude mcp add --env CPM_PLANNER_DB=/path/to/cpm-planner.db --env CPM_MAX_TTL_SECS=28800 --transport stdio --scope user cpm-planner -- cpm-planner
-```
-
-`--scope user` registers it for all your projects; `--scope project` writes a shared `.mcp.json` in the project root; the default `local` scope is private to the current project. The `.mcp.json` equivalent:
-
-```json
-{
-  "mcpServers": {
-    "cpm-planner": {
-      "command": "cpm-planner",
-      "args": [],
-      "env": { "CPM_PLANNER_DB": "/path/to/cpm-planner.db" }
-    }
-  }
-}
-```
-
-### Claude Desktop
-
-GUI apps do not inherit your shell `PATH`: use the absolute path the installer printed as `command`.
-
-Edit `claude_desktop_config.json` (Settings, Developer, Edit Config) and restart Claude Desktop:
-
-- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
-- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
-
-```json
-{
-  "mcpServers": {
-    "cpm-planner": {
-      "command": "cpm-planner",
-      "args": [],
-      "env": { "CPM_PLANNER_DB": "/path/to/cpm-planner.db" }
-    }
-  }
-}
-```
-
-On Windows use an absolute command path with escaped backslashes, e.g. `C:\\Users\\you\\AppData\\Local\\Programs\\cpm-planner\\cpm-planner.exe`.
-
-npx form:
-
-```json
-{ "mcpServers": { "cpm-planner": { "command": "npx", "args": ["-y", "@matthew-cochran/cpm"] } } }
-```
-
-### Cursor
-
-Use the absolute path the installer printed as `command` (GUI apps do not inherit your shell `PATH`).
-
-`~/.cursor/mcp.json` (all projects) or `.cursor/mcp.json` (one project):
-
-```json
-{
-  "mcpServers": {
-    "cpm-planner": {
-      "type": "stdio",
-      "command": "cpm-planner",
-      "args": [],
-      "env": { "CPM_PLANNER_DB": "/path/to/cpm-planner.db" }
-    }
-  }
-}
-```
-
-npx form:
-
-```json
-{ "mcpServers": { "cpm-planner": { "type": "stdio", "command": "npx", "args": ["-y", "@matthew-cochran/cpm"] } } }
-```
-
-### VS Code
-
-Use the absolute path the installer printed as `command` (GUI apps do not inherit your shell `PATH`).
-
-`.vscode/mcp.json` in the workspace. Note the top-level key is `servers`, not `mcpServers`:
-
-```json
-{
-  "servers": {
-    "cpm-planner": {
-      "type": "stdio",
-      "command": "cpm-planner",
-      "args": [],
-      "env": { "CPM_PLANNER_DB": "/path/to/cpm-planner.db" }
-    }
-  }
-}
-```
-
-npx form, in `.vscode/mcp.json` or from the command line for your user profile:
-
-```json
-{ "servers": { "cpm-planner": { "type": "stdio", "command": "npx", "args": ["-y", "@matthew-cochran/cpm"] } } }
-```
-
-```sh
-code --add-mcp '{"name":"cpm-planner","command":"npx","args":["-y","@matthew-cochran/cpm"]}'
-```
-
-### Codex CLI
-
-```sh
-codex mcp add cpm-planner --env CPM_PLANNER_DB=/path/to/cpm-planner.db -- cpm-planner
-# npx
-codex mcp add cpm-planner -- npx -y @matthew-cochran/cpm
-```
-
-or in `~/.codex/config.toml`:
-
-```toml
-[mcp_servers.cpm-planner]
-command = "cpm-planner"
-args = []
-
-[mcp_servers.cpm-planner.env]
-CPM_PLANNER_DB = "/path/to/cpm-planner.db"
-```
-
-npx form: `command = "npx"` and `args = ["-y", "@matthew-cochran/cpm"]`.
-
-### Agent self-install
-
-An agent can install and verify cpm-planner itself:
-
-1. Detect the OS and CPU architecture (`uname -sm`, or `$env:PROCESSOR_ARCHITECTURE` on Windows).
-2. Run the installer for that OS (`install.sh` or `install.ps1`, see [Install](#install)). It verifies the SHA-256 and exits non-zero on any mismatch; stop if it does. Note the absolute path it prints (e.g. `/home/you/.local/bin/cpm-planner`).
-3. Register the server with your own client using the matching section above, with that absolute path as the command (for Claude Code: `claude mcp add cpm-planner --scope user -- /home/you/.local/bin/cpm-planner`). Restart or reload the client if it requires that.
-4. Confirm `plan.status` appears among your available tools. You can also check registration from the CLI: `claude mcp list` / `claude mcp get cpm-planner` (Claude Code) or `codex mcp list` (Codex).
-5. Call `plan.submit` with these arguments (a two-deliverable smoke plan), then read it back with `plan.get` using the returned plan id and confirm both deliverables round-trip:
-
-```json
-{"graph":{"deliverables":[{"id":"a","owned_files":["a.txt"],"prerequisites":[],"estimated_effort_hours":1},{"id":"b","owned_files":["b.txt"],"prerequisites":["a"],"estimated_effort_hours":1}]}}
-```
-
-To check a binary without any MCP client, use the smoke script from [Verify the install](#verify-the-install).
-
-## Agent skill
-
-Six agent skills ship inside the binary. `deliverable-cpm` teaches the plan-as-code method
-this server is built for: deliverables as artifacts, consumption edges, lint, sync,
-levelling, the fork/compare/select improvement loop, leased execution and earned value.
-Five short skills sit on top of it: `cpm-plan`, `cpm-improve`, `cpm-run`, `cpm-ev` and
-`cpm-revise`. The sources are in [`skills/`](skills/).
-
-Install them for your agent with `cpm-planner skills install`. Pick `--user` for all your
-projects, or `--project <dir>` for one repository:
-
-| Agent | Command | Writes | You type |
-|---|---|---|---|
-| Claude Code | `cpm-planner skills install --target claude --user` | `~/.claude/skills/` (project: `.claude/skills/`) | `/cpm-plan` |
-| Codex | `cpm-planner skills install --target codex --user` | `~/.agents/skills/` (project: `.agents/skills/`) | `$cpm-plan` |
-| Cursor | `cpm-planner skills install --target cursor --user` | `~/.cursor/skills/` (project: `.cursor/skills/`) | `/cpm-plan` |
-| GitHub Copilot (VS Code) | `cpm-planner skills install --target copilot --user` | `~/.copilot/skills/` (project: `.github/skills/`) | `/cpm-plan` |
-| Gemini CLI | `cpm-planner skills install --target gemini --user` | `~/.agents/skills/` plus one command per skill in `~/.gemini/commands/cpm-*.toml` | `/cpm-plan` (the command) |
-| Any AGENTS.md reader | `cpm-planner skills install --target agents-md --project .` | a managed block in `AGENTS.md`, plus `.agents/skills/` | depends on the tool |
-| Several of the above | `cpm-planner skills install --target all --project .` | `.claude/skills/` and `.agents/skills/` only | as above |
-
-The same goes for the other skills: `/cpm-improve`, `$cpm-run`, and so on. Agents also load
-a skill by themselves when your request matches its description. `--target all` writes only
-`.claude/skills/` (Claude Code) and `.agents/skills/` (Codex, Gemini and others). Cursor and
-Copilot read both of those directories and may list each skill twice; to avoid that, install
-for them with `--target cursor` or `--target copilot` alone. Uninstalling one target keeps a
-shared directory such as `.agents/skills/` until the last target that uses it is
-uninstalled. The `agents-md` block sits between `<!-- cpm-planner:begin -->` and
-`<!-- cpm-planner:end -->`; the rest of `AGENTS.md` is left byte for byte as it was.
-
-The installer:
-
-- prints one line per file (`created`, `updated`, `unchanged`, `modified, skipped`,
-  `foreign, skipped` or `removed`), then a summary;
-- records what it wrote in `.cpm-planner-skills.json` in each skills directory. A file you
-  edited, or one it did not write, is kept and reported as skipped; `--force` overwrites
-  it. A newer cpm-planner updates the files that still match what the older one wrote;
-- never writes MCP configuration. It prints the registration command for your agent
-  instead (see [Register as an MCP server](#register-as-an-mcp-server)). On Windows the
-  printed commands paste into both cmd and PowerShell: paths use `\` and a path with
-  spaces is in double quotes. In PowerShell, a path containing `$` or a backtick needs
-  single quotes instead, and for `code --add-mcp` use the printed JSON snippet (in
-  "MCP: Open User Configuration"), because PowerShell strips the `\"` escapes;
-- takes `--dry-run` to show what it would do without writing anything;
-- refuses (exit 1, nothing changed) a manifest with unsafe paths, a symlink that leads out of
-  the skills directory, or `AGENTS.md` markers that are nested, duplicated or unbalanced.
-
-```sh
-cpm-planner skills list                                   # what is installed, user and current project
-cpm-planner skills uninstall --target claude --user       # removes only files that still match the manifest
-```
-
-Restart the agent, or start a new session, so it loads the skills. Per-tool paths and
-sources are in [docs/agents/tool-matrix.md](docs/agents/tool-matrix.md); step-by-step setup
-per tool is in [docs/AGENT-INSTALL.md](docs/AGENT-INSTALL.md).
-
-To install by hand instead, download the source archive of your release,
-`https://github.com/praxec/cpm-planner/archive/refs/tags/v<version>.tar.gz` (here `<version>`
-is the number without the `v`, such as `0.2.0`), and copy the directories under
-`cpm-planner-<version>/skills/` into the agent's skills directory from the table.
+[docs/AGENT-INSTALL.md](docs/AGENT-INSTALL.md) has the per-client steps (Claude
+Code, Claude Desktop, Codex, Cursor, VS Code, Gemini CLI and others), `env`
+blocks, verification and troubleshooting. [llms.txt](llms.txt) indexes the docs
+for LLMs.
 
 ## MCP tools
 

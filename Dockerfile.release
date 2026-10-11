@@ -1,0 +1,19 @@
+# Release image for cpm-planner (MCP server over stdio). It packages the
+# release binaries the release workflow already built, smoke-tested and listed
+# in checksums.sha256, so the image runs exactly the released binary and no
+# compilation happens under emulation. The image workflow
+# (.github/workflows/image.yml) verifies the archives and unpacks them to
+# dist/linux-<arch>/cpm-planner before building. To build from source, use
+# the Dockerfile instead.
+FROM debian:trixie-slim
+ARG TARGETARCH
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/* \
+    && useradd -m -u 10001 app \
+    && mkdir -p /data && chown app:app /data
+COPY --chmod=0755 dist/linux-${TARGETARCH}/cpm-planner /usr/local/bin/cpm-planner
+USER app
+ENV CPM_PLANNER_DB=/data/cpm-planner.db
+VOLUME ["/data"]
+LABEL io.modelcontextprotocol.server.name="io.github.praxec/cpm-planner"
+# The gateway spawns this container with `docker run -i` and speaks MCP over stdio.
+ENTRYPOINT ["cpm-planner"]
