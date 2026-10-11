@@ -222,6 +222,11 @@ jobs:
       PKG: "@matthew-cochran/cpm"
       VERSION: ${{ needs.create-release.outputs.version }}
     steps:
+      # The checkout supplies scripts/npm-publish.sh, which skips a version
+      # already on npm and sends pre-releases to the `next` dist-tag.
+      - uses: actions/checkout@v7
+        with:
+          path: src
       - uses: actions/setup-node@v7
         with:
           node-version: 22
@@ -243,15 +248,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ "$(npm view "${PKG}@${VERSION}" version 2>/dev/null || true)" = "$VERSION" ]; then
-            echo "${PKG}@${VERSION} is already on npm; nothing to publish."
-            exit 0
-          fi
-          # Pre-releases (X.Y.Z-rc.N) go to the `next` dist-tag, never `latest`.
-          dist_tag=latest
-          case "$VERSION" in *-*) dist_tag=next ;; esac
-          npm publish "npm-dist/matthew-cochran-cpm-${VERSION}.tgz" \
-            --access public --provenance --tag "$dist_tag"
+          bash src/scripts/npm-publish.sh "npm-dist/matthew-cochran-cpm-${VERSION}.tgz" "$VERSION"
       - name: verify the published launcher runs the release binary
         shell: bash
         run: |
