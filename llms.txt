@@ -8,8 +8,7 @@ Install with `curl -fsSL https://github.com/praxec/cpm-planner/releases/latest/d
 
 - [Agent install guide](https://github.com/praxec/cpm-planner/blob/main/docs/AGENT-INSTALL.md): which tool you are, then numbered install, MCP registration, skills and verify steps, plus uninstall and troubleshooting
 - [README: Install](https://github.com/praxec/cpm-planner/blob/main/README.md#install): installers, pinned versions, source, Docker
-- [README: Register as an MCP server](https://github.com/praxec/cpm-planner/blob/main/README.md#register-as-an-mcp-server): binary and npx snippets per client
-- [README: Agent skill](https://github.com/praxec/cpm-planner/blob/main/README.md#agent-skill): `skills install`, `list` and `uninstall`
+- [README: Use with AI agents](https://github.com/praxec/cpm-planner/blob/main/README.md#use-with-ai-agents): the short form of MCP registration and `skills install`
 - [Agent tool matrix](https://github.com/praxec/cpm-planner/blob/main/docs/agents/tool-matrix.md): per-tool skill paths, invocation syntax and MCP config, with vendor sources
 
 ## Use

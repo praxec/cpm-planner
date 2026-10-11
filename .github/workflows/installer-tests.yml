@@ -12,7 +12,7 @@ jobs:
   installer:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
           node-version: 24
@@ -20,7 +20,7 @@ jobs:
   windows-target:
     runs-on: windows-11-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - shell: pwsh
         run: |
           $target = ./scripts/install.ps1 -PrintTarget
@@ -28,7 +28,7 @@ jobs:
   windows-x64-target:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - shell: pwsh
         env:
           PRAXEC_ARCH: x86_64
@@ -50,7 +50,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
       - name: Build

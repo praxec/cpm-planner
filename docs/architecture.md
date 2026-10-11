@@ -135,7 +135,7 @@ them a graph, a state and a time.
 - `npm/` (not part of the crate): the `@matthew-cochran/cpm` npx launcher. It
   downloads the release archive for the platform, verifies its SHA-256 against
   `checksums.sha256`, extracts it into a per-user cache and runs the binary
-  over stdio. It is published to npm separately (see
+  over stdio. The release workflow publishes it to npm (see
   [releasing.md](releasing.md)).
 
 ## Request flow

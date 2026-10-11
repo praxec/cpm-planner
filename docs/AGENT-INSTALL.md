@@ -14,8 +14,7 @@ Per-tool skill paths, invocations and MCP snippets come from the
 [agent tool matrix](agents/tool-matrix.md); other commands come from each
 tool's docs, cited where they are used.
 The `skills` subcommand and the `npx` launcher need **cpm-planner 0.2.0 or
-later**. The `npx` commands work once `@matthew-cochran/cpm` is published to
-npm (from 0.2.0); until then use the installed binary.
+later**.
 
 ## Contents
 
@@ -28,6 +27,8 @@ npm (from 0.2.0); until then use the installed binary.
 - [Gemini CLI](#gemini-cli)
 - [Other tools: Zed, Windsurf, Roo, Amp and AGENTS.md readers](#other-tools-zed-windsurf-roo-amp-and-agentsmd-readers)
 - [Claude Desktop](#claude-desktop)
+- [Environment variables in the MCP config](#environment-variables-in-the-mcp-config)
+- [About the skills](#about-the-skills)
 - [Verify](#verify)
 - [Uninstall](#uninstall)
 - [Troubleshooting](#troubleshooting)
@@ -65,9 +66,11 @@ only their own target.
 
 Pick one of the two forms. Every section below shows both.
 
-**A. The binary (recommended).** The installers check the SHA-256 against the
-release's `checksums.sha256`, exit non-zero on a mismatch and install nothing.
-If the installer fails, stop.
+**A. The binary (recommended).** The installers resolve the OS and CPU
+themselves and download the matching archive; to check them by hand, run
+`uname -sm` (or `$env:PROCESSOR_ARCHITECTURE` on Windows). They check the
+SHA-256 against the release's `checksums.sha256`, exit non-zero on a mismatch
+and install nothing. If the installer fails, stop.
 
 ```sh
 # Linux / macOS  ->  ~/.local/bin/cpm-planner
@@ -94,7 +97,8 @@ The default install directories are those of `scripts/install.sh` and
 clients need it (see [PATH for GUI clients](#path-for-gui-clients)). If the
 directory is not on your `PATH`, the installer prints the line to add, or pass
 `--add-to-path` (`-AddToPath` on Windows). More options are in the
-[README install section](../README.md#install).
+[README install section](../README.md#install). To run the container image as
+the MCP server instead, see the [README's Docker section](../README.md#docker).
 
 **B. npx, nothing to install.** With Node 18 or later, `npx -y @matthew-cochran/cpm`
 downloads the release binary on first run, verifies it and caches it. It passes
@@ -129,6 +133,10 @@ into the npx cache. Register the `npx` form instead.
    # npx
    claude mcp add --transport stdio --scope project cpm-planner -- npx -y @matthew-cochran/cpm
    ```
+
+   Without `--scope`, the default `local` scope is private to the current
+   project. If `cpm-planner` is not on your `PATH`, use the absolute path the
+   installer printed (e.g. `/home/you/.local/bin/cpm-planner`) as the command.
 
    The resulting `.mcp.json` (npx form):
 
@@ -335,8 +343,7 @@ To install for Claude Code and every `.agents/skills/` reader in one go, use
 Claude Desktop takes the MCP server but has no skills target.
 
 1. Install the binary ([step 1](#step-1-install-the-program), form A).
-2. Edit `claude_desktop_config.json` (Settings, Developer, Edit Config; paths
-   from the [README's Claude Desktop section](../README.md#claude-desktop)):
+2. Edit `claude_desktop_config.json` (Settings, Developer, Edit Config):
    - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
    - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
 
@@ -348,7 +355,90 @@ Claude Desktop takes the MCP server but has no skills target.
    { "mcpServers": { "cpm-planner": { "command": "npx", "args": ["-y", "@matthew-cochran/cpm"] } } }
    ```
 
+   On Windows use an absolute command path with escaped backslashes, e.g. `C:\\Users\\you\\AppData\\Local\\Programs\\cpm-planner\\cpm-planner.exe`.
 3. Restart Claude Desktop, then check that `plan.status` is among the tools.
+
+## Environment variables in the MCP config
+
+Every registration can carry an optional `env` block; leave it out to use the
+defaults. The variables are listed in the
+[README's environment variables section](../README.md#environment-variables).
+
+Claude Code (put another option, such as `--transport stdio`, between `--env`
+and the server name, or `--env` swallows the name):
+
+```sh
+claude mcp add --env CPM_PLANNER_DB=/path/to/cpm-planner.db --env CPM_MAX_TTL_SECS=28800 --transport stdio --scope user cpm-planner -- cpm-planner
+```
+
+Codex:
+
+```sh
+codex mcp add cpm-planner --env CPM_PLANNER_DB=/path/to/cpm-planner.db -- cpm-planner
+```
+
+or in `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.cpm-planner]
+command = "cpm-planner"
+args = []
+
+[mcp_servers.cpm-planner.env]
+CPM_PLANNER_DB = "/path/to/cpm-planner.db"
+```
+
+In a JSON config (`.mcp.json`, Claude Desktop, Cursor, VS Code, Gemini CLI),
+`env` sits next to `command`. For example, in Cursor's `mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "cpm-planner": {
+      "type": "stdio",
+      "command": "cpm-planner",
+      "args": [],
+      "env": { "CPM_PLANNER_DB": "/path/to/cpm-planner.db" }
+    }
+  }
+}
+```
+
+VS Code uses the same entry under its top-level `servers` key.
+
+## About the skills
+
+Six agent skills ship inside the binary. `deliverable-cpm` teaches the plan-as-code method
+this server is built for: deliverables as artifacts, consumption edges, lint, sync,
+levelling, the fork/compare/select improvement loop, leased execution and earned value.
+Five short skills sit on top of it: `cpm-plan`, `cpm-improve`, `cpm-run`, `cpm-ev` and
+`cpm-revise`. The sources are in [`skills/`](../skills/).
+
+`cpm-planner skills install`:
+
+- prints one line per file (`created`, `updated`, `unchanged`, `modified, skipped`,
+  `foreign, skipped` or `removed`), then a summary;
+- records what it wrote in `.cpm-planner-skills.json` in each skills directory. A file you
+  edited, or one it did not write, is kept and reported as skipped; `--force` overwrites
+  it. A newer cpm-planner updates the files that still match what the older one wrote;
+- never writes MCP configuration. It prints the registration command for your agent
+  instead (see your tool's section above). On Windows, see
+  [Windows quoting](#windows-quoting) for pasting the printed commands;
+- takes `--dry-run` to show what it would do without writing anything;
+- refuses (exit 1, nothing changed) a manifest with unsafe paths, a symlink that leads out of
+  the skills directory, or `AGENTS.md` markers that are nested, duplicated or unbalanced.
+
+```sh
+cpm-planner skills list                                   # what is installed, user and current project
+cpm-planner skills uninstall --target claude --user       # removes only files that still match the manifest
+```
+
+Restart the agent, or start a new session, so it loads the skills.
+
+To install by hand instead, download the source archive of your release,
+`https://github.com/praxec/cpm-planner/archive/refs/tags/v<version>.tar.gz` (here `<version>`
+is the number without the `v`, such as `0.2.0`), and copy the directories under
+`cpm-planner-<version>/skills/` into the agent's skills directory from your tool's section.
 
 ## Verify
 
@@ -433,8 +523,7 @@ the line it printed.
 - If a client cannot start `npx` on Windows, register the binary form with the
   absolute `.exe` path instead: the installer's default is
   `%LOCALAPPDATA%\Programs\cpm-planner\cpm-planner.exe` (`scripts/install.ps1`),
-  and the [README's Claude Desktop section](../README.md#claude-desktop) shows
-  it in JSON.
+  and the [Claude Desktop section](#claude-desktop) shows it in JSON.
 
 ### A stale npm cache
 
