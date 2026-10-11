@@ -117,3 +117,17 @@ jobs:
             - name: npm pack (dry run)
               working-directory: npm
               run: npm pack --dry-run --ignore-scripts
+            # Runs the release publish script against a freshly packed tarball
+            # under a throwaway pre-release version, as release.yml calls it.
+            - name: npm publish script (dry run)
+              if: runner.os == 'Linux'
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  work=$(mktemp -d)
+                  cp -R npm "$work/npm"
+                  version="0.0.0-ci.${GITHUB_RUN_ID}"
+                  (cd "$work/npm" && npm pkg set version="$version" && npm pack --ignore-scripts --pack-destination ..)
+                  mkdir -p npm-dist
+                  mv "$work/matthew-cochran-cpm-${version}.tgz" npm-dist/
+                  bash scripts/npm-publish.sh "npm-dist/matthew-cochran-cpm-${version}.tgz" "$version" --dry-run
