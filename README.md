@@ -139,8 +139,9 @@ npm install -g @matthew-cochran/cpm
 cpm-planner --version
 ```
 
-The package is a small launcher. During install it downloads the release
-binary for your platform, verifies its checksum and caches it. The package
+The package is a small launcher. It downloads the release binary for your
+platform, verifies its checksum and caches it, during install or, where npm
+skips install scripts, on first run. The package
 version is the release version, so `npm install -g @matthew-cochran/cpm@0.2.0`
 pins one. To run it without installing, use `npx -y @matthew-cochran/cpm`.
 For details and environment variables, see [npm/README.md](npm/README.md).
