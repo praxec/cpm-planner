@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Fail when any version field in server.json differs from Cargo.toml's package version.
-# Usage: scripts/check-version-sync.sh [cargo_toml] [server_json]
+# Fail when any version field in server.json, or the npm launcher's
+# npm/package.json version, differs from Cargo.toml's package version.
+# Usage: scripts/check-version-sync.sh [cargo_toml] [server_json] [npm_package_json]
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cargo_toml="${1:-$root/Cargo.toml}"
 server_json="${2:-$root/server.json}"
+npm_package_json="${3:-$root/npm/package.json}"
 
 # First `version = "..."` inside the [package] table.
 cargo_version="$(awk '
@@ -27,6 +29,12 @@ for v in $versions $tags; do
     status=1
   fi
 done
+
+npm_version="$(jq -r '.version // "<missing>"' "$npm_package_json")"
+if [ "$npm_version" != "$cargo_version" ]; then
+  echo "npm/package.json version $npm_version != Cargo.toml version $cargo_version" >&2
+  status=1
+fi
 
 [ "$status" -eq 0 ] && echo "version sync ok: $cargo_version"
 exit "$status"

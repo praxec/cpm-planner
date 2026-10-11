@@ -1,15 +1,46 @@
 [package]
 name = "cpm-planner"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.99"
 license = "Apache-2.0"
 repository = "https://github.com/praxec/cpm-planner"
-description = "Critical Path Method (CPM) planner exposed as an MCP server: schedules a task graph (earliest/latest start, slack, critical path, bottlenecks) and coordinates lock-aware parallel execution over MCP."
+homepage = "https://github.com/praxec/cpm-planner"
+documentation = "https://docs.rs/cpm-planner"
+description = "Critical Path Method planner as an MCP server: schedules task graphs (slack, critical path, resource levelling, Monte Carlo), leases lock-aware parallel cohorts to agents, versions plan-as-code variants, and tracks earned value."
 authors = ["Matthew Cochran <matthew@cochranweb.com>"]
 readme = "README.md"
-keywords = ["mcp", "cpm", "critical-path", "planner", "scheduling"]
+keywords = ["mcp", "critical-path", "scheduling", "earned-value", "agents"]
 categories = ["development-tools", "command-line-utilities"]
+# Repository tooling, CI, design history and container files stay out of the
+# crate. tests/repo_hygiene.rs checks the git checkout (line endings, issue
+# forms, doc links), so it is not packaged either.
+exclude = [
+    "/.agents/",
+    "/.claude/",
+    "/.cpm-planner/",
+    "/.delivery/",
+    "/.superpowers/",
+    "/.github/",
+    "/docs/superpowers/",
+    "/scripts/",
+    "/npm/",
+    "/tests/repo_hygiene.rs",
+    "/Dockerfile",
+    "/.dockerignore",
+    "/.editorconfig",
+    "/.gitattributes",
+    "/.gitignore",
+    "/.ignore",
+    "/delivery.config.json",
+    "/deny.toml",
+    "/rust-toolchain.toml",
+    "/server.json",
+]
+
+[package.metadata.docs.rs]
+# No cargo features and no `docsrs` cfg: build the docs for one target only.
+targets = ["x86_64-unknown-linux-gnu"]
 
 [lib]
 name = "cpm_planner"
@@ -26,7 +57,7 @@ async-trait = "0.1"
 # deliverable-lease circuit breaker classifies + decides through this crate's
 # FailureClass / RetryDecision types so cpm-planner speaks the same reliability
 # language as the rest of praxec (rather than hand-rolling its own).
-execution-policy = { git = "https://github.com/matt-cochran/execution-policy" }
+execution-policy = "0.0.6"
 chrono = { version = "0.4", features = ["serde"] }
 rand = { version = "0.10.3", default-features = false }
 rand_chacha = { version = "0.10.0", default-features = false }
@@ -56,3 +87,7 @@ libc = "0.2.190"
 [dev-dependencies]
 tempfile = "3.27.0"
 wiremock = "0.6.5"
+# Parses the issue-form YAML in tests/repo_hygiene.rs (maintained serde_yaml fork).
+serde_yaml_ng = "0.10.0"
+# Parses the generated Gemini command files in tests/skills_install.rs.
+toml = "0.9"

@@ -58,8 +58,49 @@ use crate::task::CriticalPathResult;
 /// (useful for tests / ephemeral runs).
 pub const DB_PATH_ENV: &str = "CPM_PLANNER_DB";
 
-/// Default on-disk location relative to `$HOME`.
-const DEFAULT_DB_RELATIVE: &str = ".local/share/praxec/cpm-planner.db";
+/// Default on-disk location relative to the home directory (see
+/// [`home_dir_from`]), as path components so the separator is native.
+const DEFAULT_DB_RELATIVE: [&str; 4] = [".local", "share", "praxec", "cpm-planner.db"];
+
+/// Resolve the user's home directory through `lookup` (an environment
+/// reader): a non-empty `HOME`, else a non-empty `USERPROFILE` (the
+/// Windows convention, where `HOME` is normally unset). `None` if neither
+/// is set.
+///
+/// Taking the lookup as a closure keeps tests free of process-global
+/// environment mutation, which would race under the parallel test runner.
+pub(crate) fn home_dir_from(
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    ["HOME", "USERPROFILE"]
+        .into_iter()
+        .find_map(|name| lookup(name).filter(|v| !v.is_empty()))
+        .map(PathBuf::from)
+}
+
+/// [`home_dir_from`] over the real process environment.
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    home_dir_from(|name| std::env::var_os(name))
+}
+
+/// [`SqlitePlanStore::default_db_path`] over an injectable environment
+/// lookup (see [`home_dir_from`]).
+fn default_db_path_from(
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> anyhow::Result<PathBuf> {
+    if let Some(overridden) = lookup(DB_PATH_ENV) {
+        return Ok(PathBuf::from(overridden));
+    }
+    let home = home_dir_from(&lookup).ok_or_else(|| {
+        anyhow!(
+            "neither HOME nor USERPROFILE is set and {DB_PATH_ENV} was not provided; \
+             cannot locate database"
+        )
+    })?;
+    Ok(DEFAULT_DB_RELATIVE
+        .iter()
+        .fold(home, |path, part| path.join(part)))
+}
 
 /// Map any backend failure into the planner's wire-stable error variant.
 pub(crate) fn backend(err: impl Into<anyhow::Error>) -> PlannerError {
@@ -114,15 +155,11 @@ impl SqlitePlanStore {
     }
 
     /// Resolve the database path: `$CPM_PLANNER_DB` if set, else
-    /// `~/.local/share/praxec/cpm-planner.db`.
+    /// `~/.local/share/praxec/cpm-planner.db` on every OS, where `~` is
+    /// `HOME`, falling back to `USERPROFILE` (so on Windows it is
+    /// `%USERPROFILE%\.local\share\praxec\cpm-planner.db`).
     pub fn default_db_path() -> anyhow::Result<PathBuf> {
-        if let Some(overridden) = std::env::var_os(DB_PATH_ENV) {
-            return Ok(PathBuf::from(overridden));
-        }
-        let home = std::env::var_os("HOME").ok_or_else(|| {
-            anyhow!("HOME is not set and {DB_PATH_ENV} was not provided; cannot locate database")
-        })?;
-        Ok(PathBuf::from(home).join(DEFAULT_DB_RELATIVE))
+        default_db_path_from(|name| std::env::var_os(name))
     }
 
     fn init(mut conn: Connection) -> anyhow::Result<Self> {
@@ -1016,6 +1053,52 @@ mod tests {
     use super::*;
     use crate::plan::Deliverable;
     use crate::task::CriticalPathResult;
+
+    /// An environment lookup over a fixed set of variables, so path tests
+    /// never touch (or race on) the real process environment.
+    fn env_of(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        let vars: Vec<(String, String)> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |name| vars.iter().find(|(k, _)| k == name).map(|(_, v)| v.into())
+    }
+
+    fn expected_db_under(home: &str) -> PathBuf {
+        PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join("praxec")
+            .join("cpm-planner.db")
+    }
+
+    #[test]
+    fn default_db_path_prefers_home() {
+        let path = default_db_path_from(env_of(&[("HOME", "/h"), ("USERPROFILE", "/u")])).unwrap();
+        assert_eq!(path, expected_db_under("/h"));
+    }
+
+    #[test]
+    fn default_db_path_falls_back_to_userprofile_without_home() {
+        let path = default_db_path_from(env_of(&[("USERPROFILE", "/u")])).unwrap();
+        assert_eq!(path, expected_db_under("/u"));
+        // An empty HOME counts as unset.
+        let path = default_db_path_from(env_of(&[("HOME", ""), ("USERPROFILE", "/u")])).unwrap();
+        assert_eq!(path, expected_db_under("/u"));
+    }
+
+    #[test]
+    fn default_db_path_errors_without_home_or_userprofile() {
+        let err = default_db_path_from(env_of(&[])).unwrap_err().to_string();
+        assert!(err.contains("HOME") && err.contains("USERPROFILE"), "{err}");
+        assert!(err.contains(DB_PATH_ENV), "{err}");
+    }
+
+    #[test]
+    fn default_db_path_env_override_wins() {
+        let path = default_db_path_from(env_of(&[(DB_PATH_ENV, "/x.db")])).unwrap();
+        assert_eq!(path, PathBuf::from("/x.db"));
+    }
 
     fn plan_state_with_one_ready() -> PlanState {
         let graph = PlanGraph {

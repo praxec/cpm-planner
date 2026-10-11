@@ -1,0 +1,33 @@
+# cpm-planner
+
+> cpm-planner is a Critical Path Method (CPM) planner for agent work, exposed as an MCP server over stdio. It computes the schedule of a task graph (earliest and latest start and finish, slack, critical path), leases lock-aware cohorts of ready deliverables with disjoint file sets, keeps plans as code with forkable variants, and tracks earned value. It ships agent skills (`/cpm-plan`, `/cpm-improve`, `/cpm-run`, `/cpm-ev`, `/cpm-revise`) that `cpm-planner skills install` writes for Claude Code, Codex, Cursor, GitHub Copilot, Gemini CLI and AGENTS.md readers.
+
+Install with `curl -fsSL https://github.com/praxec/cpm-planner/releases/latest/download/install.sh | sh` (Linux, macOS), `irm https://github.com/praxec/cpm-planner/releases/latest/download/install.ps1 | iex` (Windows), or run `npx -y @matthew-cochran/cpm` (from 0.2.0). Then register the MCP server and run `cpm-planner skills install --target <claude|codex|cursor|copilot|gemini> --user`. The links below point at the `main` branch, which holds the latest release.
+
+## Install
+
+- [Agent install guide](https://github.com/praxec/cpm-planner/blob/main/docs/AGENT-INSTALL.md): which tool you are, then numbered install, MCP registration, skills and verify steps, plus uninstall and troubleshooting
+- [README: Install](https://github.com/praxec/cpm-planner/blob/main/README.md#install): installers, pinned versions, source, Docker
+- [README: Register as an MCP server](https://github.com/praxec/cpm-planner/blob/main/README.md#register-as-an-mcp-server): binary and npx snippets per client
+- [README: Agent skill](https://github.com/praxec/cpm-planner/blob/main/README.md#agent-skill): `skills install`, `list` and `uninstall`
+- [Agent tool matrix](https://github.com/praxec/cpm-planner/blob/main/docs/agents/tool-matrix.md): per-tool skill paths, invocation syntax and MCP config, with vendor sources
+
+## Use
+
+- [README: MCP tools](https://github.com/praxec/cpm-planner/blob/main/README.md#mcp-tools): every `plan.*` tool and its arguments
+- [README: Quickstart: plan as code](https://github.com/praxec/cpm-planner/blob/main/README.md#quickstart-plan-as-code): lint, sync and status of a plan file
+- [deliverable-cpm skill](https://github.com/praxec/cpm-planner/blob/main/skills/deliverable-cpm/SKILL.md): the plan-as-code method the server is built for
+- [cpm-plan skill](https://github.com/praxec/cpm-planner/blob/main/skills/cpm-plan/SKILL.md): build a CPM plan from a goal
+- [README: Environment variables](https://github.com/praxec/cpm-planner/blob/main/README.md#environment-variables): database path, project root, lease TTL, review model
+
+## Project
+
+- [Architecture](https://github.com/praxec/cpm-planner/blob/main/docs/architecture.md): modules, request flow, store schema and concurrency
+- [CHANGELOG](https://github.com/praxec/cpm-planner/blob/main/CHANGELOG.md): release history
+- [AGENTS.md](https://github.com/praxec/cpm-planner/blob/main/AGENTS.md): instructions for coding agents contributing to this repository
+
+## Optional
+
+- [Other skills](https://github.com/praxec/cpm-planner/tree/main/skills): `cpm-improve`, `cpm-run`, `cpm-ev`, `cpm-revise`
+- [CONTRIBUTING](https://github.com/praxec/cpm-planner/blob/main/CONTRIBUTING.md): toolchain, gates and branch model
+- [npm launcher](https://github.com/praxec/cpm-planner/blob/main/npm/README.md): how `npx -y @matthew-cochran/cpm` downloads, verifies and caches the binary
