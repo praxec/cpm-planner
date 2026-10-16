@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-16
+
+### Added
+
+- Execution always has an earned-value baseline. `CPM_BASELINE_MODE` (`auto`, the default, or `refuse`) is read at server start. In `auto`, the first execution-starting call on a plan with no baseline takes one from the current graph, inside the same store write, with reason `first_execution` and the usual `plan.ev.baselined` audit event; the call's response carries `baseline_taken: {baseline_number, as_of, reason}`. The execution-starting calls are `plan.acquire_cohort` that leases at least one deliverable, `plan.mark_status` to in-progress or complete (locked or lockless), and `plan.select` of a variant that already has progress. In `refuse`, those calls fail with `BASELINE_REQUIRED` and change nothing. `plan.status` now reports `baseline: {baseline_number, as_of} | null`, and `plan.revise`/`plan.select` never replace an existing baseline (#71).
+- `plan.lint` on a stored `plan_id` adds a `NO_BASELINE` warning when the plan is executable and has recorded progress but no earned-value baseline, naming it `name/variant` when it has one; linting a graph or file never adds it (#71).
+- `plan.baseline` accepts `backfill_from` (RFC 3339): it sets the baseline's `start` retroactively, marks the baseline `backfilled: true` (reported by `plan.ev` and in the `plan.ev.baselined` audit event), and lets a plan that already has progress take its first baseline. It must not be in the future or before the plan's creation time (`INVALID_VALUE`). The new `baselines.backfilled` column is added by schema migration v5; baselines written before v5 read as not backfilled (#71).
+
+### Changed
+
+- `plan.status` lists the `ready` set by ascending total float (smallest float first, then smallest latest start, then id), so the most critical ready work leads. `plan.acquire_cohort` is unchanged: it still leases by longest remaining tail, so the `ready` order no longer mirrors cohort order (#15).
+
+### Tests
+
+- Regression tests pin the CPM critical path to a prerequisite chain for a sibling fan-out and for two roots feeding one node, and check that the critical-path duration is the longest path rather than a sum of branches (#18).
+
+### Security
+
+- `rustls` 0.23.46 (RUSTSEC-2026-0346 to 0349) and a `cargo update` of 20 crates; `cargo deny` advisories and `cargo audit` are clean.
+
 ## [0.2.2] - 2026-10-11
 
 ### Fixed
@@ -208,7 +228,8 @@ approximations. For the method, caveats and known limitations, see
 - Six-tool MCP surface: `plan.submit`, `plan.acquire_cohort`, `plan.heartbeat`,
   `plan.mark_status`, `plan.status`, and `plan.force_release`.
 
-[Unreleased]: https://github.com/praxec/cpm-planner/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/praxec/cpm-planner/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/praxec/cpm-planner/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/praxec/cpm-planner/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/praxec/cpm-planner/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/praxec/cpm-planner/compare/v0.1.0...v0.2.0

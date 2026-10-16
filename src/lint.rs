@@ -455,3 +455,17 @@ pub fn lint(graph: &PlanGraph) -> LintReport {
         findings: out,
     }
 }
+
+/// Append `finding` to `report`, restoring the deterministic finding order
+/// and recomputing `clean` ("clean means no error or warning finding").
+/// Callers outside `lint` (e.g. `plan.lint` on a stored plan) use this to
+/// add a finding without duplicating the ordering rule.
+pub fn push_finding(report: &mut LintReport, finding: LintFinding) {
+    report.findings.push(finding);
+    report.findings.sort_by(|a, b| {
+        (a.severity, &a.code, &a.ids, &a.path, &a.message)
+            .cmp(&(b.severity, &b.code, &b.ids, &b.path, &b.message))
+    });
+    report.findings.dedup();
+    report.clean = report.findings.iter().all(|f| f.severity == Severity::Info);
+}

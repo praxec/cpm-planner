@@ -34,13 +34,14 @@ use serde_json::json;
 use super::BasicCpmPlanner;
 use crate::audit::AuditEvent;
 use crate::earned_value::{
-    BaselineOutcome, BaselineRequest, EarningRule, EvReport, EvSummary, MAX_BASELINE_REASON_CHARS,
-    SNAPSHOT_EXPORT_LIMIT, SnapshotFormat, SnapshotOutcome, SnapshotRequest, SnapshotSummary,
-    build_baseline, compute_ev, render_snapshots_markdown, trend_alerts,
+    BaselineMode, BaselineOutcome, BaselineRequest, BaselineTaken, EarningRule, EvReport,
+    EvSummary, FIRST_EXECUTION_REASON, MAX_BASELINE_REASON_CHARS, SNAPSHOT_EXPORT_LIMIT,
+    SnapshotFormat, SnapshotOutcome, SnapshotRequest, SnapshotSummary, build_baseline, compute_ev,
+    render_snapshots_markdown, trend_alerts,
 };
 use crate::ev_store;
 use crate::locks::PlanState;
-use crate::plan::{PlanGraph, PlanId, PlannerError};
+use crate::plan::{DeliverableStatus, PlanGraph, PlanId, PlannerError};
 use crate::plan_store::{backend, load_plan_state};
 
 fn load_state(tx: &Transaction<'_>, plan_id: &PlanId) -> Result<PlanState, PlannerError> {
@@ -119,14 +120,111 @@ fn normalise_reason(reason: Option<&str>) -> Result<Option<String>, PlannerError
     Ok((!trimmed.is_empty()).then(|| trimmed.to_string()))
 }
 
+/// `true` when `state` shows work on the plan has started: a non-pending,
+/// non-ready status, a lease or attempt history, a held lock, or queued
+/// actuals. Selecting such a variant is an execution-starting call.
+pub(super) fn state_has_progress(state: &PlanState) -> bool {
+    state.statuses.values().any(|status| {
+        matches!(
+            status,
+            DeliverableStatus::InProgress
+                | DeliverableStatus::Complete
+                | DeliverableStatus::Failed { .. }
+        )
+    }) || !state.attempt_counts.is_empty()
+        || !state.failure_counts.is_empty()
+        || !state.lapse_counts.is_empty()
+        || !state.locks.is_empty()
+        || !state.reported_actuals.is_empty()
+}
+
+/// Build and insert a plan's first baseline (number 1, reason
+/// [`FIRST_EXECUTION_REASON`]) from `state`'s graph, inside the caller's
+/// write transaction. Returns the summary and the `plan.ev.baselined`
+/// audit event to flush after commit.
+pub(super) fn insert_first_baseline(
+    tx: &Transaction<'_>,
+    plan_id: &PlanId,
+    state: &PlanState,
+    now: DateTime<Utc>,
+) -> Result<(BaselineTaken, AuditEvent), PlannerError> {
+    let baseline = build_baseline(&state.graph, &state.cached_result, now, None, 1)?;
+    ev_store::insert_baseline(tx, plan_id, &baseline, Some(FIRST_EXECUTION_REASON), now)?;
+    let taken = BaselineTaken {
+        baseline_number: baseline.number,
+        as_of: baseline.start,
+        reason: FIRST_EXECUTION_REASON.to_string(),
+    };
+    let event = AuditEvent::new("plan.ev.baselined").with_payload(json!({
+        "plan_id": plan_id.0,
+        "baseline_number": baseline.number,
+        "previous_baseline": serde_json::Value::Null,
+        "start": baseline.start,
+        "bac": baseline.bac,
+        "finish_hours": baseline.finish_hours,
+        "deliverable_count": baseline.rows.len(),
+        "reason": FIRST_EXECUTION_REASON,
+        "backfilled": baseline.backfilled,
+    }));
+    Ok((taken, event))
+}
+
 impl BasicCpmPlanner {
+    /// Enforce the baseline requirement for an execution-starting call,
+    /// inside the caller's write transaction. Auto mode takes the first
+    /// baseline when the plan has none, recording its `plan.ev.baselined`
+    /// event in `audit`; refuse mode returns
+    /// [`PlannerError::BaselineRequired`]. `Ok(None)` when a baseline
+    /// already exists.
+    pub(super) fn ensure_execution_baseline(
+        &self,
+        tx: &Transaction<'_>,
+        plan_id: &PlanId,
+        state: &PlanState,
+        now: DateTime<Utc>,
+        audit: &mut Vec<AuditEvent>,
+    ) -> Result<Option<BaselineTaken>, PlannerError> {
+        if ev_store::latest_baseline(tx, plan_id)?.is_some() {
+            return Ok(None);
+        }
+        match self.baseline_mode {
+            BaselineMode::Refuse => Err(PlannerError::BaselineRequired {
+                plan_id: plan_id.0.clone(),
+            }),
+            BaselineMode::Auto => {
+                let (taken, event) = insert_first_baseline(tx, plan_id, state, now)?;
+                audit.push(event);
+                Ok(Some(taken))
+            }
+        }
+    }
+
+    /// `true` when `plan_id` has recorded progress ([`state_has_progress`])
+    /// but no earned-value baseline: the state `plan.lint` reports as
+    /// `NO_BASELINE`. Read-only.
+    pub(crate) fn has_progress_without_baseline(
+        &self,
+        plan_id: &PlanId,
+    ) -> Result<bool, PlannerError> {
+        self.store.read_tx(|tx| {
+            let state = load_state(tx, plan_id)?;
+            if ev_store::latest_baseline(tx, plan_id)?.is_some() {
+                return Ok(false);
+            }
+            Ok(state_has_progress(&state))
+        })
+    }
+
     /// Freeze the plan's current CPM schedule and budgets as its next
     /// baseline (`plan.baseline`). The first baseline is number 1; a
     /// re-baseline takes the next number and needs a non-blank `reason`
     /// (`INVALID_GRAPH` otherwise). Actuals and snapshots are kept: only
     /// the PV curve and budgets change. `start` defaults to the clock's now.
     /// `calendar` defaults to wall-clock hours on the first baseline and to
-    /// the previous baseline's calendar on a re-baseline.
+    /// the previous baseline's calendar on a re-baseline. `backfill_from`
+    /// sets `start` retroactively and marks the baseline backfilled; it must
+    /// not be in the future or before the plan's creation time
+    /// (`INVALID_VALUE`).
     /// Gated like execution (selected, unarchived variant only). Audited as
     /// `plan.ev.baselined`.
     pub(super) async fn take_baseline(
@@ -135,10 +233,27 @@ impl BasicCpmPlanner {
     ) -> Result<BaselineOutcome, PlannerError> {
         let reason = normalise_reason(req.reason.as_deref())?;
         let now = self.now();
-        let start = req.start.unwrap_or(now);
+        let backfill_from = req.backfill_from;
+        let start = backfill_from.or(req.start).unwrap_or(now);
         let plan_id = req.plan_id;
         let (outcome, previous) = self.store.write_tx(|tx| {
             crate::portfolio::ensure_executable(tx, &plan_id)?;
+            if let Some(backfill) = backfill_from {
+                if backfill > now {
+                    return Err(PlannerError::InvalidValue {
+                        reason: format!("backfill_from {backfill} is in the future (now is {now})"),
+                    });
+                }
+                if let Some(created) = ev_store::plan_created_at(tx, &plan_id)?
+                    && backfill < created
+                {
+                    return Err(PlannerError::InvalidValue {
+                        reason: format!(
+                            "backfill_from {backfill} is before the plan's creation time {created}"
+                        ),
+                    });
+                }
+            }
             let state = load_state(tx, &plan_id)?;
             let latest = ev_store::latest_baseline(tx, &plan_id)?;
             let previous = latest.as_ref().map(|b| b.baseline.number);
@@ -160,8 +275,9 @@ impl BasicCpmPlanner {
                     reason: format!("plan {plan_id} has used every baseline number"),
                 })?,
             };
-            let baseline =
+            let mut baseline =
                 build_baseline(&state.graph, &state.cached_result, start, calendar, number)?;
+            baseline.backfilled = backfill_from.is_some();
             ev_store::insert_baseline(tx, &plan_id, &baseline, reason.as_deref(), now)?;
             let outcome = BaselineOutcome {
                 plan_id: plan_id.0.clone(),
@@ -172,6 +288,7 @@ impl BasicCpmPlanner {
                 finish_hours: baseline.finish_hours,
                 deliverable_count: baseline.rows.len(),
                 reason: reason.clone(),
+                backfilled: baseline.backfilled,
             };
             Ok((outcome, previous))
         })?;
@@ -184,6 +301,7 @@ impl BasicCpmPlanner {
             "finish_hours": outcome.finish_hours,
             "deliverable_count": outcome.deliverable_count,
             "reason": outcome.reason,
+            "backfilled": outcome.backfilled,
         }));
         self.flush_audit(vec![event]).await;
         Ok(outcome)
