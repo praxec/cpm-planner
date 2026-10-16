@@ -1287,6 +1287,12 @@ pub enum PlannerError {
     #[error("INVALID_ACTUALS: {reason}")]
     InvalidActuals { reason: String },
 
+    /// A request carried a value that is well-typed but out of range for
+    /// the plan it targets, e.g. a `plan.baseline` `backfill_from` in the
+    /// future or before the plan's creation time.
+    #[error("INVALID_VALUE: {reason}")]
+    InvalidValue { reason: String },
+
     /// An earned-value read or snapshot (`plan.ev`, `plan.snapshot`)
     /// targeted a plan that has no baseline yet; take one with
     /// `plan.baseline` first.

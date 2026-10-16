@@ -164,6 +164,7 @@ pub(super) fn insert_first_baseline(
         "finish_hours": baseline.finish_hours,
         "deliverable_count": baseline.rows.len(),
         "reason": FIRST_EXECUTION_REASON,
+        "backfilled": baseline.backfilled,
     }));
     Ok((taken, event))
 }
@@ -198,13 +199,32 @@ impl BasicCpmPlanner {
         }
     }
 
+    /// `true` when `plan_id` has recorded progress ([`state_has_progress`])
+    /// but no earned-value baseline: the state `plan.lint` reports as
+    /// `NO_BASELINE`. Read-only.
+    pub(crate) fn has_progress_without_baseline(
+        &self,
+        plan_id: &PlanId,
+    ) -> Result<bool, PlannerError> {
+        self.store.read_tx(|tx| {
+            let state = load_state(tx, plan_id)?;
+            if ev_store::latest_baseline(tx, plan_id)?.is_some() {
+                return Ok(false);
+            }
+            Ok(state_has_progress(&state))
+        })
+    }
+
     /// Freeze the plan's current CPM schedule and budgets as its next
     /// baseline (`plan.baseline`). The first baseline is number 1; a
     /// re-baseline takes the next number and needs a non-blank `reason`
     /// (`INVALID_GRAPH` otherwise). Actuals and snapshots are kept: only
     /// the PV curve and budgets change. `start` defaults to the clock's now.
     /// `calendar` defaults to wall-clock hours on the first baseline and to
-    /// the previous baseline's calendar on a re-baseline.
+    /// the previous baseline's calendar on a re-baseline. `backfill_from`
+    /// sets `start` retroactively and marks the baseline backfilled; it must
+    /// not be in the future or before the plan's creation time
+    /// (`INVALID_VALUE`).
     /// Gated like execution (selected, unarchived variant only). Audited as
     /// `plan.ev.baselined`.
     pub(super) async fn take_baseline(
@@ -213,10 +233,27 @@ impl BasicCpmPlanner {
     ) -> Result<BaselineOutcome, PlannerError> {
         let reason = normalise_reason(req.reason.as_deref())?;
         let now = self.now();
-        let start = req.start.unwrap_or(now);
+        let backfill_from = req.backfill_from;
+        let start = backfill_from.or(req.start).unwrap_or(now);
         let plan_id = req.plan_id;
         let (outcome, previous) = self.store.write_tx(|tx| {
             crate::portfolio::ensure_executable(tx, &plan_id)?;
+            if let Some(backfill) = backfill_from {
+                if backfill > now {
+                    return Err(PlannerError::InvalidValue {
+                        reason: format!("backfill_from {backfill} is in the future (now is {now})"),
+                    });
+                }
+                if let Some(created) = ev_store::plan_created_at(tx, &plan_id)?
+                    && backfill < created
+                {
+                    return Err(PlannerError::InvalidValue {
+                        reason: format!(
+                            "backfill_from {backfill} is before the plan's creation time {created}"
+                        ),
+                    });
+                }
+            }
             let state = load_state(tx, &plan_id)?;
             let latest = ev_store::latest_baseline(tx, &plan_id)?;
             let previous = latest.as_ref().map(|b| b.baseline.number);
@@ -238,8 +275,9 @@ impl BasicCpmPlanner {
                     reason: format!("plan {plan_id} has used every baseline number"),
                 })?,
             };
-            let baseline =
+            let mut baseline =
                 build_baseline(&state.graph, &state.cached_result, start, calendar, number)?;
+            baseline.backfilled = backfill_from.is_some();
             ev_store::insert_baseline(tx, &plan_id, &baseline, reason.as_deref(), now)?;
             let outcome = BaselineOutcome {
                 plan_id: plan_id.0.clone(),
@@ -250,6 +288,7 @@ impl BasicCpmPlanner {
                 finish_hours: baseline.finish_hours,
                 deliverable_count: baseline.rows.len(),
                 reason: reason.clone(),
+                backfilled: baseline.backfilled,
             };
             Ok((outcome, previous))
         })?;
@@ -262,6 +301,7 @@ impl BasicCpmPlanner {
             "finish_hours": outcome.finish_hours,
             "deliverable_count": outcome.deliverable_count,
             "reason": outcome.reason,
+            "backfilled": outcome.backfilled,
         }));
         self.flush_audit(vec![event]).await;
         Ok(outcome)

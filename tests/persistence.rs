@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
 use cpm_planner::audit::NullAuditSink;
+use cpm_planner::earned_value::BaselineRequest;
 use cpm_planner::plan::{
     AcquireRequest, CallerId, Deliverable, DeliverableStatus, ForceReleaseRequest,
     HeartbeatRequest, MarkStatusRequest, PlanGraph, PlannerError,
@@ -762,10 +763,10 @@ async fn reopening_store_repairs_stale_cached_critical_path() {
 }
 
 #[test]
-fn opened_store_reports_schema_version_4() {
+fn opened_store_reports_schema_version_5() {
     let db = TempDb::new();
     drop(SqlitePlanStore::open(&db.path).unwrap());
-    assert_eq!(user_version(&db.path), 4);
+    assert_eq!(user_version(&db.path), 5);
 }
 
 fn user_version(path: &Path) -> i64 {
@@ -791,11 +792,32 @@ async fn v2_database_with_legacy_plan(path: &Path) -> cpm_planner::plan::PlanId 
 }
 
 #[tokio::test]
-async fn migration_from_v2_database_reaches_v4() {
+async fn migration_from_v2_database_reaches_current_schema() {
     let db = TempDb::new();
     v2_database_with_legacy_plan(&db.path).await;
     drop(SqlitePlanStore::open(&db.path).unwrap());
-    assert_eq!(user_version(&db.path), 4);
+    assert_eq!(user_version(&db.path), 5);
+}
+
+/// A database written at the previous schema version (v4) has its
+/// `baselines.backfilled` column added by the v5 migration, defaulting the
+/// existing baseline to not backfilled.
+#[tokio::test]
+async fn upgraded_v4_database_reads_baseline_as_not_backfilled() {
+    let db = TempDb::new();
+    let plan_id = submit_parallel_chains(&db.path).await;
+    open_planner(&db.path)
+        .baseline(BaselineRequest::new(plan_id.clone()))
+        .await
+        .unwrap();
+    rusqlite::Connection::open(&db.path)
+        .unwrap()
+        .execute_batch(
+            "ALTER TABLE baselines DROP COLUMN backfilled;\n             PRAGMA user_version = 4;",
+        )
+        .unwrap();
+    let report = open_planner(&db.path).ev(&plan_id, None).await.unwrap();
+    assert!(!report.backfilled);
 }
 
 #[tokio::test]
@@ -822,15 +844,15 @@ async fn migrated_v2_database_accepts_named_sync() {
 }
 
 #[test]
-fn newer_schema_rejection_names_supported_version_4() {
+fn newer_schema_rejection_names_supported_version_5() {
     let db = TempDb::new();
     drop(SqlitePlanStore::open(&db.path).unwrap());
     rusqlite::Connection::open(&db.path)
         .unwrap()
-        .pragma_update(None, "user_version", 5)
+        .pragma_update(None, "user_version", 6)
         .unwrap();
     let err = SqlitePlanStore::open(&db.path).err().unwrap();
-    assert!(format!("{err:#}").contains("(4)"));
+    assert!(format!("{err:#}").contains("(5)"));
 }
 
 #[tokio::test]

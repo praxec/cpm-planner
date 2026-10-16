@@ -111,6 +111,10 @@ pub struct Baseline {
     pub bac: f32,
     /// Baseline project finish (`__finish__` earliest finish), in hours.
     pub finish_hours: f32,
+    /// True when `start` came from `plan.baseline`'s `backfill_from` rather
+    /// than the call time.
+    #[serde(default)]
+    pub backfilled: bool,
 }
 
 /// Reported progress for one deliverable.
@@ -217,6 +221,9 @@ pub struct EvReport {
     /// to the moment the report was computed.
     pub as_of: DateTime<Utc>,
     pub baseline_number: u32,
+    /// True when the baseline was taken with `backfill_from`.
+    #[serde(default)]
+    pub backfilled: bool,
     pub bac: f32,
     pub pv: f32,
     pub ev: f32,
@@ -458,6 +465,7 @@ pub fn build_baseline(
         rows,
         bac,
         finish_hours: finish_of(cpm),
+        backfilled: false,
     })
 }
 
@@ -633,6 +641,7 @@ pub fn compute_ev(
     let report = EvReport {
         as_of,
         baseline_number: baseline.number,
+        backfilled: baseline.backfilled,
         bac: baseline.bac,
         pv: pv as f32,
         ev: ev as f32,
@@ -683,6 +692,10 @@ pub struct BaselineRequest {
     /// Why the plan is re-baselined. Required (non-blank) when the plan
     /// already has a baseline; at most [`MAX_BASELINE_REASON_CHARS`].
     pub reason: Option<String>,
+    /// Retroactive baseline start: the baseline's `start` is this instant
+    /// instead of now and the baseline is marked `backfilled`. Must not be
+    /// in the future or before the plan's creation time.
+    pub backfill_from: Option<DateTime<Utc>>,
 }
 
 impl BaselineRequest {
@@ -692,11 +705,17 @@ impl BaselineRequest {
             start: None,
             calendar: None,
             reason: None,
+            backfill_from: None,
         }
     }
 
     pub fn with_start(mut self, start: DateTime<Utc>) -> Self {
         self.start = Some(start);
+        self
+    }
+
+    pub fn with_backfill_from(mut self, backfill_from: DateTime<Utc>) -> Self {
+        self.backfill_from = Some(backfill_from);
         self
     }
 
@@ -722,6 +741,9 @@ pub struct BaselineOutcome {
     pub finish_hours: f32,
     pub deliverable_count: usize,
     pub reason: Option<String>,
+    /// True when `start` came from `backfill_from`.
+    #[serde(default)]
+    pub backfilled: bool,
 }
 
 /// The reason recorded on a baseline an execution-starting call took
@@ -1004,6 +1026,7 @@ mod tests {
             rows,
             bac,
             finish_hours,
+            backfilled: false,
         }
     }
 

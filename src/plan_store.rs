@@ -528,6 +528,7 @@ const MIGRATIONS: &[fn(&Connection) -> anyhow::Result<()>] = &[
     migrate_v2_cpm_version,  // plans.cpm_version
     migrate_v3_portfolio,    // plan_lines, variants, revisions
     migrate_v4_earned_value, // baselines, ev_actuals, ev_snapshots
+    migrate_v5_baseline_backfilled, // baselines.backfilled
 ];
 
 /// Runs the whole ladder plus the stale sweep in one immediate transaction,
@@ -694,6 +695,20 @@ fn migrate_v4_earned_value(conn: &Connection) -> anyhow::Result<()> {
              ON ev_snapshots(plan_id, as_of_us, taken_at_us);",
     )
     .context("creating earned-value tables")
+}
+
+/// Add `baselines.backfilled` (schema v5). Baselines written before v5 are
+/// not backfilled, so the column defaults to 0. Idempotent via
+/// [`add_column_if_missing`] so a database stamped before versioning (or one
+/// that already carries the column) still reaches v5.
+fn migrate_v5_baseline_backfilled(conn: &Connection) -> anyhow::Result<()> {
+    add_column_if_missing(
+        conn,
+        "baselines",
+        "backfilled",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    Ok(())
 }
 
 /// Bring every schema v4 database to the final v4 layout. Runs on EVERY open,

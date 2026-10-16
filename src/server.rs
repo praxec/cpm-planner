@@ -82,6 +82,7 @@ use crate::earned_value::{
     BaselineRequest, BaselineTaken, Calendar, SnapshotFormat, SnapshotRequest,
 };
 use crate::edits::GraphEdit;
+use crate::lint::{LintFinding, Severity};
 use crate::llm::jev::JevJudge;
 use crate::llm::{ConfigError, JudgmentModel, LlmConfig};
 use crate::monte_carlo::MonteCarloRequest;
@@ -438,6 +439,8 @@ struct BaselineArgs {
     calendar: Option<Calendar>,
     #[serde(default)]
     reason: Option<String>,
+    #[serde(default)]
+    backfill_from: Option<DateTime<Utc>>,
 }
 
 /// `plan.ev`: the earned-value report against the latest baseline.
@@ -873,7 +876,9 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                 "Lint a graph, stored plan, or plan file without creating one: cycles (with the \
                  loop), redundant edges, edges without rationale, interface edges \
                  not targeting a contract, deliverables feeding no milestone, and \
-                 unordered file overlaps. Provide exactly one of graph, plan_id, or path.",
+                 unordered file overlaps. Linting by plan_id also adds NO_BASELINE \
+                 (warning) when the plan is executable and has recorded progress but no \
+                 earned-value baseline. Provide exactly one of graph, plan_id, or path.",
             ),
             schema_object(json!({
                 "type": "object",
@@ -1148,8 +1153,12 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                  value. The first baseline is number 1; re-baselining needs a non-blank \
                  `reason` (INVALID_GRAPH otherwise) and keeps actuals and snapshots. \
                  Without `calendar`, a re-baseline keeps the previous baseline's calendar \
-                 (the first baseline counts wall-clock hours). Execution-side: the plan must be its line's selected, unarchived variant \
-                 (VARIANT_NOT_SELECTED / ARCHIVE_REFUSED). Audited as plan.ev.baselined.",
+                 (the first baseline counts wall-clock hours). `backfill_from` (RFC 3339) \
+                 sets the baseline's `start` retroactively and marks it `backfilled: true` \
+                 (reported by plan.ev); it must not be in the future or before the plan's \
+                 creation time (INVALID_VALUE). Execution-side: the plan must be its line's \
+                 selected, unarchived variant (VARIANT_NOT_SELECTED / ARCHIVE_REFUSED). \
+                 Audited as plan.ev.baselined.",
             ),
             schema_object(json!({
                 "type": "object",
@@ -1157,7 +1166,8 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                     "plan_id": { "type": "string" },
                     "start": { "type": "string", "format": "date-time", "description": "RFC 3339 instant the PV clock starts from; defaults to now." },
                     "calendar": calendar_schema(),
-                    "reason": { "type": "string", "maxLength": 2048, "description": "Why the plan is re-baselined; required when a baseline exists." }
+                    "reason": { "type": "string", "maxLength": 2048, "description": "Why the plan is re-baselined; required when a baseline exists." },
+                    "backfill_from": { "type": "string", "format": "date-time", "description": "RFC 3339 instant to use as the baseline's start, marking it backfilled; must not be in the future or before the plan's creation time." }
                 },
                 "required": ["plan_id"],
                 "additionalProperties": false
@@ -1178,6 +1188,7 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                  the plan, including removed and unbaselined deliverables (rate 1 when the \
                  baseline has no row). A \
                  ratio whose denominator is 0 is null and explained in `undefined`. \
+                 `backfilled` is true when the baseline was taken with `backfill_from`. \
                  Read-only; works on any variant. \
                  NOT_BASELINED before plan.baseline.",
             ),
@@ -1681,10 +1692,43 @@ impl PlanServer {
 
     async fn handle_lint(&self, args: Value) -> Result<Value, McpError> {
         let parsed: GraphOrPlanIdArgs = parse_args(args)?;
+        let stored_plan = parsed.plan_id.clone();
         let graph = self
             .resolve_graph(parsed.graph, parsed.plan_id, parsed.path)
             .await?;
-        let report = run_blocking(move || Ok(crate::lint::lint(&graph))).await?;
+        let mut report = run_blocking(move || Ok(crate::lint::lint(&graph))).await?;
+        if let Some(plan_id) = stored_plan {
+            let plan_id = PlanId(plan_id);
+            let status = self
+                .planner
+                .status(&plan_id)
+                .await
+                .map_err(planner_error_to_mcp)?;
+            let applicable = status.selected != Some(false)
+                && self
+                    .planner
+                    .has_progress_without_baseline(&plan_id)
+                    .map_err(planner_error_to_mcp)?;
+            if applicable {
+                let label = match (&status.name, &status.variant) {
+                    (Some(name), Some(variant)) => format!("{name}/{variant}"),
+                    _ => plan_id.0.clone(),
+                };
+                crate::lint::push_finding(
+                    &mut report,
+                    LintFinding {
+                        code: "NO_BASELINE".to_string(),
+                        severity: Severity::Warning,
+                        message: format!(
+                            "plan '{label}' has recorded progress but no earned-value baseline; \
+                             call plan.baseline"
+                        ),
+                        ids: Vec::new(),
+                        path: None,
+                    },
+                );
+            }
+        }
         to_value(&report)
     }
 
@@ -1930,6 +1974,7 @@ impl PlanServer {
         request.start = parsed.start;
         request.calendar = parsed.calendar;
         request.reason = parsed.reason;
+        request.backfill_from = parsed.backfill_from;
         let outcome = self
             .planner
             .baseline(request)
@@ -2313,7 +2358,7 @@ Tools (twenty-three total, all `plan.<verb>`):
   plan.get             — return the submitted PlanGraph (deliverables, estimates, files, metadata) for a plan_id
   plan.force_release   — operator escape hatch; emits audit event with `reason`; optional reset_counters:true also clears lapse/failure counters and revives a circuit-broken deliverable
   plan.accept          — a manager/owner marks a deliverable Complete without a lease (audited; evidence required; override_lock to take over a live lease)
-  plan.lint            — static checks without submitting: cycles (with the loop), redundant edges, edges without rationale, interface edges not targeting a contract, deliverables feeding no milestone, unordered file overlaps
+  plan.lint            — static checks without submitting: cycles (with the loop), redundant edges, edges without rationale, interface edges not targeting a contract, deliverables feeding no milestone, unordered file overlaps; linting by plan_id also adds NO_BASELINE (warning) when the plan is executable and has progress but no earned-value baseline
   plan.schedule        — level a graph against resource capacities (`metadata.owner` by default): makespan, per-deliverable start/finish, per-resource load, driving chain (dependency vs resource waits), project and feeding buffers; capacities is required and every resource carrying work needs >= 1 unit (INVALID_CAPACITIES: lists the missing ones); project_buffer_pct 0..100 (default 25)
   plan.simulate        — read-only what-if: lint, critical path, schedule, milestones, optional resource schedule (schedule: same inputs as plan.schedule) and Monte Carlo (monte_carlo: iterations 1..50000, default 2000; seed, default 0xC0FFEE, reproducible on the same platform and build; iterations × (deliverables + prerequisite edges) must not exceed 200000000), and the scorecard; persists nothing
   plan.sync            — register or update one variant of a named plan line from a plan file (path: .cpm-planner/plans/<name>/<variant>.json, tracked by content hash for drift; any name/variant/project given must match the path) or an inline graph (requires name; variant defaults to "main"); project defaults to the discovered root; force releases live locks of removed deliverables
@@ -2324,8 +2369,8 @@ Tools (twenty-three total, all `plan.<verb>`):
   plan.select          — make a variant its line's selected (only executable) variant, carrying progress over (Complete statuses of identically defined deliverables, with their earned-value actuals); force releases locks on the previous variant; selecting a variant that gains progress is execution-starting, so in auto mode a variant with no baseline takes one (reported as baseline_taken) and in refuse mode it is BASELINE_REQUIRED
   plan.archive         — archive (archived defaults true) or unarchive a whole line or one variant; archived variants stay readable but refuse sync/select/execute
   plan.compare         — compare stored plans (plan_ids: 2..16 distinct ids, or plan line name in project, default the discovered root, for every live variant, at most 16) on the scorecard: Pareto front, weighted rank, recommended; weights must be finite and >= 0; the Monte Carlo budget (200000000) is shared across variants
-  plan.baseline        — freeze the plan's CPM schedule (es/ef) and budgets (effort basis x metadata.cost_rate, default 1) as its next numbered earned-value baseline; optional start (RFC 3339, default now) and calendar {hours_per_day (0 < h <= 24, default 8), workdays (default mon..fri), utc_offset_minutes (default 0)} (omitted: wall-clock hours on the first baseline, the previous baseline's calendar on a re-baseline); re-baselining needs a non-blank reason (<= 2048 chars, INVALID_GRAPH otherwise) and keeps actuals and snapshots; baselines, actuals and snapshots belong to one variant, so a newly selected variant takes its own baseline 1 with no reason needed; selected, unarchived variant only; audited as plan.ev.baselined
-  plan.ev              — earned-value report against the latest baseline as of as_of (RFC 3339, default now; as_of is the PV status date, while EV and AC reflect progress and actuals recorded up to the moment the call runs): bac, pv, ev, ac, sv, cv, spi, cpi, eac, etc, vac, tcpi, per-deliverable rows, critical_float_consumed_hours, alerts (SPI_BELOW_0_9 / CPI_BELOW_0_9 when below 0.9 on the two latest stored non-backfilled snapshots by as_of of the current baseline; the current reading is not one of them), excluded_unbaselined; AC sums every recorded hour of the plan (removed and unbaselined deliverables included, at rate 1 when the baseline has no row); a baselined deliverable removed by plan.revise reports status "removed" and keeps its earned percent at removal (100 if complete), and re-adding it restarts its earned percent (hours keep accumulating); a ratio with a zero denominator is null and explained in `undefined` (never NaN); read-only on any variant; NOT_BASELINED before plan.baseline
+  plan.baseline        — freeze the plan's CPM schedule (es/ef) and budgets (effort basis x metadata.cost_rate, default 1) as its next numbered earned-value baseline; optional start (RFC 3339, default now) and calendar {hours_per_day (0 < h <= 24, default 8), workdays (default mon..fri), utc_offset_minutes (default 0)} (omitted: wall-clock hours on the first baseline, the previous baseline's calendar on a re-baseline); optional backfill_from (RFC 3339) sets start retroactively and marks the baseline backfilled:true (reported by plan.ev) and must not be in the future or before the plan's creation time (INVALID_VALUE); re-baselining needs a non-blank reason (<= 2048 chars, INVALID_GRAPH otherwise) and keeps actuals and snapshots; baselines, actuals and snapshots belong to one variant, so a newly selected variant takes its own baseline 1 with no reason needed; selected, unarchived variant only; audited as plan.ev.baselined
+  plan.ev              — earned-value report against the latest baseline as of as_of (RFC 3339, default now; as_of is the PV status date, while EV and AC reflect progress and actuals recorded up to the moment the call runs): baseline_number, backfilled (true when plan.baseline was given backfill_from), bac, pv, ev, ac, sv, cv, spi, cpi, eac, etc, vac, tcpi, per-deliverable rows, critical_float_consumed_hours, alerts (SPI_BELOW_0_9 / CPI_BELOW_0_9 when below 0.9 on the two latest stored non-backfilled snapshots by as_of of the current baseline; the current reading is not one of them), excluded_unbaselined; AC sums every recorded hour of the plan (removed and unbaselined deliverables included, at rate 1 when the baseline has no row); a baselined deliverable removed by plan.revise reports status "removed" and keeps its earned percent at removal (100 if complete), and re-adding it restarts its earned percent (hours keep accumulating); a ratio with a zero denominator is null and explained in `undefined` (never NaN); read-only on any variant; NOT_BASELINED before plan.baseline
   plan.snapshot        — compute the plan.ev report and append it as a snapshot (as_of is the PV status date; EV and AC are as recorded when the call runs, so a snapshot whose as_of is more than an hour before taken_at is marked backfilled: true, raises no alerts and is skipped by later alerts); returns summary (undefined explains each null ratio; alerts consider only readings up to its own position: this snapshot and the latest earlier one by as_of of the current baseline, so a backfill never takes alerts from newer readings), snapshot_count and export of the newest 100 snapshots by as_of (ties by taken_at), oldest first, so a backfilled as_of lands in date order; a backfill older than those 100 is stored and counted but not listed: a list of summaries (format "json", default) or a Markdown table with columns date, PV, EV, AC, SPI, CPI, EAC (format "markdown"); selected, unarchived variant only; NOT_BASELINED before plan.baseline
   plan.review          — optional AI review (read-only; graph, plan_id or path; optional capacities/resource_key/project_buffer_pct and max_questions 1..64, default 64): lint always runs and lint errors return status invalid_graph with no judge call; otherwise ONE batched call to Jev (TypeSafe's calibrated-judgment model, via OpenRouter) scores likely false dependencies, missing dependencies, split and interface-split candidates and crash options. Probabilities are advisory, not facts. proposals are plan.fork edit lists, each verified by simulate (lints clean, shortens the makespan) and ranked by hours_saved / max(cost, 1). Without an OpenRouter key, or with an unusable LLM setting, status is review_unavailable with a reason, plus lint; a provider failure is review_unavailable with "<class>: <message>". The plan graph is sent to OpenRouter
   plan.submit with a `name` (optional `project`/`variant`, variant defaults to "main") registers a named variant instead of an unnamed plan

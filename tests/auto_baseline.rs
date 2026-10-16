@@ -8,8 +8,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, TimeZone, Utc};
-use cpm_planner::BasicCpmPlanner;
+use chrono::{DateTime, Duration, TimeZone, Utc};
 use cpm_planner::audit::MemoryAuditSink;
 use cpm_planner::earned_value::{BaselineMode, BaselineRequest, BaselineTaken};
 use cpm_planner::plan::{
@@ -17,14 +16,19 @@ use cpm_planner::plan::{
     PlannerError, ReviseRequest, SyncRequest,
 };
 use cpm_planner::ports::Planner;
+use cpm_planner::server::TOOL_LINT;
+use cpm_planner::{BasicCpmPlanner, PlanServer};
+use rmcp::model::{CallToolRequestParams, JsonObject};
+use serde_json::{Value, json};
 
 fn t0() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 1, 5, 0, 0, 0).unwrap()
 }
 
 struct Fixture {
-    planner: BasicCpmPlanner,
+    planner: Arc<BasicCpmPlanner>,
     audit: Arc<MemoryAuditSink>,
+    now: Arc<Mutex<DateTime<Utc>>>,
 }
 
 impl Fixture {
@@ -32,13 +36,27 @@ impl Fixture {
         let now = Arc::new(Mutex::new(t0()));
         let clock = now.clone();
         let audit = Arc::new(MemoryAuditSink::new());
-        let planner = BasicCpmPlanner::with_parts(
-            audit.clone(),
-            std::time::Duration::from_secs(3600),
-            Arc::new(move || *clock.lock().unwrap()),
-        )
-        .with_baseline_mode(mode);
-        Self { planner, audit }
+        let planner = Arc::new(
+            BasicCpmPlanner::with_parts(
+                audit.clone(),
+                std::time::Duration::from_secs(3600),
+                Arc::new(move || *clock.lock().unwrap()),
+            )
+            .with_baseline_mode(mode),
+        );
+        Self {
+            planner,
+            audit,
+            now,
+        }
+    }
+
+    fn set_now(&self, at: DateTime<Utc>) {
+        *self.now.lock().unwrap() = at;
+    }
+
+    fn server(&self) -> PlanServer {
+        PlanServer::new(self.planner.clone())
     }
 
     fn auto() -> Self {
@@ -385,4 +403,115 @@ async fn refuse_select_of_a_progressed_variant_without_baseline_is_baseline_requ
         .await
         .expect_err("expected refusal");
     assert!(matches!(err, PlannerError::BaselineRequired { .. }));
+}
+
+// ── plan.lint: NO_BASELINE ───────────────────────────────────────────────
+
+async fn lint(f: &Fixture, args: Value) -> Value {
+    let map: JsonObject = match args {
+        Value::Object(m) => m,
+        _ => panic!("lint args must be an object"),
+    };
+    f.server()
+        .dispatch_call(CallToolRequestParams::new(TOOL_LINT).with_arguments(map))
+        .await
+        .expect("plan.lint returns Ok")
+}
+
+fn has_finding(report: &Value, code: &str) -> bool {
+    report["findings"]
+        .as_array()
+        .is_some_and(|findings| findings.iter().any(|f| f["code"] == code))
+}
+
+#[tokio::test]
+async fn lint_by_plan_id_reports_no_baseline_for_a_progressed_unbaselined_plan() {
+    let f = Fixture::auto();
+    let plan_id = f.plan().await;
+    f.planner
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
+            "a",
+            worker(),
+            DeliverableStatus::Failed {
+                reason: "boom".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    let report = lint(&f, json!({ "plan_id": plan_id.0 })).await;
+    assert!(has_finding(&report, "NO_BASELINE"));
+}
+
+#[tokio::test]
+async fn lint_by_plan_id_reports_no_no_baseline_for_a_baselined_plan() {
+    let f = Fixture::auto();
+    let plan_id = f.baselined().await;
+    let report = lint(&f, json!({ "plan_id": plan_id.0 })).await;
+    assert!(!has_finding(&report, "NO_BASELINE"));
+}
+
+#[tokio::test]
+async fn lint_by_graph_never_reports_no_baseline() {
+    let f = Fixture::auto();
+    let report = lint(&f, json!({ "graph": graph() })).await;
+    assert!(!has_finding(&report, "NO_BASELINE"));
+}
+
+// ── plan.baseline: backfill_from ─────────────────────────────────────────
+
+#[tokio::test]
+async fn baseline_backfill_from_sets_the_baseline_start() {
+    let f = Fixture::auto();
+    let plan_id = f.plan().await;
+    // `plans.created_at_us` is the store's real `Utc::now`, so the valid
+    // backfill instant must be after submission; the fake clock then moves
+    // past it so it is not "in the future".
+    let start = Utc::now() + Duration::seconds(1);
+    f.set_now(start + Duration::days(1));
+    let outcome = f
+        .planner
+        .baseline(BaselineRequest::new(plan_id).with_backfill_from(start))
+        .await
+        .unwrap();
+    assert_eq!(outcome.start, start);
+}
+
+#[tokio::test]
+async fn plan_ev_reports_a_backfilled_baseline_as_backfilled() {
+    let f = Fixture::auto();
+    let plan_id = f.plan().await;
+    let start = Utc::now() + Duration::seconds(1);
+    f.set_now(start + Duration::days(1));
+    f.planner
+        .baseline(BaselineRequest::new(plan_id.clone()).with_backfill_from(start))
+        .await
+        .unwrap();
+    let report = f.planner.ev(&plan_id, None).await.unwrap();
+    assert!(report.backfilled);
+}
+
+#[tokio::test]
+async fn baseline_backfill_from_in_the_future_is_rejected() {
+    let f = Fixture::auto();
+    let plan_id = f.plan().await;
+    let err = f
+        .planner
+        .baseline(BaselineRequest::new(plan_id).with_backfill_from(t0() + Duration::hours(1)))
+        .await
+        .expect_err("future backfill must be refused");
+    assert!(matches!(err, PlannerError::InvalidValue { .. }));
+}
+
+#[tokio::test]
+async fn baseline_backfill_from_before_the_plan_creation_is_rejected() {
+    let f = Fixture::auto();
+    let plan_id = f.plan().await;
+    f.set_now(t0() + Duration::days(1));
+    let err = f
+        .planner
+        .baseline(BaselineRequest::new(plan_id).with_backfill_from(t0() - Duration::hours(1)))
+        .await
+        .expect_err("backfill before creation must be refused");
+    assert!(matches!(err, PlannerError::InvalidValue { .. }));
 }
