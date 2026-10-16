@@ -40,6 +40,11 @@ plan.force_release {"plan_id": "<plan_id>", "deliverable_id": "<id>",
                     "reason": "runner crashed; fixed disk", "reset_counters": true}
 ```
 
+The first acquire or mark on a plan with no baseline may take one automatically and report
+`baseline_taken` (with `CPM_BASELINE_MODE=refuse` it fails with `BASELINE_REQUIRED`).
+`plan.status` lists `ready` by ascending float, while `plan.acquire_cohort` leases by
+latest start, so the two orders can differ.
+
 ## 2. Keep the lease
 
 ```text

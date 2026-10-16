@@ -604,10 +604,28 @@ async fn acquire_prefers_longest_remaining_tail() {
 }
 
 #[tokio::test]
-async fn ready_order_matches_longest_remaining_tail() {
+async fn status_ready_orders_by_float_before_latest_start() {
     let (planner, plan_id) = submit_long_tail_vs_short_leaf().await;
     let status = planner.status(&plan_id).await.unwrap();
-    assert_eq!(status.ready, vec!["a", "b"]);
+    // `b` has the smaller float (0 vs 1) but the later latest start (7h vs 1h).
+    assert_eq!(status.ready, vec!["b", "a"]);
+}
+
+#[tokio::test]
+async fn acquire_cohort_orders_by_latest_start_before_float() {
+    let (planner, plan_id) = submit_long_tail_vs_short_leaf().await;
+    let cohort = planner
+        .acquire_cohort(AcquireRequest::new(plan_id, caller("w1"), 2))
+        .await
+        .unwrap();
+    let ids: Vec<&str> = cohort
+        .rows
+        .iter()
+        .map(|r| r.deliverable.id.as_str())
+        .collect();
+    // `a` has the larger float (1 vs 0) but the earlier latest start, so the
+    // shared priority_key still leases it first.
+    assert_eq!(ids, vec!["a", "b"]);
 }
 
 #[tokio::test]

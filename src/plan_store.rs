@@ -49,6 +49,7 @@ use anyhow::{Context, anyhow};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
+use crate::earned_value::PlanBaseline;
 use crate::locks::PlanState;
 use crate::plan::{CallerId, DeliverableStatus, LockInfo, PlanGraph, PlanId, PlannerError};
 use crate::task::CriticalPathResult;
@@ -121,6 +122,13 @@ fn dt_from_micros(us: i64, column: &str) -> Result<DateTime<Utc>, PlannerError> 
 pub struct SqlitePlanStore {
     conn: Mutex<Connection>,
 }
+
+/// Return of [`SqlitePlanStore::read_plan_and_variant`]: the closure's value
+/// and the plan's variant info, plus the plan's latest earned-value baseline.
+type PlanVariantBaseline<R> = (
+    (R, Option<crate::portfolio::VariantInfo>),
+    Option<PlanBaseline>,
+);
 
 impl SqlitePlanStore {
     /// Open (creating if necessary) the database at `path`. Parent
@@ -393,6 +401,31 @@ impl SqlitePlanStore {
         self.mutate_plan_inner(plan_id, true, f)
     }
 
+    /// [`Self::mutate_executable_plan`] for an execution operation: same
+    /// gating and commit semantics, but the closure also receives the open
+    /// transaction so it can take the plan's first earned-value baseline in
+    /// the same write (see `planner::ev`). `save_plan_state` runs after the
+    /// closure; an `Err` rolls the whole transaction back.
+    pub(crate) fn mutate_executable_plan_tx<R>(
+        &self,
+        plan_id: &PlanId,
+        f: impl FnOnce(&Transaction<'_>, &mut PlanState) -> Result<R, PlannerError>,
+    ) -> Result<R, PlannerError> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(backend)?;
+        crate::portfolio::ensure_executable(&tx, plan_id)?;
+        let mut state =
+            load_plan_state(&tx, plan_id)?.ok_or_else(|| PlannerError::PlanNotFound {
+                plan_id: plan_id.0.clone(),
+            })?;
+        let out = f(&tx, &mut state)?;
+        save_plan_state(&tx, plan_id, &mut state)?;
+        tx.commit().map_err(backend)?;
+        Ok(out)
+    }
+
     fn mutate_plan_inner<R>(
         &self,
         plan_id: &PlanId,
@@ -432,19 +465,25 @@ impl SqlitePlanStore {
     }
 
     /// [`Self::read_plan`] that also returns, from the same snapshot, the
-    /// named variant owning the plan (`None` for an unnamed plan).
+    /// named variant owning the plan (`None` for an unnamed plan) and the
+    /// plan's latest earned-value baseline (`None` before the first).
     pub(crate) fn read_plan_and_variant<R>(
         &self,
         plan_id: &PlanId,
         f: impl FnOnce(&PlanState) -> R,
-    ) -> Result<(R, Option<crate::portfolio::VariantInfo>), PlannerError> {
+    ) -> Result<PlanVariantBaseline<R>, PlannerError> {
         self.read_tx(|tx| {
             let state =
                 load_plan_state(tx, plan_id)?.ok_or_else(|| PlannerError::PlanNotFound {
                     plan_id: plan_id.0.clone(),
                 })?;
             let info = crate::portfolio::variant_info(tx, plan_id)?;
-            Ok((f(&state), info))
+            let baseline =
+                crate::ev_store::latest_baseline(tx, plan_id)?.map(|stored| PlanBaseline {
+                    baseline_number: stored.baseline.number,
+                    as_of: stored.baseline.start,
+                });
+            Ok(((f(&state), info), baseline))
         })
     }
 
@@ -489,6 +528,7 @@ const MIGRATIONS: &[fn(&Connection) -> anyhow::Result<()>] = &[
     migrate_v2_cpm_version,  // plans.cpm_version
     migrate_v3_portfolio,    // plan_lines, variants, revisions
     migrate_v4_earned_value, // baselines, ev_actuals, ev_snapshots
+    migrate_v5_baseline_backfilled, // baselines.backfilled
 ];
 
 /// Runs the whole ladder plus the stale sweep in one immediate transaction,
@@ -655,6 +695,20 @@ fn migrate_v4_earned_value(conn: &Connection) -> anyhow::Result<()> {
              ON ev_snapshots(plan_id, as_of_us, taken_at_us);",
     )
     .context("creating earned-value tables")
+}
+
+/// Add `baselines.backfilled` (schema v5). Baselines written before v5 are
+/// not backfilled, so the column defaults to 0. Idempotent via
+/// [`add_column_if_missing`] so a database stamped before versioning (or one
+/// that already carries the column) still reaches v5.
+fn migrate_v5_baseline_backfilled(conn: &Connection) -> anyhow::Result<()> {
+    add_column_if_missing(
+        conn,
+        "baselines",
+        "backfilled",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    Ok(())
 }
 
 /// Bring every schema v4 database to the final v4 layout. Runs on EVERY open,

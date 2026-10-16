@@ -42,6 +42,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::earned_value::{BaselineTaken, PlanBaseline};
+
 /// Opaque plan identifier returned by [`crate::ports::Planner::submit_plan`].
 ///
 /// The string form is implementation-defined (UUID, deterministic content
@@ -838,6 +840,10 @@ pub struct SelectOutcome {
     /// Sorted ids of the previous variant's live locks released by a forced
     /// selection.
     pub released_locks: Vec<String>,
+    /// A baseline taken automatically because the newly selected variant had
+    /// progress but no baseline (auto mode); absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_taken: Option<BaselineTaken>,
 }
 
 /// Snapshot of a held lock. The Planner records one [`LockInfo`] per
@@ -892,6 +898,9 @@ pub struct Cohort {
     /// Paths in this cohort claimed in append mode by two or more
     /// deliverables (in the cohort or against held locks).
     pub shared_paths: Vec<PathBuf>,
+    /// A baseline taken automatically because this acquire started
+    /// execution on a plan that had none (auto mode); absent otherwise.
+    pub baseline_taken: Option<BaselineTaken>,
 }
 
 /// A deliverable the acquire considered but did not lease, and why.
@@ -941,6 +950,8 @@ struct FlatCohort {
     blocked: Vec<BlockedDeliverable>,
     #[serde(default)]
     shared_paths: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    baseline_taken: Option<BaselineTaken>,
 }
 
 impl From<Cohort> for FlatCohort {
@@ -957,6 +968,7 @@ impl From<Cohort> for FlatCohort {
             locks,
             blocked: cohort.blocked,
             shared_paths: cohort.shared_paths,
+            baseline_taken: cohort.baseline_taken,
         }
     }
 }
@@ -986,6 +998,7 @@ impl TryFrom<FlatCohort> for Cohort {
             rows,
             blocked: flat.blocked,
             shared_paths: flat.shared_paths,
+            baseline_taken: flat.baseline_taken,
         })
     }
 }
@@ -1058,6 +1071,10 @@ pub struct PlanStatus {
     /// project root for the variant's project, or the file is unreadable.
     #[serde(default)]
     pub definition_drift: Option<bool>,
+    /// The latest earned-value baseline of the plan, or `null` before the
+    /// first baseline.
+    #[serde(default)]
+    pub baseline: Option<PlanBaseline>,
 }
 
 /// A milestone's schedule summary, reported by [`PlanStatus::milestones`].
@@ -1270,11 +1287,26 @@ pub enum PlannerError {
     #[error("INVALID_ACTUALS: {reason}")]
     InvalidActuals { reason: String },
 
+    /// A request carried a value that is well-typed but out of range for
+    /// the plan it targets, e.g. a `plan.baseline` `backfill_from` in the
+    /// future or before the plan's creation time.
+    #[error("INVALID_VALUE: {reason}")]
+    InvalidValue { reason: String },
+
     /// An earned-value read or snapshot (`plan.ev`, `plan.snapshot`)
     /// targeted a plan that has no baseline yet; take one with
     /// `plan.baseline` first.
     #[error("NOT_BASELINED: plan {plan_id} has no baseline; take one with plan.baseline")]
     NotBaselined { plan_id: String },
+
+    /// The server runs in `refuse` baseline mode and an execution-starting
+    /// call targeted a plan with no baseline yet; take one with
+    /// `plan.baseline` first.
+    #[error(
+        "BASELINE_REQUIRED: plan {plan_id} has no earned-value baseline and \
+         CPM_BASELINE_MODE=refuse; take one with plan.baseline"
+    )]
+    BaselineRequired { plan_id: String },
 
     /// Catch-all for backend failures (DB unavailable, serialization
     /// errors against the persistence layer, etc.). Wraps the underlying
@@ -1409,6 +1441,7 @@ mod tests {
                     },
                 },
             ],
+            baseline_taken: None,
         };
         let json = serde_json::to_value(&cohort)?;
         // Wire shape: top-level keys are plan_id + deliverables + locks

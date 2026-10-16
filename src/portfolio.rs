@@ -858,6 +858,7 @@ pub(crate) fn select(
             changed: false,
             carried: Vec::new(),
             released_locks: Vec::new(),
+            baseline_taken: None,
         },
         reaped: Vec::new(),
         released: Vec::new(),

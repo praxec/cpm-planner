@@ -111,6 +111,10 @@ pub struct Baseline {
     pub bac: f32,
     /// Baseline project finish (`__finish__` earliest finish), in hours.
     pub finish_hours: f32,
+    /// True when `start` came from `plan.baseline`'s `backfill_from` rather
+    /// than the call time.
+    #[serde(default)]
+    pub backfilled: bool,
 }
 
 /// Reported progress for one deliverable.
@@ -217,6 +221,9 @@ pub struct EvReport {
     /// to the moment the report was computed.
     pub as_of: DateTime<Utc>,
     pub baseline_number: u32,
+    /// True when the baseline was taken with `backfill_from`.
+    #[serde(default)]
+    pub backfilled: bool,
     pub bac: f32,
     pub pv: f32,
     pub ev: f32,
@@ -458,6 +465,7 @@ pub fn build_baseline(
         rows,
         bac,
         finish_hours: finish_of(cpm),
+        backfilled: false,
     })
 }
 
@@ -633,6 +641,7 @@ pub fn compute_ev(
     let report = EvReport {
         as_of,
         baseline_number: baseline.number,
+        backfilled: baseline.backfilled,
         bac: baseline.bac,
         pv: pv as f32,
         ev: ev as f32,
@@ -683,6 +692,10 @@ pub struct BaselineRequest {
     /// Why the plan is re-baselined. Required (non-blank) when the plan
     /// already has a baseline; at most [`MAX_BASELINE_REASON_CHARS`].
     pub reason: Option<String>,
+    /// Retroactive baseline start: the baseline's `start` is this instant
+    /// instead of now and the baseline is marked `backfilled`. Must not be
+    /// in the future or before the plan's creation time.
+    pub backfill_from: Option<DateTime<Utc>>,
 }
 
 impl BaselineRequest {
@@ -692,11 +705,17 @@ impl BaselineRequest {
             start: None,
             calendar: None,
             reason: None,
+            backfill_from: None,
         }
     }
 
     pub fn with_start(mut self, start: DateTime<Utc>) -> Self {
         self.start = Some(start);
+        self
+    }
+
+    pub fn with_backfill_from(mut self, backfill_from: DateTime<Utc>) -> Self {
+        self.backfill_from = Some(backfill_from);
         self
     }
 
@@ -722,6 +741,46 @@ pub struct BaselineOutcome {
     pub finish_hours: f32,
     pub deliverable_count: usize,
     pub reason: Option<String>,
+    /// True when `start` came from `backfill_from`.
+    #[serde(default)]
+    pub backfilled: bool,
+}
+
+/// The reason recorded on a baseline an execution-starting call took
+/// automatically because the plan had none.
+pub const FIRST_EXECUTION_REASON: &str = "first_execution";
+
+/// How execution treats a plan that has no earned-value baseline yet.
+/// Server-configured once at startup with `CPM_BASELINE_MODE`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BaselineMode {
+    /// Execution takes the first baseline itself, from the current graph as
+    /// of the call, in the same write transaction (the default).
+    #[default]
+    Auto,
+    /// Execution is refused with `BASELINE_REQUIRED` until the operator
+    /// calls `plan.baseline`.
+    Refuse,
+}
+
+/// A baseline an execution-starting call took automatically. Reported in
+/// `baseline_taken` on the call's response; absent when one already existed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BaselineTaken {
+    /// Number within the plan; `1` for the first baseline.
+    pub baseline_number: u32,
+    /// The baseline's PV start (the call time).
+    pub as_of: DateTime<Utc>,
+    /// Always [`FIRST_EXECUTION_REASON`].
+    pub reason: String,
+}
+
+/// The latest baseline summary `plan.status` reports; `null` before the
+/// first baseline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanBaseline {
+    pub baseline_number: u32,
+    pub as_of: DateTime<Utc>,
 }
 
 /// Export format of `plan.snapshot`.
@@ -967,6 +1026,7 @@ mod tests {
             rows,
             bac,
             finish_hours,
+            backfilled: false,
         }
     }
 

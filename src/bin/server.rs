@@ -33,6 +33,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cpm_planner::audit::{AuditSink, NullAuditSink};
+use cpm_planner::earned_value::BaselineMode;
 use cpm_planner::llm::LlmConfig;
 use cpm_planner::planner::{DEFAULT_MAX_TTL, MAX_TTL_CEILING};
 use cpm_planner::project::{PROJECT_ROOT_ENV, ProjectRoot};
@@ -123,6 +124,8 @@ async fn serve() -> anyhow::Result<()> {
     let store = SqlitePlanStore::open(&db_path)?;
     let max_ttl = resolve_max_ttl()?;
     tracing::info!(max_ttl_secs = max_ttl.as_secs(), "lease TTL ceiling");
+    let baseline_mode = resolve_baseline_mode()?;
+    tracing::info!(?baseline_mode, "earned-value baseline mode");
 
     // Discover the repo root for plan-as-code tools: CPM_PROJECT_ROOT if
     // set, else the nearest ancestor of cwd containing .cpm-planner/ or
@@ -134,7 +137,9 @@ async fn serve() -> anyhow::Result<()> {
         None => tracing::info!("no project root discovered; path-based tools disabled"),
     }
 
-    let mut planner_builder = BasicCpmPlanner::with_store(store, audit).with_max_ttl(max_ttl);
+    let mut planner_builder = BasicCpmPlanner::with_store(store, audit)
+        .with_max_ttl(max_ttl)
+        .with_baseline_mode(baseline_mode);
     if let Some(root) = project_root {
         planner_builder = planner_builder.with_project_root(root);
     }
@@ -210,6 +215,27 @@ fn parse_max_ttl(raw: Result<String, VarError>) -> anyhow::Result<Duration> {
     }
 }
 
+/// Resolve the earned-value baseline mode from `CPM_BASELINE_MODE`.
+///
+/// Unset -> [`BaselineMode::Auto`]. Anything but `auto` or `refuse` aborts
+/// startup with a clear message rather than silently picking a mode.
+fn resolve_baseline_mode() -> anyhow::Result<BaselineMode> {
+    parse_baseline_mode(std::env::var("CPM_BASELINE_MODE"))
+}
+
+/// Pure parse of the `CPM_BASELINE_MODE` lookup result.
+fn parse_baseline_mode(raw: Result<String, VarError>) -> anyhow::Result<BaselineMode> {
+    match raw {
+        Err(VarError::NotPresent) => Ok(BaselineMode::Auto),
+        Err(VarError::NotUnicode(_)) => anyhow::bail!("CPM_BASELINE_MODE is not valid unicode"),
+        Ok(raw) => match raw.trim() {
+            "auto" => Ok(BaselineMode::Auto),
+            "refuse" => Ok(BaselineMode::Refuse),
+            other => anyhow::bail!("CPM_BASELINE_MODE must be 'auto' or 'refuse'; got '{other}'"),
+        },
+    }
+}
+
 fn init_tracing() {
     // Defaults to `info`. Log to stderr so stdout remains exclusively the
     // MCP transport channel (rmcp's `stdio()` uses stdin/stdout for the
@@ -261,5 +287,34 @@ mod tests {
     fn non_unicode_max_ttl_is_rejected() {
         let bad = VarError::NotUnicode(std::ffi::OsString::from("x"));
         assert!(parse_max_ttl(Err(bad)).is_err());
+    }
+
+    #[test]
+    fn unset_baseline_mode_is_auto() {
+        assert_eq!(
+            parse_baseline_mode(Err(VarError::NotPresent)).unwrap(),
+            BaselineMode::Auto
+        );
+    }
+
+    #[test]
+    fn explicit_auto_baseline_mode_parses() {
+        assert_eq!(
+            parse_baseline_mode(Ok("auto".into())).unwrap(),
+            BaselineMode::Auto
+        );
+    }
+
+    #[test]
+    fn refuse_baseline_mode_parses() {
+        assert_eq!(
+            parse_baseline_mode(Ok("refuse".into())).unwrap(),
+            BaselineMode::Refuse
+        );
+    }
+
+    #[test]
+    fn unknown_baseline_mode_is_rejected() {
+        assert!(parse_baseline_mode(Ok("sometimes".into())).is_err());
     }
 }

@@ -4,8 +4,9 @@
 //! accompany (a lease ending adds its hours in the same transaction that
 //! releases it).
 //!
-//! Tables (created by the v4 migration in [`crate::plan_store`]):
-//! - `baselines(plan_id, number, start_us, calendar, rows, bac, reason, created_at_us)`
+//! Tables (created by the v4 migration in [`crate::plan_store`]; the
+//! `backfilled` column is added by the v5 migration):
+//! - `baselines(plan_id, number, start_us, calendar, rows, bac, reason, created_at_us, backfilled)`
 //! - `ev_actuals(plan_id, deliverable_id, earned_pct, actual_hours, leased_hours, evidence, updated_at_us,
 //!   removed_at_us, frozen_pct)`; a row outlives its deliverable (spend is real), and a revise that
 //!   removes a baselined deliverable freezes its earned percent ([`freeze_removed`])
@@ -327,8 +328,8 @@ pub(crate) fn insert_baseline(
     let rows = serde_json::to_string(&baseline.rows).map_err(backend)?;
     conn.execute(
         "INSERT INTO baselines
-             (plan_id, number, start_us, calendar, rows, bac, reason, created_at_us)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (plan_id, number, start_us, calendar, rows, bac, reason, created_at_us, backfilled)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             plan_id.0,
             baseline.number,
@@ -337,15 +338,41 @@ pub(crate) fn insert_baseline(
             rows,
             f64::from(baseline.bac),
             reason,
-            created_at.timestamp_micros()
+            created_at.timestamp_micros(),
+            i64::from(baseline.backfilled)
         ],
     )
     .map_err(backend)?;
     Ok(())
 }
 
+/// The creation time of `plan_id`, or `None` when the row is missing.
+pub(crate) fn plan_created_at(
+    conn: &Connection,
+    plan_id: &PlanId,
+) -> Result<Option<DateTime<Utc>>, PlannerError> {
+    let us: Option<i64> = conn
+        .query_row(
+            "SELECT created_at_us FROM plans WHERE plan_id = ?1",
+            params![plan_id.0],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(backend)?;
+    us.map(|us| dt(us, "plans.created_at_us")).transpose()
+}
+
 /// `baselines` columns after `plan_id`, in table order.
-type BaselineColumns = (u32, i64, Option<String>, String, f64, Option<String>, i64);
+type BaselineColumns = (
+    u32,
+    i64,
+    Option<String>,
+    String,
+    f64,
+    Option<String>,
+    i64,
+    i64,
+);
 
 /// The highest-numbered baseline of `plan_id`, if any.
 ///
@@ -359,7 +386,7 @@ pub(crate) fn latest_baseline(
 ) -> Result<Option<StoredBaseline>, PlannerError> {
     let row: Option<BaselineColumns> = conn
         .query_row(
-            "SELECT number, start_us, calendar, rows, bac, reason, created_at_us
+            "SELECT number, start_us, calendar, rows, bac, reason, created_at_us, backfilled
              FROM baselines WHERE plan_id = ?1 ORDER BY number DESC LIMIT 1",
             params![plan_id.0],
             |r| {
@@ -371,12 +398,13 @@ pub(crate) fn latest_baseline(
                     r.get(4)?,
                     r.get(5)?,
                     r.get(6)?,
+                    r.get(7)?,
                 ))
             },
         )
         .optional()
         .map_err(backend)?;
-    let Some((number, start_us, calendar, rows, bac, reason, created_us)) = row else {
+    let Some((number, start_us, calendar, rows, bac, reason, created_us, backfilled)) = row else {
         return Ok(None);
     };
     let corrupt =
@@ -405,6 +433,7 @@ pub(crate) fn latest_baseline(
             rows,
             bac: bac as f32,
             finish_hours,
+            backfilled: backfilled != 0,
         },
         reason,
         created_at: dt(created_us, "baselines.created_at_us")?,
@@ -631,6 +660,7 @@ mod tests {
             }],
             bac: 4.0,
             finish_hours: 2.0,
+            backfilled: false,
         }
     }
 
