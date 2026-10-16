@@ -34,13 +34,14 @@ use serde_json::json;
 use super::BasicCpmPlanner;
 use crate::audit::AuditEvent;
 use crate::earned_value::{
-    BaselineOutcome, BaselineRequest, EarningRule, EvReport, EvSummary, MAX_BASELINE_REASON_CHARS,
-    SNAPSHOT_EXPORT_LIMIT, SnapshotFormat, SnapshotOutcome, SnapshotRequest, SnapshotSummary,
-    build_baseline, compute_ev, render_snapshots_markdown, trend_alerts,
+    BaselineMode, BaselineOutcome, BaselineRequest, BaselineTaken, EarningRule, EvReport,
+    EvSummary, FIRST_EXECUTION_REASON, MAX_BASELINE_REASON_CHARS, SNAPSHOT_EXPORT_LIMIT,
+    SnapshotFormat, SnapshotOutcome, SnapshotRequest, SnapshotSummary, build_baseline, compute_ev,
+    render_snapshots_markdown, trend_alerts,
 };
 use crate::ev_store;
 use crate::locks::PlanState;
-use crate::plan::{PlanGraph, PlanId, PlannerError};
+use crate::plan::{DeliverableStatus, PlanGraph, PlanId, PlannerError};
 use crate::plan_store::{backend, load_plan_state};
 
 fn load_state(tx: &Transaction<'_>, plan_id: &PlanId) -> Result<PlanState, PlannerError> {
@@ -119,7 +120,84 @@ fn normalise_reason(reason: Option<&str>) -> Result<Option<String>, PlannerError
     Ok((!trimmed.is_empty()).then(|| trimmed.to_string()))
 }
 
+/// `true` when `state` shows work on the plan has started: a non-pending,
+/// non-ready status, a lease or attempt history, a held lock, or queued
+/// actuals. Selecting such a variant is an execution-starting call.
+pub(super) fn state_has_progress(state: &PlanState) -> bool {
+    state.statuses.values().any(|status| {
+        matches!(
+            status,
+            DeliverableStatus::InProgress
+                | DeliverableStatus::Complete
+                | DeliverableStatus::Failed { .. }
+        )
+    }) || !state.attempt_counts.is_empty()
+        || !state.failure_counts.is_empty()
+        || !state.lapse_counts.is_empty()
+        || !state.locks.is_empty()
+        || !state.reported_actuals.is_empty()
+}
+
+/// Build and insert a plan's first baseline (number 1, reason
+/// [`FIRST_EXECUTION_REASON`]) from `state`'s graph, inside the caller's
+/// write transaction. Returns the summary and the `plan.ev.baselined`
+/// audit event to flush after commit.
+pub(super) fn insert_first_baseline(
+    tx: &Transaction<'_>,
+    plan_id: &PlanId,
+    state: &PlanState,
+    now: DateTime<Utc>,
+) -> Result<(BaselineTaken, AuditEvent), PlannerError> {
+    let baseline = build_baseline(&state.graph, &state.cached_result, now, None, 1)?;
+    ev_store::insert_baseline(tx, plan_id, &baseline, Some(FIRST_EXECUTION_REASON), now)?;
+    let taken = BaselineTaken {
+        baseline_number: baseline.number,
+        as_of: baseline.start,
+        reason: FIRST_EXECUTION_REASON.to_string(),
+    };
+    let event = AuditEvent::new("plan.ev.baselined").with_payload(json!({
+        "plan_id": plan_id.0,
+        "baseline_number": baseline.number,
+        "previous_baseline": serde_json::Value::Null,
+        "start": baseline.start,
+        "bac": baseline.bac,
+        "finish_hours": baseline.finish_hours,
+        "deliverable_count": baseline.rows.len(),
+        "reason": FIRST_EXECUTION_REASON,
+    }));
+    Ok((taken, event))
+}
+
 impl BasicCpmPlanner {
+    /// Enforce the baseline requirement for an execution-starting call,
+    /// inside the caller's write transaction. Auto mode takes the first
+    /// baseline when the plan has none, recording its `plan.ev.baselined`
+    /// event in `audit`; refuse mode returns
+    /// [`PlannerError::BaselineRequired`]. `Ok(None)` when a baseline
+    /// already exists.
+    pub(super) fn ensure_execution_baseline(
+        &self,
+        tx: &Transaction<'_>,
+        plan_id: &PlanId,
+        state: &PlanState,
+        now: DateTime<Utc>,
+        audit: &mut Vec<AuditEvent>,
+    ) -> Result<Option<BaselineTaken>, PlannerError> {
+        if ev_store::latest_baseline(tx, plan_id)?.is_some() {
+            return Ok(None);
+        }
+        match self.baseline_mode {
+            BaselineMode::Refuse => Err(PlannerError::BaselineRequired {
+                plan_id: plan_id.0.clone(),
+            }),
+            BaselineMode::Auto => {
+                let (taken, event) = insert_first_baseline(tx, plan_id, state, now)?;
+                audit.push(event);
+                Ok(Some(taken))
+            }
+        }
+    }
+
     /// Freeze the plan's current CPM schedule and budgets as its next
     /// baseline (`plan.baseline`). The first baseline is number 1; a
     /// re-baseline takes the next number and needs a non-blank `reason`

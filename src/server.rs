@@ -78,7 +78,9 @@ use std::time::Duration;
 
 use crate::audit::AuditEvent;
 use crate::compare::{CompareRequest, CompareWeights};
-use crate::earned_value::{BaselineRequest, Calendar, SnapshotFormat, SnapshotRequest};
+use crate::earned_value::{
+    BaselineRequest, BaselineTaken, Calendar, SnapshotFormat, SnapshotRequest,
+};
 use crate::edits::GraphEdit;
 use crate::llm::jev::JevJudge;
 use crate::llm::{ConfigError, JudgmentModel, LlmConfig};
@@ -491,11 +493,23 @@ struct SubmitResponse {
 #[derive(Debug, Serialize)]
 struct OkResponse {
     ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    baseline_taken: Option<BaselineTaken>,
 }
 
 impl OkResponse {
     fn new() -> Self {
-        Self { ok: true }
+        Self {
+            ok: true,
+            baseline_taken: None,
+        }
+    }
+
+    fn with_baseline_taken(baseline_taken: Option<BaselineTaken>) -> Self {
+        Self {
+            ok: true,
+            baseline_taken,
+        }
     }
 }
 
@@ -1604,11 +1618,12 @@ impl PlanServer {
         if let Some(evidence) = parsed.evidence {
             request = request.with_evidence(evidence);
         }
-        self.planner
+        let baseline_taken = self
+            .planner
             .mark_status(request)
             .await
             .map_err(planner_error_to_mcp)?;
-        to_value(&OkResponse::new())
+        to_value(&OkResponse::with_baseline_taken(baseline_taken))
     }
 
     async fn handle_status(&self, args: Value) -> Result<Value, McpError> {
@@ -2289,11 +2304,11 @@ Tools (twenty-three total, all `plan.<verb>`):
                         an optional earning_rule (zero_hundred default: 100% only when complete; fifty_fifty: 50% once in progress or any earned_pct is reported; weighted: the reported earned_pct) sets how earned value credits progress; it is part of the plan's identity
                         an optional estimate {optimistic, likely, pessimistic} (0 <= optimistic <= likely <= pessimistic) is a three-point effort estimate; scheduled length precedence is duration_hours > estimated_effort_hours > estimate.likely > 0 for a milestone > estimator default, and Monte Carlo samples the estimate only when neither duration_hours nor estimated_effort_hours is set
                         limits: at most 5000 deliverables; every hour value (effort, duration, lag, estimate) must be finite and between 0 and 1000000 (INVALID_GRAPH)
-  plan.acquire_cohort  — atomically acquire ready deliverables with no conflicting file claims (an owned_files entry may be {path, mode: "append"}: append claims on one path may be co-leased and are listed in the response's shared_paths; exclusive claims never overlap anything at once; plan.submit accepts a shared file only when the claimants are ordered by prerequisites, or all claims are append)
+  plan.acquire_cohort  — atomically acquire ready deliverables with no conflicting file claims (an owned_files entry may be {path, mode: "append"}: append claims on one path may be co-leased and are listed in the response's shared_paths; exclusive claims never overlap anything at once; plan.submit accepts a shared file only when the claimants are ordered by prerequisites, or all claims are append); a call that leases at least one deliverable is execution-starting: it takes the plan's first earned-value baseline in auto mode and reports baseline_taken {baseline_number, as_of, reason:"first_execution"} (in refuse mode it fails with BASELINE_REQUIRED unless the plan already has one)
   plan.heartbeat       — refresh a held lock's TTL
   plan.mark_status     — set a deliverable's status (Complete/Failed releases the lock); lockless Complete/Ready/InProgress requires complete prerequisites (PREREQUISITES_INCOMPLETE) and is audited; a lockless InProgress persists across restarts and is not leasable until handed back with a lockless Ready (plan.force_release does not affect it)
-                        optional earned-value progress: earned_pct (integer 0..100, only with in_progress; accepted and ignored with complete), actual_effort_hours (total so far, finite 0..1000000; replaces leased hours as actual cost), evidence (<= 2048 chars, appended to the deliverable's list, at most 100 entries); violations are INVALID_ACTUALS. plan.select copies the actuals of every deliverable whose Complete status it carries (leased hours add up; the carried deliverable's reported earned_pct and hours win; the newest 100 evidence entries are kept). Every lease that ends (complete, failed, force_release, expiry, accept override, forced revise/select/archive) adds its hours (up to expiry for a lapsed lease) to the deliverable's leased hours
-  plan.status          — read-only snapshot ([id, status, attempt_count, failure_count, lapse_count] rows, critical_path (one real chain, always __start__ to __finish__), critical_ids, per-deliverable schedule (es/ef/ls/lf/float, hours; synthetic __start__/__finish__ endpoint rows have synthetic=true and critical=true; critical_ids lists only real deliverables), the ready set in acquire/ready priority order (smallest latest start first, i.e. longest remaining tail, then least float, then id), plan_complete, milestones (one row per `milestone: true` deliverable, or metadata.milestone == true: id, critical_path from __start__ to it, hours = its earliest finish, complete), held locks; for a named variant also name, variant, selected and definition_drift). __start__ and __finish__ are reserved deliverable ids (INVALID_GRAPH)
+                        optional earned-value progress: earned_pct (integer 0..100, only with in_progress; accepted and ignored with complete), actual_effort_hours (total so far, finite 0..1000000; replaces leased hours as actual cost), evidence (<= 2048 chars, appended to the deliverable's list, at most 100 entries); violations are INVALID_ACTUALS. plan.select copies the actuals of every deliverable whose Complete status it carries (leased hours add up; the carried deliverable's reported earned_pct and hours win; the newest 100 evidence entries are kept). Every lease that ends (complete, failed, force_release, expiry, accept override, forced revise/select/archive) adds its hours (up to expiry for a lapsed lease) to the deliverable's leased hours; a mark to in_progress or complete is execution-starting: in auto mode it takes the plan's first baseline (reported as baseline_taken) if none exists, in refuse mode it is BASELINE_REQUIRED
+  plan.status          — read-only snapshot ([id, status, attempt_count, failure_count, lapse_count] rows, critical_path (one real chain, always __start__ to __finish__), critical_ids, per-deliverable schedule (es/ef/ls/lf/float, hours; synthetic __start__/__finish__ endpoint rows have synthetic=true and critical=true; critical_ids lists only real deliverables), the ready set in acquire/ready priority order (smallest latest start first, i.e. longest remaining tail, then least float, then id), plan_complete, milestones (one row per `milestone: true` deliverable, or metadata.milestone == true: id, critical_path from __start__ to it, hours = its earliest finish, complete), held locks, baseline (the latest {baseline_number, as_of}, or null before the first); for a named variant also name, variant, selected and definition_drift). __start__ and __finish__ are reserved deliverable ids (INVALID_GRAPH)
                         definition_drift: null when unknown (no root for the variant's project, no tracked file, file missing/unreadable/over 8 MiB); false when the file matches the last synced/exported bytes or its graph equals the head graph (re-formatting is not drift); true when the file's graph differs from the head or does not parse — so after an inline revise it is true until plan.export or plan.sync {path}
   plan.get             — return the submitted PlanGraph (deliverables, estimates, files, metadata) for a plan_id
   plan.force_release   — operator escape hatch; emits audit event with `reason`; optional reset_counters:true also clears lapse/failure counters and revives a circuit-broken deliverable
@@ -2306,7 +2321,7 @@ Tools (twenty-three total, all `plan.<verb>`):
   plan.export          — write the head graph of a plan_id to its variant file (or a confined path) and return the root-relative path; refuses another variant's tracked file or unsynced local edits unless force; the file is not synced (exporting to the variant's own tracked file records its hash)
   plan.revise          — replace a plan's graph in place, carrying progress over; returns the new revision and diff; force releases live locks of removed deliverables
   plan.fork            — copy a named variant's head graph, apply ordered edits, register it as a new draft (not selected) variant; an archived line is refused (ARCHIVE_REFUSED) before any file is written
-  plan.select          — make a variant its line's selected (only executable) variant, carrying progress over (Complete statuses of identically defined deliverables, with their earned-value actuals); force releases locks on the previous variant
+  plan.select          — make a variant its line's selected (only executable) variant, carrying progress over (Complete statuses of identically defined deliverables, with their earned-value actuals); force releases locks on the previous variant; selecting a variant that gains progress is execution-starting, so in auto mode a variant with no baseline takes one (reported as baseline_taken) and in refuse mode it is BASELINE_REQUIRED
   plan.archive         — archive (archived defaults true) or unarchive a whole line or one variant; archived variants stay readable but refuse sync/select/execute
   plan.compare         — compare stored plans (plan_ids: 2..16 distinct ids, or plan line name in project, default the discovered root, for every live variant, at most 16) on the scorecard: Pareto front, weighted rank, recommended; weights must be finite and >= 0; the Monte Carlo budget (200000000) is shared across variants
   plan.baseline        — freeze the plan's CPM schedule (es/ef) and budgets (effort basis x metadata.cost_rate, default 1) as its next numbered earned-value baseline; optional start (RFC 3339, default now) and calendar {hours_per_day (0 < h <= 24, default 8), workdays (default mon..fri), utc_offset_minutes (default 0)} (omitted: wall-clock hours on the first baseline, the previous baseline's calendar on a re-baseline); re-baselining needs a non-blank reason (<= 2048 chars, INVALID_GRAPH otherwise) and keeps actuals and snapshots; baselines, actuals and snapshots belong to one variant, so a newly selected variant takes its own baseline 1 with no reason needed; selected, unarchived variant only; audited as plan.ev.baselined
@@ -2333,11 +2348,17 @@ Leases default to 5 minutes. Pass ttl_seconds (≤ server max, default 8h)
 on acquire/heartbeat for long-running work, and heartbeat at least every
 ttl/3.
 
+Every plan's first execution takes an earned-value baseline automatically
+(CPM_BASELINE_MODE=auto, the default), reported as baseline_taken on the
+acquire/mark/select response; set CPM_BASELINE_MODE=refuse to make those
+calls fail with BASELINE_REQUIRED until plan.baseline is called. plan.status
+reports the plan's baseline (or null).
+
 Errors carry stable prefixes: LOCK_HELD, LOCK_NOT_HELD, LOCK_EXPIRED,
 OVERLAP_DETECTED, MISSING_PREREQUISITE, PLAN_NOT_FOUND,
 DELIVERABLE_NOT_FOUND, LAPSE_LIMIT, PREREQUISITES_INCOMPLETE, INVALID_GRAPH,
 INVALID_CAPACITIES, VARIANT_NOT_SELECTED, ARCHIVE_REFUSED, INVALID_PATH,
-INVALID_ACTUALS, NOT_BASELINED, BACKEND_ERROR.
+INVALID_ACTUALS, BASELINE_REQUIRED, NOT_BASELINED, BACKEND_ERROR.
 
 DeliverableStatus is internally tagged on `status`:
   {"status":"pending"} | {"status":"ready"} | {"status":"in_progress"} |

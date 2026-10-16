@@ -724,6 +724,43 @@ pub struct BaselineOutcome {
     pub reason: Option<String>,
 }
 
+/// The reason recorded on a baseline an execution-starting call took
+/// automatically because the plan had none.
+pub const FIRST_EXECUTION_REASON: &str = "first_execution";
+
+/// How execution treats a plan that has no earned-value baseline yet.
+/// Server-configured once at startup with `CPM_BASELINE_MODE`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BaselineMode {
+    /// Execution takes the first baseline itself, from the current graph as
+    /// of the call, in the same write transaction (the default).
+    #[default]
+    Auto,
+    /// Execution is refused with `BASELINE_REQUIRED` until the operator
+    /// calls `plan.baseline`.
+    Refuse,
+}
+
+/// A baseline an execution-starting call took automatically. Reported in
+/// `baseline_taken` on the call's response; absent when one already existed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BaselineTaken {
+    /// Number within the plan; `1` for the first baseline.
+    pub baseline_number: u32,
+    /// The baseline's PV start (the call time).
+    pub as_of: DateTime<Utc>,
+    /// Always [`FIRST_EXECUTION_REASON`].
+    pub reason: String,
+}
+
+/// The latest baseline summary `plan.status` reports; `null` before the
+/// first baseline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanBaseline {
+    pub baseline_number: u32,
+    pub as_of: DateTime<Utc>,
+}
+
 /// Export format of `plan.snapshot`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

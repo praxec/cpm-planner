@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 
 use crate::compare::Comparison;
 use crate::earned_value::{
-    BaselineOutcome, BaselineRequest, EvReport, SnapshotOutcome, SnapshotRequest,
+    BaselineOutcome, BaselineRequest, BaselineTaken, EvReport, SnapshotOutcome, SnapshotRequest,
 };
 use crate::plan::{
     AcceptRequest, AcquireRequest, Cohort, ComparePlansRequest, ForceReleaseRequest, ForkRequest,
@@ -63,8 +63,15 @@ pub trait Planner: Send + Sync {
     /// call is rejected with [`PlannerError::LockNotHeld`]. Optional
     /// earned-value progress fields are validated as
     /// [`PlannerError::InvalidActuals`] (see [`MarkStatusRequest`]) and
-    /// stored with the mark.
-    async fn mark_status(&self, req: MarkStatusRequest) -> Result<(), PlannerError>;
+    /// stored with the mark. A mark to `InProgress` or `Complete` is
+    /// execution-starting: in the server's `auto` baseline mode it takes
+    /// the plan's first baseline when none exists and returns it; in
+    /// `refuse` mode it fails with [`PlannerError::BaselineRequired`] and
+    /// changes nothing.
+    async fn mark_status(
+        &self,
+        req: MarkStatusRequest,
+    ) -> Result<Option<BaselineTaken>, PlannerError>;
 
     /// Refresh the TTL on a held lock. Rejected with
     /// [`PlannerError::LockNotHeld`] if `caller_id` is not the holder, or with

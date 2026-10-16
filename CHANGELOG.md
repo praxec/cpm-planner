@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Execution always has an earned-value baseline. `CPM_BASELINE_MODE` (`auto`, the default, or `refuse`) is read at server start. In `auto`, the first execution-starting call on a plan with no baseline takes one from the current graph, inside the same store write, with reason `first_execution` and the usual `plan.ev.baselined` audit event; the call's response carries `baseline_taken: {baseline_number, as_of, reason}`. The execution-starting calls are `plan.acquire_cohort` that leases at least one deliverable, `plan.mark_status` to in-progress or complete (locked or lockless), and `plan.select` of a variant that already has progress. In `refuse`, those calls fail with `BASELINE_REQUIRED` and change nothing. `plan.status` now reports `baseline: {baseline_number, as_of} | null`, and `plan.revise`/`plan.select` never replace an existing baseline.
+
 ## [0.2.2] - 2026-10-11
 
 ### Fixed

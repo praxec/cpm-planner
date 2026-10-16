@@ -1064,12 +1064,8 @@ async fn lockless_earned_pct_survives_restart() {
         d.earning_rule = Some(cpm_planner::earned_value::EarningRule::FiftyFifty);
     }
     let plan_id = lockless_in_progress_d1(&db.path, graph).await;
-    open_planner(&db.path)
-        .baseline(cpm_planner::earned_value::BaselineRequest::new(
-            plan_id.clone(),
-        ))
-        .await
-        .expect("baseline");
+    // The lockless in_progress mark is execution-starting, so it already
+    // took the plan's first baseline; read it back after reopening.
     let report = open_planner(&db.path)
         .ev(&plan_id, None)
         .await

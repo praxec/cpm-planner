@@ -34,6 +34,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::audit::{AuditEvent, AuditSink, NullAuditSink};
+use crate::earned_value::{BaselineMode, BaselineTaken};
 use crate::plan::{
     AcceptRequest, AcquireRequest, BlockedDeliverable, CallerId, Cohort, CohortRow,
     ComparePlansRequest, Deliverable, DeliverableStatus, FINISH_ID, FileMode, ForceReleaseRequest,
@@ -133,6 +134,8 @@ pub struct BasicCpmPlanner {
     /// The project whose plan files this planner may read and write (drift
     /// detection, fork). `None`: file features degrade to inline/unknown.
     project_root: Option<ProjectRoot>,
+    /// How execution treats a plan with no earned-value baseline yet.
+    baseline_mode: BaselineMode,
 }
 
 impl BasicCpmPlanner {
@@ -210,7 +213,17 @@ impl BasicCpmPlanner {
             max_ttl: DEFAULT_MAX_TTL,
             clock,
             project_root: None,
+            baseline_mode: BaselineMode::Auto,
         }
+    }
+
+    /// Set how execution treats a plan with no earned-value baseline yet:
+    /// [`BaselineMode::Auto`] (the default) takes the first baseline
+    /// automatically; [`BaselineMode::Refuse`] fails with
+    /// `BASELINE_REQUIRED` until `plan.baseline` is called.
+    pub fn with_baseline_mode(mut self, mode: BaselineMode) -> Self {
+        self.baseline_mode = mode;
+        self
     }
 
     /// Give the planner a project root. [`Planner::status`] then reports
@@ -1400,10 +1413,34 @@ impl Planner for BasicCpmPlanner {
         force: bool,
     ) -> Result<SelectOutcome, PlannerError> {
         let now = self.now();
-        let selected = self
-            .store
-            .write_tx(|tx| crate::portfolio::select(tx, plan_id, force, now))?;
-        self.flush_audit(selection_events(&selected, now)).await;
+        let mut baseline_audit: Vec<AuditEvent> = Vec::new();
+        // Selecting a variant that gains progress (carried from the previous
+        // one, or already present) is execution-starting: in auto mode it
+        // takes a baseline when the newly selected variant has none, in the
+        // same write; in refuse mode it fails with BASELINE_REQUIRED.
+        let selected = self.store.write_tx(|tx| {
+            let mut selected = crate::portfolio::select(tx, plan_id, force, now)?;
+            if selected.outcome.changed {
+                let state = crate::plan_store::load_plan_state(tx, plan_id)?.ok_or_else(|| {
+                    PlannerError::PlanNotFound {
+                        plan_id: plan_id.0.clone(),
+                    }
+                })?;
+                if ev::state_has_progress(&state) {
+                    selected.outcome.baseline_taken = self.ensure_execution_baseline(
+                        tx,
+                        plan_id,
+                        &state,
+                        now,
+                        &mut baseline_audit,
+                    )?;
+                }
+            }
+            Ok(selected)
+        })?;
+        let mut events = selection_events(&selected, now);
+        events.extend(baseline_audit);
+        self.flush_audit(events).await;
         Ok(selected.outcome)
     }
 
@@ -1444,7 +1481,8 @@ impl Planner for BasicCpmPlanner {
         // that's what gives us atomicity against concurrent acquirers,
         // including acquirers in other OS processes.
         let mut audit_buf: Vec<AuditEvent> = Vec::new();
-        let cohort = self.store.mutate_executable_plan(&plan_id, |state| {
+        let store = &self.store;
+        let cohort = store.mutate_executable_plan_tx(&plan_id, |tx, state| {
             // 1. Reap expired locks, emitting expiry events.
             let reaped = state.reap_expired(now);
             for lock in &reaped {
@@ -1710,11 +1748,22 @@ impl Planner for BasicCpmPlanner {
             shared_paths.sort();
             shared_paths.dedup();
 
+            // Execution starts when at least one deliverable is leased;
+            // then the plan needs an earned-value baseline. In auto mode
+            // this takes one from the graph as of this call, in the same
+            // write; in refuse mode it is a BASELINE_REQUIRED error.
+            let baseline_taken = if rows.is_empty() {
+                None
+            } else {
+                self.ensure_execution_baseline(tx, &plan_id, state, now, &mut audit_buf)?
+            };
+
             Ok(Cohort {
                 plan_id: plan_id.clone(),
                 rows,
                 blocked,
                 shared_paths,
+                baseline_taken,
             })
         })?;
 
@@ -1722,7 +1771,10 @@ impl Planner for BasicCpmPlanner {
         Ok(cohort)
     }
 
-    async fn mark_status(&self, req: MarkStatusRequest) -> Result<(), PlannerError> {
+    async fn mark_status(
+        &self,
+        req: MarkStatusRequest,
+    ) -> Result<Option<BaselineTaken>, PlannerError> {
         let MarkStatusRequest {
             plan_id,
             deliverable_id,
@@ -1748,7 +1800,8 @@ impl Planner for BasicCpmPlanner {
         let caller_id = &caller_id;
         let now = self.now();
         let mut audit_buf: Vec<AuditEvent> = Vec::new();
-        self.store.mutate_executable_plan(&plan_id, |state| {
+        let store = &self.store;
+        let baseline_taken = store.mutate_executable_plan_tx(&plan_id, |tx, state| {
             // Deliverable existence.
             if !state
                 .graph
@@ -1794,6 +1847,17 @@ impl Planner for BasicCpmPlanner {
 
             // Progress fields ride along with every accepted mark (also an
             // idempotent Complete); a refused mark rolls them back.
+            // An InProgress/Complete mark is execution-starting: ensure the
+            // plan has a baseline (auto: take one; refuse: fail) before any
+            // mutation is persisted.
+            let baseline_taken = if matches!(
+                status,
+                DeliverableStatus::InProgress | DeliverableStatus::Complete
+            ) {
+                self.ensure_execution_baseline(tx, &plan_id, state, now, &mut audit_buf)?
+            } else {
+                None
+            };
             state.report_actuals(deliverable_id, report, now);
 
             // Completing without a lease: every prerequisite must be done,
@@ -1804,7 +1868,7 @@ impl Planner for BasicCpmPlanner {
                     state.statuses.get(deliverable_id),
                     Some(DeliverableStatus::Complete)
                 ) {
-                    return Ok(());
+                    return Ok(baseline_taken);
                 }
                 let missing = incomplete_prerequisites(state, deliverable_id);
                 if !missing.is_empty() {
@@ -1894,7 +1958,7 @@ impl Planner for BasicCpmPlanner {
                     .insert(deliverable_id.to_string(), status.clone());
             }
 
-            Ok(())
+            Ok(baseline_taken)
         })?;
 
         // SPEC §33 audit fixup (F6 ORPHAN-001): the previous
@@ -1905,7 +1969,7 @@ impl Planner for BasicCpmPlanner {
         // it actually needs it.
 
         self.flush_audit(audit_buf).await;
-        Ok(())
+        Ok(baseline_taken)
     }
 
     async fn heartbeat(&self, req: HeartbeatRequest) -> Result<(), PlannerError> {
@@ -1969,7 +2033,7 @@ impl Planner for BasicCpmPlanner {
     }
 
     async fn status(&self, plan_id: &PlanId) -> Result<PlanStatus, PlannerError> {
-        let ((mut status, head_hash), info) =
+        let (((mut status, head_hash), info), baseline) =
             self.store.read_plan_and_variant(plan_id, |state| {
                 // Preserve insertion order from the original graph for stable UI.
                 let deliverables: Vec<(String, DeliverableStatus, u32, u32, u32)> = state
@@ -2038,9 +2102,11 @@ impl Planner for BasicCpmPlanner {
                     variant: None,
                     selected: None,
                     definition_drift: None,
+                    baseline: None,
                 };
                 (status, hash_graph(&state.graph))
             })?;
+        status.baseline = baseline;
         if let Some(info) = info {
             // File I/O outside the read snapshot; the head hash is from it.
             status.definition_drift =
