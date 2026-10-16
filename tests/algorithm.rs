@@ -199,6 +199,43 @@ fn optimal_parallel_duration_is_max_earliest_finish() {
 }
 
 #[test]
+fn sibling_fanout_critical_path_is_a_prerequisite_chain() {
+    // A fans out to siblings B (longer) and C, which rejoin at D.
+    let mut tasks = vec![
+        make_task("A", 1.0, vec![]),
+        make_task("B", 4.0, vec!["A"]),
+        make_task("C", 1.0, vec!["A"]),
+        make_task("D", 1.0, vec!["B", "C"]),
+    ];
+    let result = CpmAlgorithm::calculate(&mut tasks);
+    assert_chain_is_prerequisite_path(&result);
+}
+
+#[test]
+fn two_roots_feeding_one_node_critical_path_is_a_prerequisite_chain() {
+    // P0a (14h) and P1a (5h) are unrelated roots; P1c1 waits on both.
+    let mut tasks = vec![
+        make_task("P0a", 14.0, vec![]),
+        make_task("P1a", 5.0, vec![]),
+        make_task("P1c1", 2.0, vec!["P0a", "P1a"]),
+    ];
+    let result = CpmAlgorithm::calculate(&mut tasks);
+    assert_chain_is_prerequisite_path(&result);
+}
+
+#[test]
+fn two_roots_critical_path_duration_is_the_longest_path() {
+    // Longest path is P0a (14) -> P1c1 (2) = 16, not 14 + 5 + 2 or 19 + 2.
+    let mut tasks = vec![
+        make_task("P0a", 14.0, vec![]),
+        make_task("P1a", 5.0, vec![]),
+        make_task("P1c1", 2.0, vec!["P0a", "P1a"]),
+    ];
+    let result = CpmAlgorithm::calculate(&mut tasks);
+    assert!((result.critical_path_duration - 16.0).abs() < 1e-3);
+}
+
+#[test]
 fn duplicate_prerequisite_ids_still_schedule() {
     let mut tasks = vec![
         make_task("A", 1.0, vec![]),
