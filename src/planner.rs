@@ -1187,6 +1187,29 @@ fn priority_key(
     )
 }
 
+/// Sort key for the `plan.status` ready display: smallest total float first
+/// (most critical ready work leads), then smallest latest start, then id for
+/// determinism. This deliberately differs from [`priority_key`], which drives
+/// cohort leasing by longest remaining tail.
+fn ready_display_key(
+    deliverable_id: &str,
+    sched_by_id: &HashMap<&str, (f32, f32)>,
+) -> (i64, i64, String) {
+    let (latest_start, float) = match sched_by_id.get(deliverable_id) {
+        Some(&v) => v,
+        None => unreachable!(
+            "deliverable '{deliverable_id}' is in the ready set but absent from the cached \
+             CPM schedule — ready set and CPM result are out of sync"
+        ),
+    };
+    let scale = |h: f32| (h * 1000.0).round() as i64;
+    (
+        scale(float),
+        scale(latest_start),
+        deliverable_id.to_string(),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Planner impl
 // ---------------------------------------------------------------------------
@@ -2064,16 +2087,17 @@ impl Planner for BasicCpmPlanner {
                             && !state.locks.contains_key(&r.id)
                     })
                     .collect();
-                // Same ordering as acquire_cohort (shared priority_key). Membership is a
-                // superset: acquire may still skip deliverables at the failure or lapse
-                // cap, manual deliverables, or ones whose files overlap a held lock.
+                // Display order is float-first (ready_display_key); acquire_cohort keeps
+                // its own longest-remaining-tail priority_key. Membership is a superset:
+                // acquire may still skip deliverables at the failure or lapse cap, manual
+                // deliverables, or ones whose files overlap a held lock.
                 let sched_by_id: HashMap<&str, (f32, f32)> = state
                     .cached_result
                     .tasks
                     .iter()
                     .map(|t| (t.id.as_str(), (t.latest_start, t.float)))
                     .collect();
-                ready_rows.sort_by_key(|r| priority_key(&r.id, &sched_by_id));
+                ready_rows.sort_by_key(|r| ready_display_key(&r.id, &sched_by_id));
                 let ready: Vec<String> = ready_rows.iter().map(|r| r.id.clone()).collect();
 
                 let milestones =
