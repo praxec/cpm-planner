@@ -35,6 +35,15 @@ plan.baseline {"plan_id": "<plan_id>", "start": "2026-10-12T00:00:00+02:00",
   8 hours per day earns no PV that day.
 - Budgets are effort × `metadata.cost_rate` (default 1).
 - Selected, unarchived variant only.
+- **Execution auto-baselines.** The first execution-starting call (`plan.acquire_cohort`
+  that leases work, a `plan.mark_status` to in-progress or complete, or `plan.select` of a
+  variant with progress) takes baseline 1 from the current graph and reports
+  `baseline_taken`; with `CPM_BASELINE_MODE=refuse` it fails with `BASELINE_REQUIRED`.
+  `plan.status` reports the latest `baseline` (`{baseline_number, as_of}` or null).
+- `plan.lint` on a plan with progress but no baseline warns `NO_BASELINE`.
+- `backfill_from` (RFC 3339) recovers an unbaselined plan: it sets the baseline `start`
+  retroactively and marks it `backfilled: true` (reported by `plan.ev`). It must not be in
+  the future or before the plan's creation (`INVALID_VALUE`).
 
 ## 2. Read
 
