@@ -1077,6 +1077,17 @@ pub struct PlanStatus {
     /// `None` for an unnamed plan.
     #[serde(default)]
     pub selected: Option<bool>,
+    /// Effective archived flag of this variant (its line is archived or the
+    /// variant itself is); `None` for an unnamed plan. Archived variants
+    /// stay readable through `status` and `ev`.
+    #[serde(default)]
+    pub archived: Option<bool>,
+    /// Only when [`PlanStatus::archived`] is `Some(true)`: the name of the
+    /// project's single active plan line, so a caller holding a stale id
+    /// learns where the live work is. `None` when not archived, for an
+    /// unnamed plan, or when the project has zero or several active lines.
+    #[serde(default)]
+    pub active_plan: Option<String>,
     /// `Some(true)` when the variant's plan file no longer matches what was
     /// last synced (by content hash), `Some(false)` when it matches. `None`
     /// (unknown) when the variant has no source file, the planner has no

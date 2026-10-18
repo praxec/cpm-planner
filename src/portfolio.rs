@@ -451,6 +451,9 @@ pub(crate) struct VariantInfo {
     pub(crate) variant: String,
     /// True for its line's selected variant.
     pub(crate) selected: bool,
+    /// Effective archived flag: the variant's line is archived or the
+    /// variant row itself is.
+    pub(crate) archived: bool,
     pub(crate) source_path: Option<String>,
     /// See the module docs: a file hash only when `source_path` is set.
     pub(crate) content_hash: Option<String>,
@@ -462,7 +465,8 @@ pub(crate) fn variant_info(
     plan_id: &PlanId,
 ) -> Result<Option<VariantInfo>, PlannerError> {
     tx.query_row(
-        "SELECT v.project, v.name, v.variant, l.selected_variant, v.source_path, v.content_hash
+        "SELECT v.project, v.name, v.variant, l.selected_variant, v.source_path, v.content_hash,
+                v.archived, COALESCE(l.archived, 0)
          FROM variants v
          LEFT JOIN plan_lines l ON l.project = v.project AND l.name = v.name
          WHERE v.plan_id = ?1",
@@ -470,10 +474,13 @@ pub(crate) fn variant_info(
         |r| {
             let variant: String = r.get(2)?;
             let selected: Option<String> = r.get(3)?;
+            let v_archived: bool = r.get(6)?;
+            let line_archived: bool = r.get(7)?;
             Ok(VariantInfo {
                 project: r.get(0)?,
                 name: r.get(1)?,
                 selected: selected.as_deref() == Some(variant.as_str()),
+                archived: line_archived || v_archived,
                 variant,
                 source_path: r.get(4)?,
                 content_hash: r.get(5)?,
@@ -620,6 +627,19 @@ pub(crate) fn active_lines(
         }
     }
     Ok(out)
+}
+
+/// The name of the project's single active plan line (see [`active_lines`]),
+/// or `None` when the project has zero or several.
+pub(crate) fn active_line_name(
+    tx: &Transaction<'_>,
+    project: &str,
+) -> Result<Option<String>, PlannerError> {
+    let mut lines = active_lines(tx, project)?;
+    match lines.len() {
+        1 => Ok(lines.pop().map(|(name, _)| name)),
+        _ => Ok(None),
+    }
 }
 
 /// The plan id of the line's selected variant, regardless of archiving (the

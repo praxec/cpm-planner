@@ -2158,6 +2158,8 @@ impl Planner for BasicCpmPlanner {
                     name: None,
                     variant: None,
                     selected: None,
+                    archived: None,
+                    active_plan: None,
                     definition_drift: None,
                     baseline: None,
                 };
@@ -2171,6 +2173,14 @@ impl Planner for BasicCpmPlanner {
             status.name = Some(info.name);
             status.variant = Some(info.variant);
             status.selected = Some(info.selected);
+            status.archived = Some(info.archived);
+            if info.archived {
+                // Where the live work is, for a caller holding a stale id.
+                let project = info.project;
+                status.active_plan = self
+                    .store
+                    .read_tx(|tx| crate::portfolio::active_line_name(tx, &project))?;
+            }
         }
         Ok(status)
     }
