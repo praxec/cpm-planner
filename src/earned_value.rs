@@ -245,6 +245,19 @@ pub struct EvReport {
     /// re-baseline, but their spend counts in AC at rate 1.0 (their live
     /// `cost_rate` applies only once a baseline row exists).
     pub excluded_unbaselined: Vec<String>,
+    /// True when the plan belongs to an effectively archived variant (its
+    /// line is archived or the variant itself is); false for unnamed plans
+    /// and live variants. Archived variants stay readable through `ev`.
+    #[serde(default)]
+    pub archived: bool,
+    /// Only when [`EvReport::archived`] is true: the name of the project's
+    /// single active plan line, so a caller holding a stale id learns where
+    /// the live work is. `None` when not archived or when the project has
+    /// zero or several active lines; omitted from the wire when `None` (the
+    /// report's nulls are reserved for metrics explained by
+    /// [`EvReport::undefined`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_plan: Option<String>,
 }
 
 fn weekday_from_name(name: &str) -> Option<Weekday> {
@@ -670,6 +683,8 @@ pub fn compute_ev(
             v.sort();
             v
         },
+        archived: false,
+        active_plan: None,
     };
     Ok(report)
 }

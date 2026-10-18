@@ -451,6 +451,9 @@ pub(crate) struct VariantInfo {
     pub(crate) variant: String,
     /// True for its line's selected variant.
     pub(crate) selected: bool,
+    /// Effective archived flag: the variant's line is archived or the
+    /// variant row itself is.
+    pub(crate) archived: bool,
     pub(crate) source_path: Option<String>,
     /// See the module docs: a file hash only when `source_path` is set.
     pub(crate) content_hash: Option<String>,
@@ -462,7 +465,8 @@ pub(crate) fn variant_info(
     plan_id: &PlanId,
 ) -> Result<Option<VariantInfo>, PlannerError> {
     tx.query_row(
-        "SELECT v.project, v.name, v.variant, l.selected_variant, v.source_path, v.content_hash
+        "SELECT v.project, v.name, v.variant, l.selected_variant, v.source_path, v.content_hash,
+                v.archived, COALESCE(l.archived, 0)
          FROM variants v
          LEFT JOIN plan_lines l ON l.project = v.project AND l.name = v.name
          WHERE v.plan_id = ?1",
@@ -470,10 +474,13 @@ pub(crate) fn variant_info(
         |r| {
             let variant: String = r.get(2)?;
             let selected: Option<String> = r.get(3)?;
+            let v_archived: bool = r.get(6)?;
+            let line_archived: bool = r.get(7)?;
             Ok(VariantInfo {
                 project: r.get(0)?,
                 name: r.get(1)?,
                 selected: selected.as_deref() == Some(variant.as_str()),
+                archived: line_archived || v_archived,
                 variant,
                 source_path: r.get(4)?,
                 content_hash: r.get(5)?,
@@ -580,6 +587,75 @@ pub(crate) fn ensure_revisable(tx: &Transaction<'_>, plan_id: &PlanId) -> Result
         return Err(variant_archived(&variant, &name));
     }
     Ok(())
+}
+
+/// `(line name, selected variant's plan id)` for every active plan line of
+/// `project`, sorted by name. A line is active when it is not archived, its
+/// `selected_variant` is set and that variant is not archived, and its plan
+/// is not all-complete (a plan with no deliverables counts as complete, as in
+/// [`list`]).
+pub(crate) fn active_lines(
+    tx: &Transaction<'_>,
+    project: &str,
+) -> Result<Vec<(String, PlanId)>, PlannerError> {
+    let rows: Vec<(String, String)> = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT l.name, v.plan_id
+                 FROM plan_lines l
+                 JOIN variants v ON v.project = l.project AND v.name = l.name
+                 WHERE l.project = ?1 AND l.archived = 0
+                   AND l.selected_variant IS NOT NULL
+                   AND v.variant = l.selected_variant AND v.archived = 0
+                 ORDER BY l.name",
+            )
+            .map_err(backend)?;
+        stmt.query_map(params![project], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(backend)?
+            .collect::<Result<_, _>>()
+            .map_err(backend)?
+    };
+
+    let mut out = Vec::with_capacity(rows.len());
+    for (name, plan_id) in rows {
+        let plan_id = PlanId(plan_id);
+        let state = load_plan_state(tx, &plan_id)?.ok_or_else(|| PlannerError::PlanNotFound {
+            plan_id: plan_id.0.clone(),
+        })?;
+        if !all_complete(&state) {
+            out.push((name, plan_id));
+        }
+    }
+    Ok(out)
+}
+
+/// The name of the project's single active plan line (see [`active_lines`]),
+/// or `None` when the project has zero or several.
+pub(crate) fn active_line_name(
+    tx: &Transaction<'_>,
+    project: &str,
+) -> Result<Option<String>, PlannerError> {
+    let mut lines = active_lines(tx, project)?;
+    match lines.len() {
+        1 => Ok(lines.pop().map(|(name, _)| name)),
+        _ => Ok(None),
+    }
+}
+
+/// The plan id of the line's selected variant, regardless of archiving (the
+/// callers handle archived lines and variants). An unknown line is
+/// `PLAN_NOT_FOUND`; a line without a selected variant is `PLAN_NOT_FOUND`
+/// naming the line.
+pub(crate) fn resolve_line(
+    tx: &Transaction<'_>,
+    project: &str,
+    name: &str,
+) -> Result<PlanId, PlannerError> {
+    let line_row = line(tx, project, name)?.ok_or_else(|| line_not_found(project, name))?;
+    let Some(variant) = line_row.selected_variant else {
+        return Err(no_selected_variant(project, name));
+    };
+    variant_plan_id(tx, project, name, &variant)?.ok_or_else(|| no_selected_variant(project, name))
 }
 
 /// Plan lines of `project` sorted by name, variants sorted by variant.
@@ -757,6 +833,12 @@ fn variant_archived(variant: &str, name: &str) -> PlannerError {
 fn line_not_found(project: &str, name: &str) -> PlannerError {
     PlannerError::PlanNotFound {
         plan_id: format!("plan line '{name}' in project '{project}'"),
+    }
+}
+
+fn no_selected_variant(project: &str, name: &str) -> PlannerError {
+    PlannerError::PlanNotFound {
+        plan_id: format!("plan line '{name}' in project '{project}' has no selected variant"),
     }
 }
 

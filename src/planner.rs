@@ -39,8 +39,8 @@ use crate::plan::{
     AcceptRequest, AcquireRequest, BlockedDeliverable, CallerId, Cohort, CohortRow,
     ComparePlansRequest, Deliverable, DeliverableStatus, FINISH_ID, FileMode, ForceReleaseRequest,
     ForkRequest, HeartbeatRequest, LockInfo, MAX_DELIVERABLES, MarkStatusRequest, OwnedFile,
-    PlanDefinition, PlanGraph, PlanId, PlanLineSummary, PlanStatus, PlannerError, ReviseRequest,
-    START_ID, ScheduleRow, SelectOutcome, SyncOutcome, SyncRequest,
+    PlanDefinition, PlanGraph, PlanId, PlanLineSummary, PlanRef, PlanStatus, PlannerError,
+    ReviseRequest, START_ID, ScheduleRow, SelectOutcome, SyncOutcome, SyncRequest,
 };
 use crate::plan_store::SqlitePlanStore;
 use crate::portfolio::{Archived, Revised, Selected, Synced, VariantInfo};
@@ -1405,6 +1405,39 @@ impl Planner for BasicCpmPlanner {
             .read_tx(|tx| crate::portfolio::list(tx, project, include_archived))
     }
 
+    async fn resolve_plan(&self, plan: PlanRef) -> Result<PlanId, PlannerError> {
+        match plan {
+            PlanRef::Id(plan_id) => Ok(plan_id),
+            PlanRef::Line { project, name } => self
+                .store
+                .read_tx(|tx| crate::portfolio::resolve_line(tx, &project, &name)),
+            PlanRef::Active { project } => self.store.read_tx(|tx| {
+                let lines = crate::portfolio::active_lines(tx, &project)?;
+                match lines.as_slice() {
+                    [] => Err(PlannerError::NoActivePlan { project }),
+                    [(_, plan_id)] => Ok(plan_id.clone()),
+                    _ => Err(PlannerError::AmbiguousActivePlan {
+                        project,
+                        lines: lines.into_iter().map(|(name, _)| name).collect(),
+                    }),
+                }
+            }),
+        }
+    }
+
+    async fn list_active_plans(&self, project: &str) -> Result<Vec<PlanLineSummary>, PlannerError> {
+        self.store.read_tx(|tx| {
+            let names: HashSet<String> = crate::portfolio::active_lines(tx, project)?
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            Ok(crate::portfolio::list(tx, project, false)?
+                .into_iter()
+                .filter(|line| names.contains(&line.name))
+                .collect())
+        })
+    }
+
     async fn revision_graph(
         &self,
         plan_id: &PlanId,
@@ -2125,6 +2158,8 @@ impl Planner for BasicCpmPlanner {
                     name: None,
                     variant: None,
                     selected: None,
+                    archived: None,
+                    active_plan: None,
                     definition_drift: None,
                     baseline: None,
                 };
@@ -2138,6 +2173,14 @@ impl Planner for BasicCpmPlanner {
             status.name = Some(info.name);
             status.variant = Some(info.variant);
             status.selected = Some(info.selected);
+            status.archived = Some(info.archived);
+            if info.archived {
+                // Where the live work is, for a caller holding a stale id.
+                let project = info.project;
+                status.active_plan = self
+                    .store
+                    .read_tx(|tx| crate::portfolio::active_line_name(tx, &project))?;
+            }
         }
         Ok(status)
     }
