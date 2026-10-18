@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use cpm_planner::audit::MemoryAuditSink;
 use cpm_planner::server::{
-    TOOL_ACQUIRE_COHORT, TOOL_BASELINE, TOOL_EV, TOOL_LIST, TOOL_MARK_STATUS, TOOL_STATUS,
-    TOOL_SUBMIT, plan_tool_definitions,
+    TOOL_ACQUIRE_COHORT, TOOL_ARCHIVE, TOOL_BASELINE, TOOL_EV, TOOL_LIST, TOOL_MARK_STATUS,
+    TOOL_STATUS, TOOL_SUBMIT, plan_tool_definitions,
 };
 use cpm_planner::{BasicCpmPlanner, PlanServer, SqlitePlanStore};
 use rmcp::model::{CallToolRequestParams, JsonObject};
@@ -354,4 +354,55 @@ fn plan_status_schema_no_longer_requires_plan_id() {
         .and_then(|value| value.as_array());
 
     assert!(!required.is_some_and(|names| names.contains(&json!("plan_id"))));
+}
+
+// ── Issue #77 acceptance: stale ids and line equivalence ─────────────────────
+
+#[tokio::test]
+async fn ev_by_line_equals_ev_by_selected_plan_id() {
+    let db = TempDb::new();
+    let server = db.server();
+    let id = sync_line(&server, "web", "main", one("a")).await;
+    baseline(&server, &id).await;
+    let as_of = "2030-01-01T00:00:00Z";
+
+    let by_line = server
+        .dispatch_call(call_args(
+            TOOL_EV,
+            json!({ "plan": "web", "project": PROJECT, "as_of": as_of }),
+        ))
+        .await
+        .expect("plan.ev by line returns Ok");
+    let by_id = server
+        .dispatch_call(call_args(TOOL_EV, json!({ "plan_id": id, "as_of": as_of })))
+        .await
+        .expect("plan.ev by id returns Ok");
+
+    assert_eq!(by_line, by_id);
+}
+
+#[tokio::test]
+async fn ev_by_stale_archived_plan_id_flags_it_and_names_the_live_line() {
+    let db = TempDb::new();
+    let server = db.server();
+    let old = sync_line(&server, "sprint-1", "main", one("a")).await;
+    baseline(&server, &old).await;
+    server
+        .dispatch_call(call_args(
+            TOOL_ARCHIVE,
+            json!({ "name": "sprint-1", "project": PROJECT }),
+        ))
+        .await
+        .expect("plan.archive returns Ok");
+    let _live = sync_line(&server, "sprint-2", "main", one("b")).await;
+
+    let report = server
+        .dispatch_call(call_args(TOOL_EV, json!({ "plan_id": old })))
+        .await
+        .expect("plan.ev on an archived variant stays readable");
+
+    assert_eq!(
+        (&report["archived"], &report["active_plan"]),
+        (&json!(true), &json!("sprint-2"))
+    );
 }
