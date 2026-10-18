@@ -89,7 +89,7 @@ use crate::monte_carlo::MonteCarloRequest;
 use crate::plan::{
     AcceptRequest, AcquireRequest, CallerId, Cohort, ComparePlansRequest, DeliverableStatus,
     ForceReleaseRequest, ForkRequest, HeartbeatRequest, MarkStatusRequest, PlanDefinition,
-    PlanGraph, PlanId, PlanStatus, PlannerError, ReviseRequest, SyncRequest,
+    PlanGraph, PlanId, PlanRef, PlanStatus, PlannerError, ReviseRequest, SyncRequest,
 };
 use crate::ports::Planner;
 use crate::project::ProjectRoot;
@@ -192,7 +192,14 @@ struct SubmitArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AcquireCohortArgs {
-    plan_id: String,
+    #[serde(default)]
+    plan_id: Option<String>,
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    project: Option<String>,
     caller_id: String,
     max_count: usize,
     #[serde(default)]
@@ -213,7 +220,14 @@ struct AcquireFilter {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AcceptArgs {
-    plan_id: String,
+    #[serde(default)]
+    plan_id: Option<String>,
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    project: Option<String>,
     deliverable_id: String,
     accepted_by: String,
     evidence: String,
@@ -224,7 +238,14 @@ struct AcceptArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HeartbeatArgs {
-    plan_id: String,
+    #[serde(default)]
+    plan_id: Option<String>,
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    project: Option<String>,
     deliverable_id: String,
     caller_id: String,
     #[serde(default)]
@@ -234,7 +255,14 @@ struct HeartbeatArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MarkStatusArgs {
-    plan_id: String,
+    #[serde(default)]
+    plan_id: Option<String>,
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    project: Option<String>,
     deliverable_id: String,
     caller_id: String,
     status: DeliverableStatus,
@@ -251,19 +279,40 @@ struct MarkStatusArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StatusArgs {
-    plan_id: String,
+    #[serde(default)]
+    plan_id: Option<String>,
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    project: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GetArgs {
-    plan_id: String,
+    #[serde(default)]
+    plan_id: Option<String>,
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    project: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ForceReleaseArgs {
-    plan_id: String,
+    #[serde(default)]
+    plan_id: Option<String>,
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    project: Option<String>,
     deliverable_id: String,
     reason: String,
     #[serde(default)]
@@ -346,6 +395,8 @@ struct ListArgs {
     project: Option<String>,
     #[serde(default)]
     include_archived: bool,
+    #[serde(default)]
+    active: bool,
 }
 
 /// `plan.export`: write a plan's head graph to its variant file (or `path`).
@@ -432,7 +483,14 @@ struct CompareArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BaselineArgs {
-    plan_id: String,
+    #[serde(default)]
+    plan_id: Option<String>,
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    project: Option<String>,
     #[serde(default)]
     start: Option<DateTime<Utc>>,
     #[serde(default)]
@@ -447,7 +505,14 @@ struct BaselineArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EvArgs {
-    plan_id: String,
+    #[serde(default)]
+    plan_id: Option<String>,
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    project: Option<String>,
     #[serde(default)]
     as_of: Option<DateTime<Utc>>,
 }
@@ -456,7 +521,14 @@ struct EvArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SnapshotArgs {
-    plan_id: String,
+    #[serde(default)]
+    plan_id: Option<String>,
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    project: Option<String>,
     #[serde(default)]
     as_of: Option<DateTime<Utc>>,
     #[serde(default)]
@@ -614,6 +686,44 @@ fn path_schema() -> Value {
     })
 }
 
+/// The plan-selector properties shared by the execution and portfolio tools:
+/// `plan_id` (no longer required), `plan` (a line name), `active` and
+/// `project`. Spliced into a tool's base `properties` object so the
+/// hand-written schema tracks `deny_unknown_fields`.
+fn with_plan_selector(mut properties: Value) -> Value {
+    if let Some(props) = properties.as_object_mut() {
+        props.insert(
+            "plan_id".to_string(),
+            json!({
+                "type": "string",
+                "description": "A stored plan id (from plan.submit/plan.sync). Provide exactly one of plan_id, plan, or active."
+            }),
+        );
+        props.insert(
+            "plan".to_string(),
+            json!({
+                "type": "string",
+                "description": "Plan line name; resolves to its selected variant. Use instead of plan_id."
+            }),
+        );
+        props.insert(
+            "active".to_string(),
+            json!({
+                "type": "boolean",
+                "description": "Resolve to the project's one unarchived, incomplete line (NO_ACTIVE_PLAN / AMBIGUOUS_ACTIVE_PLAN otherwise). Use instead of plan_id."
+            }),
+        );
+        props.insert(
+            "project".to_string(),
+            json!({
+                "type": "string",
+                "description": "Project for plan or active; default the discovered root."
+            }),
+        );
+    }
+    properties
+}
+
 fn edits_schema() -> Value {
     json!({
         "type": "array",
@@ -709,12 +819,12 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                  (not reported in blocked). The response carries blocked \
                  [{id, code, reason}], blocked_count, and needs_operator \
                  (true when any blocked code is LAPSE_LIMIT: clear with \
-                 plan.force_release {reset_counters: true}).",
+                 plan.force_release {reset_counters: true}). \
+                 Select the plan by plan_id, plan line name, or active: true.",
             ),
             schema_object(json!({
                 "type": "object",
-                "properties": {
-                    "plan_id":   { "type": "string" },
+                "properties": with_plan_selector(json!({
                     "caller_id": { "type": "string" },
                     "max_count": { "type": "integer", "minimum": 1 },
                     "ids":       { "type": "array", "minItems": 1, "items": { "type": "string" } },
@@ -724,8 +834,8 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                         "properties": { "metadata": { "type": "object" } },
                         "additionalProperties": false
                     }
-                },
-                "required": ["plan_id", "caller_id", "max_count"]
+                })),
+                "required": ["caller_id", "max_count"]
             })),
         ),
         Tool::new(
@@ -733,17 +843,17 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
             Cow::Borrowed(
                 "Refresh the TTL on a held lock; LOCK_NOT_HELD or LOCK_EXPIRED on failure. \
                  Optional ttl_seconds sets the new TTL (clamped to the server \
-                 maximum); without it the lease is never shortened.",
+                 maximum); without it the lease is never shortened. \
+                 Select the plan by plan_id, plan line name, or active: true.",
             ),
             schema_object(json!({
                 "type": "object",
-                "properties": {
-                    "plan_id":        { "type": "string" },
+                "properties": with_plan_selector(json!({
                     "deliverable_id": { "type": "string" },
                     "caller_id":      { "type": "string" },
                     "ttl_seconds":    { "type": "integer", "minimum": 1 }
-                },
-                "required": ["plan_id", "deliverable_id", "caller_id"]
+                })),
+                "required": ["deliverable_id", "caller_id"]
             })),
         ),
         Tool::new(
@@ -763,12 +873,12 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                  as actual cost) and evidence (<= 2048 chars, appended to a list of \
                  at most 100); \
                  violations are INVALID_ACTUALS. Every lease that ends adds its hours \
-                 to the deliverable's leased hours.",
+                 to the deliverable's leased hours. \
+                 Select the plan by plan_id, plan line name, or active: true.",
             ),
             schema_object(json!({
                 "type": "object",
-                "properties": {
-                    "plan_id":        { "type": "string" },
+                "properties": with_plan_selector(json!({
                     "deliverable_id": { "type": "string" },
                     "caller_id":      { "type": "string" },
                     "status": {
@@ -792,8 +902,8 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                         "maxLength": 2048,
                         "description": "One evidence note, appended to the deliverable's evidence list (at most 100 entries)."
                     }
-                },
-                "required": ["plan_id", "deliverable_id", "caller_id", "status"]
+                })),
+                "required": ["deliverable_id", "caller_id", "status"]
             })),
         ),
         Tool::new(
@@ -803,48 +913,46 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                  failure_count, lapse_count] rows, critical_path (one real chain, always from __start__ to __finish__), \
                  critical_ids, per-deliverable schedule (es/ef/ls/lf/float, hours; \
                  synthetic __start__/__finish__ rows have synthetic=true), \
-                 the ready set in float-ascending order (smallest float first, then smallest latest start, then id), plan_complete, milestones (per milestone: id, critical_path from __start__, hours, complete), and held locks.",
+                 the ready set in float-ascending order (smallest float first, then smallest latest start, then id), plan_complete, milestones (per milestone: id, critical_path from __start__, hours, complete), and held locks. \
+                 Select the plan by plan_id, plan line name, or active: true.",
             ),
             schema_object(json!({
                 "type": "object",
-                "properties": {
-                    "plan_id": { "type": "string" }
-                },
-                "required": ["plan_id"]
+                "properties": with_plan_selector(json!({})),
+                "additionalProperties": false
             })),
         ),
         Tool::new(
             Cow::Borrowed(TOOL_GET),
             Cow::Borrowed(
                 "Return the stored PlanGraph (deliverables, estimates, files, \
-                 metadata) for a plan_id.",
+                 metadata) for a plan selected by plan_id, plan line name, or \
+                 active: true.",
             ),
             schema_object(json!({
                 "type": "object",
-                "properties": {
-                    "plan_id": { "type": "string" }
-                },
-                "required": ["plan_id"]
+                "properties": with_plan_selector(json!({})),
+                "additionalProperties": false
             })),
         ),
         Tool::new(
             Cow::Borrowed(TOOL_FORCE_RELEASE),
             Cow::Borrowed(
                 "Operator escape hatch — release a lock regardless of caller. \
-                 Emits an audit event carrying `reason`.",
+                 Emits an audit event carrying `reason`. \
+                 Select the plan by plan_id, plan line name, or active: true.",
             ),
             schema_object(json!({
                 "type": "object",
-                "properties": {
-                    "plan_id":        { "type": "string" },
+                "properties": with_plan_selector(json!({
                     "deliverable_id": { "type": "string" },
                     "reason":         { "type": "string" },
                     "reset_counters": {
                         "type": "boolean",
                         "description": "Also clear lapse and failure counters (revives a circuit-broken deliverable)."
                     }
-                },
-                "required": ["plan_id", "deliverable_id", "reason"]
+                })),
+                "required": ["deliverable_id", "reason"]
             })),
         ),
         Tool::new(
@@ -853,12 +961,12 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                 "Manager/owner acceptance: mark a deliverable Complete without \
                  holding its lease. Requires all prerequisites Complete and \
                  evidence; audited. A live lease held by someone else is refused \
-                 (LOCK_HELD) unless override_lock is true.",
+                 (LOCK_HELD) unless override_lock is true. \
+                 Select the plan by plan_id, plan line name, or active: true.",
             ),
             schema_object(json!({
                 "type": "object",
-                "properties": {
-                    "plan_id":        { "type": "string" },
+                "properties": with_plan_selector(json!({
                     "deliverable_id": { "type": "string" },
                     "accepted_by":    { "type": "string" },
                     "evidence":       { "type": "string" },
@@ -866,8 +974,8 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                         "type": "boolean",
                         "description": "Take over a live lease held by another caller."
                     }
-                },
-                "required": ["plan_id", "deliverable_id", "accepted_by", "evidence"]
+                })),
+                "required": ["deliverable_id", "accepted_by", "evidence"]
             })),
         ),
         Tool::new(
@@ -995,13 +1103,15 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
             Cow::Borrowed(
                 "List every plan line of `project` (default: the discovered project \
                  root), sorted by name with each line's variants sorted by variant. \
-                 Archived lines and variants are omitted unless include_archived.",
+                 Archived lines and variants are omitted unless include_archived. \
+                 With active: true, return only the project's active lines.",
             ),
             schema_object(json!({
                 "type": "object",
                 "properties": {
                     "project": { "type": "string", "description": "Project key; defaults to the discovered project root." },
-                    "include_archived": { "type": "boolean", "description": "Include archived lines and variants (default false)." }
+                    "include_archived": { "type": "boolean", "description": "Include archived lines and variants (default false)." },
+                    "active": { "type": "boolean", "description": "Return only the project's active lines (unarchived, incomplete); mutually exclusive with include_archived." }
                 },
                 "additionalProperties": false
             })),
@@ -1158,18 +1268,17 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                  (reported by plan.ev); it must not be in the future or before the plan's \
                  creation time (INVALID_VALUE). Execution-side: the plan must be its line's \
                  selected, unarchived variant (VARIANT_NOT_SELECTED / ARCHIVE_REFUSED). \
-                 Audited as plan.ev.baselined.",
+                 Audited as plan.ev.baselined. \
+                 Select the plan by plan_id, plan line name, or active: true.",
             ),
             schema_object(json!({
                 "type": "object",
-                "properties": {
-                    "plan_id": { "type": "string" },
+                "properties": with_plan_selector(json!({
                     "start": { "type": "string", "format": "date-time", "description": "RFC 3339 instant the PV clock starts from; defaults to now." },
                     "calendar": calendar_schema(),
                     "reason": { "type": "string", "maxLength": 2048, "description": "Why the plan is re-baselined; required when a baseline exists." },
                     "backfill_from": { "type": "string", "format": "date-time", "description": "RFC 3339 instant to use as the baseline's start, marking it backfilled; must not be in the future or before the plan's creation time." }
-                },
-                "required": ["plan_id"],
+                })),
                 "additionalProperties": false
             })),
         ),
@@ -1190,15 +1299,14 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                  ratio whose denominator is 0 is null and explained in `undefined`. \
                  `backfilled` is true when the baseline was taken with `backfill_from`. \
                  Read-only; works on any variant. \
-                 NOT_BASELINED before plan.baseline.",
+                 NOT_BASELINED before plan.baseline. \
+                 Select the plan by plan_id, plan line name, or active: true.",
             ),
             schema_object(json!({
                 "type": "object",
-                "properties": {
-                    "plan_id": { "type": "string" },
+                "properties": with_plan_selector(json!({
                     "as_of": { "type": "string", "format": "date-time", "description": "RFC 3339 PV status date; defaults to now. EV and AC are always as recorded when the call runs." }
-                },
-                "required": ["plan_id"],
+                })),
                 "additionalProperties": false
             })),
         ),
@@ -1216,16 +1324,15 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                  is counted but not listed): a list of \
                  summaries (format json, default) or a Markdown table with columns \
                  date, PV, EV, AC, SPI, CPI, EAC (format markdown). \
-                 Execution-side like plan.baseline. NOT_BASELINED before plan.baseline.",
+                 Execution-side like plan.baseline. NOT_BASELINED before plan.baseline. \
+                 Select the plan by plan_id, plan line name, or active: true.",
             ),
             schema_object(json!({
                 "type": "object",
-                "properties": {
-                    "plan_id": { "type": "string" },
+                "properties": with_plan_selector(json!({
                     "as_of": { "type": "string", "format": "date-time", "description": "RFC 3339 PV status date; defaults to now. EV and AC are always as recorded when the call runs." },
                     "format": { "type": "string", "enum": ["json", "markdown"], "description": "Export format (default json)." }
-                },
-                "required": ["plan_id"],
+                })),
                 "additionalProperties": false
             })),
         ),
@@ -1407,6 +1514,68 @@ impl PlanServer {
         Ok(self.project_root()?.project_key())
     }
 
+    /// Resolve the plan selector shared by the execution and portfolio
+    /// tools: exactly one of `plan_id`, `plan` (a line name) or
+    /// `active: true`, with an optional `project` for `plan`/`active` (which
+    /// defaults to [`Self::default_project`]). Mismatches are
+    /// `invalid_params`; [`Planner::resolve_plan`] otherwise maps
+    /// `NO_ACTIVE_PLAN` / `AMBIGUOUS_ACTIVE_PLAN` / `PLAN_NOT_FOUND`
+    /// through unchanged.
+    async fn resolve_plan_selector(
+        &self,
+        plan_id: Option<String>,
+        plan: Option<String>,
+        active: bool,
+        project: Option<String>,
+    ) -> Result<PlanId, McpError> {
+        let supplied = [plan_id.is_some(), plan.is_some(), active]
+            .iter()
+            .filter(|present| **present)
+            .count();
+        if supplied != 1 {
+            return Err(McpError::invalid_params(
+                "provide exactly one of plan_id, plan, or active: true",
+                None,
+            ));
+        }
+        if plan_id.is_some() && project.is_some() {
+            return Err(McpError::invalid_params(
+                "project applies only to plan or active",
+                None,
+            ));
+        }
+        let reference = match (plan_id, plan, active) {
+            (Some(plan_id), None, false) => PlanRef::Id(PlanId(plan_id)),
+            (None, Some(name), false) => PlanRef::Line {
+                project: self.selector_project(project)?,
+                name,
+            },
+            (None, None, true) => PlanRef::Active {
+                project: self.selector_project(project)?,
+            },
+            // `supplied == 1` guarantees exactly one arm above.
+            _ => {
+                return Err(McpError::invalid_params(
+                    "provide exactly one of plan_id, plan, or active: true",
+                    None,
+                ));
+            }
+        };
+        self.planner
+            .resolve_plan(reference)
+            .await
+            .map_err(planner_error_to_mcp)
+    }
+
+    /// The project for a `plan`/`active` selector: the explicit key or the
+    /// discovered root's key.
+    fn selector_project(&self, project: Option<String>) -> Result<String, McpError> {
+        match project {
+            Some(project) => Ok(project),
+            None => self.default_project(),
+        }
+    }
+
     /// Resolve the read-only analysis tools' graph selector: exactly one of
     /// an inline `graph`, a stored `plan_id`, or a plan-file `path`; any
     /// other combination is an invalid-params error.
@@ -1549,11 +1718,11 @@ impl PlanServer {
                 None,
             ));
         }
-        let mut request = AcquireRequest::new(
-            PlanId(parsed.plan_id),
-            CallerId(parsed.caller_id),
-            parsed.max_count,
-        );
+        let plan_id = self
+            .resolve_plan_selector(parsed.plan_id, parsed.plan, parsed.active, parsed.project)
+            .await?;
+        let mut request =
+            AcquireRequest::new(plan_id, CallerId(parsed.caller_id), parsed.max_count);
         if let Some(ids) = parsed.ids {
             request = request.with_ids(ids);
         }
@@ -1588,11 +1757,11 @@ impl PlanServer {
 
     async fn handle_heartbeat(&self, args: Value) -> Result<Value, McpError> {
         let parsed: HeartbeatArgs = parse_args(args)?;
-        let mut request = HeartbeatRequest::new(
-            PlanId(parsed.plan_id),
-            parsed.deliverable_id,
-            CallerId(parsed.caller_id),
-        );
+        let plan_id = self
+            .resolve_plan_selector(parsed.plan_id, parsed.plan, parsed.active, parsed.project)
+            .await?;
+        let mut request =
+            HeartbeatRequest::new(plan_id, parsed.deliverable_id, CallerId(parsed.caller_id));
         if let Some(ttl) = ttl_from_seconds(parsed.ttl_seconds)? {
             request = request.with_ttl(ttl);
         }
@@ -1612,8 +1781,11 @@ impl PlanServer {
             parsed.evidence.as_deref(),
         )
         .map_err(planner_error_to_mcp)?;
+        let plan_id = self
+            .resolve_plan_selector(parsed.plan_id, parsed.plan, parsed.active, parsed.project)
+            .await?;
         let mut request = MarkStatusRequest::new(
-            PlanId(parsed.plan_id),
+            plan_id,
             parsed.deliverable_id,
             CallerId(parsed.caller_id),
             parsed.status,
@@ -1639,9 +1811,12 @@ impl PlanServer {
 
     async fn handle_status(&self, args: Value) -> Result<Value, McpError> {
         let parsed: StatusArgs = parse_args(args)?;
+        let plan_id = self
+            .resolve_plan_selector(parsed.plan_id, parsed.plan, parsed.active, parsed.project)
+            .await?;
         let status: PlanStatus = self
             .planner
-            .status(&PlanId(parsed.plan_id))
+            .status(&plan_id)
             .await
             .map_err(planner_error_to_mcp)?;
         to_value(&status)
@@ -1649,9 +1824,12 @@ impl PlanServer {
 
     async fn handle_get(&self, args: Value) -> Result<Value, McpError> {
         let parsed: GetArgs = parse_args(args)?;
+        let plan_id = self
+            .resolve_plan_selector(parsed.plan_id, parsed.plan, parsed.active, parsed.project)
+            .await?;
         let definition: PlanDefinition = self
             .planner
-            .get_plan(&PlanId(parsed.plan_id))
+            .get_plan(&plan_id)
             .await
             .map_err(planner_error_to_mcp)?;
         to_value(&definition)
@@ -1659,10 +1837,13 @@ impl PlanServer {
 
     async fn handle_accept(&self, args: Value) -> Result<Value, McpError> {
         let parsed: AcceptArgs = parse_args(args)?;
+        let plan_id = self
+            .resolve_plan_selector(parsed.plan_id, parsed.plan, parsed.active, parsed.project)
+            .await?;
         self.planner
             .accept(
                 AcceptRequest::new(
-                    PlanId(parsed.plan_id),
+                    plan_id,
                     parsed.deliverable_id,
                     parsed.accepted_by,
                     parsed.evidence,
@@ -1676,14 +1857,13 @@ impl PlanServer {
 
     async fn handle_force_release(&self, args: Value) -> Result<Value, McpError> {
         let parsed: ForceReleaseArgs = parse_args(args)?;
+        let plan_id = self
+            .resolve_plan_selector(parsed.plan_id, parsed.plan, parsed.active, parsed.project)
+            .await?;
         self.planner
             .force_release(
-                ForceReleaseRequest::new(
-                    PlanId(parsed.plan_id),
-                    parsed.deliverable_id,
-                    parsed.reason,
-                )
-                .reset_counters(parsed.reset_counters),
+                ForceReleaseRequest::new(plan_id, parsed.deliverable_id, parsed.reason)
+                    .reset_counters(parsed.reset_counters),
             )
             .await
             .map_err(planner_error_to_mcp)?;
@@ -1837,15 +2017,24 @@ impl PlanServer {
 
     async fn handle_list(&self, args: Value) -> Result<Value, McpError> {
         let parsed: ListArgs = parse_args(args)?;
+        if parsed.active && parsed.include_archived {
+            return Err(McpError::invalid_params(
+                "active and include_archived are mutually exclusive",
+                None,
+            ));
+        }
         let project = match parsed.project {
             Some(project) => project,
             None => self.default_project()?,
         };
-        let lines = self
-            .planner
-            .list_plans(&project, parsed.include_archived)
-            .await
-            .map_err(planner_error_to_mcp)?;
+        let lines = if parsed.active {
+            self.planner.list_active_plans(&project).await
+        } else {
+            self.planner
+                .list_plans(&project, parsed.include_archived)
+                .await
+        }
+        .map_err(planner_error_to_mcp)?;
         to_value(&lines)
     }
 
@@ -1970,7 +2159,10 @@ impl PlanServer {
 
     async fn handle_baseline(&self, args: Value) -> Result<Value, McpError> {
         let parsed: BaselineArgs = parse_args(args)?;
-        let mut request = BaselineRequest::new(PlanId(parsed.plan_id));
+        let plan_id = self
+            .resolve_plan_selector(parsed.plan_id, parsed.plan, parsed.active, parsed.project)
+            .await?;
+        let mut request = BaselineRequest::new(plan_id);
         request.start = parsed.start;
         request.calendar = parsed.calendar;
         request.reason = parsed.reason;
@@ -1986,7 +2178,9 @@ impl PlanServer {
     async fn handle_ev(&self, args: Value) -> Result<Value, McpError> {
         let parsed: EvArgs = parse_args(args)?;
         let planner = Arc::clone(&self.planner);
-        let plan_id = PlanId(parsed.plan_id);
+        let plan_id = self
+            .resolve_plan_selector(parsed.plan_id, parsed.plan, parsed.active, parsed.project)
+            .await?;
         let report = run_blocking_planner("ev", async move {
             Planner::ev(&*planner, &plan_id, parsed.as_of).await
         })
@@ -1996,7 +2190,10 @@ impl PlanServer {
 
     async fn handle_snapshot(&self, args: Value) -> Result<Value, McpError> {
         let parsed: SnapshotArgs = parse_args(args)?;
-        let mut request = SnapshotRequest::new(PlanId(parsed.plan_id)).with_format(parsed.format);
+        let plan_id = self
+            .resolve_plan_selector(parsed.plan_id, parsed.plan, parsed.active, parsed.project)
+            .await?;
+        let mut request = SnapshotRequest::new(plan_id).with_format(parsed.format);
         request.as_of = parsed.as_of;
         let planner = Arc::clone(&self.planner);
         let outcome = run_blocking_planner("snapshot", async move {
