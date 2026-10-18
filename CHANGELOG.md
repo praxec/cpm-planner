@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-18
+
 ### Added
 
 - Plan selectors for the execution, read and earned-value tools (`plan.status`, `plan.get`, `plan.ev`, `plan.snapshot`, `plan.baseline`, `plan.acquire_cohort`, `plan.heartbeat`, `plan.mark_status`, `plan.accept` and `plan.force_release`): a call takes exactly one of `plan_id`, `plan` (a plan line name, resolved to its selected variant) or `active: true` (the project's single unarchived line whose selected variant is unarchived and not complete), with an optional `project` (default: the discovered root) for `plan`/`active`. No active line is `NO_ACTIVE_PLAN`; several are `AMBIGUOUS_ACTIVE_PLAN`, naming them; an unknown line, or a line with no selected variant, is `PLAN_NOT_FOUND`; supplying none, several, or `project` with `plan_id` is invalid params. `plan.list {active: true}` returns only the active lines and cannot be combined with `include_archived`. Recurring jobs and agents can look the plan up with `active` or `plan` instead of pinning a `plan_id`; `active` matches only an incomplete line, so a lease holder keeps the resolved `plan_id` for its heartbeats and marks (#77).
@@ -233,7 +235,8 @@ approximations. For the method, caveats and known limitations, see
 - Six-tool MCP surface: `plan.submit`, `plan.acquire_cohort`, `plan.heartbeat`,
   `plan.mark_status`, `plan.status`, and `plan.force_release`.
 
-[Unreleased]: https://github.com/praxec/cpm-planner/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/praxec/cpm-planner/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/praxec/cpm-planner/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/praxec/cpm-planner/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/praxec/cpm-planner/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/praxec/cpm-planner/compare/v0.2.0...v0.2.1
