@@ -89,7 +89,7 @@ use crate::monte_carlo::MonteCarloRequest;
 use crate::plan::{
     AcceptRequest, AcquireRequest, CallerId, Cohort, ComparePlansRequest, DeliverableStatus,
     ForceReleaseRequest, ForkRequest, HeartbeatRequest, MarkStatusRequest, PlanDefinition,
-    PlanGraph, PlanId, PlanStatus, PlannerError, ReviseRequest, SyncRequest,
+    PlanGraph, PlanId, PlanRef, PlanStatus, PlannerError, ReviseRequest, SyncRequest,
 };
 use crate::ports::Planner;
 use crate::project::ProjectRoot;
@@ -192,7 +192,14 @@ struct SubmitArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AcquireCohortArgs {
-    plan_id: String,
+    #[serde(default)]
+    plan_id: Option<String>,
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    project: Option<String>,
     caller_id: String,
     max_count: usize,
     #[serde(default)]
@@ -213,7 +220,14 @@ struct AcquireFilter {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AcceptArgs {
-    plan_id: String,
+    #[serde(default)]
+    plan_id: Option<String>,
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    project: Option<String>,
     deliverable_id: String,
     accepted_by: String,
     evidence: String,
@@ -224,7 +238,14 @@ struct AcceptArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HeartbeatArgs {
-    plan_id: String,
+    #[serde(default)]
+    plan_id: Option<String>,
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    project: Option<String>,
     deliverable_id: String,
     caller_id: String,
     #[serde(default)]
@@ -234,7 +255,14 @@ struct HeartbeatArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MarkStatusArgs {
-    plan_id: String,
+    #[serde(default)]
+    plan_id: Option<String>,
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    project: Option<String>,
     deliverable_id: String,
     caller_id: String,
     status: DeliverableStatus,
@@ -251,19 +279,40 @@ struct MarkStatusArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StatusArgs {
-    plan_id: String,
+    #[serde(default)]
+    plan_id: Option<String>,
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    project: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GetArgs {
-    plan_id: String,
+    #[serde(default)]
+    plan_id: Option<String>,
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    project: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ForceReleaseArgs {
-    plan_id: String,
+    #[serde(default)]
+    plan_id: Option<String>,
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    project: Option<String>,
     deliverable_id: String,
     reason: String,
     #[serde(default)]
@@ -346,6 +395,8 @@ struct ListArgs {
     project: Option<String>,
     #[serde(default)]
     include_archived: bool,
+    #[serde(default)]
+    active: bool,
 }
 
 /// `plan.export`: write a plan's head graph to its variant file (or `path`).
@@ -432,7 +483,14 @@ struct CompareArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BaselineArgs {
-    plan_id: String,
+    #[serde(default)]
+    plan_id: Option<String>,
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    project: Option<String>,
     #[serde(default)]
     start: Option<DateTime<Utc>>,
     #[serde(default)]
@@ -447,7 +505,14 @@ struct BaselineArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EvArgs {
-    plan_id: String,
+    #[serde(default)]
+    plan_id: Option<String>,
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    project: Option<String>,
     #[serde(default)]
     as_of: Option<DateTime<Utc>>,
 }
@@ -456,7 +521,14 @@ struct EvArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SnapshotArgs {
-    plan_id: String,
+    #[serde(default)]
+    plan_id: Option<String>,
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    project: Option<String>,
     #[serde(default)]
     as_of: Option<DateTime<Utc>>,
     #[serde(default)]
@@ -614,6 +686,44 @@ fn path_schema() -> Value {
     })
 }
 
+/// The plan-selector properties shared by the execution and portfolio tools:
+/// `plan_id` (no longer required), `plan` (a line name), `active` and
+/// `project`. Spliced into a tool's base `properties` object so the
+/// hand-written schema tracks `deny_unknown_fields`.
+fn with_plan_selector(mut properties: Value) -> Value {
+    if let Some(props) = properties.as_object_mut() {
+        props.insert(
+            "plan_id".to_string(),
+            json!({
+                "type": "string",
+                "description": "A stored plan id (from plan.submit/plan.sync). Provide exactly one of plan_id, plan, or active."
+            }),
+        );
+        props.insert(
+            "plan".to_string(),
+            json!({
+                "type": "string",
+                "description": "Plan line name; resolves to its selected variant. Use instead of plan_id."
+            }),
+        );
+        props.insert(
+            "active".to_string(),
+            json!({
+                "type": "boolean",
+                "description": "Resolve to the project's one unarchived, incomplete line (NO_ACTIVE_PLAN / AMBIGUOUS_ACTIVE_PLAN otherwise). Use instead of plan_id."
+            }),
+        );
+        props.insert(
+            "project".to_string(),
+            json!({
+                "type": "string",
+                "description": "Project for plan or active; default the discovered root."
+            }),
+        );
+    }
+    properties
+}
+
 fn edits_schema() -> Value {
     json!({
         "type": "array",
@@ -709,12 +819,12 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                  (not reported in blocked). The response carries blocked \
                  [{id, code, reason}], blocked_count, and needs_operator \
                  (true when any blocked code is LAPSE_LIMIT: clear with \
-                 plan.force_release {reset_counters: true}).",
+                 plan.force_release {reset_counters: true}). \
+                 Select the plan by plan_id, plan line name, or active: true.",
             ),
             schema_object(json!({
                 "type": "object",
-                "properties": {
-                    "plan_id":   { "type": "string" },
+                "properties": with_plan_selector(json!({
                     "caller_id": { "type": "string" },
                     "max_count": { "type": "integer", "minimum": 1 },
                     "ids":       { "type": "array", "minItems": 1, "items": { "type": "string" } },
@@ -724,8 +834,8 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                         "properties": { "metadata": { "type": "object" } },
                         "additionalProperties": false
                     }
-                },
-                "required": ["plan_id", "caller_id", "max_count"]
+                })),
+                "required": ["caller_id", "max_count"]
             })),
         ),
         Tool::new(
@@ -733,17 +843,17 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
             Cow::Borrowed(
                 "Refresh the TTL on a held lock; LOCK_NOT_HELD or LOCK_EXPIRED on failure. \
                  Optional ttl_seconds sets the new TTL (clamped to the server \
-                 maximum); without it the lease is never shortened.",
+                 maximum); without it the lease is never shortened. \
+                 Select the plan by plan_id, plan line name, or active: true.",
             ),
             schema_object(json!({
                 "type": "object",
-                "properties": {
-                    "plan_id":        { "type": "string" },
+                "properties": with_plan_selector(json!({
                     "deliverable_id": { "type": "string" },
                     "caller_id":      { "type": "string" },
                     "ttl_seconds":    { "type": "integer", "minimum": 1 }
-                },
-                "required": ["plan_id", "deliverable_id", "caller_id"]
+                })),
+                "required": ["deliverable_id", "caller_id"]
             })),
         ),
         Tool::new(
@@ -763,12 +873,12 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                  as actual cost) and evidence (<= 2048 chars, appended to a list of \
                  at most 100); \
                  violations are INVALID_ACTUALS. Every lease that ends adds its hours \
-                 to the deliverable's leased hours.",
+                 to the deliverable's leased hours. \
+                 Select the plan by plan_id, plan line name, or active: true.",
             ),
             schema_object(json!({
                 "type": "object",
-                "properties": {
-                    "plan_id":        { "type": "string" },
+                "properties": with_plan_selector(json!({
                     "deliverable_id": { "type": "string" },
                     "caller_id":      { "type": "string" },
                     "status": {
@@ -792,8 +902,8 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                         "maxLength": 2048,
                         "description": "One evidence note, appended to the deliverable's evidence list (at most 100 entries)."
                     }
-                },
-                "required": ["plan_id", "deliverable_id", "caller_id", "status"]
+                })),
+                "required": ["deliverable_id", "caller_id", "status"]
             })),
         ),
         Tool::new(
@@ -803,48 +913,46 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                  failure_count, lapse_count] rows, critical_path (one real chain, always from __start__ to __finish__), \
                  critical_ids, per-deliverable schedule (es/ef/ls/lf/float, hours; \
                  synthetic __start__/__finish__ rows have synthetic=true), \
-                 the ready set in float-ascending order (smallest float first, then smallest latest start, then id), plan_complete, milestones (per milestone: id, critical_path from __start__, hours, complete), and held locks.",
+                 the ready set in float-ascending order (smallest float first, then smallest latest start, then id), plan_complete, milestones (per milestone: id, critical_path from __start__, hours, complete), and held locks. \
+                 Select the plan by plan_id, plan line name, or active: true.",
             ),
             schema_object(json!({
                 "type": "object",
-                "properties": {
-                    "plan_id": { "type": "string" }
-                },
-                "required": ["plan_id"]
+                "properties": with_plan_selector(json!({})),
+                "additionalProperties": false
             })),
         ),
         Tool::new(
             Cow::Borrowed(TOOL_GET),
             Cow::Borrowed(
                 "Return the stored PlanGraph (deliverables, estimates, files, \
-                 metadata) for a plan_id.",
+                 metadata) for a plan selected by plan_id, plan line name, or \
+                 active: true.",
             ),
             schema_object(json!({
                 "type": "object",
-                "properties": {
-                    "plan_id": { "type": "string" }
-                },
-                "required": ["plan_id"]
+                "properties": with_plan_selector(json!({})),
+                "additionalProperties": false
             })),
         ),
         Tool::new(
             Cow::Borrowed(TOOL_FORCE_RELEASE),
             Cow::Borrowed(
                 "Operator escape hatch — release a lock regardless of caller. \
-                 Emits an audit event carrying `reason`.",
+                 Emits an audit event carrying `reason`. \
+                 Select the plan by plan_id, plan line name, or active: true.",
             ),
             schema_object(json!({
                 "type": "object",
-                "properties": {
-                    "plan_id":        { "type": "string" },
+                "properties": with_plan_selector(json!({
                     "deliverable_id": { "type": "string" },
                     "reason":         { "type": "string" },
                     "reset_counters": {
                         "type": "boolean",
                         "description": "Also clear lapse and failure counters (revives a circuit-broken deliverable)."
                     }
-                },
-                "required": ["plan_id", "deliverable_id", "reason"]
+                })),
+                "required": ["deliverable_id", "reason"]
             })),
         ),
         Tool::new(
@@ -853,12 +961,12 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                 "Manager/owner acceptance: mark a deliverable Complete without \
                  holding its lease. Requires all prerequisites Complete and \
                  evidence; audited. A live lease held by someone else is refused \
-                 (LOCK_HELD) unless override_lock is true.",
+                 (LOCK_HELD) unless override_lock is true. \
+                 Select the plan by plan_id, plan line name, or active: true.",
             ),
             schema_object(json!({
                 "type": "object",
-                "properties": {
-                    "plan_id":        { "type": "string" },
+                "properties": with_plan_selector(json!({
                     "deliverable_id": { "type": "string" },
                     "accepted_by":    { "type": "string" },
                     "evidence":       { "type": "string" },
@@ -866,8 +974,8 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                         "type": "boolean",
                         "description": "Take over a live lease held by another caller."
                     }
-                },
-                "required": ["plan_id", "deliverable_id", "accepted_by", "evidence"]
+                })),
+                "required": ["deliverable_id", "accepted_by", "evidence"]
             })),
         ),
         Tool::new(
@@ -995,13 +1103,15 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
             Cow::Borrowed(
                 "List every plan line of `project` (default: the discovered project \
                  root), sorted by name with each line's variants sorted by variant. \
-                 Archived lines and variants are omitted unless include_archived.",
+                 Archived lines and variants are omitted unless include_archived. \
+                 With active: true, return only the project's active lines.",
             ),
             schema_object(json!({
                 "type": "object",
                 "properties": {
                     "project": { "type": "string", "description": "Project key; defaults to the discovered project root." },
-                    "include_archived": { "type": "boolean", "description": "Include archived lines and variants (default false)." }
+                    "include_archived": { "type": "boolean", "description": "Include archived lines and variants (default false)." },
+                    "active": { "type": "boolean", "description": "Return only the project's active lines (unarchived, incomplete); mutually exclusive with include_archived." }
                 },
                 "additionalProperties": false
             })),
@@ -1158,18 +1268,17 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                  (reported by plan.ev); it must not be in the future or before the plan's \
                  creation time (INVALID_VALUE). Execution-side: the plan must be its line's \
                  selected, unarchived variant (VARIANT_NOT_SELECTED / ARCHIVE_REFUSED). \
-                 Audited as plan.ev.baselined.",
+                 Audited as plan.ev.baselined. \
+                 Select the plan by plan_id, plan line name, or active: true.",
             ),
             schema_object(json!({
                 "type": "object",
-                "properties": {
-                    "plan_id": { "type": "string" },
+                "properties": with_plan_selector(json!({
                     "start": { "type": "string", "format": "date-time", "description": "RFC 3339 instant the PV clock starts from; defaults to now." },
                     "calendar": calendar_schema(),
                     "reason": { "type": "string", "maxLength": 2048, "description": "Why the plan is re-baselined; required when a baseline exists." },
                     "backfill_from": { "type": "string", "format": "date-time", "description": "RFC 3339 instant to use as the baseline's start, marking it backfilled; must not be in the future or before the plan's creation time." }
-                },
-                "required": ["plan_id"],
+                })),
                 "additionalProperties": false
             })),
         ),
@@ -1190,15 +1299,14 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                  ratio whose denominator is 0 is null and explained in `undefined`. \
                  `backfilled` is true when the baseline was taken with `backfill_from`. \
                  Read-only; works on any variant. \
-                 NOT_BASELINED before plan.baseline.",
+                 NOT_BASELINED before plan.baseline. \
+                 Select the plan by plan_id, plan line name, or active: true.",
             ),
             schema_object(json!({
                 "type": "object",
-                "properties": {
-                    "plan_id": { "type": "string" },
+                "properties": with_plan_selector(json!({
                     "as_of": { "type": "string", "format": "date-time", "description": "RFC 3339 PV status date; defaults to now. EV and AC are always as recorded when the call runs." }
-                },
-                "required": ["plan_id"],
+                })),
                 "additionalProperties": false
             })),
         ),
@@ -1216,16 +1324,15 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                  is counted but not listed): a list of \
                  summaries (format json, default) or a Markdown table with columns \
                  date, PV, EV, AC, SPI, CPI, EAC (format markdown). \
-                 Execution-side like plan.baseline. NOT_BASELINED before plan.baseline.",
+                 Execution-side like plan.baseline. NOT_BASELINED before plan.baseline. \
+                 Select the plan by plan_id, plan line name, or active: true.",
             ),
             schema_object(json!({
                 "type": "object",
-                "properties": {
-                    "plan_id": { "type": "string" },
+                "properties": with_plan_selector(json!({
                     "as_of": { "type": "string", "format": "date-time", "description": "RFC 3339 PV status date; defaults to now. EV and AC are always as recorded when the call runs." },
                     "format": { "type": "string", "enum": ["json", "markdown"], "description": "Export format (default json)." }
-                },
-                "required": ["plan_id"],
+                })),
                 "additionalProperties": false
             })),
         ),
@@ -1407,6 +1514,68 @@ impl PlanServer {
         Ok(self.project_root()?.project_key())
     }
 
+    /// Resolve the plan selector shared by the execution and portfolio
+    /// tools: exactly one of `plan_id`, `plan` (a line name) or
+    /// `active: true`, with an optional `project` for `plan`/`active` (which
+    /// defaults to [`Self::default_project`]). Mismatches are
+    /// `invalid_params`; [`Planner::resolve_plan`] otherwise maps
+    /// `NO_ACTIVE_PLAN` / `AMBIGUOUS_ACTIVE_PLAN` / `PLAN_NOT_FOUND`
+    /// through unchanged.
+    async fn resolve_plan_selector(
+        &self,
+        plan_id: Option<String>,
+        plan: Option<String>,
+        active: bool,
+        project: Option<String>,
+    ) -> Result<PlanId, McpError> {
+        let supplied = [plan_id.is_some(), plan.is_some(), active]
+            .iter()
+            .filter(|present| **present)
+            .count();
+        if supplied != 1 {
+            return Err(McpError::invalid_params(
+                "provide exactly one of plan_id, plan, or active: true",
+                None,
+            ));
+        }
+        if plan_id.is_some() && project.is_some() {
+            return Err(McpError::invalid_params(
+                "project applies only to plan or active",
+                None,
+            ));
+        }
+        let reference = match (plan_id, plan, active) {
+            (Some(plan_id), None, false) => PlanRef::Id(PlanId(plan_id)),
+            (None, Some(name), false) => PlanRef::Line {
+                project: self.selector_project(project)?,
+                name,
+            },
+            (None, None, true) => PlanRef::Active {
+                project: self.selector_project(project)?,
+            },
+            // `supplied == 1` guarantees exactly one arm above.
+            _ => {
+                return Err(McpError::invalid_params(
+                    "provide exactly one of plan_id, plan, or active: true",
+                    None,
+                ));
+            }
+        };
+        self.planner
+            .resolve_plan(reference)
+            .await
+            .map_err(planner_error_to_mcp)
+    }
+
+    /// The project for a `plan`/`active` selector: the explicit key or the
+    /// discovered root's key.
+    fn selector_project(&self, project: Option<String>) -> Result<String, McpError> {
+        match project {
+            Some(project) => Ok(project),
+            None => self.default_project(),
+        }
+    }
+
     /// Resolve the read-only analysis tools' graph selector: exactly one of
     /// an inline `graph`, a stored `plan_id`, or a plan-file `path`; any
     /// other combination is an invalid-params error.
@@ -1549,11 +1718,11 @@ impl PlanServer {
                 None,
             ));
         }
-        let mut request = AcquireRequest::new(
-            PlanId(parsed.plan_id),
-            CallerId(parsed.caller_id),
-            parsed.max_count,
-        );
+        let plan_id = self
+            .resolve_plan_selector(parsed.plan_id, parsed.plan, parsed.active, parsed.project)
+            .await?;
+        let mut request =
+            AcquireRequest::new(plan_id, CallerId(parsed.caller_id), parsed.max_count);
         if let Some(ids) = parsed.ids {
             request = request.with_ids(ids);
         }
@@ -1588,11 +1757,11 @@ impl PlanServer {
 
     async fn handle_heartbeat(&self, args: Value) -> Result<Value, McpError> {
         let parsed: HeartbeatArgs = parse_args(args)?;
-        let mut request = HeartbeatRequest::new(
-            PlanId(parsed.plan_id),
-            parsed.deliverable_id,
-            CallerId(parsed.caller_id),
-        );
+        let plan_id = self
+            .resolve_plan_selector(parsed.plan_id, parsed.plan, parsed.active, parsed.project)
+            .await?;
+        let mut request =
+            HeartbeatRequest::new(plan_id, parsed.deliverable_id, CallerId(parsed.caller_id));
         if let Some(ttl) = ttl_from_seconds(parsed.ttl_seconds)? {
             request = request.with_ttl(ttl);
         }
@@ -1612,8 +1781,11 @@ impl PlanServer {
             parsed.evidence.as_deref(),
         )
         .map_err(planner_error_to_mcp)?;
+        let plan_id = self
+            .resolve_plan_selector(parsed.plan_id, parsed.plan, parsed.active, parsed.project)
+            .await?;
         let mut request = MarkStatusRequest::new(
-            PlanId(parsed.plan_id),
+            plan_id,
             parsed.deliverable_id,
             CallerId(parsed.caller_id),
             parsed.status,
@@ -1639,9 +1811,12 @@ impl PlanServer {
 
     async fn handle_status(&self, args: Value) -> Result<Value, McpError> {
         let parsed: StatusArgs = parse_args(args)?;
+        let plan_id = self
+            .resolve_plan_selector(parsed.plan_id, parsed.plan, parsed.active, parsed.project)
+            .await?;
         let status: PlanStatus = self
             .planner
-            .status(&PlanId(parsed.plan_id))
+            .status(&plan_id)
             .await
             .map_err(planner_error_to_mcp)?;
         to_value(&status)
@@ -1649,9 +1824,12 @@ impl PlanServer {
 
     async fn handle_get(&self, args: Value) -> Result<Value, McpError> {
         let parsed: GetArgs = parse_args(args)?;
+        let plan_id = self
+            .resolve_plan_selector(parsed.plan_id, parsed.plan, parsed.active, parsed.project)
+            .await?;
         let definition: PlanDefinition = self
             .planner
-            .get_plan(&PlanId(parsed.plan_id))
+            .get_plan(&plan_id)
             .await
             .map_err(planner_error_to_mcp)?;
         to_value(&definition)
@@ -1659,10 +1837,13 @@ impl PlanServer {
 
     async fn handle_accept(&self, args: Value) -> Result<Value, McpError> {
         let parsed: AcceptArgs = parse_args(args)?;
+        let plan_id = self
+            .resolve_plan_selector(parsed.plan_id, parsed.plan, parsed.active, parsed.project)
+            .await?;
         self.planner
             .accept(
                 AcceptRequest::new(
-                    PlanId(parsed.plan_id),
+                    plan_id,
                     parsed.deliverable_id,
                     parsed.accepted_by,
                     parsed.evidence,
@@ -1676,14 +1857,13 @@ impl PlanServer {
 
     async fn handle_force_release(&self, args: Value) -> Result<Value, McpError> {
         let parsed: ForceReleaseArgs = parse_args(args)?;
+        let plan_id = self
+            .resolve_plan_selector(parsed.plan_id, parsed.plan, parsed.active, parsed.project)
+            .await?;
         self.planner
             .force_release(
-                ForceReleaseRequest::new(
-                    PlanId(parsed.plan_id),
-                    parsed.deliverable_id,
-                    parsed.reason,
-                )
-                .reset_counters(parsed.reset_counters),
+                ForceReleaseRequest::new(plan_id, parsed.deliverable_id, parsed.reason)
+                    .reset_counters(parsed.reset_counters),
             )
             .await
             .map_err(planner_error_to_mcp)?;
@@ -1837,15 +2017,24 @@ impl PlanServer {
 
     async fn handle_list(&self, args: Value) -> Result<Value, McpError> {
         let parsed: ListArgs = parse_args(args)?;
+        if parsed.active && parsed.include_archived {
+            return Err(McpError::invalid_params(
+                "active and include_archived are mutually exclusive",
+                None,
+            ));
+        }
         let project = match parsed.project {
             Some(project) => project,
             None => self.default_project()?,
         };
-        let lines = self
-            .planner
-            .list_plans(&project, parsed.include_archived)
-            .await
-            .map_err(planner_error_to_mcp)?;
+        let lines = if parsed.active {
+            self.planner.list_active_plans(&project).await
+        } else {
+            self.planner
+                .list_plans(&project, parsed.include_archived)
+                .await
+        }
+        .map_err(planner_error_to_mcp)?;
         to_value(&lines)
     }
 
@@ -1970,7 +2159,10 @@ impl PlanServer {
 
     async fn handle_baseline(&self, args: Value) -> Result<Value, McpError> {
         let parsed: BaselineArgs = parse_args(args)?;
-        let mut request = BaselineRequest::new(PlanId(parsed.plan_id));
+        let plan_id = self
+            .resolve_plan_selector(parsed.plan_id, parsed.plan, parsed.active, parsed.project)
+            .await?;
+        let mut request = BaselineRequest::new(plan_id);
         request.start = parsed.start;
         request.calendar = parsed.calendar;
         request.reason = parsed.reason;
@@ -1986,7 +2178,9 @@ impl PlanServer {
     async fn handle_ev(&self, args: Value) -> Result<Value, McpError> {
         let parsed: EvArgs = parse_args(args)?;
         let planner = Arc::clone(&self.planner);
-        let plan_id = PlanId(parsed.plan_id);
+        let plan_id = self
+            .resolve_plan_selector(parsed.plan_id, parsed.plan, parsed.active, parsed.project)
+            .await?;
         let report = run_blocking_planner("ev", async move {
             Planner::ev(&*planner, &plan_id, parsed.as_of).await
         })
@@ -1996,7 +2190,10 @@ impl PlanServer {
 
     async fn handle_snapshot(&self, args: Value) -> Result<Value, McpError> {
         let parsed: SnapshotArgs = parse_args(args)?;
-        let mut request = SnapshotRequest::new(PlanId(parsed.plan_id)).with_format(parsed.format);
+        let plan_id = self
+            .resolve_plan_selector(parsed.plan_id, parsed.plan, parsed.active, parsed.project)
+            .await?;
+        let mut request = SnapshotRequest::new(plan_id).with_format(parsed.format);
         request.as_of = parsed.as_of;
         let planner = Arc::clone(&self.planner);
         let outcome = run_blocking_planner("snapshot", async move {
@@ -2343,6 +2540,22 @@ fn instructions() -> &'static str {
     r#"This is the cpm-planner MCP server — the open-source CPM planner.
 
 Tools (twenty-three total, all `plan.<verb>`):
+  Selectors (plan.status, plan.get, plan.ev, plan.snapshot, plan.baseline,
+  plan.acquire_cohort, plan.heartbeat, plan.mark_status, plan.accept and
+  plan.force_release): pass exactly one of plan_id, plan (a plan line name,
+  resolved to its selected variant) or active: true (the project's single line
+  that is unarchived and whose selected variant is unarchived and not complete).
+  plan and active also accept an optional project (default: the discovered
+  project root); plan_id refuses project. No active line is NO_ACTIVE_PLAN;
+  several are AMBIGUOUS_ACTIVE_PLAN, naming them. An unknown line, or one with
+  no selected variant, is PLAN_NOT_FOUND. Supplying none, several, or project
+  with plan_id is invalid params. Recurring jobs and agents should look the
+  plan up with active (or plan) rather than pin a plan_id, so they follow the
+  work to the next line. active matches only an incomplete line and changes
+  when another line goes live: resolve once (plan.status returns plan_id, as
+  does acquire_cohort), then keep that plan_id for heartbeats, marks and the
+  final status/ev of the plan. A pinned id of an archived variant still reads
+  through plan.status/plan.ev with archived: true and active_plan.
   plan.submit          — submit a PlanGraph, get a plan_id (idempotent on identical graphs)
                         a prerequisite is an id string or {id, consumes?, kind?: artifact|interface, lag_hours?}; a deliverable's duration_hours (calendar time; when absent the default is the effort estimate, explicit or estimator-derived) and lag_hours (minimum wait after a prerequisite finishes) drive the schedule
                         a milestone (milestone: true) is zero-length unless you give it an estimate or duration; it is still an ordinary deliverable someone must complete (accept or mark Complete), and it is not leased if metadata.kind=manual
@@ -2353,16 +2566,16 @@ Tools (twenty-three total, all `plan.<verb>`):
   plan.heartbeat       — refresh a held lock's TTL
   plan.mark_status     — set a deliverable's status (Complete/Failed releases the lock); lockless Complete/Ready/InProgress requires complete prerequisites (PREREQUISITES_INCOMPLETE) and is audited; a lockless InProgress persists across restarts and is not leasable until handed back with a lockless Ready (plan.force_release does not affect it)
                         optional earned-value progress: earned_pct (integer 0..100, only with in_progress; accepted and ignored with complete), actual_effort_hours (total so far, finite 0..1000000; replaces leased hours as actual cost), evidence (<= 2048 chars, appended to the deliverable's list, at most 100 entries); violations are INVALID_ACTUALS. plan.select copies the actuals of every deliverable whose Complete status it carries (leased hours add up; the carried deliverable's reported earned_pct and hours win; the newest 100 evidence entries are kept). Every lease that ends (complete, failed, force_release, expiry, accept override, forced revise/select/archive) adds its hours (up to expiry for a lapsed lease) to the deliverable's leased hours; a mark to in_progress or complete is execution-starting: in auto mode it takes the plan's first baseline (reported as baseline_taken) if none exists, in refuse mode it is BASELINE_REQUIRED
-  plan.status          — read-only snapshot ([id, status, attempt_count, failure_count, lapse_count] rows, critical_path (one real chain, always __start__ to __finish__), critical_ids, per-deliverable schedule (es/ef/ls/lf/float, hours; synthetic __start__/__finish__ endpoint rows have synthetic=true and critical=true; critical_ids lists only real deliverables), the ready set in float-ascending order (smallest float first, then smallest latest start, then id; acquire_cohort still leases by longest remaining tail), plan_complete, milestones (one row per `milestone: true` deliverable, or metadata.milestone == true: id, critical_path from __start__ to it, hours = its earliest finish, complete), held locks, baseline (the latest {baseline_number, as_of}, or null before the first); for a named variant also name, variant, selected and definition_drift). __start__ and __finish__ are reserved deliverable ids (INVALID_GRAPH)
+  plan.status          — read-only snapshot ([id, status, attempt_count, failure_count, lapse_count] rows, critical_path (one real chain, always __start__ to __finish__), critical_ids, per-deliverable schedule (es/ef/ls/lf/float, hours; synthetic __start__/__finish__ endpoint rows have synthetic=true and critical=true; critical_ids lists only real deliverables), the ready set in float-ascending order (smallest float first, then smallest latest start, then id; acquire_cohort still leases by longest remaining tail), plan_complete, milestones (one row per `milestone: true` deliverable, or metadata.milestone == true: id, critical_path from __start__ to it, hours = its earliest finish, complete), held locks, baseline (the latest {baseline_number, as_of}, or null before the first); for a named variant also name, variant, selected, archived and active_plan (the project's single active line's name when the variant is archived; archived and active_plan are null for an unnamed plan), and definition_drift). __start__ and __finish__ are reserved deliverable ids (INVALID_GRAPH)
                         definition_drift: null when unknown (no root for the variant's project, no tracked file, file missing/unreadable/over 8 MiB); false when the file matches the last synced/exported bytes or its graph equals the head graph (re-formatting is not drift); true when the file's graph differs from the head or does not parse — so after an inline revise it is true until plan.export or plan.sync {path}
-  plan.get             — return the submitted PlanGraph (deliverables, estimates, files, metadata) for a plan_id
+  plan.get             — return the submitted PlanGraph (deliverables, estimates, files, metadata) for a plan_id, plan or active selector
   plan.force_release   — operator escape hatch; emits audit event with `reason`; optional reset_counters:true also clears lapse/failure counters and revives a circuit-broken deliverable
   plan.accept          — a manager/owner marks a deliverable Complete without a lease (audited; evidence required; override_lock to take over a live lease)
   plan.lint            — static checks without submitting: cycles (with the loop), redundant edges, edges without rationale, interface edges not targeting a contract, deliverables feeding no milestone, unordered file overlaps; linting by plan_id also adds NO_BASELINE (warning) when the plan is executable and has progress but no earned-value baseline
   plan.schedule        — level a graph against resource capacities (`metadata.owner` by default): makespan, per-deliverable start/finish, per-resource load, driving chain (dependency vs resource waits), project and feeding buffers; capacities is required and every resource carrying work needs >= 1 unit (INVALID_CAPACITIES: lists the missing ones); project_buffer_pct 0..100 (default 25)
   plan.simulate        — read-only what-if: lint, critical path, schedule, milestones, optional resource schedule (schedule: same inputs as plan.schedule) and Monte Carlo (monte_carlo: iterations 1..50000, default 2000; seed, default 0xC0FFEE, reproducible on the same platform and build; iterations × (deliverables + prerequisite edges) must not exceed 200000000), and the scorecard; persists nothing
   plan.sync            — register or update one variant of a named plan line from a plan file (path: .cpm-planner/plans/<name>/<variant>.json, tracked by content hash for drift; any name/variant/project given must match the path) or an inline graph (requires name; variant defaults to "main"); project defaults to the discovered root; force releases live locks of removed deliverables
-  plan.list            — list every plan line of project (default: discovered root), variants sorted; archived omitted unless include_archived
+  plan.list            — list every plan line of project (default: discovered root), variants sorted; archived omitted unless include_archived; active: true returns only the active lines (not combinable with include_archived)
   plan.export          — write the head graph of a plan_id to its variant file (or a confined path) and return the root-relative path; refuses another variant's tracked file or unsynced local edits unless force; the file is not synced (exporting to the variant's own tracked file records its hash)
   plan.revise          — replace a plan's graph in place, carrying progress over; returns the new revision and diff; force releases live locks of removed deliverables
   plan.fork            — copy a named variant's head graph, apply ordered edits, register it as a new draft (not selected) variant; an archived line is refused (ARCHIVE_REFUSED) before any file is written
@@ -2370,7 +2583,7 @@ Tools (twenty-three total, all `plan.<verb>`):
   plan.archive         — archive (archived defaults true) or unarchive a whole line or one variant; archived variants stay readable but refuse sync/select/execute
   plan.compare         — compare stored plans (plan_ids: 2..16 distinct ids, or plan line name in project, default the discovered root, for every live variant, at most 16) on the scorecard: Pareto front, weighted rank, recommended; weights must be finite and >= 0; the Monte Carlo budget (200000000) is shared across variants
   plan.baseline        — freeze the plan's CPM schedule (es/ef) and budgets (effort basis x metadata.cost_rate, default 1) as its next numbered earned-value baseline; optional start (RFC 3339, default now) and calendar {hours_per_day (0 < h <= 24, default 8), workdays (default mon..fri), utc_offset_minutes (default 0)} (omitted: wall-clock hours on the first baseline, the previous baseline's calendar on a re-baseline); optional backfill_from (RFC 3339) sets start retroactively and marks the baseline backfilled:true (reported by plan.ev) and must not be in the future or before the plan's creation time (INVALID_VALUE); re-baselining needs a non-blank reason (<= 2048 chars, INVALID_GRAPH otherwise) and keeps actuals and snapshots; baselines, actuals and snapshots belong to one variant, so a newly selected variant takes its own baseline 1 with no reason needed; selected, unarchived variant only; audited as plan.ev.baselined
-  plan.ev              — earned-value report against the latest baseline as of as_of (RFC 3339, default now; as_of is the PV status date, while EV and AC reflect progress and actuals recorded up to the moment the call runs): baseline_number, backfilled (true when plan.baseline was given backfill_from), bac, pv, ev, ac, sv, cv, spi, cpi, eac, etc, vac, tcpi, per-deliverable rows, critical_float_consumed_hours, alerts (SPI_BELOW_0_9 / CPI_BELOW_0_9 when below 0.9 on the two latest stored non-backfilled snapshots by as_of of the current baseline; the current reading is not one of them), excluded_unbaselined; AC sums every recorded hour of the plan (removed and unbaselined deliverables included, at rate 1 when the baseline has no row); a baselined deliverable removed by plan.revise reports status "removed" and keeps its earned percent at removal (100 if complete), and re-adding it restarts its earned percent (hours keep accumulating); a ratio with a zero denominator is null and explained in `undefined` (never NaN); read-only on any variant; NOT_BASELINED before plan.baseline
+  plan.ev              — earned-value report against the latest baseline as of as_of (RFC 3339, default now; as_of is the PV status date, while EV and AC reflect progress and actuals recorded up to the moment the call runs): baseline_number, backfilled (true when plan.baseline was given backfill_from), bac, pv, ev, ac, sv, cv, spi, cpi, eac, etc, vac, tcpi, per-deliverable rows, critical_float_consumed_hours, alerts (SPI_BELOW_0_9 / CPI_BELOW_0_9 when below 0.9 on the two latest stored non-backfilled snapshots by as_of of the current baseline; the current reading is not one of them), excluded_unbaselined; AC sums every recorded hour of the plan (removed and unbaselined deliverables included, at rate 1 when the baseline has no row); a baselined deliverable removed by plan.revise reports status "removed" and keeps its earned percent at removal (100 if complete), and re-adding it restarts its earned percent (hours keep accumulating); a ratio with a zero denominator is null and explained in `undefined` (never NaN); read-only on any variant, including an archived one (which reports archived: true and, when the project has exactly one active line, its active_plan name); NOT_BASELINED before plan.baseline
   plan.snapshot        — compute the plan.ev report and append it as a snapshot (as_of is the PV status date; EV and AC are as recorded when the call runs, so a snapshot whose as_of is more than an hour before taken_at is marked backfilled: true, raises no alerts and is skipped by later alerts); returns summary (undefined explains each null ratio; alerts consider only readings up to its own position: this snapshot and the latest earlier one by as_of of the current baseline, so a backfill never takes alerts from newer readings), snapshot_count and export of the newest 100 snapshots by as_of (ties by taken_at), oldest first, so a backfilled as_of lands in date order; a backfill older than those 100 is stored and counted but not listed: a list of summaries (format "json", default) or a Markdown table with columns date, PV, EV, AC, SPI, CPI, EAC (format "markdown"); selected, unarchived variant only; NOT_BASELINED before plan.baseline
   plan.review          — optional AI review (read-only; graph, plan_id or path; optional capacities/resource_key/project_buffer_pct and max_questions 1..64, default 64): lint always runs and lint errors return status invalid_graph with no judge call; otherwise ONE batched call to Jev (TypeSafe's calibrated-judgment model, via OpenRouter) scores likely false dependencies, missing dependencies, split and interface-split candidates and crash options. Probabilities are advisory, not facts. proposals are plan.fork edit lists, each verified by simulate (lints clean, shortens the makespan) and ranked by hours_saved / max(cost, 1). Without an OpenRouter key, or with an unusable LLM setting, status is review_unavailable with a reason, plus lint; a provider failure is review_unavailable with "<class>: <message>". The plan graph is sent to OpenRouter
   plan.submit with a `name` (optional `project`/`variant`, variant defaults to "main") registers a named variant instead of an unnamed plan
@@ -2400,8 +2613,9 @@ calls fail with BASELINE_REQUIRED until plan.baseline is called. plan.status
 reports the plan's baseline (or null).
 
 Errors carry stable prefixes: LOCK_HELD, LOCK_NOT_HELD, LOCK_EXPIRED,
-OVERLAP_DETECTED, MISSING_PREREQUISITE, PLAN_NOT_FOUND,
-DELIVERABLE_NOT_FOUND, LAPSE_LIMIT, PREREQUISITES_INCOMPLETE, INVALID_GRAPH,
+OVERLAP_DETECTED, MISSING_PREREQUISITE, PLAN_NOT_FOUND, NO_ACTIVE_PLAN,
+AMBIGUOUS_ACTIVE_PLAN, DELIVERABLE_NOT_FOUND, LAPSE_LIMIT,
+PREREQUISITES_INCOMPLETE, INVALID_GRAPH,
 INVALID_CAPACITIES, VARIANT_NOT_SELECTED, ARCHIVE_REFUSED, INVALID_PATH,
 INVALID_ACTUALS, BASELINE_REQUIRED, NOT_BASELINED, BACKEND_ERROR.
 

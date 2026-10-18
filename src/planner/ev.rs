@@ -322,16 +322,34 @@ impl BasicCpmPlanner {
         as_of: Option<DateTime<Utc>>,
     ) -> Result<EvReport, PlannerError> {
         let as_of = as_of.unwrap_or_else(|| self.now());
-        let (graph, statuses, baseline, actuals, ratios) = self.store.read_tx(|tx| {
+        let (graph, statuses, baseline, actuals, ratios, variant) = self.store.read_tx(|tx| {
             let state = load_state(tx, plan_id)?;
             let baseline = ev_store::latest_baseline(tx, plan_id)?
                 .ok_or_else(|| not_baselined(plan_id))?
                 .baseline;
             let actuals = ev_store::load_actuals(tx, plan_id)?;
             let ratios = alert_ratios(tx, plan_id, baseline.number, None, 2)?;
-            Ok((state.graph, state.statuses, baseline, actuals, ratios))
+            let variant = match crate::portfolio::variant_info(tx, plan_id)? {
+                Some(info) => {
+                    let active_plan = if info.archived {
+                        crate::portfolio::active_line_name(tx, &info.project)?
+                    } else {
+                        None
+                    };
+                    Some((info.archived, active_plan))
+                }
+                None => None,
+            };
+            Ok((
+                state.graph,
+                state.statuses,
+                baseline,
+                actuals,
+                ratios,
+                variant,
+            ))
         })?;
-        compute_ev(
+        let mut report = compute_ev(
             &baseline,
             &graph,
             &statuses,
@@ -339,7 +357,12 @@ impl BasicCpmPlanner {
             &actuals,
             as_of,
             &ratios,
-        )
+        )?;
+        if let Some((archived, active_plan)) = variant {
+            report.archived = archived;
+            report.active_plan = active_plan;
+        }
+        Ok(report)
     }
 
     /// Compute the report (as for [`Self::ev_report`]) and append it as a

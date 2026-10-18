@@ -17,6 +17,20 @@ Summarises deliverable-cpm; if they ever disagree, the server's behaviour wins.
 - After an approved scope change made with `cpm-revise`.
 - Not for: claiming or closing work, or recording hours → use cpm-run.
 
+**Selecting the plan.** `plan.baseline`, `plan.ev` and `plan.snapshot` take exactly one
+of `plan_id`, `plan` (a plan line name, resolved to its selected variant) or
+`active: true` (the project's single unarchived line whose selected variant is
+unarchived and not complete), with an optional `project` (default: the discovered root)
+for `plan`/`active`; `plan_id` refuses `project`. A recurring EV job should look the plan
+up with `{"active": true}` (or `{"plan": "<line>"}`) instead of pinning a `plan_id`, so it
+follows the work to the next line. `active` matches only an incomplete line: for the
+closing reading of a plan that just completed, use its `plan_id` or `plan`. A pinned id of
+an archived variant still reads through `plan.status` and `plan.ev`, which report
+`archived: true` and `active_plan` (the project's single active line); never report its
+numbers as current. `plan.baseline` and `plan.snapshot` refuse it with `ARCHIVE_REFUSED`. `active`
+with no such line is `NO_ACTIVE_PLAN`; with several it is `AMBIGUOUS_ACTIVE_PLAN`, naming
+them.
+
 ## 1. Baseline
 
 ```text

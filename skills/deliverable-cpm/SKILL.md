@@ -213,7 +213,12 @@ responses.
 
 ## 7. Execute
 
-Execute the selected variant's `plan_id`.
+Execute the selected variant. Execution calls take exactly one of `plan_id`, `plan` (a
+plan line name) or `active: true` (the project's single active line), with an optional
+`project` for `plan`/`active`. Find the plan with `{"active": true}` (or
+`{"plan": "<line>"}`) rather than a remembered `plan_id`, then keep the `plan_id`
+returned by `plan.acquire_cohort` for the lease: `active` matches only an incomplete
+line and changes when another line goes live.
 
 - **Claim work** with `plan.acquire_cohort {plan_id, caller_id, max_count}`. It hands out
   ready deliverables whose files don't conflict, ordered by priority:
