@@ -12,7 +12,7 @@ use crate::earned_value::{
 use crate::plan::{
     AcceptRequest, AcquireRequest, Cohort, ComparePlansRequest, ForceReleaseRequest, ForkRequest,
     HeartbeatRequest, MarkStatusRequest, PlanDefinition, PlanGraph, PlanId, PlanLineSummary,
-    PlanStatus, PlannerError, ReviseRequest, SelectOutcome, SyncOutcome, SyncRequest,
+    PlanRef, PlanStatus, PlannerError, ReviseRequest, SelectOutcome, SyncOutcome, SyncRequest,
 };
 use crate::project::ProjectRoot;
 use crate::revise::RevisionDiff;
@@ -114,6 +114,21 @@ pub trait Planner: Send + Sync {
         project: &str,
         include_archived: bool,
     ) -> Result<Vec<PlanLineSummary>, PlannerError>;
+
+    /// Resolve a [`PlanRef`] to a stored plan's id. [`PlanRef::Id`] is
+    /// returned unchanged without a lookup; [`PlanRef::Line`] is the
+    /// selected variant of the named line (an unknown line is
+    /// `PLAN_NOT_FOUND`); [`PlanRef::Active`] is the project's single active
+    /// line, where active means unarchived with an unarchived selected
+    /// variant whose plan is not all-complete. No active line is
+    /// [`PlannerError::NoActivePlan`]; several are
+    /// [`PlannerError::AmbiguousActivePlan`] naming every one.
+    async fn resolve_plan(&self, plan: PlanRef) -> Result<PlanId, PlannerError>;
+
+    /// The project's active plan lines: the rows [`Planner::list_plans`]
+    /// returns with `include_archived` false, filtered to the names
+    /// [`Planner::resolve_plan`] considers active, in the same order.
+    async fn list_active_plans(&self, project: &str) -> Result<Vec<PlanLineSummary>, PlannerError>;
 
     /// The graph of `revision` (the head when `None`) with its revision
     /// number. A plan never revised is at revision 1.

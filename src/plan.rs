@@ -65,6 +65,18 @@ impl std::fmt::Display for PlanId {
     }
 }
 
+/// How a caller names the plan it wants resolved (see
+/// [`crate::ports::Planner::resolve_plan`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanRef {
+    /// The plan with this exact id, returned unchanged without a lookup.
+    Id(PlanId),
+    /// The selected variant of the plan line `(project, name)`.
+    Line { project: String, name: String },
+    /// The project's single active plan line: its selected variant's plan.
+    Active { project: String },
+}
+
 /// Opaque per-orchestrator identity. The Planner uses this to verify that
 /// the caller releasing a lock is the same caller who acquired it.
 ///
@@ -1278,6 +1290,26 @@ pub enum PlannerError {
     /// on any variant of an archived line.
     #[error("ARCHIVE_REFUSED: {reason}")]
     ArchiveRefused { reason: String },
+
+    /// [`crate::ports::Planner::resolve_plan`] with
+    /// [`PlanRef::Active`] found no active line: every line
+    /// of `project` is archived, complete, or has no live selected variant.
+    #[error(
+        "NO_ACTIVE_PLAN: project '{project}' has no active plan line (an unarchived line whose \
+         selected variant is unarchived and not complete)"
+    )]
+    NoActivePlan { project: String },
+
+    /// [`crate::ports::Planner::resolve_plan`] with
+    /// [`PlanRef::Active`] found more than one active line in
+    /// `project`; `lines` holds every name, sorted.
+    #[error(
+        "AMBIGUOUS_ACTIVE_PLAN: project '{project}' has {n} active plan lines: {names}; pass \
+         plan or plan_id",
+        n = lines.len(),
+        names = lines.join(", ")
+    )]
+    AmbiguousActivePlan { project: String, lines: Vec<String> },
 
     /// `mark_status` progress fields failed validation: `earned_pct` above
     /// 100 or given with a status other than `in_progress`/`complete`,

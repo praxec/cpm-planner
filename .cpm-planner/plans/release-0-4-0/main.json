@@ -2,45 +2,87 @@
   "deliverables": [
     {
       "id": "selector-core",
-      "owned_files": ["src/portfolio.rs", "src/plan.rs", "src/ports.rs", "src/planner.rs", "tests/plan_selector.rs"],
+      "owned_files": [
+        "src/portfolio.rs",
+        "src/plan.rs",
+        "src/ports.rs",
+        "src/planner.rs",
+        "tests/plan_selector.rs"
+      ],
       "prerequisites": [],
-      "estimate": { "optimistic": 2, "likely": 3, "pessimistic": 5 },
+      "estimate": {
+        "optimistic": 2,
+        "likely": 3,
+        "pessimistic": 5
+      },
       "earning_rule": "fifty_fifty",
       "metadata": {
         "artifact": "PlanRef + Planner::resolve_plan/list_active_plans, NO_ACTIVE_PLAN/AMBIGUOUS_ACTIVE_PLAN errors, tests/plan_selector.rs",
         "owner": "junior",
         "contract": true,
-        "issues": ["#77"],
+        "issues": [
+          "#77"
+        ],
         "description": "Resolve a plan by id, line name (selected variant) or the project's single active line"
       }
     },
     {
       "id": "archived-read-flag",
-      "owned_files": ["src/plan.rs", "src/planner.rs", "src/earned_value.rs", "tests/archived_reads.rs"],
-      "prerequisites": [
-        { "id": "selector-core", "consumes": "portfolio::active_lines and the active-line rule", "kind": "interface" }
+      "owned_files": [
+        "src/portfolio.rs",
+        "src/plan.rs",
+        "src/planner.rs",
+        "src/planner/ev.rs",
+        "src/earned_value.rs",
+        "tests/archived_reads.rs"
       ],
-      "estimate": { "optimistic": 1.5, "likely": 2, "pessimistic": 4 },
+      "prerequisites": [
+        {
+          "id": "selector-core",
+          "consumes": "portfolio::active_lines and the active-line rule",
+          "kind": "interface"
+        }
+      ],
+      "estimate": {
+        "optimistic": 1.5,
+        "likely": 2,
+        "pessimistic": 4
+      },
       "earning_rule": "fifty_fifty",
       "metadata": {
         "artifact": "plan.status and plan.ev report archived + active_plan; tests/archived_reads.rs",
         "owner": "junior",
-        "issues": ["#77"],
+        "issues": [
+          "#77"
+        ],
         "description": "Archived variants stay readable but are flagged, naming the live line"
       }
     },
     {
       "id": "server-selector",
-      "owned_files": ["src/server.rs", "tests/server_selector.rs"],
-      "prerequisites": [
-        { "id": "selector-core", "consumes": "Planner::resolve_plan, Planner::list_active_plans, PlanRef", "kind": "interface" }
+      "owned_files": [
+        "src/server.rs",
+        "tests/server_selector.rs"
       ],
-      "estimate": { "optimistic": 2, "likely": 3, "pessimistic": 5 },
+      "prerequisites": [
+        {
+          "id": "selector-core",
+          "consumes": "Planner::resolve_plan, Planner::list_active_plans, PlanRef",
+          "kind": "interface"
+        }
+      ],
+      "estimate": {
+        "optimistic": 2,
+        "likely": 3,
+        "pessimistic": 5
+      },
       "earning_rule": "fifty_fifty",
       "metadata": {
         "artifact": "plan_id | plan | active selector on ten tools, plan.list active filter, schemas; tests/server_selector.rs",
         "owner": "junior",
-        "issues": ["#77"],
+        "issues": [
+          "#77"
+        ],
         "description": "Wire the selector through the MCP surface"
       }
     },
@@ -49,8 +91,14 @@
       "milestone": true,
       "owned_files": [],
       "prerequisites": [
-        { "id": "archived-read-flag", "consumes": "archived read behaviour" },
-        { "id": "server-selector", "consumes": "selector tool surface" }
+        {
+          "id": "archived-read-flag",
+          "consumes": "archived read behaviour"
+        },
+        {
+          "id": "server-selector",
+          "consumes": "selector tool surface"
+        }
       ],
       "estimated_effort_hours": 1,
       "metadata": {
@@ -61,16 +109,29 @@
     },
     {
       "id": "docs-skills",
-      "owned_files": ["README.md", "docs/", "skills/cpm-ev/SKILL.md", "skills/cpm-run/SKILL.md", "skills/deliverable-cpm/SKILL.md", "CHANGELOG.md", "src/server.rs"],
+      "owned_files": [
+        "README.md",
+        "docs/",
+        "skills/cpm-ev/SKILL.md",
+        "skills/cpm-run/SKILL.md",
+        "skills/deliverable-cpm/SKILL.md",
+        "CHANGELOG.md",
+        "src/server.rs"
+      ],
       "prerequisites": [
-        { "id": "selector-integrated", "consumes": "final selector and archived semantics" }
+        {
+          "id": "selector-integrated",
+          "consumes": "final selector and archived semantics"
+        }
       ],
       "estimated_effort_hours": 1.5,
       "earning_rule": "zero_hundred",
       "metadata": {
         "artifact": "docs, skills, server instructions and CHANGELOG describe plan/active selectors and archived reads",
         "owner": "junior",
-        "issues": ["#77"]
+        "issues": [
+          "#77"
+        ]
       }
     },
     {
@@ -78,7 +139,10 @@
       "milestone": true,
       "owned_files": [],
       "prerequisites": [
-        { "id": "docs-skills", "consumes": "documented feature branch" }
+        {
+          "id": "docs-skills",
+          "consumes": "documented feature branch"
+        }
       ],
       "estimated_effort_hours": 0.5,
       "metadata": {
@@ -89,9 +153,18 @@
     },
     {
       "id": "version-bump",
-      "owned_files": ["Cargo.toml", "Cargo.lock", "server.json", "npm/package.json", "CHANGELOG.md"],
+      "owned_files": [
+        "Cargo.toml",
+        "Cargo.lock",
+        "server.json",
+        "npm/package.json",
+        "CHANGELOG.md"
+      ],
       "prerequisites": [
-        { "id": "feature-pr-merged", "consumes": "dev with the release contents" }
+        {
+          "id": "feature-pr-merged",
+          "consumes": "dev with the release contents"
+        }
       ],
       "estimated_effort_hours": 0.5,
       "earning_rule": "zero_hundred",
@@ -105,7 +178,10 @@
       "milestone": true,
       "owned_files": [],
       "prerequisites": [
-        { "id": "version-bump", "consumes": "0.4.0 on dev" }
+        {
+          "id": "version-bump",
+          "consumes": "0.4.0 on dev"
+        }
       ],
       "estimated_effort_hours": 0.25,
       "metadata": {
