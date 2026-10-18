@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Plan selectors for the execution, read and earned-value tools (`plan.status`, `plan.get`, `plan.ev`, `plan.snapshot`, `plan.baseline`, `plan.acquire_cohort`, `plan.heartbeat`, `plan.mark_status`, `plan.accept` and `plan.force_release`): a call takes exactly one of `plan_id`, `plan` (a plan line name, resolved to its selected variant) or `active: true` (the project's single unarchived line whose selected variant is unarchived and not complete), with an optional `project` (default: the discovered root) for `plan`/`active`. No active line is `NO_ACTIVE_PLAN`; several are `AMBIGUOUS_ACTIVE_PLAN`, naming them; an unknown line, or a line with no selected variant, is `PLAN_NOT_FOUND`; supplying none, several, or `project` with `plan_id` is invalid params. `plan.list {active: true}` returns only the active lines and cannot be combined with `include_archived`. Recurring jobs and agents can look the plan up with `active` or `plan` instead of pinning a `plan_id`; `active` matches only an incomplete line, so a lease holder keeps the resolved `plan_id` for its heartbeats and marks (#77).
+- Archived variants stay readable: `plan.status` and `plan.ev` report `archived` and `active_plan` (the project's single active line's name when the read variant is archived, so a caller with a stale `plan_id` learns where the live work is), while `plan.snapshot`, `plan.baseline` and execution still refuse with `ARCHIVE_REFUSED` (#77).
+
 ## [0.3.0] - 2026-10-16
 
 ### Added

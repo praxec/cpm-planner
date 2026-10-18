@@ -17,6 +17,21 @@ Summarises deliverable-cpm; if they ever disagree, the server's behaviour wins.
 - `plan.status {plan_id}` shows the `ready` set, `plan_complete` and `locks_held`.
 - Not for: changing what a deliverable is or adding work → use cpm-revise.
 
+**Selecting the plan.** Every execution call takes exactly one of `plan_id`, `plan`
+(a plan line name, resolved to its selected variant) or `active: true` (the project's
+single unarchived line whose selected variant is unarchived and not complete), plus an
+optional `project` (default: the discovered root) for `plan` and `active`; `plan_id`
+refuses `project`. A recurring job or a fresh agent should find its plan with
+`{"active": true}` (or `{"plan": "<line>"}`) rather than a remembered `plan_id`, so it
+follows the work to the next line. Once you hold a lease, use the `plan_id` that
+`plan.acquire_cohort` returned for `plan.heartbeat`, `plan.mark_status` and the final
+`plan.status`: `active` changes, or becomes `AMBIGUOUS_ACTIVE_PLAN`, as soon as another
+line goes live, and it stops matching once the plan is complete. A pinned id of an
+archived variant still reads through `plan.status` and `plan.ev`, which report
+`archived: true` and `active_plan` naming where the live work is, while an execution
+call on it refuses with `ARCHIVE_REFUSED`. `active` with no such line is
+`NO_ACTIVE_PLAN`; with several it is `AMBIGUOUS_ACTIVE_PLAN`, naming them.
+
 ## 1. Claim a cohort
 
 ```text

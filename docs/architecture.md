@@ -140,6 +140,17 @@ them a graph, a state and a time.
 
 ## Request flow
 
+Tools that act on a stored plan — `plan.status`, `plan.get`, `plan.ev`,
+`plan.snapshot`, `plan.baseline`, `plan.acquire_cohort`, `plan.heartbeat`,
+`plan.mark_status`, `plan.accept` and `plan.force_release` — address it by exactly
+one of `plan_id`, `plan` (a plan line name, resolved to its selected variant) or
+`active: true` (the project's single unarchived line whose selected variant is
+unarchived and not complete), with an optional `project` (default: the discovered
+root) for `plan`/`active`. `plan_id` with `project`, or none or several selectors,
+is invalid params; no active line is `NO_ACTIVE_PLAN` and several are
+`AMBIGUOUS_ACTIVE_PLAN`; an unknown line is `PLAN_NOT_FOUND`. `plan.list {active:
+true}` lists only the active lines.
+
 The usual lifecycle of a plan, by tool:
 
 1. **Define.** `plan.lint` checks a graph, a stored plan or a plan file without
