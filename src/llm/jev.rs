@@ -40,10 +40,15 @@ const BODY_LOG_CHARS: usize = 200;
 /// rig-typesafeai 0.45 reads Jev's input and output tokens but not its
 /// `total_tokens`; report their sum so callers keep a total.
 fn with_total_tokens(usage: rig_core::completion::Usage) -> rig_core::completion::Usage {
-    if usage.total_tokens.is_some() || (usage.input_tokens.is_none() && usage.output_tokens.is_none()) {
+    if usage.total_tokens.is_some()
+        || (usage.input_tokens.is_none() && usage.output_tokens.is_none())
+    {
         return usage;
     }
-    let total = usage.input_tokens.unwrap_or(0).saturating_add(usage.output_tokens.unwrap_or(0));
+    let total = usage
+        .input_tokens
+        .unwrap_or(0)
+        .saturating_add(usage.output_tokens.unwrap_or(0));
     usage.total_tokens(total)
 }
 
