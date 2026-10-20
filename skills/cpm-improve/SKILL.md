@@ -1,6 +1,6 @@
 ---
 name: cpm-improve
-description: Use when a cpm-planner plan (plan.* tools) is synced and the user wants it shorter, cheaper or less risky; when asked to crash or fast-track a schedule, shorten it past a known bottleneck, try a split or contract-first as a variant, compare plan variants, run Monte Carlo (P80, sensitivity), or get an AI plan review (Jev via OpenRouter). Covers optional plan.review, plan.fork with edits, plan.simulate and plan.compare, explaining the trade-off in numbers, plan.select and plan.archive.
+description: Use when shortening, cheapening or de-risking a synced cpm-planner plan (plan.* tools); when asked to crash or fast-track a schedule, shorten it past a known bottleneck, try a split or contract-first as a variant, compare plan variants, run Monte Carlo (P80, sensitivity), or get an AI plan review (Jev via OpenRouter). Covers optional plan.review, plan.fork with edits, plan.simulate and plan.compare, explaining the trade-off in numbers, plan.select and plan.archive.
 ---
 
 # cpm-improve: fork, measure, compare, select
@@ -10,6 +10,9 @@ selected variant to try an idea. The full method and move table are in
 [the deliverable-cpm skill](../deliverable-cpm/SKILL.md) (section 6), with a worked run in
 [improvement-loop.md](../deliverable-cpm/examples/improvement-loop.md).
 Summarises deliverable-cpm; if they ever disagree, the server's behaviour wins.
+
+Calling the tools: see [Calling the tools](../deliverable-cpm/SKILL.md#calling-the-tools)
+(registered MCP server or a host wrapper such as `junior tools call`).
 
 ## When to use
 

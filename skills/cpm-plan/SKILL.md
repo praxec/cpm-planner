@@ -1,6 +1,6 @@
 ---
 name: cpm-plan
-description: Use when the cpm-planner MCP server (plan.* tools) is available and the user wants to plan a project, break work into deliverables with dependencies, estimate effort, find the critical path (CPM), check milestones, or level the schedule against real capacity to see the critical path and the levelled bottleneck (resource levelling, makespan). Covers authoring a .cpm-planner/plans/<name>/<variant>.json plan file of artifact deliverables and consumption edges, plan.lint until clean, plan.sync, reading critical_path and milestones in plan.status, and plan.schedule with capacities.
+description: Use when planning work as artifact deliverables with dependencies, estimating effort, finding the critical path (CPM), checking milestones, or levelling the schedule against real capacity to see the critical path and the levelled bottleneck (resource levelling, makespan). Covers authoring a .cpm-planner/plans/<name>/<variant>.json plan file of artifact deliverables and consumption edges, plan.lint until clean, plan.sync, reading critical_path and milestones in plan.status, and plan.schedule with capacities.
 ---
 
 # cpm-plan: author, lint, sync and level a plan
@@ -9,6 +9,9 @@ Turn the user's goal into a tracked plan file, register it and check that its cr
 and levelled schedule make sense. The full method (artifact rules, edge rules, examples) is
 in [the deliverable-cpm skill](../deliverable-cpm/SKILL.md); this skill is the short path.
 Summarises deliverable-cpm; if they ever disagree, the server's behaviour wins.
+
+Calling the tools: see [Calling the tools](../deliverable-cpm/SKILL.md#calling-the-tools)
+(registered MCP server or a host wrapper such as `junior tools call`).
 
 ## When to use
 
