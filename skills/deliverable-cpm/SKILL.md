@@ -22,6 +22,23 @@ or `.git`. Paths you pass to tools are relative to that root.
 A worked plan file: [examples/small-plan.json](examples/small-plan.json).
 A worked improvement loop: [examples/improvement-loop.md](examples/improvement-loop.md).
 
+## Calling the tools
+
+The tools are the same whichever way you reach them; the method names and
+arguments in this skill do not change.
+
+- **Registered MCP server.** When `cpm-planner` is registered with your agent
+  host, call the tools directly (`plan.status plan_id=<id>` with its arguments).
+- **Through a host wrapper.** When the server is not registered, a wrapper can
+  spawn the binary per call. With Junior, `junior tools call cpm plan.status
+  key=value ...` takes inline arguments (values parse as JSON),
+  `echo '{"tool":"plan.status","arguments":{...}}' | junior tools call cpm -`
+  reads the request from stdin, and `junior tools call cpm request.json`
+  reads it from a file. Each call prints the bare result.
+
+Do not register a server just to follow this skill; use whichever route your
+host already has.
+
 ## 1. Nodes are artifacts
 
 Each deliverable names what can be inspected when it is done, in `metadata.artifact`:

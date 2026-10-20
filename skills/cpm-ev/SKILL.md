@@ -10,6 +10,9 @@ against it. The full method is in [the deliverable-cpm skill](../deliverable-cpm
 (section 8).
 Summarises deliverable-cpm; if they ever disagree, the server's behaviour wins.
 
+Calling the tools: see [Calling the tools](../deliverable-cpm/SKILL.md#calling-the-tools)
+(registered MCP server or a host wrapper such as `junior tools call`).
+
 ## When to use
 
 - Right after `plan.select` (each variant has its own baselines), before work starts.

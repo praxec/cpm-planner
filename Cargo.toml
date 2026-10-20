@@ -1,6 +1,6 @@
 [package]
 name = "cpm-planner"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 rust-version = "1.99"
 license = "Apache-2.0"
@@ -74,10 +74,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 cap-std = "4.0.3"
 cap-fs-ext = "4.0.3"
-rig-core = { version = "0.44", default-features = false, features = ["reqwest", "rustls"] }
-rig-typesafeai = { version = "0.44", default-features = false, features = ["reqwest", "rustls"] }
+rig-core = { version = "0.45", default-features = false, features = ["reqwest", "rustls"] }
+rig-typesafeai = { version = "0.45", default-features = false, features = ["reqwest", "rustls"] }
 # Each JevJudge owns its reqwest client (see src/llm/jev.rs); same features as rig's.
-rig-reqwest = { version = "0.44", default-features = false, features = ["rustls"] }
+rig-reqwest = { version = "0.45", default-features = false, features = ["rustls"] }
 url = "2.5"
 
 [target.'cfg(unix)'.dependencies]
