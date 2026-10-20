@@ -328,16 +328,15 @@ async fn jev_reply_with_numeric_usage_cost_decodes() {
 }
 
 #[tokio::test]
-async fn jev_reply_with_object_usage_cost_decodes() {
+async fn jev_reply_with_object_usage_cost_leaves_cost_unreported() {
+    // rig-typesafeai 0.45 reads only a numeric `usage.cost` (OpenRouter's
+    // shape); a cost of another shape is unreported, never a failed reply.
     let mut body = openrouter_reply();
     body["usage"]["cost"] = json!({ "input": 0.00001, "output": 0.00000386, "total": 0.00001386 });
     let decisions = decide_with(ResponseTemplate::new(200).set_body_json(body))
         .await
         .unwrap();
-    assert_eq!(
-        decisions.usage.and_then(|u| u.cost).map(|c| c.total),
-        Some(0.00001386)
-    );
+    assert_eq!(decisions.usage.and_then(|u| u.cost).map(|c| c.total), None);
 }
 
 #[tokio::test]
@@ -403,12 +402,14 @@ async fn jev_numeric_state_is_invalid_request_without_sending() {
 }
 
 #[tokio::test]
-async fn jev_reply_with_repeated_question_id_is_decode() {
+async fn jev_reply_with_repeated_question_id_keeps_one_answer() {
+    // rig-typesafeai 0.45 compares question-id sets, so a repeated key in the
+    // reply object collapses to one answer instead of failing the decode.
     let body = r#"{"model":"m","answers":{"dep_real":{"type":"noul","noul":0.5},"dep_real":{"type":"noul","noul":0.6}}}"#;
-    let err = decide_with(ResponseTemplate::new(200).set_body_string(body))
+    let decisions = decide_with(ResponseTemplate::new(200).set_body_string(body))
         .await
-        .unwrap_err();
-    assert_eq!(err.kind(), JudgmentErrorKind::Decode);
+        .unwrap();
+    assert_eq!(decisions.answers.len(), 1);
 }
 
 #[tokio::test]
