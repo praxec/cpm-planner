@@ -9,6 +9,9 @@ Execute the selected variant's `plan_id` one cohort at a time. The full method i
 [the deliverable-cpm skill](../deliverable-cpm/SKILL.md) (section 7).
 Summarises deliverable-cpm; if they ever disagree, the server's behaviour wins.
 
+Calling the tools: see [Calling the tools](../deliverable-cpm/SKILL.md#calling-the-tools)
+(registered MCP server or a host wrapper such as `junior tools call`).
+
 ## When to use
 
 - The variant is selected (`cpm-improve`, or the only variant) and, for earned value,

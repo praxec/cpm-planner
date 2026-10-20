@@ -9,6 +9,9 @@ The plan file is the definition. Every change goes through it. The full method i
 [the deliverable-cpm skill](../deliverable-cpm/SKILL.md) (section 9).
 Summarises deliverable-cpm; if they ever disagree, the server's behaviour wins.
 
+Calling the tools: see [Calling the tools](../deliverable-cpm/SKILL.md#calling-the-tools)
+(registered MCP server or a host wrapper such as `junior tools call`).
+
 ## When to use
 
 - Scope or estimates change, or an edge turns out to be false or missing.

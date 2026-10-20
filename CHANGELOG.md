@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-20
+
+### Added
+
+- The `deliverable-cpm` skill documents how to call the tools whether `cpm-planner` is a registered MCP server or reached through a host wrapper such as `junior tools call`, in a new "Calling the tools" section the other `cpm-*` skills link to (#82).
+
+### Changed
+
+- Agent skills trigger on planning work instead of on the MCP server being available: the `cpm-plan`, `cpm-improve`, `cpm-revise`, `cpm-run` and `cpm-ev` descriptions no longer require the server to be registered (#82).
+- `rig-core`, `rig-typesafeai` and `rig-reqwest` are 0.45, and cpm-planner's Jev cost-decode workaround is gone now that rig reads OpenRouter's numeric `usage.cost` (#40).
+
+### Fixed
+
+- Jev results follow rig 0.45: `total_tokens` is derived from input plus output tokens, an object-shaped `usage.cost` is left unreported instead of failing the decode, and a repeated question id in a reply collapses to one answer rather than failing the decode (#40).
+
 ## [0.4.0] - 2026-10-18
 
 ### Added
@@ -235,7 +250,8 @@ approximations. For the method, caveats and known limitations, see
 - Six-tool MCP surface: `plan.submit`, `plan.acquire_cohort`, `plan.heartbeat`,
   `plan.mark_status`, `plan.status`, and `plan.force_release`.
 
-[Unreleased]: https://github.com/praxec/cpm-planner/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/praxec/cpm-planner/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/praxec/cpm-planner/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/praxec/cpm-planner/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/praxec/cpm-planner/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/praxec/cpm-planner/compare/v0.2.1...v0.2.2
