@@ -8,8 +8,8 @@ use std::time::Duration;
 use cpm_planner::llm::jev::JevJudge;
 use cpm_planner::llm::openrouter::chat_client;
 use cpm_planner::llm::{
-    ApiKey, ConfigError, DEFAULT_JEV_ENDPOINT, DEFAULT_JEV_MODEL, DEFAULT_LLM_MODEL,
-    JudgmentErrorKind, JudgmentModel, KeyFileIgnoredReason, LlmConfig, MAX_ERROR_MESSAGE_CHARS,
+    ApiKey, ConfigError, DEFAULT_JEV_ENDPOINT, DEFAULT_JEV_MODEL, JudgmentErrorKind, JudgmentModel,
+    KeyFileIgnoredReason, LlmConfig, MAX_ERROR_MESSAGE_CHARS,
 };
 use rig_typesafeai::types::{Answer, Question};
 use serde_json::json;
@@ -67,8 +67,102 @@ fn config_timeout_defaults_to_thirty_seconds() {
 }
 
 #[test]
-fn config_generative_model_defaults_to_gpt_5_mini() {
-    assert_eq!(config_with_key().llm_model(), DEFAULT_LLM_MODEL);
+fn config_generative_model_defaults_to_commodity_model() {
+    assert_eq!(
+        config_with_key().llm_model(),
+        "deepseek/deepseek-v4.1-flash"
+    );
+}
+
+#[test]
+fn config_frontier_openai_model_is_refused() {
+    let err = LlmConfig::from_lookup(lookup(&[
+        ("OPENROUTER_API_KEY", SENTINEL),
+        ("CPM_LLM_MODEL", "openai/gpt-5-mini"),
+    ]))
+    .unwrap_err();
+    assert!(matches!(err, ConfigError::FrontierModel { .. }));
+}
+
+#[test]
+fn config_refused_model_error_names_the_model() {
+    let err = LlmConfig::from_lookup(lookup(&[
+        ("OPENROUTER_API_KEY", SENTINEL),
+        ("CPM_LLM_MODEL", "openai/gpt-5-mini"),
+    ]))
+    .unwrap_err();
+    assert!(format!("{err}").contains("openai/gpt-5-mini"));
+}
+
+#[test]
+fn config_frontier_anthropic_model_is_refused() {
+    let err = LlmConfig::from_lookup(lookup(&[
+        ("OPENROUTER_API_KEY", SENTINEL),
+        ("CPM_LLM_MODEL", "anthropic/claude-x"),
+    ]))
+    .unwrap_err();
+    assert!(matches!(err, ConfigError::FrontierModel { .. }));
+}
+
+#[test]
+fn config_frontier_google_model_is_refused() {
+    let err = LlmConfig::from_lookup(lookup(&[
+        ("OPENROUTER_API_KEY", SENTINEL),
+        ("CPM_LLM_MODEL", "google/gemini-3"),
+    ]))
+    .unwrap_err();
+    assert!(matches!(err, ConfigError::FrontierModel { .. }));
+}
+
+#[test]
+fn config_frontier_xai_model_is_refused() {
+    let err = LlmConfig::from_lookup(lookup(&[
+        ("OPENROUTER_API_KEY", SENTINEL),
+        ("CPM_LLM_MODEL", "x-ai/grok-5"),
+    ]))
+    .unwrap_err();
+    assert!(matches!(err, ConfigError::FrontierModel { .. }));
+}
+
+#[test]
+fn config_floating_alias_model_is_refused() {
+    let result = LlmConfig::from_lookup(lookup(&[
+        ("OPENROUTER_API_KEY", SENTINEL),
+        ("CPM_LLM_MODEL", "~openai/gpt-latest"),
+    ]));
+    assert!(result.is_err());
+}
+
+#[test]
+fn config_frontier_xai_alias_vendor_is_refused() {
+    let err = LlmConfig::from_lookup(lookup(&[
+        ("OPENROUTER_API_KEY", SENTINEL),
+        ("CPM_LLM_MODEL", "xai/grok-5"),
+    ]))
+    .unwrap_err();
+    assert!(matches!(err, ConfigError::FrontierModel { .. }));
+}
+
+#[test]
+fn config_openai_oss_model_is_allowed() {
+    let cfg = LlmConfig::from_lookup(lookup(&[
+        ("OPENROUTER_API_KEY", SENTINEL),
+        ("CPM_LLM_MODEL", "openai/gpt-oss-120b"),
+    ]))
+    .unwrap()
+    .unwrap();
+    assert_eq!(cfg.llm_model(), "openai/gpt-oss-120b");
+}
+
+#[test]
+fn config_commodity_model_override_is_allowed() {
+    let cfg = LlmConfig::from_lookup(lookup(&[
+        ("OPENROUTER_API_KEY", SENTINEL),
+        ("CPM_LLM_MODEL", "deepseek/deepseek-v4.1-flash"),
+    ]))
+    .unwrap()
+    .unwrap();
+    assert_eq!(cfg.llm_model(), "deepseek/deepseek-v4.1-flash");
 }
 
 #[test]
@@ -78,7 +172,7 @@ fn config_overrides_are_read_from_env() {
         ("CPM_JEV_MODEL", "typesafe/jev-2"),
         ("CPM_JEV_ENDPOINT", "http://127.0.0.1:9/v1/systemone"),
         ("CPM_LLM_TIMEOUT_SECS", "300"),
-        ("CPM_LLM_MODEL", "anthropic/claude-x"),
+        ("CPM_LLM_MODEL", "deepseek/deepseek-v4.1-flash"),
     ]))
     .unwrap()
     .unwrap();
@@ -93,7 +187,7 @@ fn config_overrides_are_read_from_env() {
             "typesafe/jev-2",
             "http://127.0.0.1:9/v1/systemone",
             Duration::from_secs(300),
-            "anthropic/claude-x"
+            "deepseek/deepseek-v4.1-flash"
         )
     );
 }
