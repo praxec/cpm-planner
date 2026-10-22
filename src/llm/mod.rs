@@ -136,7 +136,7 @@ pub enum ConfigError {
     InvalidModel { reason: &'static str },
     /// `CPM_LLM_MODEL` names a frontier vendor this build refuses in favour
     /// of a commodity model. The id is kept: it already passed the model-id
-    /// and key checks in [`parse_model`].
+    /// and key checks in `parse_model`.
     #[error("{LLM_MODEL_ENV} must name a commodity model, not a frontier vendor: {model}")]
     FrontierModel { model: String },
     /// `CPM_OPENROUTER_KEY_FILE` names something that cannot be used as a
