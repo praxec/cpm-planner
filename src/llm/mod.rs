@@ -53,8 +53,8 @@ pub const MAX_REPORTED_MODEL_CHARS: usize = 64;
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// Inclusive bounds for [`LLM_TIMEOUT_ENV`], seconds.
 pub const TIMEOUT_SECS_RANGE: std::ops::RangeInclusive<u64> = 1..=300;
-/// Default generative model (not used by any tool yet).
-pub const DEFAULT_LLM_MODEL: &str = "openai/gpt-5-mini";
+/// Default generative model: a commodity model, not a frontier vendor.
+pub const DEFAULT_LLM_MODEL: &str = "deepseek/deepseek-v4.1-flash";
 
 /// Redaction marker used wherever the key would otherwise appear.
 pub const REDACTED: &str = "[redacted]";
@@ -134,6 +134,11 @@ pub enum ConfigError {
     /// the configured key. The value is not kept.
     #[error("{JEV_MODEL_ENV} {reason}")]
     InvalidModel { reason: &'static str },
+    /// `CPM_LLM_MODEL` names a frontier vendor this build refuses in favour
+    /// of a commodity model. The id is kept: it already passed the model-id
+    /// and key checks in [`parse_model`].
+    #[error("{LLM_MODEL_ENV} must name a commodity model, not a frontier vendor: {model}")]
+    FrontierModel { model: String },
     /// `CPM_OPENROUTER_KEY_FILE` names something that cannot be used as a
     /// key file (missing, unreadable, not a regular file, too large). The
     /// path is not kept.
@@ -156,6 +161,9 @@ impl ConfigError {
             ),
             Self::InvalidEndpoint { reason } => format!("{JEV_ENDPOINT_ENV} invalid: {reason}"),
             Self::InvalidModel { reason } => format!("{JEV_MODEL_ENV} invalid: {reason}"),
+            Self::FrontierModel { model } => {
+                format!("{LLM_MODEL_ENV} refused frontier model: {model}")
+            }
             Self::KeyFile { reason } => {
                 format!("key file unreadable: {reason} ({OPENROUTER_KEY_FILE_ENV})")
             }
@@ -250,7 +258,7 @@ impl LlmConfig {
             config.jev_model = parse_model(model.trim(), &config.api_key)?;
         }
         if let Some(model) = non_blank(LLM_MODEL_ENV) {
-            config.llm_model = model.trim().to_string();
+            config.llm_model = parse_generative_model(model.trim(), &config.api_key)?;
         }
         Ok(Some(config))
     }
@@ -333,6 +341,27 @@ fn parse_model(raw: &str, key: &ApiKey) -> Result<String, ConfigError> {
         return invalid("must not contain the OpenRouter key");
     }
     Ok(raw.to_string())
+}
+
+/// Validate a [`LLM_MODEL_ENV`] value and refuse frontier vendors, matching
+/// Junior's `model-policy.ts`. `openai/gpt-oss*` is the one `openai/`
+/// exception.
+fn parse_generative_model(raw: &str, key: &ApiKey) -> Result<String, ConfigError> {
+    let model = parse_model(raw, key)?;
+    if frontier_vendor(&model).is_some() {
+        return Err(ConfigError::FrontierModel { model });
+    }
+    Ok(model)
+}
+
+/// The frontier vendor prefix `model` belongs to, if any.
+fn frontier_vendor(model: &str) -> Option<&'static str> {
+    if model.starts_with("openai/gpt-oss") {
+        return None;
+    }
+    ["anthropic/", "openai/", "google/", "x-ai/", "xai/"]
+        .into_iter()
+        .find(|prefix| model.starts_with(prefix))
 }
 
 fn parse_endpoint(raw: &str) -> Result<String, ConfigError> {

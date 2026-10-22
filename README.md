@@ -425,7 +425,7 @@ Set these in a client's `env` block (or `-e`/`--env` flag, or `docker run -e`). 
 | `CPM_JEV_MODEL` | `typesafe/jev-1.13` | Jev model id for `plan.review`: at most 128 characters of `A-Z a-z 0-9 . _ : / -`, and never containing the key; anything else is logged (naming the variable, not the value) and makes `plan.review` unavailable. |
 | `CPM_JEV_ENDPOINT` | `https://openrouter.ai/api/v1/systemone` | Jev endpoint URL: `https://`, or `http://` only for a loopback host, with no credentials. |
 | `CPM_LLM_TIMEOUT_SECS` | `30` | Bound on each LLM call, integer seconds in 1..=300. |
-| `CPM_LLM_MODEL` | `openai/gpt-5-mini` | Generative (chat) model id; not used by any tool yet. |
+| `CPM_LLM_MODEL` | `deepseek/deepseek-v4.1-flash` | Generative (chat) model id: at most 128 characters of `A-Z a-z 0-9 . _ : / -`. A frontier vendor is refused before any call, with a typed error naming the model: `anthropic/`, `openai/` (except `openai/gpt-oss*`), `google/`, `x-ai/`, `xai/`. |
 
 Leases default to 5 minutes. For long-running work pass `ttl_seconds` (≤ the server maximum) on acquire/heartbeat, and heartbeat at least every `ttl/3`.
 
