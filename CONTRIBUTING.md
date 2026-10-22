@@ -7,7 +7,7 @@ server facade. By participating you agree to the
 
 ## Toolchain
 
-The Rust toolchain is pinned in `rust-toolchain.toml` (1.99.0, with rustfmt and
+The Rust toolchain is pinned in `rust-toolchain.toml` (1.99.1, with rustfmt and
 clippy); `rust-version` in `Cargo.toml` is the MSRV. `rustup` picks the pin up
 automatically. Files use LF line endings (`.gitattributes`, enforced by
 `tests/repo_hygiene.rs`).
