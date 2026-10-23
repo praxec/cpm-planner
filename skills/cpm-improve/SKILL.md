@@ -87,7 +87,8 @@ plan.compare  {"plan": "<name>", "schedule": {"capacities": {...}}, "monte_carlo
   `{makespan, p80, criticality_risk, total_effort, peak_load}` (finite, >= 0).
 - `capacities` must cover every pool of every variant, or `INVALID_CAPACITIES`.
 - Read `pareto_optimal`, `rank` and `rationale` on each `variants[]` entry, and the
-  top-level `recommended`.
+  top-level `recommended`. A non-empty `tied_with_recommended` means the scores tie:
+  the recommendation is a tie-break, so choose on the trade-off, not the rank.
 
 ## 5. Explain, then select
 

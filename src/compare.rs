@@ -79,6 +79,10 @@ pub struct VariantComparison {
 pub struct Comparison {
     /// In input order; `rank` gives the ordering.
     pub variants: Vec<VariantComparison>,
+    /// Variants other than `recommended` whose score equals the recommended
+    /// one within `1e-9`. Empty when the recommendation is unique.
+    #[serde(default)]
+    pub tied_with_recommended: Vec<PlanId>,
     pub recommended: PlanId,
 }
 
@@ -262,10 +266,26 @@ pub fn compare(
             .total_cmp(&scores[b])
             .then_with(|| inputs[a].0.0.cmp(&inputs[b].0.0))
     });
+    // Competition ranking: equal scores (within 1e-9) share a rank and the
+    // next distinct score skips the tied positions (1, 1, 3).
     let mut ranks = vec![0u32; inputs.len()];
     for (pos, &i) in order.iter().enumerate() {
-        ranks[i] = u32::try_from(pos + 1).unwrap_or(u32::MAX);
+        ranks[i] = if pos > 0 && (scores[i] - scores[order[pos - 1]]).abs() <= 1e-9 {
+            ranks[order[pos - 1]]
+        } else {
+            u32::try_from(pos + 1).unwrap_or(u32::MAX)
+        };
     }
+
+    let recommended_index = order[0];
+    let recommended_score = scores[recommended_index];
+    let recommended_variant = inputs[recommended_index].1.clone();
+    let tied_with_recommended: Vec<PlanId> = inputs
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != recommended_index && (scores[*i] - recommended_score).abs() <= 1e-9)
+        .map(|(_, (id, _, _))| id.clone())
+        .collect();
 
     let variants = cards
         .into_iter()
@@ -278,12 +298,20 @@ pub fn compare(
             pareto_optimal: !values.iter().any(|o| dominates(o, &values[i])),
             score: scores[i],
             rank: ranks[i],
-            rationale: rationale(i, &values),
+            rationale: if i != recommended_index && (scores[i] - recommended_score).abs() <= 1e-9 {
+                format!(
+                    "tied on score with {recommended_variant}; {}",
+                    rationale(i, &values)
+                )
+            } else {
+                rationale(i, &values)
+            },
         })
         .collect();
 
     Ok(Comparison {
         variants,
-        recommended: inputs[order[0]].0.clone(),
+        tied_with_recommended,
+        recommended: inputs[recommended_index].0.clone(),
     })
 }

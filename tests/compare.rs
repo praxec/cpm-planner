@@ -262,3 +262,70 @@ fn compare_shared_monte_carlo_budget_is_enforced() {
         "got {err}"
     );
 }
+
+// ── Score ties (U2) ─────────────────────────────────────────────────────────
+
+/// Two variants with the same graph therefore have the same score.
+fn twins() -> Vec<(PlanId, String, PlanGraph)> {
+    vec![input("same-a", single()), input("same-b", single())]
+}
+
+#[test]
+fn identical_graphs_both_rank_one() {
+    let c = compare(&twins(), &CompareRequest::default()).expect("compare");
+    assert_eq!([by_id(&c, "same-a").rank, by_id(&c, "same-b").rank], [1, 1]);
+}
+
+#[test]
+fn tied_with_recommended_lists_the_other_identical_variant() {
+    let c = compare(&twins(), &CompareRequest::default()).expect("compare");
+    assert_eq!(c.tied_with_recommended, vec![PlanId("same-b".to_string())]);
+}
+
+#[test]
+fn tied_variant_rationale_starts_with_the_recommended_variant_name() {
+    let c = compare(&twins(), &CompareRequest::default()).expect("compare");
+    assert!(
+        by_id(&c, "same-b")
+            .rationale
+            .starts_with("tied on score with variant-same-a")
+    );
+}
+
+#[test]
+fn distinct_makespans_receive_distinct_ranks() {
+    let inputs = vec![
+        input("fast", graph(&[("x", &[], 10.0)])),
+        input("slow", graph(&[("x", &[], 14.0)])),
+    ];
+    let c = compare(&inputs, &CompareRequest::default()).expect("compare");
+    assert_eq!([by_id(&c, "fast").rank, by_id(&c, "slow").rank], [1, 2]);
+}
+
+#[test]
+fn distinct_makespans_have_no_tied_with_recommended() {
+    let inputs = vec![
+        input("fast", graph(&[("x", &[], 10.0)])),
+        input("slow", graph(&[("x", &[], 14.0)])),
+    ];
+    let c = compare(&inputs, &CompareRequest::default()).expect("compare");
+    assert!(c.tied_with_recommended.is_empty());
+}
+
+#[test]
+fn rank_after_a_tie_skips_to_the_next_position() {
+    let inputs = vec![
+        input("tie-a", single()),
+        input("tie-b", single()),
+        input("worse", chain()),
+    ];
+    let c = compare(&inputs, &CompareRequest::default()).expect("compare");
+    assert_eq!(by_id(&c, "worse").rank, 3);
+}
+
+#[test]
+fn serialized_comparison_contains_tied_with_recommended() {
+    let c = compare(&twins(), &CompareRequest::default()).expect("compare");
+    let value = serde_json::to_value(&c).expect("serialize");
+    assert!(value.get("tied_with_recommended").is_some());
+}
