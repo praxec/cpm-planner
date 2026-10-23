@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-10-23
+
+### Changed
+
+- `plan.compare` reports ties: variants whose scores are equal (within 1e-9) share a rank (1, 1, 3), the new `tied_with_recommended` lists the variants tied with `recommended`, and a tied variant's rationale starts with "tied on score with <variant>". `recommended` is still one plan id, chosen as before ([#91](https://github.com/praxec/cpm-planner/issues/91)).
+
+### Fixed
+
+- `plan.ev` no longer reports an SPI in the hundreds of thousands right after a (re-)baseline. Planned value below 0.01 h (`MIN_MEASURABLE_PV_HOURS`) leaves `spi` undefined, with the reason in `undefined` ([#90](https://github.com/praxec/cpm-planner/issues/90)).
+
 ## [0.4.2] - 2026-10-22
 
 ### Changed

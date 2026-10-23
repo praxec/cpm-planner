@@ -305,6 +305,19 @@ async fn ev_reports_earned_value_from_mark_status() {
 }
 
 #[tokio::test]
+async fn ev_right_after_baseline_with_completed_work_has_null_spi() {
+    let f = Fixture::new();
+    let plan_id = f.baselined().await;
+    f.complete_a(&plan_id).await;
+    let r = f
+        .planner
+        .ev(&plan_id, Some(t0() + Duration::seconds(1)))
+        .await
+        .unwrap();
+    assert!(r.spi.is_none());
+}
+
+#[tokio::test]
 async fn rebaseline_keeps_actuals() {
     let f = Fixture::new();
     let plan_id = f.baselined().await;

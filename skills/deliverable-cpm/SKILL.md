@@ -216,7 +216,8 @@ Design several variants and pick one. Never edit the selected variant to try an 
    criticality risk, total effort and peak load. The capacities must cover every pool of
    every variant, or the call fails with `INVALID_CAPACITIES`. P80 comes from Monte Carlo
    on the unlevelled network, so it ignores resource waits. Read `pareto_optimal`, `rank` and
-   `rationale` on each `variants[]` entry, and the top-level `recommended`. Change the
+   `rationale` on each `variants[]` entry, and the top-level `recommended` (with
+   `tied_with_recommended` when scores tie; then the pick is only a tie-break). Change the
    priorities with `weights`.
 5. **Explain the trade-off** to the user before you select, in numbers: what each candidate
    gains, what it costs (effort, risk band, P80), and which assumption it depends on (for
