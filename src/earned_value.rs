@@ -603,8 +603,13 @@ pub fn compute_ev(
     };
     let spi = ratio(
         "spi",
-        (pv != 0.0).then(|| ev / pv),
-        "PV is 0 before any work was planned",
+        (pv >= MIN_MEASURABLE_PV_HOURS).then(|| ev / pv),
+        if pv == 0.0 {
+            "PV is 0 before any work was planned"
+        } else {
+            "PV below 0.01 h, too little planned work to measure (for example right after a \
+             baseline)"
+        },
     );
     let cpi = ratio(
         "cpi",
@@ -695,6 +700,11 @@ pub const MAX_BASELINE_REASON_CHARS: usize = crate::plan::MAX_EVIDENCE_CHARS;
 
 /// Most snapshots a `plan.snapshot` export lists (the newest ones).
 pub const SNAPSHOT_EXPORT_LIMIT: usize = 100;
+
+/// Planned value below this many hours is not yet measurable: an SPI computed
+/// from it would only amplify rounding noise (for example right after a
+/// baseline), so it is reported as undefined instead.
+pub const MIN_MEASURABLE_PV_HOURS: f64 = 0.01;
 
 /// Take a baseline of a plan (`plan.baseline`).
 #[derive(Debug, Clone, PartialEq)]
@@ -1566,6 +1576,60 @@ mod tests {
             undefined_reason(&r, "spi").as_deref(),
             Some("PV is 0 before any work was planned")
         );
+    }
+
+    /// PV 0.000249, EV 72: below [`MIN_MEASURABLE_PV_HOURS`].
+    fn tiny_pv_report() -> EvReport {
+        let b = baseline(vec![
+            row("a", 0.0, 1.0, 0.000249),
+            row("b", 100.0, 200.0, 72.0),
+        ]);
+        let g = graph(vec![
+            deliverable("a", 0.000249, &[]),
+            deliverable("b", 72.0, &[]),
+        ]);
+        let st = statuses(&[
+            ("a", DeliverableStatus::Pending),
+            ("b", DeliverableStatus::Complete),
+        ]);
+        let rules = HashMap::from([
+            ("a".to_string(), EarningRule::Weighted),
+            ("b".to_string(), EarningRule::Weighted),
+        ]);
+        report(&b, &g, &st, &rules, &HashMap::new(), 1)
+    }
+
+    #[test]
+    fn spi_is_null_when_pv_is_below_min_measurable() {
+        assert!(tiny_pv_report().spi.is_none());
+    }
+
+    #[test]
+    fn spi_below_min_measurable_reason_is_explained() {
+        assert_eq!(
+            undefined_reason(&tiny_pv_report(), "spi").as_deref(),
+            Some(
+                "PV below 0.01 h, too little planned work to measure (for example right after a \
+                 baseline)"
+            )
+        );
+    }
+
+    #[test]
+    fn spi_is_computed_when_pv_meets_min_measurable() {
+        let b = baseline(vec![row("a", 0.0, 16.0, 8.0)]);
+        let g = graph(vec![deliverable("a", 8.0, &[])]);
+        let st = statuses(&[("a", DeliverableStatus::InProgress)]);
+        let rules = HashMap::from([("a".to_string(), EarningRule::Weighted)]);
+        let actuals = HashMap::from([(
+            "a".to_string(),
+            Actuals {
+                earned_pct: Some(50),
+                ..Actuals::default()
+            },
+        )]);
+        let r = report(&b, &g, &st, &rules, &actuals, 16);
+        assert_eq!(r.spi, Some(0.5));
     }
 
     #[test]
