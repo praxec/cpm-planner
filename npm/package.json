@@ -1,6 +1,6 @@
 {
   "name": "@matthew-cochran/cpm",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "description": "npx launcher for the cpm-planner MCP server: downloads the verified release binary for your platform and runs it over stdio.",
   "keywords": [
     "mcp",

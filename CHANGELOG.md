@@ -7,17 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-10-26
+
 ### Changed
 
 - `plan.review` asks paired artifact-identity and independent-build questions for every reviewed prerequisite edge, prioritizes milestone/merge fan-out and generic or duplicated consumption claims, and reports exact edge coverage. Capped reviews now return `status: "partial"` and name every edge lacking a complete paired answer ([#94](https://github.com/praxec/cpm-planner/issues/94)).
 
 ### Added
 
+- `plan.lint` warns about generic or repeatedly identical dependency consumption text (`LOW_INFORMATION_CONSUMES`) and milestone/manual fan-out sharing that text (`MILESTONE_FANOUT`), making suspect scheduling edges visible without rejecting the plan ([#95](https://github.com/praxec/cpm-planner/issues/95)).
+
 - Bounded release-DAG compilation through offline `cpm-planner release compile|lint|diff` and MCP `plan.release.compile`/`plan.release.diff`: explicit protected promotions, parallel check joins, owner waits, proof retries/skips, retained receipts, central acceptance, resource classes, history-backed duration provenance, and policy drift reporting ([#100](https://github.com/praxec/cpm-planner/issues/100)).
 
 - `plan.schedule` and scheduled `plan.simulate` now level multi-pool claims declared as `metadata.resources` (for example `{\"agent\":1,\"builder\":1}`), report the specifically saturated pool in each driving-chain resource wait, and model a `duration_hours` observation window with `metadata.wall_clock_only: true` as elapsed time that consumes no capacity ([#96](https://github.com/praxec/cpm-planner/issues/96)).
 
 - A revised plan now protects active work from stale prerequisite or exact-revision-barrier contracts. A deliverable may declare `metadata.consumes_revision_from` for one of its direct prerequisites. Changing either that barrier or its prerequisite set refuses a live lease by default; `force: true` atomically releases it, re-derives its status, retains prior evidence/hours, and returns `diff.superseded_revision` separately from failures ([#97](https://github.com/praxec/cpm-planner/issues/97)).
+
+### Fixed
+
+- Durable-state opening refuses an existing empty database or missing previously known plans unless an explicit initialization/recovery mode acknowledges it. Recovery creates a timestamped SQLite backup including committed WAL pages; command results expose the resolved state location, outcome and backup path ([#99](https://github.com/praxec/cpm-planner/issues/99)).
 
 ## [0.4.3] - 2026-10-23
 

@@ -145,6 +145,14 @@ keeps stdout clean for MCP (`initialize` and `tools/list`).
 
 ## 6. Verify the release
 
+The release owner records the version, tagged commit, release workflow URL,
+checksums/manifest, channel verification results, rollback rehearsal and operator
+handoff in the release receipt. A version bump or merged implementation PR is
+preparation; release acceptance requires the published artifacts and their
+verification evidence. Track GitHub assets, npm, GHCR, the MCP registry and
+crates.io separately so a best-effort or manual publish cannot silently disappear
+from the receipt.
+
 Assets: the release page lists six archives, `checksums.sha256`,
 `release-manifest.json`, `install.sh`, `install.ps1`,
 `matthew-cochran-cpm-X.Y.Z.tgz` and `npm-package.sha256`.
@@ -189,6 +197,24 @@ the README installs from the git tag. docs.rs builds the new version on its own
 a few minutes after publishing.
 
 ## Rollback
+
+Before upgrading a durable deployment, stop every process using its resolved
+`CPM_PLANNER_DB` (or the default state path). Preserve the database and its
+`.state-receipt.json` sidecar together in a dated backup outside the live state
+directory; if the store was not cleanly closed, preserve its `-wal` and `-shm`
+files as well. Never copy a live SQLite database file as a backup: committed WAL
+pages can be omitted. Record the backup location and previous binary version in
+the release receipt.
+
+Rehearse rollback in an isolated directory: restore that pre-upgrade state and
+receipt, run the previous pinned release against it, then confirm the known plan
+ids, baselines, actuals and evidence are intact. Binary rollback alone is not a
+state rollback. Keep the upgraded state separately for diagnosis; never open it
+with an older binary unless compatibility has been verified. Leave
+`CPM_PLANNER_STATE_MODE` unset during normal startup; `initialize` and `recover`
+acknowledge state loss and must not be used to bypass a rollback verification
+failure. Record the tested commands/results and the maintainer responsible for
+the final channel and state decision.
 
 - **A build failed before publishing.** The release is still a draft. Fix the
   problem on `dev`, then delete the draft and the tag and re-release with the
