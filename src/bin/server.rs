@@ -37,7 +37,7 @@ use cpm_planner::earned_value::BaselineMode;
 use cpm_planner::llm::LlmConfig;
 use cpm_planner::planner::{DEFAULT_MAX_TTL, MAX_TTL_CEILING};
 use cpm_planner::project::{PROJECT_ROOT_ENV, ProjectRoot};
-use cpm_planner::{BasicCpmPlanner, PlanServer, SqlitePlanStore};
+use cpm_planner::{BasicCpmPlanner, PlanServer, STATE_MODE_ENV, SqlitePlanStore, StateOpenMode};
 use tracing_subscriber::EnvFilter;
 
 const USAGE: &str = "\
@@ -120,8 +120,9 @@ async fn serve() -> anyhow::Result<()> {
     // ~/.local/share/praxec/cpm-planner.db; override with CPM_PLANNER_DB
     // (":memory:" gives the old ephemeral behaviour).
     let db_path = SqlitePlanStore::default_db_path()?;
-    tracing::info!(db = %db_path.display(), "opening planner database");
-    let store = SqlitePlanStore::open(&db_path)?;
+    let state_mode = resolve_state_mode()?;
+    tracing::info!(db = %db_path.display(), ?state_mode, "opening planner database");
+    let (store, state_report) = SqlitePlanStore::open_with_report(&db_path, state_mode)?;
     let max_ttl = resolve_max_ttl()?;
     tracing::info!(max_ttl_secs = max_ttl.as_secs(), "lease TTL ceiling");
     let baseline_mode = resolve_baseline_mode()?;
@@ -153,6 +154,7 @@ async fn serve() -> anyhow::Result<()> {
     tracing::info!("starting cpm-planner stdio server");
     // The server reads the project root from the planner.
     PlanServer::new(planner)
+        .with_durable_state_report(state_report)
         .with_llm_config(llm_config)
         .serve_stdio()
         .await?;
@@ -179,6 +181,18 @@ fn discover_project_root() -> Option<ProjectRoot> {
             tracing::warn!(error = %err, "cannot read the current directory; no project root");
             None
         }
+    }
+}
+
+fn resolve_state_mode() -> anyhow::Result<StateOpenMode> {
+    match std::env::var(STATE_MODE_ENV) {
+        Err(VarError::NotPresent) => Ok(StateOpenMode::Normal),
+        Ok(value) if value == "initialize" => Ok(StateOpenMode::Initialize),
+        Ok(value) if value == "recover" => Ok(StateOpenMode::Recover),
+        Ok(value) => anyhow::bail!(
+            "{STATE_MODE_ENV} must be `initialize` or `recover` when set, got `{value}`"
+        ),
+        Err(VarError::NotUnicode(_)) => anyhow::bail!("{STATE_MODE_ENV} is not valid Unicode"),
     }
 }
 

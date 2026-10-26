@@ -1425,6 +1425,7 @@ impl ReviewJudge {
 #[derive(Clone)]
 pub struct PlanServer {
     planner: Arc<BasicCpmPlanner>,
+    durable_state: Option<Value>,
     server_name: String,
     server_version: String,
     judge: ReviewJudge,
@@ -1437,11 +1438,20 @@ impl PlanServer {
     pub fn new(planner: Arc<BasicCpmPlanner>) -> Self {
         Self {
             planner,
+            durable_state: None,
             server_name: "cpm-planner".to_string(),
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             judge: ReviewJudge::NotConfigured,
             review_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REVIEWS)),
         }
+    }
+
+    /// Attach startup durable-state provenance to every tool response. The
+    /// production binary supplies it; direct library users retain the stable
+    /// response shape unless they explicitly opt in.
+    pub fn with_durable_state_report(mut self, report: crate::StateOpenReport) -> Self {
+        self.durable_state = Some(json!(report));
+        self
     }
 
     /// Set `plan.review`'s judge: `None` means no key is configured (the
@@ -1645,7 +1655,7 @@ impl PlanServer {
             .map(|m| Value::Object(m.clone()))
             .unwrap_or_else(|| json!({}));
 
-        match request.name.as_ref() {
+        let result = match request.name.as_ref() {
             TOOL_SUBMIT => self.handle_submit(args).await,
             TOOL_ACQUIRE_COHORT => self.handle_acquire_cohort(args).await,
             TOOL_HEARTBEAT => self.handle_heartbeat(args).await,
@@ -1676,7 +1686,13 @@ impl PlanServer {
                 ),
                 None,
             )),
-        }
+        };
+        result.map(|mut value| {
+            if let (Some(report), Some(object)) = (&self.durable_state, value.as_object_mut()) {
+                object.insert("durable_state".to_string(), report.clone());
+            }
+            value
+        })
     }
 
     // -------------------------------------------------------------------
