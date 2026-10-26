@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `plan.schedule` and scheduled `plan.simulate` now level multi-pool claims declared as `metadata.resources` (for example `{\"agent\":1,\"builder\":1}`), report the specifically saturated pool in each driving-chain resource wait, and model a `duration_hours` observation window with `metadata.wall_clock_only: true` as elapsed time that consumes no capacity ([#96](https://github.com/praxec/cpm-planner/issues/96)).
 
+- A revised plan now protects active work from stale prerequisite or exact-revision-barrier contracts. A deliverable may declare `metadata.consumes_revision_from` for one of its direct prerequisites. Changing either that barrier or its prerequisite set refuses a live lease by default; `force: true` atomically releases it, re-derives its status, retains prior evidence/hours, and returns `diff.superseded_revision` separately from failures ([#97](https://github.com/praxec/cpm-planner/issues/97)).
+
 ## [0.4.3] - 2026-10-23
 
 ### Changed

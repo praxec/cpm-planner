@@ -169,6 +169,7 @@ fn diff(first: &PlanGraph, other: &PlanGraph) -> RevisionDiff {
             .collect(),
         reopened: Vec::new(),
         released_locks: Vec::new(),
+        superseded_revision: None,
     }
 }
 

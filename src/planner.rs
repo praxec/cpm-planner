@@ -572,6 +572,24 @@ pub(crate) fn validate_graph(graph: &PlanGraph) -> Result<(), PlannerError> {
                 });
             }
         }
+        if let Some(barrier) = d.metadata.get("consumes_revision_from") {
+            let Some(barrier) = barrier.as_str().filter(|id| !id.is_empty()) else {
+                return Err(PlannerError::InvalidGraph {
+                    reason: format!(
+                        "deliverable '{}' metadata.consumes_revision_from must be a non-empty deliverable id",
+                        d.id
+                    ),
+                });
+            };
+            if !d.prerequisites.iter().any(|p| p.id() == barrier) {
+                return Err(PlannerError::InvalidGraph {
+                    reason: format!(
+                        "deliverable '{}' consumes revision from '{barrier}' but does not declare it as a prerequisite",
+                        d.id
+                    ),
+                });
+            }
+        }
     }
 
     // Shared files: any pair of claimants where at least one claim is
@@ -1016,6 +1034,17 @@ fn incomplete_prerequisites(state: &PlanState, deliverable_id: &str) -> Vec<Stri
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Whether a deliverable can receive a fresh lease. A superseded revision is
+/// intentionally re-acquirable only after all of its new prerequisites are
+/// complete; it never lets the stale holder complete without that new lease.
+fn is_reacquirable(state: &PlanState, d: &Deliverable) -> bool {
+    matches!(
+        state.statuses.get(&d.id),
+        Some(DeliverableStatus::Ready | DeliverableStatus::SupersededRevision)
+    ) && crate::graph::prerequisite_ids(d)
+        .all(|p| matches!(state.statuses.get(p), Some(DeliverableStatus::Complete)))
 }
 
 /// Mark a deliverable `Complete`: end any lease at `now` (dropping its file
@@ -1624,7 +1653,7 @@ impl Planner for BasicCpmPlanner {
                 .filter(|d| {
                     in_scope(d)
                         && !is_manual(d)
-                        && matches!(state.statuses.get(&d.id), Some(DeliverableStatus::Ready))
+                        && is_reacquirable(state, d)
                         && !state.locks.contains_key(&d.id)
                         && state.lapse_count(&d.id) >= MAX_LAPSES
                 })
@@ -1680,7 +1709,7 @@ impl Planner for BasicCpmPlanner {
                         block("MANUAL", "manual deliverable; never leased".to_string());
                     } else if state.locks.contains_key(&d.id) {
                         block("LOCKED", "held by an active lease".to_string());
-                    } else if !matches!(status, Some(DeliverableStatus::Ready)) {
+                    } else if !is_reacquirable(state, d) {
                         block(
                             "NOT_READY",
                             format!(
@@ -1699,7 +1728,7 @@ impl Planner for BasicCpmPlanner {
                 ready.extend(state.graph.deliverables.iter().filter(|d| {
                     in_scope(d)
                         && !is_manual(d)
-                        && matches!(state.statuses.get(&d.id), Some(DeliverableStatus::Ready))
+                        && is_reacquirable(state, d)
                         && !state.locks.contains_key(&d.id)
                         && !lapse_blocked.iter().any(|b| b.id == d.id)
                 }));
@@ -1887,6 +1916,18 @@ impl Planner for BasicCpmPlanner {
                 .get(deliverable_id)
                 .cloned()
                 .unwrap_or(DeliverableStatus::Pending);
+
+            // A forced revision invalidated this caller's old lease. It must
+            // acquire a fresh lease against the new contract; lockless marks
+            // cannot turn diagnostic old evidence into acceptance.
+            if !state.locks.contains_key(deliverable_id)
+                && matches!(previous_status, DeliverableStatus::SupersededRevision)
+            {
+                return Err(PlannerError::LockNotHeld {
+                    caller_id: caller_id.0.clone(),
+                    deliverable_id: deliverable_id.to_string(),
+                });
+            }
 
             // No lock and already Complete: only an idempotent Complete is
             // allowed; a late holder of an overridden lease cannot undo an
@@ -2116,8 +2157,14 @@ impl Planner for BasicCpmPlanner {
                 let mut ready_rows: Vec<&ScheduleRow> = schedule
                     .iter()
                     .filter(|r| {
-                        matches!(state.statuses.get(&r.id), Some(DeliverableStatus::Ready))
-                            && !state.locks.contains_key(&r.id)
+                        state
+                            .graph
+                            .deliverables
+                            .iter()
+                            .find(|d| d.id == r.id)
+                            .is_some_and(|d| {
+                                !state.locks.contains_key(&r.id) && is_reacquirable(state, d)
+                            })
                     })
                     .collect();
                 // Display order is float-first (ready_display_key); acquire_cohort keeps
@@ -2372,6 +2419,25 @@ mod tests {
     fn canonical_form_omits_an_absent_earning_rule() {
         let d = deliverable("D1", Some(1.0), json!({}));
         assert!(canonical_deliverable(&d).get("earning_rule").is_none());
+    }
+
+    #[test]
+    fn revision_barrier_must_be_a_direct_prerequisite() {
+        let mut d = deliverable(
+            "consumer",
+            Some(1.0),
+            json!({
+                "consumes_revision_from": "barrier"
+            }),
+        );
+        d.prerequisites = vec![];
+        let barrier = deliverable("barrier", Some(1.0), json!({}));
+        let err = validate_graph(&PlanGraph {
+            deliverables: vec![barrier, d],
+            max_chained_dispatch: None,
+        })
+        .expect_err("barrier must order consumer");
+        assert!(matches!(err, PlannerError::InvalidGraph { .. }));
     }
 
     #[test]
