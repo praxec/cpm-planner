@@ -46,6 +46,7 @@ cpm-planner: Critical Path Method planner as an MCP server.
 Usage:
   cpm-planner                 Run the MCP server on stdio (how MCP clients start it)
   cpm-planner skills <cmd>    Install, uninstall or list the agent skills
+  cpm-planner release <cmd>   Compile, lint or diff a bounded release workflow
   cpm-planner --version       Print the version
   cpm-planner --help          Print this help
 ";
@@ -71,10 +72,15 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         "--help" | "-h" | "help" if args.len() == 1 => {
-            print!("{USAGE}\n{}", cpm_planner::skills::USAGE);
+            print!(
+                "{USAGE}\n{}\n{}",
+                cpm_planner::skills::USAGE,
+                cpm_planner::release_cli::USAGE
+            );
             ExitCode::SUCCESS
         }
         "skills" => ExitCode::from(cpm_planner::skills::run(&args[1..])),
+        "release" => ExitCode::from(cpm_planner::release_cli::run(&args[1..])),
         _ => {
             eprintln!(
                 "cpm-planner: unexpected arguments `{}`\n\n{USAGE}",
