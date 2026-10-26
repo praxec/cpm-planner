@@ -105,6 +105,37 @@ fn cli_diff_exits_one_for_stale_policy() {
 }
 
 #[test]
+fn cli_diff_exits_one_for_a_graph_dispatch_policy_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("main.json");
+    let mut graph = cpm_planner::release_dag::compile(
+        &serde_json::from_str(include_str!("../examples/release-workflow.json")).unwrap(),
+    )
+    .unwrap()
+    .graph;
+    graph.max_chained_dispatch = Some(1);
+    std::fs::write(&path, serde_json::to_vec(&graph).unwrap()).unwrap();
+    let output = binary()
+        .args(["release", "diff", "examples/release-workflow.json"])
+        .arg(path)
+        .output()
+        .unwrap();
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        (
+            output.status.code(),
+            result["stale"].as_bool(),
+            result["graph_changes"].clone()
+        ),
+        (
+            Some(1),
+            Some(true),
+            serde_json::json!(["max_chained_dispatch"])
+        )
+    );
+}
+
+#[test]
 fn cli_refuses_oversized_input_before_parsing() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("too-large.json");

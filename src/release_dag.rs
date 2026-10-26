@@ -226,6 +226,8 @@ pub struct ReleaseDiff {
     pub added: Vec<String>,
     pub removed: Vec<String>,
     pub changed: Vec<String>,
+    /// Changed graph-level definition fields, separate from deliverable ids.
+    pub graph_changes: Vec<String>,
 }
 
 /// Inline schema used by MCP; all nested wire structs reject unknown keys too.
@@ -956,12 +958,22 @@ pub fn diff(w: &ReleaseWorkflow, previous: &PlanGraph) -> Result<ReleaseDiff, Pl
         .filter(|(id, d)| old.get(*id).is_some_and(|before| *before != **d))
         .map(|(id, _)| id.clone())
         .collect::<Vec<_>>();
+    let graph_changes = if previous.max_chained_dispatch != current.graph.max_chained_dispatch {
+        vec!["max_chained_dispatch".to_string()]
+    } else {
+        Vec::new()
+    };
     Ok(ReleaseDiff {
-        stale: policy_changed || !added.is_empty() || !removed.is_empty() || !changed.is_empty(),
+        stale: policy_changed
+            || !added.is_empty()
+            || !removed.is_empty()
+            || !changed.is_empty()
+            || !graph_changes.is_empty(),
         policy_changed,
         current_policy_digest: current.policy_digest,
         added,
         removed,
         changed,
+        graph_changes,
     })
 }

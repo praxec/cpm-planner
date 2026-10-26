@@ -25,7 +25,7 @@ read no credentials, and neither open the planner database nor modify files.
 MCP equivalents are `plan.release.compile {workflow}` and
 `plan.release.diff {workflow, graph}`. Their arguments are inline JSON, using
 the same schema and validation as the CLI. Compile returns the report; diff
-returns `{stale, policy_changed, current_policy_digest, added, removed, changed}`.
+returns `{stale, policy_changed, current_policy_digest, added, removed, changed, graph_changes}`.
 Unknown nested keys and schema versions are refused. Neither call submits,
 baselines, leases, completes, accepts or revises any work.
 
@@ -137,7 +137,9 @@ remain stable across recompilation.
 `release diff` recompiles the current snapshot and compares it with the retained
 plan, reporting changed/added/removed ids and policy drift. History-only estimate
 changes can make `stale: true` while `policy_changed: false`. Local edits or
-missing compiler provenance also make the definition stale. A policy change can
+missing compiler provenance also make the definition stale. Graph-level edits,
+including `max_chained_dispatch`, are named in `graph_changes` and make the
+definition stale even when no deliverable or workflow policy changed. A policy change can
 mark otherwise identical nodes changed because their provenance digest changed.
 
 Run ordinary `plan.lint`, `plan.simulate` and `plan.schedule` on the generated

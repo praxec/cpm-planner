@@ -259,6 +259,31 @@ fn caller_edits_in_a_generated_plan_are_detected() {
     assert!(diff(&workflow(input()), &g).unwrap().stale);
 }
 
+#[test]
+fn graph_dispatch_policy_edits_are_stale_without_deliverable_or_workflow_changes() {
+    let mut graph = compiled();
+    graph.max_chained_dispatch = Some(1);
+    let result = diff(&workflow(input()), &graph).unwrap();
+    assert_eq!(
+        (
+            result.stale,
+            result.policy_changed,
+            result.added,
+            result.removed,
+            result.changed,
+            result.graph_changes
+        ),
+        (
+            true,
+            false,
+            vec![],
+            vec![],
+            vec![],
+            vec!["max_chained_dispatch".to_string()]
+        )
+    );
+}
+
 #[tokio::test]
 async fn owner_and_runner_nodes_cannot_be_leased_by_agents() {
     let planner = BasicCpmPlanner::new();
