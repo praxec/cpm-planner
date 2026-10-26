@@ -59,6 +59,11 @@ use crate::task::CriticalPathResult;
 /// (useful for tests / ephemeral runs).
 pub const DB_PATH_ENV: &str = "CPM_PLANNER_DB";
 
+/// Explicit acknowledgement required to initialise or recover a damaged
+/// existing state location. Normal startup never silently treats an existing
+/// empty database as a new planner.
+pub const STATE_MODE_ENV: &str = "CPM_PLANNER_STATE_MODE";
+
 /// Default on-disk location relative to the home directory (see
 /// [`home_dir_from`]), as path components so the separator is native.
 const DEFAULT_DB_RELATIVE: [&str; 4] = [".local", "share", "praxec", "cpm-planner.db"];
@@ -121,6 +126,89 @@ fn dt_from_micros(us: i64, column: &str) -> Result<DateTime<Utc>, PlannerError> 
 /// The mutex is never held across an `.await`.
 pub struct SqlitePlanStore {
     conn: Mutex<Connection>,
+    receipt_path: Option<PathBuf>,
+}
+
+/// How a file-backed durable store was opened. This is included in every MCP
+/// response from the production server so callers can retain the evidence.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StateOpenOutcome {
+    Created,
+    Opened,
+    Recovered,
+    Ephemeral,
+}
+
+/// Durable-state provenance for an opened planner database.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StateOpenReport {
+    pub location: String,
+    pub outcome: StateOpenOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup_path: Option<String>,
+}
+
+/// Operator acknowledgement for a damaged or replaced state location.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateOpenMode {
+    Normal,
+    Initialize,
+    Recover,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct StateReceipt {
+    version: u8,
+    plan_ids: Vec<String>,
+}
+
+fn receipt_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.state-receipt.json", path.display()))
+}
+
+fn read_receipt(path: &Path) -> anyhow::Result<Option<StateReceipt>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("reading durable-state receipt at {}", path.display()))?;
+    let receipt: StateReceipt = serde_json::from_slice(&bytes)
+        .with_context(|| format!("decoding durable-state receipt at {}", path.display()))?;
+    if receipt.version != 1 {
+        anyhow::bail!(
+            "unsupported durable-state receipt version {} at {}",
+            receipt.version,
+            path.display()
+        );
+    }
+    Ok(Some(receipt))
+}
+
+fn backup_state(path: &Path) -> anyhow::Result<PathBuf> {
+    let stamp = Utc::now().format("%Y%m%dT%H%M%S%.6fZ");
+    let backup = PathBuf::from(format!("{}.backup-{stamp}", path.display()));
+    let source = Connection::open(path)
+        .with_context(|| format!("opening durable state {} for backup", path.display(),))?;
+    let mut destination = Connection::open(&backup).with_context(|| {
+        format!(
+            "opening durable-state backup destination {}",
+            backup.display()
+        )
+    })?;
+    // SQLite's online backup API includes committed WAL pages; copying the
+    // database file directly would silently omit those pages on an active
+    // store, defeating the recovery guarantee.
+    rusqlite::backup::Backup::new(&source, &mut destination)?
+        .run_to_completion(64, std::time::Duration::from_millis(1), None)
+        .with_context(|| {
+            format!(
+                "backing up durable state {} to {} before recovery",
+                path.display(),
+                backup.display()
+            )
+        })?;
+    Ok(backup)
 }
 
 /// Return of [`SqlitePlanStore::read_plan_and_variant`]: the closure's value
@@ -135,8 +223,25 @@ impl SqlitePlanStore {
     /// directories are created. The special path `:memory:` opens a
     /// private in-memory database.
     pub fn open(path: &Path) -> anyhow::Result<Self> {
+        Ok(Self::open_with_report(path, StateOpenMode::Normal)?.0)
+    }
+
+    /// Open a durable store and return evidence of how its state location was
+    /// handled. `Initialize` and `Recover` are intentionally explicit: they
+    /// acknowledge that an existing empty/replaced database is being accepted.
+    pub fn open_with_report(
+        path: &Path,
+        mode: StateOpenMode,
+    ) -> anyhow::Result<(Self, StateOpenReport)> {
         if path.as_os_str() == ":memory:" {
-            return Self::open_in_memory();
+            return Ok((
+                Self::open_in_memory()?,
+                StateOpenReport {
+                    location: ":memory:".into(),
+                    outcome: StateOpenOutcome::Ephemeral,
+                    backup_path: None,
+                },
+            ));
         }
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -144,9 +249,68 @@ impl SqlitePlanStore {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating parent directory for {}", path.display()))?;
         }
+        let existed = path.exists();
+        let was_empty = existed
+            && std::fs::metadata(path)
+                .with_context(|| format!("reading database metadata at {}", path.display()))?
+                .len()
+                == 0;
+        if was_empty && mode == StateOpenMode::Normal {
+            anyhow::bail!(
+                "STATE_INITIALIZATION_REFUSED: existing durable-state location {} is empty; set {STATE_MODE_ENV}=initialize or {STATE_MODE_ENV}=recover after preserving the original state",
+                path.display()
+            );
+        }
+        let backup_path = if was_empty {
+            Some(backup_state(path)?)
+        } else {
+            None
+        };
         let conn = Connection::open(path)
             .with_context(|| format!("opening sqlite database at {}", path.display()))?;
-        Self::init(conn)
+        let receipt_path = receipt_path(path);
+        let prior_receipt = read_receipt(&receipt_path)?;
+        let store = Self::init(conn, Some(receipt_path.clone()))?;
+        let actual = store.plan_ids()?;
+        let missing: Vec<_> = prior_receipt
+            .as_ref()
+            .map(|receipt| {
+                receipt
+                    .plan_ids
+                    .iter()
+                    .filter(|id| !actual.contains(id))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !missing.is_empty() && mode != StateOpenMode::Recover {
+            anyhow::bail!(
+                "STATE_LOSS_DETECTED: durable state at {} no longer contains known plan id(s) {}; set {STATE_MODE_ENV}=recover only after reviewing a backup",
+                path.display(),
+                missing.join(", ")
+            );
+        }
+        let backup_path = if !missing.is_empty() {
+            Some(backup_state(path)?)
+        } else {
+            backup_path
+        };
+        store.refresh_receipt()?;
+        let outcome = if !missing.is_empty() || was_empty {
+            StateOpenOutcome::Recovered
+        } else if existed {
+            StateOpenOutcome::Opened
+        } else {
+            StateOpenOutcome::Created
+        };
+        Ok((
+            store,
+            StateOpenReport {
+                location: path.display().to_string(),
+                outcome,
+                backup_path: backup_path.map(|path| path.display().to_string()),
+            },
+        ))
     }
 
     /// Open a private in-memory database. State does NOT survive the
@@ -154,7 +318,7 @@ impl SqlitePlanStore {
     /// test / ephemeral configuration.
     pub fn open_in_memory() -> anyhow::Result<Self> {
         let conn = Connection::open_in_memory().context("opening in-memory sqlite database")?;
-        Self::init(conn)
+        Self::init(conn, None)
     }
 
     /// Open the database at [`Self::default_db_path`].
@@ -170,7 +334,7 @@ impl SqlitePlanStore {
         default_db_path_from(|name| std::env::var_os(name))
     }
 
-    fn init(mut conn: Connection) -> anyhow::Result<Self> {
+    fn init(mut conn: Connection, receipt_path: Option<PathBuf>) -> anyhow::Result<Self> {
         // WAL + busy_timeout: concurrent processes queue on the write
         // lock instead of failing; readers never block the writer.
         // (`execute_batch` tolerates pragmas that return a row.)
@@ -186,11 +350,44 @@ impl SqlitePlanStore {
 
         let store = Self {
             conn: Mutex::new(conn),
+            receipt_path,
         };
         store
             .quarantine_expired(Utc::now())
             .context("quarantining expired locks at startup")?;
         Ok(store)
+    }
+
+    fn plan_ids(&self) -> anyhow::Result<Vec<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("planner store mutex poisoned"))?;
+        let mut stmt = conn.prepare("SELECT plan_id FROM plans ORDER BY plan_id")?;
+        Ok(stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>()?)
+    }
+
+    fn refresh_receipt(&self) -> anyhow::Result<()> {
+        let Some(path) = &self.receipt_path else {
+            return Ok(());
+        };
+        let receipt = StateReceipt {
+            version: 1,
+            plan_ids: self.plan_ids()?,
+        };
+        let bytes = serde_json::to_vec(&receipt)?;
+        let temporary = PathBuf::from(format!("{}.tmp-{}", path.display(), uuid::Uuid::new_v4()));
+        std::fs::write(&temporary, bytes)
+            .with_context(|| format!("writing durable-state receipt {}", temporary.display()))?;
+        std::fs::rename(&temporary, path).with_context(|| {
+            format!(
+                "atomically installing durable-state receipt {}",
+                path.display()
+            )
+        })?;
+        Ok(())
     }
 
     /// Reap every lock whose TTL lapsed before `now`: the deliverable
@@ -369,6 +566,8 @@ impl SqlitePlanStore {
         .map_err(backend)?;
 
         tx.commit().map_err(backend)?;
+        drop(conn);
+        self.refresh_receipt().map_err(backend)?;
         Ok(plan_id)
     }
 
@@ -423,6 +622,8 @@ impl SqlitePlanStore {
         let out = f(&tx, &mut state)?;
         save_plan_state(&tx, plan_id, &mut state)?;
         tx.commit().map_err(backend)?;
+        drop(conn);
+        self.refresh_receipt().map_err(backend)?;
         Ok(out)
     }
 
@@ -446,6 +647,8 @@ impl SqlitePlanStore {
         let out = f(&mut state)?;
         save_plan_state(&tx, plan_id, &mut state)?;
         tx.commit().map_err(backend)?;
+        drop(conn);
+        self.refresh_receipt().map_err(backend)?;
         Ok(out)
     }
 
@@ -500,6 +703,8 @@ impl SqlitePlanStore {
             .map_err(backend)?;
         let out = f(&tx)?;
         tx.commit().map_err(backend)?;
+        drop(conn);
+        self.refresh_receipt().map_err(backend)?;
         Ok(out)
     }
 
@@ -1343,7 +1548,51 @@ mod tests {
                 p.push(suffix);
                 let _ = std::fs::remove_file(PathBuf::from(p));
             }
+            let _ = std::fs::remove_file(receipt_path(&self.path));
         }
+    }
+
+    #[test]
+    fn existing_empty_state_requires_explicit_recovery_and_reports_backup() {
+        let db = TempDbFile::new("empty-state");
+        std::fs::write(&db.path, []).unwrap();
+        let err = SqlitePlanStore::open(&db.path).err().unwrap().to_string();
+        assert!(err.contains("STATE_INITIALIZATION_REFUSED"), "{err}");
+
+        let (_store, report) =
+            SqlitePlanStore::open_with_report(&db.path, StateOpenMode::Recover).unwrap();
+        assert_eq!(report.outcome, StateOpenOutcome::Recovered);
+        assert!(
+            report
+                .backup_path
+                .as_deref()
+                .is_some_and(|path| Path::new(path).exists())
+        );
+    }
+
+    #[test]
+    fn replaced_store_with_known_plan_requires_recovery_acknowledgement() {
+        let db = TempDbFile::new("missing-known-plan");
+        let store = SqlitePlanStore::open(&db.path).unwrap();
+        store
+            .submit_or_get("hash-known", || {
+                Ok((PlanId("plan_known".into()), plan_state_with_one_ready()))
+            })
+            .unwrap();
+        drop(store);
+        std::fs::write(&db.path, []).unwrap();
+
+        let err = SqlitePlanStore::open(&db.path).err().unwrap().to_string();
+        assert!(err.contains("STATE_INITIALIZATION_REFUSED"), "{err}");
+        let (_store, report) =
+            SqlitePlanStore::open_with_report(&db.path, StateOpenMode::Recover).unwrap();
+        assert_eq!(report.outcome, StateOpenOutcome::Recovered);
+        assert!(
+            report
+                .backup_path
+                .as_deref()
+                .is_some_and(|path| Path::new(path).exists())
+        );
     }
 
     /// A v4 database stripped back to the v3 layout (earned-value tables
