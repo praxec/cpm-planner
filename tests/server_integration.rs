@@ -972,6 +972,31 @@ fn schedule_args(deliverables: Value) -> Value {
 }
 
 #[tokio::test]
+async fn plan_schedule_levels_multi_pool_and_wall_clock_only_deliverables() {
+    let args = json!({
+        "graph": { "deliverables": [
+            { "id": "build", "owned_files": [], "prerequisites": [], "duration_hours": 2.0,
+              "metadata": { "resources": { "agent": 1, "builder": 1 } } },
+            { "id": "test", "owned_files": [], "prerequisites": [], "duration_hours": 2.0,
+              "metadata": { "resources": { "agent": 1, "builder": 1 } } },
+            { "id": "ci", "owned_files": [], "prerequisites": ["build", "test"], "duration_hours": 3.0,
+              "metadata": { "wall_clock_only": true } }
+        ] },
+        "capacities": { "agent": 2, "builder": 1 }
+    });
+    let schedule = call_within(&server(), "plan.schedule", args)
+        .await
+        .expect("multi-pool schedule succeeds");
+    assert_eq!(schedule["makespan"], json!(7.0));
+    assert_eq!(schedule["rows"][1]["resources"]["builder"], json!(1));
+    assert_eq!(
+        schedule["driving_chain"][1]["waited_on_resource"],
+        json!("builder")
+    );
+    assert!(schedule["rows"][2].get("resources").is_none());
+}
+
+#[tokio::test]
 async fn plan_schedule_rejects_reserved_id() {
     let args = schedule_args(json!([
         { "id": "__start__", "owned_files": [], "prerequisites": [], "estimated_effort_hours": 1.0 }

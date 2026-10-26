@@ -133,6 +133,79 @@ fn driving_chain_marks_resource_waits() {
 }
 
 #[test]
+fn multi_resource_claim_waits_on_the_saturated_named_pool() {
+    let mut build = d("build", 2.0, "agent", &[]);
+    build.metadata = serde_json::json!({ "resources": { "agent": 1, "builder": 1 } });
+    let mut test = d("test", 2.0, "agent", &[]);
+    test.metadata = serde_json::json!({ "resources": { "agent": 1, "builder": 1 } });
+    let s = run(
+        &graph(vec![build, test]),
+        &req(&[("agent", 2), ("builder", 1)]),
+    );
+    assert_eq!(row_start(&s, "test"), 2.0);
+    assert_eq!(s.rows[0].resources["agent"], 1);
+    assert_eq!(s.rows[0].resources["builder"], 1);
+    assert_eq!(s.driving_chain[1].waited_on, WaitKind::Resource);
+    assert_eq!(
+        s.driving_chain[1].waited_on_resource.as_deref(),
+        Some("builder")
+    );
+}
+
+#[test]
+fn multi_resource_claim_requires_capacity_in_every_pool() {
+    let mut build = d("build", 2.0, "agent", &[]);
+    build.metadata = serde_json::json!({ "resources": { "agent": 1, "builder": 2 } });
+    let err = resource_schedule(&graph(vec![build]), &req(&[("agent", 1), ("builder", 1)]))
+        .expect_err("two builder units need capacity two");
+    assert_eq!(
+        err.to_string(),
+        "INVALID_CAPACITIES: no capacity for resources [builder]"
+    );
+}
+
+#[test]
+fn wall_clock_only_duration_blocks_dependents_without_consuming_capacity() {
+    let mut observation = d("ci", 3.0, "agent", &[]);
+    observation.metadata = serde_json::json!({ "wall_clock_only": true });
+    let g = graph(vec![
+        d("coding", 2.0, "agent", &[]),
+        observation,
+        d("release", 1.0, "agent", &["ci"]),
+    ]);
+    let s = run(&g, &req(&[("agent", 1)]));
+    assert_eq!(row_start(&s, "ci"), 0.0);
+    assert_eq!(row_start(&s, "release"), 3.0);
+    assert!(
+        s.rows
+            .iter()
+            .find(|row| row.id == "ci")
+            .unwrap()
+            .resources
+            .is_empty()
+    );
+    assert_eq!(
+        s.load.len(),
+        1,
+        "the observation consumes no agent capacity"
+    );
+    assert_eq!(s.load[0].busy_hours, 3.0, "coding plus release only");
+}
+
+#[test]
+fn wall_clock_only_requires_an_explicit_duration() {
+    let mut observation = d("ci", 3.0, "agent", &[]);
+    observation.duration_hours = None;
+    observation.metadata = serde_json::json!({ "wall_clock_only": true });
+    let err = resource_schedule(&graph(vec![observation]), &req(&[("agent", 1)]))
+        .expect_err("wall-clock observation must declare elapsed time");
+    assert_eq!(
+        err.to_string(),
+        "INVALID_GRAPH: ci marks wall_clock_only but has no duration_hours"
+    );
+}
+
+#[test]
 fn driving_chain_marks_dependency_waits() {
     let g = graph(vec![d("a", 2.0, "x", &[]), d("b", 2.0, "y", &["a"])]);
     let s = run(&g, &req(&[("x", 1), ("y", 1)]));
