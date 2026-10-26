@@ -9,10 +9,11 @@
 ## Checklist
 
 - [ ] Tests added or updated for the behavior change
-- [ ] All 8 gates pass (see CONTRIBUTING.md):
+- [ ] All 9 gates pass (see CONTRIBUTING.md):
   - [ ] `cargo fmt --all --check`
   - [ ] `cargo clippy --all-targets -- -D warnings`
-  - [ ] `cargo test`
+  - [ ] `cargo nextest run --all-targets`
+  - [ ] `cargo test --doc`
   - [ ] `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`
   - [ ] `cargo publish --dry-run --locked`
   - [ ] `cargo deny check`

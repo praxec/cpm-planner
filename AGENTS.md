@@ -12,7 +12,7 @@ repositories; do not add it here.
 ## Build, test and gates
 
 The toolchain is pinned in `rust-toolchain.toml`. Run every gate before you
-push; CI runs the same ones. Besides Rust you need `cargo-deny`, `bash` and
+push; CI runs the same ones. Besides Rust you need `cargo-nextest`, `cargo-deny`, `bash` and
 `jq` (for `scripts/check-version-sync.sh`), and Node 21+ (for the
 `npm/test/*.test.mjs` glob).
 
@@ -20,7 +20,8 @@ push; CI runs the same ones. Besides Rust you need `cargo-deny`, `bash` and
 cargo build
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
-cargo test
+cargo nextest run --all-targets
+cargo test --doc
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 cargo publish --dry-run --locked
 cargo deny check
@@ -70,5 +71,6 @@ The OpenRouter review test is ignored by default and costs money. Run it only
 when asked:
 
 ```sh
-OPENROUTER_API_KEY=... cargo test --test server_review -- --ignored
+OPENROUTER_API_KEY=... cargo nextest run --test server_review \
+  -E 'test(review_against_openrouter_live)' --ignored
 ```
