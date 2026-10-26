@@ -128,6 +128,7 @@ pub(super) fn state_has_progress(state: &PlanState) -> bool {
         matches!(
             status,
             DeliverableStatus::InProgress
+                | DeliverableStatus::SupersededRevision
                 | DeliverableStatus::Complete
                 | DeliverableStatus::Failed { .. }
         )

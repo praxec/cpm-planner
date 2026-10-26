@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 const EPS: f32 = 1e-4;
 const UNASSIGNED: &str = "unassigned";
+const WALL_CLOCK: &str = "wall_clock";
 
 /// Default `resource_key`: deliverables name their resource in
 /// `metadata.owner`.
@@ -34,6 +35,12 @@ pub(crate) fn check_buffer_pct(pct: f32) -> Result<(), String> {
 }
 
 /// Input to [`resource_schedule`].
+///
+/// A deliverable uses its legacy `metadata.<resource_key>` pool unless it
+/// declares `metadata.resources` as a map of pool names to positive unit
+/// claims. Every listed pool is reserved simultaneously. A deliverable with
+/// `metadata.wall_clock_only: true` must declare `duration_hours`; it advances
+/// elapsed time and dependencies but claims no capacity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScheduleRequest {
@@ -51,7 +58,13 @@ pub struct ScheduleRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScheduledRow {
     pub id: String,
+    /// Legacy display name for the primary pool. Multi-pool claims are
+    /// represented precisely in `resources`.
     pub resource: String,
+    /// Every capacity pool claimed concurrently by this deliverable.
+    /// Empty means a `wall_clock_only` observation window.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub resources: BTreeMap<String, u32>,
     pub start: f32,
     pub finish: f32,
 }
@@ -65,7 +78,8 @@ pub struct ResourceLoad {
     pub utilisation: f32,
 }
 
-/// What a driving-chain link waited on before starting.
+/// What a driving-chain link waited on before starting. For `Resource`, the
+/// concrete saturated pool is reported in [`ChainLink::waited_on_resource`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WaitKind {
@@ -79,6 +93,9 @@ pub enum WaitKind {
 pub struct ChainLink {
     pub id: String,
     pub waited_on: WaitKind,
+    /// The exact saturated pool when `waited_on` is `resource`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waited_on_resource: Option<String>,
 }
 
 /// Buffer protecting the point where a side chain joins the driving chain.
@@ -109,6 +126,7 @@ pub struct ResourceSchedule {
 struct Node {
     len: f32,
     resource: String,
+    resources: BTreeMap<String, u32>,
     /// (predecessor index, lag); a repeated id keeps its largest lag.
     preds: Vec<(usize, f32)>,
 }
@@ -150,9 +168,11 @@ pub(crate) fn resource_schedule_with_cpm(
     // allocations for large (even u32::MAX) capacities.
     let mut work_per_resource: BTreeMap<&str, usize> = BTreeMap::new();
     for n in nodes.iter().filter(|n| n.len > 0.0) {
-        *work_per_resource.entry(n.resource.as_str()).or_insert(0) += 1;
+        for (resource, claim) in &n.resources {
+            *work_per_resource.entry(resource).or_insert(0) += *claim as usize;
+        }
     }
-    let mut units: BTreeMap<&str, Vec<f32>> = work_per_resource
+    let mut units: BTreeMap<String, Vec<f32>> = work_per_resource
         .into_iter()
         .map(|(resource, work)| {
             let capacity = req
@@ -161,7 +181,7 @@ pub(crate) fn resource_schedule_with_cpm(
                 .copied()
                 .expect("INVARIANT: capacities validated before allocation")
                 as usize;
-            (resource, vec![0.0; capacity.min(work)])
+            (resource.to_string(), vec![0.0; capacity.min(work)])
         })
         .collect();
     let mut start = vec![f32::NAN; n];
@@ -169,7 +189,7 @@ pub(crate) fn resource_schedule_with_cpm(
     let mut done = 0;
     while done < n {
         // Candidate: every predecessor placed; its earliest feasible start.
-        let mut best: Option<(usize, f32, usize)> = None; // (idx, start, unit)
+        let mut best: Option<(usize, f32)> = None; // (idx, start)
         for i in 0..n {
             if !start[i].is_nan() || nodes[i].preds.iter().any(|&(p, _)| start[p].is_nan()) {
                 continue;
@@ -179,24 +199,18 @@ pub(crate) fn resource_schedule_with_cpm(
                 .iter()
                 .map(|&(p, lag)| finish[p] + lag)
                 .fold(0.0_f32, f32::max);
-            let (s, unit) = if nodes[i].len > 0.0 {
-                let pool = &units[nodes[i].resource.as_str()];
-                let (u, free) = pool
-                    .iter()
-                    .enumerate()
-                    .fold(
-                        (0, f32::INFINITY),
-                        |acc, (u, &f)| {
-                            if f < acc.1 { (u, f) } else { acc }
-                        },
-                    );
-                (ready.max(free), u)
-            } else {
-                (ready, 0)
-            };
+            let mut s = ready;
+            if nodes[i].len > 0.0 {
+                for (resource, claim) in &nodes[i].resources {
+                    let mut availability = units[resource].clone();
+                    availability.sort_by(f32::total_cmp);
+                    let free = availability[*claim as usize - 1];
+                    s = s.max(free);
+                }
+            }
             let better = match best {
                 None => true,
-                Some((b, bs, _)) => {
+                Some((b, bs)) => {
                     if (s - bs).abs() > EPS {
                         s < bs
                     } else {
@@ -212,20 +226,27 @@ pub(crate) fn resource_schedule_with_cpm(
                 }
             };
             if better {
-                best = Some((i, s, unit));
+                best = Some((i, s));
             }
         }
-        let Some((i, s, unit)) = best else {
+        let Some((i, s)) = best else {
             return Err(PlannerError::InvalidGraph {
                 reason: "resource schedule could not place every deliverable".to_string(),
             });
         };
         start[i] = s;
         finish[i] = s + nodes[i].len;
-        if nodes[i].len > 0.0
-            && let Some(pool) = units.get_mut(nodes[i].resource.as_str())
-        {
-            pool[unit] = finish[i];
+        if nodes[i].len > 0.0 {
+            for (resource, claim) in &nodes[i].resources {
+                let pool = units
+                    .get_mut(resource)
+                    .expect("INVARIANT: capacity validated before allocation");
+                let mut free: Vec<usize> = (0..pool.len()).collect();
+                free.sort_by(|&a, &b| pool[a].total_cmp(&pool[b]));
+                for unit in free.into_iter().take(*claim as usize) {
+                    pool[unit] = finish[i];
+                }
+            }
         }
         done += 1;
     }
@@ -236,15 +257,16 @@ pub(crate) fn resource_schedule_with_cpm(
         .map(|i| ScheduledRow {
             id: ids[i].to_string(),
             resource: nodes[i].resource.clone(),
+            resources: nodes[i].resources.clone(),
             start: start[i],
             finish: finish[i],
         })
         .collect();
 
-    let chain = driving_chain(&nodes, &ids, &start, &finish);
-    let chain_set: BTreeSet<usize> = chain.iter().map(|&(i, _)| i).collect();
+    let chain = driving_chain(&nodes, &ids, &start, &finish, &req.capacities);
+    let chain_set: BTreeSet<usize> = chain.iter().map(|&(i, _, _)| i).collect();
     let pct = req.project_buffer_pct / 100.0;
-    let project_buffer_hours = pct * chain.iter().map(|&(i, _)| nodes[i].len).sum::<f32>();
+    let project_buffer_hours = pct * chain.iter().map(|&(i, _, _)| nodes[i].len).sum::<f32>();
     let feeding_buffers = feeding_buffers(&nodes, &ids, &order, &chain_set, pct);
 
     Ok(ResourceSchedule {
@@ -254,9 +276,10 @@ pub(crate) fn resource_schedule_with_cpm(
         load: loads(&nodes, &req.capacities, makespan),
         driving_chain: chain
             .iter()
-            .map(|&(i, waited_on)| ChainLink {
-                id: ids[i].to_string(),
-                waited_on,
+            .map(|(i, waited_on, waited_on_resource)| ChainLink {
+                id: ids[*i].to_string(),
+                waited_on: *waited_on,
+                waited_on_resource: waited_on_resource.clone(),
             })
             .collect(),
         project_buffer_hours,
@@ -286,21 +309,76 @@ fn build_nodes(graph: &PlanGraph, key: &str) -> Result<Vec<Node>, PlannerError> 
                 let lag = preds.entry(pi).or_insert(0.0);
                 *lag = lag.max(p.lag_hours().max(0.0));
             }
+            let wall_clock_only = d
+                .metadata
+                .get("wall_clock_only")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if wall_clock_only && d.duration_hours.is_none() {
+                return Err(PlannerError::InvalidGraph {
+                    reason: format!("{} marks wall_clock_only but has no duration_hours", d.id),
+                });
+            }
+            let resources = if wall_clock_only {
+                BTreeMap::new()
+            } else {
+                resources_of(d, key)?
+            };
+            let resource = if resources.is_empty() {
+                WALL_CLOCK.to_string()
+            } else {
+                resources.keys().cloned().collect::<Vec<_>>().join("+")
+            };
             Ok(Node {
                 len: crate::schedule::scheduled_length(d, &estimator),
-                resource: resource_of(d, key),
+                resource,
+                resources,
                 preds: preds.into_iter().collect(),
             })
         })
         .collect()
 }
 
-fn resource_of(d: &Deliverable, key: &str) -> String {
-    d.metadata
-        .get(key)
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or(UNASSIGNED)
-        .to_string()
+fn resources_of(d: &Deliverable, key: &str) -> Result<BTreeMap<String, u32>, PlannerError> {
+    let Some(resources) = d.metadata.get("resources") else {
+        let resource = d
+            .metadata
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(UNASSIGNED)
+            .to_string();
+        return Ok(BTreeMap::from([(resource, 1)]));
+    };
+    let object = resources
+        .as_object()
+        .ok_or_else(|| PlannerError::InvalidGraph {
+            reason: format!("{} metadata.resources must be an object", d.id),
+        })?;
+    if object.is_empty() {
+        return Err(PlannerError::InvalidGraph {
+            reason: format!("{} metadata.resources must not be empty", d.id),
+        });
+    }
+    object
+        .iter()
+        .map(|(resource, value)| {
+            let claim = value
+                .as_u64()
+                .filter(|&n| n > 0 && n <= u32::MAX as u64)
+                .ok_or_else(|| PlannerError::InvalidGraph {
+                    reason: format!(
+                        "{} metadata.resources.{resource} must be a positive integer",
+                        d.id
+                    ),
+                })? as u32;
+            if resource.is_empty() {
+                return Err(PlannerError::InvalidGraph {
+                    reason: format!("{} metadata.resources must not name an empty pool", d.id),
+                });
+            }
+            Ok((resource.clone(), claim))
+        })
+        .collect()
 }
 
 /// Only work that occupies time needs capacity; milestones are exempt.
@@ -308,8 +386,9 @@ fn check_capacities(nodes: &[Node], caps: &BTreeMap<String, u32>) -> Result<(), 
     let missing: BTreeSet<&String> = nodes
         .iter()
         .filter(|n| n.len > 0.0)
-        .map(|n| &n.resource)
-        .filter(|r| caps.get(*r).copied().unwrap_or(0) == 0)
+        .flat_map(|n| n.resources.iter())
+        .filter(|(r, claim)| caps.get(*r).copied().unwrap_or(0) < **claim)
+        .map(|(r, _)| r)
         .collect();
     if missing.is_empty() {
         Ok(())
@@ -377,7 +456,8 @@ fn driving_chain(
     ids: &[&str],
     start: &[f32],
     finish: &[f32],
-) -> Vec<(usize, WaitKind)> {
+    capacities: &BTreeMap<String, u32>,
+) -> Vec<(usize, WaitKind, Option<String>)> {
     let Some(mut cur) = (0..nodes.len()).min_by(|&a, &b| {
         finish[b]
             .total_cmp(&finish[a])
@@ -389,7 +469,7 @@ fn driving_chain(
     loop {
         let s = start[cur];
         if s <= EPS {
-            rev.push((cur, WaitKind::Start));
+            rev.push((cur, WaitKind::Start, None));
             break;
         }
         let dep = nodes[cur]
@@ -399,24 +479,39 @@ fn driving_chain(
             .map(|&(p, _)| p)
             .min_by(|&a, &b| ids[a].cmp(ids[b]));
         if let Some(p) = dep {
-            rev.push((cur, WaitKind::Dependency));
+            rev.push((cur, WaitKind::Dependency, None));
             cur = p;
             continue;
         }
-        let res = (0..nodes.len())
-            .filter(|&j| {
-                j != cur
-                    && nodes[j].len > 0.0
-                    && nodes[j].resource == nodes[cur].resource
-                    && (finish[j] - s).abs() <= EPS
+        let res = nodes[cur]
+            .resources
+            .keys()
+            .filter(|resource| {
+                let occupied: u32 = nodes
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j != cur && start[*j] < s - EPS && finish[*j] >= s - EPS)
+                    .map(|(_, node)| node.resources.get(*resource).copied().unwrap_or(0))
+                    .sum();
+                occupied + nodes[cur].resources[*resource]
+                    > capacities.get(*resource).copied().unwrap_or(0)
             })
-            .min_by(|&a, &b| ids[a].cmp(ids[b]));
-        if let Some(j) = res {
-            rev.push((cur, WaitKind::Resource));
+            .flat_map(|resource| {
+                (0..nodes.len()).filter_map(move |j| {
+                    (j != cur
+                        && nodes[j].len > 0.0
+                        && nodes[j].resources.contains_key(resource)
+                        && (finish[j] - s).abs() <= EPS)
+                        .then_some((j, resource.clone()))
+                })
+            })
+            .min_by(|(a, ar), (b, br)| ids[*a].cmp(ids[*b]).then_with(|| ar.cmp(br)));
+        if let Some((j, resource)) = res {
+            rev.push((cur, WaitKind::Resource, Some(resource)));
             cur = j;
             continue;
         }
-        rev.push((cur, WaitKind::Start));
+        rev.push((cur, WaitKind::Start, None));
         break;
     }
     rev.reverse();
@@ -488,7 +583,9 @@ fn feeding_buffers(
 fn loads(nodes: &[Node], caps: &BTreeMap<String, u32>, makespan: f32) -> Vec<ResourceLoad> {
     let mut busy: BTreeMap<&str, f32> = BTreeMap::new();
     for n in nodes.iter().filter(|n| n.len > 0.0) {
-        *busy.entry(n.resource.as_str()).or_insert(0.0) += n.len;
+        for (resource, claim) in &n.resources {
+            *busy.entry(resource).or_insert(0.0) += n.len * *claim as f32;
+        }
     }
     busy.into_iter()
         .map(|(resource, busy_hours)| {

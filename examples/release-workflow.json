@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "repositories": {
+    "cardinality": 1,
+    "items": [{
+      "id": "app",
+      "repository": "example/app",
+      "allowed_edges": [{"from": "dev", "to": "staging"}, {"from": "staging", "to": "main"}],
+      "promotions": {
+        "cardinality": 2,
+        "items": [
+          {
+            "id": "stage", "from": "dev", "to": "staging", "depends_on": [],
+            "checks": {"cardinality": 2, "items": [
+              {"id": "linux", "workflow": "ci/linux"},
+              {"id": "windows", "workflow": "ci/windows"}
+            ]},
+            "approvals": {"cardinality": 1, "items": [{"id": "review", "environment": "staging"}]}
+          },
+          {
+            "id": "production", "from": "staging", "to": "main", "depends_on": ["stage"],
+            "checks": {"cardinality": 1, "items": [{"id": "release", "workflow": "ci/release"}]},
+            "approvals": {"cardinality": 1, "items": [{"id": "owner", "environment": "production"}]}
+          }
+        ]
+      },
+      "producers": {
+        "source": {"uri": "workflow-snapshot.json", "revision": "git:abc123", "max_items": 1},
+        "items": [{
+          "id": "proof", "workflow": "production-proof", "promotion": "production",
+          "attempts": {"cardinality": 2, "items": [{"id": "first", "outcome": "failed"}, {"id": "retry", "outcome": "planned"}]},
+          "artifacts": {"cardinality": 1, "items": [{"id": "receipt", "path": "release/proof.json"}]}
+        }]
+      }
+    }]
+  },
+  "estimates": {
+    "pr": {"hours": 0.25, "source": "release owner estimate", "confidence": 0.6},
+    "check": {"hours": 0.5, "source": "CI service objective", "confidence": 0.8},
+    "join": {"hours": 0, "source": "automatic check conjunction", "confidence": 1},
+    "approval_wait": {"hours": 2, "source": "owner availability window", "confidence": 0.5},
+    "approval": {"hours": 0.25, "source": "release owner estimate", "confidence": 0.6},
+    "merge": {"hours": 0.1, "source": "release owner estimate", "confidence": 0.8},
+    "producer": {"hours": 0.5, "source": "proof service objective", "confidence": 0.7},
+    "receipt": {"hours": 0.1, "source": "retained evidence review", "confidence": 0.8},
+    "artifact": {"hours": 0.1, "source": "retained artifact publication", "confidence": 0.8},
+    "acceptance": {"hours": 0.25, "source": "central owner acceptance", "confidence": 0.8}
+  },
+  "acceptance": {
+    "id": "production",
+    "dependencies": {"cardinality": 1, "items": [{"repository": "app", "promotion": "production", "producer": "proof", "artifact": "receipt"}]}
+  },
+  "history": [{"node_id": "release/app/promotion/stage/check/linux", "duration_hours": 0.4, "outcome": "succeeded", "evidence": "retained/run-42.json", "confidence": 0.9}]
+}

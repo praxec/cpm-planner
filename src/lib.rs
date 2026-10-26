@@ -143,6 +143,8 @@ pub mod planner;
 mod portfolio;
 pub mod ports;
 pub mod project;
+pub mod release_cli;
+pub mod release_dag;
 pub mod resource_schedule;
 pub mod review;
 pub mod revise;
@@ -160,7 +162,9 @@ pub use plan::{
     AcceptRequest, AcquireRequest, Estimate, ForceReleaseRequest, HeartbeatRequest,
     MarkStatusRequest,
 };
-pub use plan_store::{DB_PATH_ENV, SqlitePlanStore};
+pub use plan_store::{
+    DB_PATH_ENV, STATE_MODE_ENV, SqlitePlanStore, StateOpenMode, StateOpenReport,
+};
 pub use planner::{
     BasicCpmPlanner, ClockFn, DEFAULT_EFFORT_HOURS, DEFAULT_MAX_TTL, DEFAULT_TTL, MAX_ATTEMPTS,
     MAX_LAPSES,

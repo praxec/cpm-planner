@@ -58,7 +58,17 @@ fn key_of(q: &Question) -> (String, Vec<String>) {
 
 fn default_answer(q: &Question) -> Answer {
     match q {
-        Question::Noul { .. } => Answer::Noul { noul: 0.0 },
+        Question::Noul { .. } => {
+            // A neutral fake response preserves the ordinary valid-edge
+            // baseline for #94's paired edge questions: it can name the
+            // artifact and does not claim the dependent is independent.
+            let artifact_question = instructions(q)["question"]
+                .as_str()
+                .is_some_and(|text| text.contains("concrete artifact"));
+            Answer::Noul {
+                noul: if artifact_question { 1.0 } else { 0.0 },
+            }
+        }
         Question::Choice { criteria, .. } => Answer::Choice {
             choice: "none".to_string(),
             probabilities: criteria
@@ -351,6 +361,47 @@ async fn review_question_count_matches_questions_sent() {
 async fn review_flags_truncation_when_candidates_exceed_the_cap() {
     let r = run(&large_graph(), &FakeJudge::new()).await;
     assert!(r.truncated);
+    assert_eq!(r.status, ReviewStatus::Partial);
+}
+
+#[tokio::test]
+async fn partial_review_names_edges_missing_a_paired_answer() {
+    let judge = FakeJudge::new();
+    let req = ReviewRequest {
+        max_questions: Some(1),
+        ..ReviewRequest::default()
+    };
+    let r = run_with(&two_chains(), &req, &judge).await;
+    assert_eq!(r.status, ReviewStatus::Partial);
+    assert_eq!(r.edge_coverage.total_edges, 1);
+    assert_eq!(r.edge_coverage.reviewed_edges, 0);
+    assert_eq!(r.edge_coverage.coverage_pct, 0.0);
+    assert_eq!(
+        r.edge_coverage.unreviewed_edges,
+        vec![cpm_planner::review::EdgeReviewCoverage {
+            from: "a".into(),
+            to: "c".into(),
+            artifact_probability: None,
+            independence_probability: None,
+            agreement: None,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn review_asks_both_artifact_and_independence_questions_for_each_edge() {
+    let judge = FakeJudge::new();
+    run(&two_chains(), &judge).await;
+    assert_eq!(
+        judge
+            .kinds_sent()
+            .into_iter()
+            .filter(|(kind, ids)| {
+                kind == "false_dependency" && ids == &vec![String::from("a"), String::from("c")]
+            })
+            .count(),
+        2
+    );
 }
 
 #[tokio::test]

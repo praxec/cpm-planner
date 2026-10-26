@@ -27,6 +27,8 @@
 //! | `plan.lint`              | [`crate::lint::lint`]         |
 //! | `plan.schedule`          | [`crate::resource_schedule::resource_schedule`] |
 //! | `plan.simulate`          | [`crate::simulate::simulate`] |
+//! | `plan.release.compile`   | [`crate::release_dag::compile`] |
+//! | `plan.release.diff`      | [`crate::release_dag::diff`] |
 //! | `plan.sync`              | [`Planner::sync_plan`]        |
 //! | `plan.list`              | [`Planner::list_plans`]       |
 //! | `plan.export`            | [`Planner::export_plan`]      |
@@ -125,6 +127,8 @@ pub const TOOL_ACCEPT: &str = "plan.accept";
 pub const TOOL_LINT: &str = "plan.lint";
 pub const TOOL_SCHEDULE: &str = "plan.schedule";
 pub const TOOL_SIMULATE: &str = "plan.simulate";
+pub const TOOL_RELEASE_COMPILE: &str = "plan.release.compile";
+pub const TOOL_RELEASE_DIFF: &str = "plan.release.diff";
 pub const TOOL_SYNC: &str = "plan.sync";
 pub const TOOL_LIST: &str = "plan.list";
 pub const TOOL_EXPORT: &str = "plan.export";
@@ -142,8 +146,10 @@ pub const TOOL_REVIEW: &str = "plan.review";
 /// Each review is one billed OpenRouter request plus up to 65 simulates.
 pub const MAX_CONCURRENT_REVIEWS: usize = 2;
 
-/// All twenty-three MCP tool names exposed by [`PlanServer`], in declaration order.
+/// All MCP tool names exposed by [`PlanServer`], in declaration order.
 pub const PLAN_TOOL_NAMES: &[&str] = &[
+    TOOL_RELEASE_COMPILE,
+    TOOL_RELEASE_DIFF,
     TOOL_SUBMIT,
     TOOL_ACQUIRE_COHORT,
     TOOL_HEARTBEAT,
@@ -172,6 +178,19 @@ pub const PLAN_TOOL_NAMES: &[&str] = &[
 // ---------------------------------------------------------------------------
 // Per-tool argument structs
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseCompileArgs {
+    workflow: crate::release_dag::ReleaseWorkflow,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseDiffArgs {
+    workflow: crate::release_dag::ReleaseWorkflow,
+    graph: PlanGraph,
+}
 
 // `deny_unknown_fields` on every wire-arg struct: unknown keys are a caller
 // bug, not something to ignore. Fail-fast surfaces typos/drift at the
@@ -764,7 +783,7 @@ fn calendar_schema() -> Value {
 fn capacities_schema() -> Value {
     json!({
         "type": "object",
-        "description": "Units available per resource name. Every resource that carries work (a deliverable with nonzero scheduled length) needs a count of at least 1; a missing or zero entry for such a resource is INVALID_CAPACITIES. A resource with only milestones or zero-length work may be omitted or 0.",
+        "description": "Units available per resource name. Every resource claimed by a nonzero-duration deliverable needs enough units; metadata.resources may claim multiple pools concurrently. A missing, zero, or undersized entry is INVALID_CAPACITIES. wall_clock_only observations consume no capacity.",
         "additionalProperties": { "type": "integer", "minimum": 0 }
     })
 }
@@ -781,6 +800,24 @@ fn capacities_schema() -> Value {
 /// schemas are explicit and reviewable.
 pub fn plan_tool_definitions() -> Vec<Tool> {
     vec![
+        Tool::new(
+            Cow::Borrowed(TOOL_RELEASE_COMPILE),
+            Cow::Borrowed(
+                "Compile version-1 bounded release metadata into an ordinary lint-clean PlanGraph. Expands protected PR/check/approval/merge hops, producer retries, retained receipts and central acceptance. Every collection declares cardinality or a bounded retained source. Pure offline operation: never executes, accepts, submits or baselines work.",
+            ),
+            schema_object(
+                json!({"type":"object", "properties":{"workflow": crate::release_dag::workflow_schema()}, "required":["workflow"], "additionalProperties":false}),
+            ),
+        ),
+        Tool::new(
+            Cow::Borrowed(TOOL_RELEASE_DIFF),
+            Cow::Borrowed(
+                "Compare a retained compiled graph with current version-1 workflow/promotion policy. Reports policy_changed, added/removed/changed ids and stale; includes retained-history estimate drift. Read-only: apply accepted changes through normal plan.sync or plan.revise.",
+            ),
+            schema_object(
+                json!({"type":"object", "properties":{"workflow": crate::release_dag::workflow_schema(), "graph":graph_selector_schema()}, "required":["workflow","graph"], "additionalProperties":false}),
+            ),
+        ),
         Tool::new(
             Cow::Borrowed(TOOL_SUBMIT),
             Cow::Borrowed(
@@ -1002,9 +1039,12 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
             Cow::Borrowed(TOOL_SCHEDULE),
             Cow::Borrowed(
                 "Level a graph or stored plan against resource capacities \
-                 (`metadata.owner` by default): makespan, per-deliverable \
+                 (`metadata.owner` by default; metadata.resources can claim several \
+                 pools concurrently): makespan, per-deliverable \
                  start/finish, per-resource load, the driving chain (dependency vs \
-                 resource waits), and project/feeding buffers. Provide exactly one \
+                 named resource waits), and project/feeding buffers. A deliverable with \
+                 duration_hours plus metadata.wall_clock_only:true advances elapsed time \
+                 but consumes no capacity. Provide exactly one \
                  of graph or plan_id. capacities is required: every resource that \
                  carries work needs at least 1 unit (otherwise INVALID_CAPACITIES: \
                  lists the missing resources). plan.schedule rejects what \
@@ -1421,10 +1461,11 @@ impl ReviewJudge {
     }
 }
 
-/// MCP server façade exposing a [`BasicCpmPlanner`] over twenty-three tools.
+/// MCP server façade exposing a [`BasicCpmPlanner`] over twenty-five tools.
 #[derive(Clone)]
 pub struct PlanServer {
     planner: Arc<BasicCpmPlanner>,
+    durable_state: Option<Value>,
     server_name: String,
     server_version: String,
     judge: ReviewJudge,
@@ -1437,11 +1478,20 @@ impl PlanServer {
     pub fn new(planner: Arc<BasicCpmPlanner>) -> Self {
         Self {
             planner,
+            durable_state: None,
             server_name: "cpm-planner".to_string(),
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             judge: ReviewJudge::NotConfigured,
             review_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REVIEWS)),
         }
+    }
+
+    /// Attach startup durable-state provenance to every tool response. The
+    /// production binary supplies it; direct library users retain the stable
+    /// response shape unless they explicitly opt in.
+    pub fn with_durable_state_report(mut self, report: crate::StateOpenReport) -> Self {
+        self.durable_state = Some(json!(report));
+        self
     }
 
     /// Set `plan.review`'s judge: `None` means no key is configured (the
@@ -1645,7 +1695,7 @@ impl PlanServer {
             .map(|m| Value::Object(m.clone()))
             .unwrap_or_else(|| json!({}));
 
-        match request.name.as_ref() {
+        let result = match request.name.as_ref() {
             TOOL_SUBMIT => self.handle_submit(args).await,
             TOOL_ACQUIRE_COHORT => self.handle_acquire_cohort(args).await,
             TOOL_HEARTBEAT => self.handle_heartbeat(args).await,
@@ -1657,6 +1707,21 @@ impl PlanServer {
             TOOL_LINT => self.handle_lint(args).await,
             TOOL_SCHEDULE => self.handle_schedule(args).await,
             TOOL_SIMULATE => self.handle_simulate(args).await,
+            TOOL_RELEASE_COMPILE => {
+                let parsed: ReleaseCompileArgs = parse_args(args)?;
+                to_value(
+                    &run_blocking(move || crate::release_dag::compile(&parsed.workflow)).await?,
+                )
+            }
+            TOOL_RELEASE_DIFF => {
+                let parsed: ReleaseDiffArgs = parse_args(args)?;
+                to_value(
+                    &run_blocking(move || {
+                        crate::release_dag::diff(&parsed.workflow, &parsed.graph)
+                    })
+                    .await?,
+                )
+            }
             TOOL_SYNC => self.handle_sync(args).await,
             TOOL_LIST => self.handle_list(args).await,
             TOOL_EXPORT => self.handle_export(args).await,
@@ -1676,7 +1741,13 @@ impl PlanServer {
                 ),
                 None,
             )),
-        }
+        };
+        result.map(|mut value| {
+            if let (Some(report), Some(object)) = (&self.durable_state, value.as_object_mut()) {
+                object.insert("durable_state".to_string(), report.clone());
+            }
+            value
+        })
     }
 
     // -------------------------------------------------------------------
@@ -2437,7 +2508,7 @@ impl ServerHandler for PlanServer {
             Implementation::new(self.server_name.clone(), self.server_version.clone());
         server_info.title = Some("cpm-planner".to_string());
         server_info.description = Some(
-            "MCP server exposing the open-source Praxec CPM planner via twenty-three tools."
+            "MCP server exposing the open-source Praxec CPM planner via twenty-five tools."
                 .to_string(),
         );
 
@@ -2539,7 +2610,7 @@ fn planner_error_to_mcp(err: PlannerError) -> McpError {
 fn instructions() -> &'static str {
     r#"This is the cpm-planner MCP server — the open-source CPM planner.
 
-Tools (twenty-three total, all `plan.<verb>`):
+Tools (twenty-five total, all in the `plan` namespace):
   Selectors (plan.status, plan.get, plan.ev, plan.snapshot, plan.baseline,
   plan.acquire_cohort, plan.heartbeat, plan.mark_status, plan.accept and
   plan.force_release): pass exactly one of plan_id, plan (a plan line name,
@@ -2574,6 +2645,8 @@ Tools (twenty-three total, all `plan.<verb>`):
   plan.lint            — static checks without submitting: cycles (with the loop), redundant edges, edges without rationale, interface edges not targeting a contract, deliverables feeding no milestone, unordered file overlaps; linting by plan_id also adds NO_BASELINE (warning) when the plan is executable and has progress but no earned-value baseline
   plan.schedule        — level a graph against resource capacities (`metadata.owner` by default): makespan, per-deliverable start/finish, per-resource load, driving chain (dependency vs resource waits), project and feeding buffers; capacities is required and every resource carrying work needs >= 1 unit (INVALID_CAPACITIES: lists the missing ones); project_buffer_pct 0..100 (default 25)
   plan.simulate        — read-only what-if: lint, critical path, schedule, milestones, optional resource schedule (schedule: same inputs as plan.schedule) and Monte Carlo (monte_carlo: iterations 1..50000, default 2000; seed, default 0xC0FFEE, reproducible on the same platform and build; iterations × (deliverables + prerequisite edges) must not exceed 200000000), and the scorecard; persists nothing
+  plan.release.compile — offline bounded release-DAG compiler; workflow schema_version 1; outputs a lint-clean ordinary graph with per-node source/confidence and policy digest; never executes or accepts work
+  plan.release.diff    — compare a retained graph with workflow/promotion policy and history; stale means revise/sync the plan before baselining or continuing
   plan.sync            — register or update one variant of a named plan line from a plan file (path: .cpm-planner/plans/<name>/<variant>.json, tracked by content hash for drift; any name/variant/project given must match the path) or an inline graph (requires name; variant defaults to "main"); project defaults to the discovered root; force releases live locks of removed deliverables
   plan.list            — list every plan line of project (default: discovered root), variants sorted; archived omitted unless include_archived; active: true returns only the active lines (not combinable with include_archived)
   plan.export          — write the head graph of a plan_id to its variant file (or a confined path) and return the root-relative path; refuses another variant's tracked file or unsynced local edits unless force; the file is not synced (exporting to the variant's own tracked file records its hash)
