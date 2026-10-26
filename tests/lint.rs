@@ -103,6 +103,111 @@ fn legacy_metadata_consumes_counts_as_rationale() {
 }
 
 #[test]
+fn low_information_consumes_is_reported_for_generic_phrases() {
+    let g = graph(json!([
+        d("a", json!([]), json!([]), json!({})),
+        d(
+            "b",
+            json!([{ "id": "a", "consumes": "upstream artifact" }]),
+            json!([]),
+            json!({})
+        ),
+        ms("m", json!([edge("b")])),
+    ]));
+    let report = lint(&g);
+    let f = finding(&report, "LOW_INFORMATION_CONSUMES").expect("generic warning");
+    assert_eq!(f.severity, Severity::Warning);
+    assert_eq!(f.ids, vec!["b", "a"]);
+}
+
+#[test]
+fn low_information_consumes_is_reported_when_repeated_across_edges() {
+    let g = graph(json!([
+        d("a", json!([]), json!([]), json!({})),
+        d("b", json!([]), json!([]), json!({})),
+        d("c", json!([]), json!([]), json!({})),
+        d(
+            "x",
+            json!([{"id":"a","consumes":"shared output"}]),
+            json!([]),
+            json!({})
+        ),
+        d(
+            "y",
+            json!([{"id":"b","consumes":"shared output"}]),
+            json!([]),
+            json!({})
+        ),
+        d(
+            "z",
+            json!([{"id":"c","consumes":"shared output"}]),
+            json!([]),
+            json!({})
+        ),
+        ms("m", json!([edge("x"), edge("y"), edge("z")])),
+    ]));
+    let report = lint(&g);
+    let f = report
+        .findings
+        .iter()
+        .find(|f| f.code == "LOW_INFORMATION_CONSUMES" && f.message.contains("repeated"))
+        .expect("repetition warning");
+    assert_eq!(f.ids, vec!["a", "b", "c", "x", "y", "z"]);
+}
+
+#[test]
+fn milestone_fanout_with_identical_consumes_is_reported() {
+    let g = graph(json!([
+        d("a", json!([]), json!([]), json!({})),
+        ms("merge", json!([edge("a")])),
+        d(
+            "x",
+            json!([{"id":"merge","consumes":"merged release receipt"}]),
+            json!([]),
+            json!({})
+        ),
+        d(
+            "y",
+            json!([{"id":"merge","consumes":"merged release receipt"}]),
+            json!([]),
+            json!({})
+        ),
+        d(
+            "z",
+            json!([{"id":"merge","consumes":"merged release receipt"}]),
+            json!([]),
+            json!({})
+        ),
+        ms("done", json!([edge("x"), edge("y"), edge("z")])),
+    ]));
+    let report = lint(&g);
+    let f = finding(&report, "MILESTONE_FANOUT").expect("fanout warning");
+    assert_eq!(f.severity, Severity::Warning);
+    assert_eq!(f.ids, vec!["merge", "x", "y", "z"]);
+}
+
+#[test]
+fn ordinary_or_small_fanout_does_not_warn() {
+    let g = graph(json!([
+        d("a", json!([]), json!([]), json!({})),
+        d(
+            "b",
+            json!([{"id":"a","consumes":"release receipt"}]),
+            json!([]),
+            json!({})
+        ),
+        d(
+            "c",
+            json!([{"id":"a","consumes":"release receipt"}]),
+            json!([]),
+            json!({})
+        ),
+        ms("m", json!([edge("b"), edge("c")])),
+    ]));
+    assert!(finding(&lint(&g), "MILESTONE_FANOUT").is_none());
+}
+
+#[test]
 fn interface_edge_to_non_contract_is_reported() {
     let g = graph(json!([
         d("a", json!([]), json!([]), json!({})),

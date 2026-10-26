@@ -247,6 +247,116 @@ fn structure_findings(graph: &PlanGraph) -> Vec<LintFinding> {
     out
 }
 
+const REPEATED_CONSUMES_THRESHOLD: usize = 3;
+const MILESTONE_FANOUT_THRESHOLD: usize = 3;
+
+fn normalized_consumes(consumes: &str) -> String {
+    consumes.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn is_low_information_consumes(consumes: &str) -> bool {
+    let normalized = normalized_consumes(consumes).to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "upstream artifact" | "batch item" | "lane fix merged"
+    ) || normalized.starts_with("dev head with ")
+}
+
+fn is_manual_merge(d: &Deliverable) -> bool {
+    d.metadata.get("kind").and_then(serde_json::Value::as_str) == Some("manual")
+}
+
+/// Advisory findings for rationale text which technically exists, but does not
+/// identify a real producer/consumer contract. These are deliberately warnings:
+/// they make suspect schedule edges visible without rejecting valid plans.
+fn consumes_quality_findings(graph: &PlanGraph) -> Vec<LintFinding> {
+    let mut out = Vec::new();
+    let mut repeated: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    let mut fanout: HashMap<(String, String), Vec<String>> = HashMap::new();
+    let by_id: HashMap<&str, &Deliverable> = graph
+        .deliverables
+        .iter()
+        .map(|d| (d.id.as_str(), d))
+        .collect();
+
+    for dependent in &graph.deliverables {
+        for prerequisite in &dependent.prerequisites {
+            let Some(consumes) = prerequisite.consumes() else {
+                continue;
+            };
+            let normalized = normalized_consumes(consumes);
+            if is_low_information_consumes(&normalized) {
+                out.push(finding(
+                    "LOW_INFORMATION_CONSUMES",
+                    Severity::Warning,
+                    format!(
+                        "'{}' consumes '{}' from '{}', which does not identify a specific artifact or interface",
+                        dependent.id,
+                        consumes,
+                        prerequisite.id()
+                    ),
+                    vec![dependent.id.clone(), prerequisite.id().to_string()],
+                ));
+            }
+            repeated
+                .entry(normalized.clone())
+                .or_default()
+                .push((dependent.id.clone(), prerequisite.id().to_string()));
+            if by_id
+                .get(prerequisite.id())
+                .is_some_and(|producer| producer.is_milestone() || is_manual_merge(producer))
+            {
+                fanout
+                    .entry((prerequisite.id().to_string(), normalized))
+                    .or_default()
+                    .push(dependent.id.clone());
+            }
+        }
+    }
+
+    for (consumes, edges) in repeated {
+        if edges.len() < REPEATED_CONSUMES_THRESHOLD {
+            continue;
+        }
+        let mut ids: Vec<String> = edges
+            .iter()
+            .flat_map(|(dependent, producer)| [dependent.clone(), producer.clone()])
+            .collect();
+        ids.sort();
+        ids.dedup();
+        out.push(finding(
+            "LOW_INFORMATION_CONSUMES",
+            Severity::Warning,
+            format!(
+                "'{}' is repeated on {} dependency edges; name the specific artifact or interface each edge consumes",
+                consumes,
+                edges.len()
+            ),
+            ids,
+        ));
+    }
+
+    for ((producer, consumes), mut dependents) in fanout {
+        if dependents.len() < MILESTONE_FANOUT_THRESHOLD {
+            continue;
+        }
+        dependents.sort();
+        let mut ids = vec![producer.clone()];
+        ids.extend(dependents);
+        out.push(finding(
+            "MILESTONE_FANOUT",
+            Severity::Warning,
+            format!(
+                "milestone/manual merge '{producer}' fans out to {} dependents with identical consumes '{}'; check whether this is scheduling order disguised as a dependency",
+                ids.len() - 1,
+                consumes
+            ),
+            ids,
+        ));
+    }
+    out
+}
+
 /// Lint `graph`. Never errors or panics.
 pub fn lint(graph: &PlanGraph) -> LintReport {
     use Severity::{Error, Info, Warning};
@@ -419,6 +529,7 @@ pub fn lint(graph: &PlanGraph) -> LintReport {
             }
         }
     }
+    out.extend(consumes_quality_findings(graph));
 
     // Structure checks need a well-formed DAG with unique ids.
     if !cyclic && !unknown && !duplicated {
