@@ -111,6 +111,9 @@ them a graph, a state and a time.
 
 ### Surface
 
+- `release_dag.rs`: pure bounded release-workflow expansion into normal plan graphs,
+  retained-history estimates and definition/policy drift; `release_cli.rs` exposes
+  the same offline compiler, linter and diff without opening the state database.
 - `server.rs`: `PlanServer`, the MCP tools (`PLAN_TOOL_NAMES`), their JSON
   schemas, parameter range checks and the mapping from `PlannerError` to MCP
   errors.

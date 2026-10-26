@@ -143,6 +143,8 @@ pub mod planner;
 mod portfolio;
 pub mod ports;
 pub mod project;
+pub mod release_cli;
+pub mod release_dag;
 pub mod resource_schedule;
 pub mod review;
 pub mod revise;
