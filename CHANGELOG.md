@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `plan.review` asks paired artifact-identity and independent-build questions for every reviewed prerequisite edge, prioritizes milestone/merge fan-out and generic or duplicated consumption claims, and reports exact edge coverage. Capped reviews now return `status: "partial"` and name every edge lacking a complete paired answer ([#94](https://github.com/praxec/cpm-planner/issues/94)).
+
 ## [0.4.3] - 2026-10-23
 
 ### Changed
