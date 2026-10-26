@@ -235,6 +235,9 @@ pub enum Judge<'a> {
 pub enum ReviewStatus {
     /// Jev answered; findings and proposals are filled.
     Ok,
+    /// Jev answered, but the question cap left one or more dependency edges
+    /// without both required review questions.
+    Partial,
     /// No judge, or the judge failed; `reason` says why.
     ReviewUnavailable,
     /// Lint found errors; the judge was not called.
@@ -281,6 +284,36 @@ pub struct ReviewFinding {
     pub evidence: String,
 }
 
+/// The paired evidence recorded for one prerequisite edge.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EdgeReviewCoverage {
+    /// The prerequisite producer.
+    pub from: String,
+    /// The dependent that declares the prerequisite.
+    pub to: String,
+    /// Probability that the declared dependency names a concrete artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_probability: Option<f32>,
+    /// Probability that the dependent can be built and tested without waiting
+    /// for the producer to finish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub independence_probability: Option<f32>,
+    /// Whether the two answers tell the same story: a named artifact pairs
+    /// with dependence, or an unnamed artifact pairs with independence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agreement: Option<bool>,
+}
+
+/// How much of the prerequisite-edge review was actually completed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ReviewCoverage {
+    pub total_edges: usize,
+    pub reviewed_edges: usize,
+    pub coverage_pct: f32,
+    /// Every edge lacking either of its paired questions or answers.
+    pub unreviewed_edges: Vec<EdgeReviewCoverage>,
+}
+
 /// A verified edit batch `plan.fork { edits }` can apply.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Proposal {
@@ -323,6 +356,10 @@ pub struct ReviewReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_hash: Option<String>,
     pub question_count: usize,
+    /// Explicit edge coverage; unlike `truncated`, this identifies exactly
+    /// what a caller must revisit in a subsequent focused review.
+    #[serde(default)]
+    pub edge_coverage: ReviewCoverage,
 }
 
 impl ReviewReport {
@@ -341,6 +378,7 @@ impl ReviewReport {
             usage: None,
             prompt_hash: None,
             question_count: 0,
+            edge_coverage: ReviewCoverage::default(),
         }
     }
 }
@@ -409,9 +447,10 @@ pub async fn review(
         by_id,
     };
 
+    let false_edges = ctx.false_dependency_candidates();
     let lists = [
         ctx.crash_candidates(),
-        ctx.false_dependency_candidates(),
+        false_edges.clone(),
         ctx.interface_split_candidates(),
         ctx.split_candidates(),
         ctx.missing_dependency_candidates(),
@@ -448,6 +487,22 @@ pub async fn review(
     report.model = Some(decisions.model.chars().take(MAX_MODEL_CHARS).collect());
     report.usage = decisions.usage.map(sanitize_usage);
 
+    let mut edge_coverage: BTreeMap<(String, String), EdgeReviewCoverage> = false_edges
+        .iter()
+        .map(|candidate| {
+            let key = (candidate.ids[0].clone(), candidate.ids[1].clone());
+            (
+                key.clone(),
+                EdgeReviewCoverage {
+                    from: key.0,
+                    to: key.1,
+                    artifact_probability: None,
+                    independence_probability: None,
+                    agreement: None,
+                },
+            )
+        })
+        .collect();
     let mut drafts = Vec::new();
     for (i, candidate) in selected.iter().enumerate() {
         let Some(answer) = decisions.answers.get(&question_id(i)) else {
@@ -456,6 +511,25 @@ pub async fn review(
         let Some(judged) = interpret(candidate, answer) else {
             continue;
         };
+        if let Some(side) = candidate.edge_side {
+            let coverage = edge_coverage
+                .get_mut(&(candidate.ids[0].clone(), candidate.ids[1].clone()))
+                .expect("false-dependency candidate has coverage entry");
+            match side {
+                EdgeQuestionSide::Artifact => {
+                    coverage.artifact_probability = Some(judged.probability)
+                }
+                EdgeQuestionSide::Independence => {
+                    coverage.independence_probability = Some(judged.probability)
+                }
+            }
+            // The independence question retains the historical finding and
+            // proposal behavior. The artifact question supplies corroborating
+            // evidence and is represented in edge_coverage instead.
+            if side == EdgeQuestionSide::Artifact {
+                continue;
+            }
+        }
         if judged.probability >= FINDING_MIN_PROBABILITY {
             report.findings.push(ReviewFinding {
                 kind: candidate.kind,
@@ -480,15 +554,97 @@ pub async fn review(
     report
         .proposals
         .sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
+    let mut unreviewed_edges = Vec::new();
+    let mut reviewed_edges = 0;
+    for coverage in edge_coverage.values_mut() {
+        coverage.agreement = match (
+            coverage.artifact_probability,
+            coverage.independence_probability,
+        ) {
+            (Some(artifact), Some(independence)) => Some(
+                (artifact >= FINDING_MIN_PROBABILITY) != (independence >= FINDING_MIN_PROBABILITY),
+            ),
+            _ => None,
+        };
+        if coverage.agreement.is_some() {
+            reviewed_edges += 1;
+        } else {
+            unreviewed_edges.push(coverage.clone());
+        }
+    }
+    let total_edges = edge_coverage.len();
+    for coverage in edge_coverage.values() {
+        let Some(artifact_probability) = coverage.artifact_probability else {
+            continue;
+        };
+        let Some(independence_probability) = coverage.independence_probability else {
+            continue;
+        };
+        let is_candidate =
+            coverage.agreement == Some(false) || artifact_probability < FINDING_MIN_PROBABILITY;
+        if !is_candidate {
+            continue;
+        }
+        let ids = vec![coverage.from.clone(), coverage.to.clone()];
+        let probability = if coverage.agreement == Some(false) {
+            1.0
+        } else {
+            1.0 - artifact_probability
+        };
+        let evidence = format!(
+            "paired edge review: P(named artifact) = {artifact_probability:.2}; \
+             P(independent build) = {independence_probability:.2}; agreement = {}",
+            coverage.agreement.unwrap_or(false),
+        );
+        if let Some(finding) = report
+            .findings
+            .iter_mut()
+            .find(|finding| finding.kind == FindingKind::FalseDependency && finding.ids == ids)
+        {
+            finding.probability = finding.probability.max(probability);
+            finding.evidence = evidence;
+        } else {
+            report.findings.push(ReviewFinding {
+                kind: FindingKind::FalseDependency,
+                ids,
+                probability,
+                evidence,
+            });
+        }
+    }
+    report
+        .findings
+        .sort_by(|a, b| (a.kind, &a.ids).cmp(&(b.kind, &b.ids)));
+    report.edge_coverage = ReviewCoverage {
+        total_edges,
+        reviewed_edges,
+        coverage_pct: if total_edges == 0 {
+            100.0
+        } else {
+            reviewed_edges as f32 * 100.0 / total_edges as f32
+        },
+        unreviewed_edges,
+    };
+    if report.edge_coverage.reviewed_edges < report.edge_coverage.total_edges {
+        report.status = ReviewStatus::Partial;
+    }
     Ok(report)
 }
 
 // ---------------------------------------------------------------- candidates
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EdgeQuestionSide {
+    Artifact,
+    Independence,
+}
+
+#[derive(Clone)]
 struct Candidate {
     kind: FindingKind,
     ids: Vec<String>,
     question: Question,
+    edge_side: Option<EdgeQuestionSide>,
 }
 
 struct Context<'g> {
@@ -559,6 +715,7 @@ impl Context<'_> {
                         criteria,
                     },
                     ids,
+                    edge_side: None,
                 }
             })
             .collect()
@@ -593,57 +750,95 @@ impl Context<'_> {
     }
 
     fn false_dependency_candidates(&self) -> Vec<Candidate> {
-        let mut edges: Vec<(u8, f32, &str, &Deliverable)> = self
+        let mut fan_out: HashMap<&str, usize> = HashMap::new();
+        for (from, _) in self.edges() {
+            *fan_out.entry(from).or_default() += 1;
+        }
+        let mut consumes_count: HashMap<String, usize> = HashMap::new();
+        for (from, to) in self.edges() {
+            *consumes_count.entry(Self::consumes(to, from)).or_default() += 1;
+        }
+        let mut edges: Vec<(bool, usize, bool, u8, f32, &str, &Deliverable)> = self
             .edges()
             .into_iter()
             .map(|(from, to)| {
+                let consumes = Self::consumes(to, from);
                 let tier = match (self.critical(from), self.critical(&to.id)) {
                     (true, true) => 0,
                     (true, false) | (false, true) => 1,
                     (false, false) => 2,
                 };
-                (tier, self.length(from), from, to)
+                let milestone_or_merge = to.is_milestone()
+                    || self
+                        .deliverable(from)
+                        .is_some_and(Deliverable::is_milestone)
+                    || from.contains("merge")
+                    || to.id.contains("merge");
+                let generic_or_duplicated = consumes == "unstated"
+                    || consumes.len() < 24
+                    || consumes_count.get(&consumes).copied().unwrap_or_default() > 1;
+                (
+                    milestone_or_merge,
+                    fan_out.get(from).copied().unwrap_or_default(),
+                    generic_or_duplicated,
+                    tier,
+                    self.length(from),
+                    from,
+                    to,
+                )
             })
             .collect();
         edges.sort_by(|a, b| {
-            a.0.cmp(&b.0)
-                .then_with(|| b.1.total_cmp(&a.1))
-                .then_with(|| (a.2, &a.3.id).cmp(&(b.2, &b.3.id)))
+            b.0.cmp(&a.0)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| b.2.cmp(&a.2))
+                .then_with(|| a.3.cmp(&b.3))
+                .then_with(|| b.4.total_cmp(&a.4))
+                .then_with(|| (a.5, &a.6.id).cmp(&(b.5, &b.6.id)))
         });
         edges
             .into_iter()
-            .map(|(_, _, from, to)| {
+            .flat_map(|(_, _, _, _, _, from, to)| {
                 let ids = vec![from.to_string(), to.id.clone()];
-                Candidate {
-                    kind: FindingKind::FalseDependency,
-                    question: Question::Noul {
-                        instructions: instructions(
-                            FindingKind::FalseDependency,
-                            &ids,
-                            format!(
-                                "'{to}' lists '{from}' as a prerequisite (stated as consuming: \
-                                 {consumes}). Is this a false dependency, i.e. can '{to}' be done \
-                                 correctly without waiting for '{from}' to finish?",
-                                to = to.id,
-                                consumes = Self::consumes(to, from),
+                let consumes = Self::consumes(to, from);
+                [
+                    Candidate {
+                        kind: FindingKind::FalseDependency,
+                        question: Question::Noul {
+                            instructions: instructions(
+                                FindingKind::FalseDependency,
+                                &ids,
+                                format!(
+                                    "'{to}' lists '{from}' as a prerequisite (stated as consuming: \
+                                     {consumes}). Does that dependency name a concrete artifact from \
+                                     '{from}'? Answer true only when the artifact can be identified.",
+                                    to = to.id,
+                                ),
                             ),
-                        ),
-                        criteria: Some(BTreeMap::from([
-                            (
-                                "true".to_string(),
-                                json!(format!("'{}' does not need '{from}' to finish", to.id)),
-                            ),
-                            (
-                                "false".to_string(),
-                                json!(format!(
-                                    "'{}' genuinely needs what '{from}' produces",
-                                    to.id
-                                )),
-                            ),
-                        ])),
+                            criteria: Some(BTreeMap::from([("true".to_string(), json!("a concrete artifact is named")), ("false".to_string(), json!("no concrete artifact can be named"))])),
+                        },
+                        ids: ids.clone(),
+                        edge_side: Some(EdgeQuestionSide::Artifact),
                     },
-                    ids,
-                }
+                    Candidate {
+                        kind: FindingKind::FalseDependency,
+                        question: Question::Noul {
+                            instructions: instructions(
+                                FindingKind::FalseDependency,
+                                &ids,
+                                format!(
+                                    "'{to}' lists '{from}' as a prerequisite (stated as consuming: \
+                                     {consumes}). Can '{to}' be built and tested correctly on a base \
+                                     without waiting for '{from}' to finish?",
+                                    to = to.id,
+                                ),
+                            ),
+                            criteria: Some(BTreeMap::from([("true".to_string(), json!(format!("'{}' can proceed without '{from}'", to.id))), ("false".to_string(), json!(format!("'{}' needs what '{from}' produces", to.id)))])),
+                        },
+                        ids,
+                        edge_side: Some(EdgeQuestionSide::Independence),
+                    },
+                ]
             })
             .collect()
     }
@@ -684,6 +879,7 @@ impl Context<'_> {
                         criteria: None,
                     },
                     ids,
+                    edge_side: None,
                 }
             })
             .collect()
@@ -739,6 +935,7 @@ impl Context<'_> {
                         criteria: SPLIT_LEVELS.iter().map(|s| json!(s)).collect(),
                     },
                     ids,
+                    edge_side: None,
                 }
             })
             .collect()
@@ -853,6 +1050,7 @@ impl Context<'_> {
                         criteria: None,
                     },
                     ids,
+                    edge_side: None,
                 }
             })
             .collect()
