@@ -764,7 +764,7 @@ fn calendar_schema() -> Value {
 fn capacities_schema() -> Value {
     json!({
         "type": "object",
-        "description": "Units available per resource name. Every resource that carries work (a deliverable with nonzero scheduled length) needs a count of at least 1; a missing or zero entry for such a resource is INVALID_CAPACITIES. A resource with only milestones or zero-length work may be omitted or 0.",
+        "description": "Units available per resource name. Every resource claimed by a nonzero-duration deliverable needs enough units; metadata.resources may claim multiple pools concurrently. A missing, zero, or undersized entry is INVALID_CAPACITIES. wall_clock_only observations consume no capacity.",
         "additionalProperties": { "type": "integer", "minimum": 0 }
     })
 }
@@ -1002,9 +1002,12 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
             Cow::Borrowed(TOOL_SCHEDULE),
             Cow::Borrowed(
                 "Level a graph or stored plan against resource capacities \
-                 (`metadata.owner` by default): makespan, per-deliverable \
+                 (`metadata.owner` by default; metadata.resources can claim several \
+                 pools concurrently): makespan, per-deliverable \
                  start/finish, per-resource load, the driving chain (dependency vs \
-                 resource waits), and project/feeding buffers. Provide exactly one \
+                 named resource waits), and project/feeding buffers. A deliverable with \
+                 duration_hours plus metadata.wall_clock_only:true advances elapsed time \
+                 but consumes no capacity. Provide exactly one \
                  of graph or plan_id. capacities is required: every resource that \
                  carries work needs at least 1 unit (otherwise INVALID_CAPACITIES: \
                  lists the missing resources). plan.schedule rejects what \

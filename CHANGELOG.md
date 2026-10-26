@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `plan.review` asks paired artifact-identity and independent-build questions for every reviewed prerequisite edge, prioritizes milestone/merge fan-out and generic or duplicated consumption claims, and reports exact edge coverage. Capped reviews now return `status: "partial"` and name every edge lacking a complete paired answer ([#94](https://github.com/praxec/cpm-planner/issues/94)).
 
+### Added
+
+- `plan.schedule` and scheduled `plan.simulate` now level multi-pool claims declared as `metadata.resources` (for example `{\"agent\":1,\"builder\":1}`), report the specifically saturated pool in each driving-chain resource wait, and model a `duration_hours` observation window with `metadata.wall_clock_only: true` as elapsed time that consumes no capacity ([#96](https://github.com/praxec/cpm-planner/issues/96)).
+
 ## [0.4.3] - 2026-10-23
 
 ### Changed
