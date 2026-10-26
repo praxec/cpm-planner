@@ -21,7 +21,9 @@
 //!   listed in `released_locks`;
 //! - counters (attempts, failures, lapses) are kept for every surviving
 //!   deliverable, including re-derived ones;
-//! - `InProgress` (leased) deliverables keep their lease unless removed.
+//! - `InProgress` (leased) deliverables keep their lease unless removed or a
+//!   prerequisite/revision barrier changes. The latter is refused unless
+//!   `force`, which supersedes the stale lease and re-derives the status.
 //!   `Failed` deliverables are outside the reopen rule: they stay `Failed`
 //!   (re-derivation applies only to `Complete`/`Ready`/`Pending`).
 
@@ -48,6 +50,11 @@ pub struct RevisionDiff {
     pub reopened: Vec<String>,
     /// Deliverable ids whose live lock was force-released by a removal.
     pub released_locks: Vec<String>,
+    /// Deliverable ids whose active lease was superseded because the revised
+    /// graph changed its prerequisite or declared revision barrier. These are
+    /// diagnostic invalidations, not failed executions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_revision: Option<Box<Vec<String>>>,
 }
 
 /// Whether a deliverable in `status` is subject to re-derivation.
@@ -67,6 +74,13 @@ fn is_contract(d: &Deliverable) -> bool {
 
 fn prereq_set(d: &Deliverable) -> BTreeSet<&str> {
     prerequisite_ids(d).collect()
+}
+
+/// Optional declared producer of the immutable revision consumed by `d`.
+/// The declaration deliberately lives in metadata for backward-compatible
+/// plan files; graph validation requires it to name a direct prerequisite.
+fn revision_barrier(d: &Deliverable) -> Option<&str> {
+    d.metadata.get("consumes_revision_from")?.as_str()
 }
 
 /// Derive the runtime state of `new` from `old`, carrying progress over per
@@ -163,13 +177,40 @@ pub(crate) fn plan_revision(
         .map(String::as_str)
         .collect();
 
-    // Seeds: survivors whose prerequisite id set changed, or that consume an
-    // interface of a changed contract deliverable.
+    // A live lease cannot keep working against a changed prerequisite or
+    // exact-revision barrier. Refuse by default so the coordinator sees the
+    // stale holder; `force` atomically releases it, preserves its evidence and
+    // reports a distinct supersession rather than a failure.
+    let mut superseded: BTreeSet<String> = BTreeSet::new();
+    for id in &diff.changed {
+        let (o, n) = (old_by_id[id.as_str()], new_by_id[id.as_str()]);
+        let invalidated =
+            prereq_set(o) != prereq_set(n) || revision_barrier(o) != revision_barrier(n);
+        if invalidated
+            && matches!(old.statuses.get(id), Some(DeliverableStatus::InProgress))
+            && let Some(lock) = live(id)
+        {
+            if !force {
+                return Err(PlannerError::LockHeld {
+                    plan_id: lock.plan_id.0.clone(),
+                    deliverable_id: id.clone(),
+                    holder: lock.caller_id.0.clone(),
+                });
+            }
+            superseded.insert(id.clone());
+            diff.released_locks.push(id.clone());
+        }
+    }
+
+    // Seeds: survivors whose prerequisite id set or explicit barrier changed,
+    // or that consume an interface of a changed contract deliverable.
     let carried = |id: &str| old.statuses.get(id).filter(|s| rederivable(s));
     let mut rederive: BTreeSet<String> = BTreeSet::new();
     for id in &diff.changed {
         let (o, n) = (old_by_id[id.as_str()], new_by_id[id.as_str()]);
-        if carried(id).is_some() && prereq_set(o) != prereq_set(n) {
+        if (carried(id).is_some() || superseded.contains(id))
+            && (prereq_set(o) != prereq_set(n) || revision_barrier(o) != revision_barrier(n))
+        {
             rederive.insert(id.clone());
         }
     }
@@ -259,6 +300,12 @@ pub(crate) fn plan_revision(
             }
         }
     }
+    // A superseded lease is visible until a fresh cohort acquires it. Do not
+    // reduce it to Ready/Pending: that would let the old holder complete
+    // locklessly after its contract has changed.
+    for id in &superseded {
+        statuses.insert(id.clone(), DeliverableStatus::SupersededRevision);
+    }
 
     let survives = |id: &String| new_by_id.contains_key(id.as_str());
     let mut state = PlanState::new(new.clone(), statuses, cached_result);
@@ -296,7 +343,7 @@ pub(crate) fn plan_revision(
     state.locks = old
         .locks
         .iter()
-        .filter(|(k, l)| survives(k) && l.expires_at >= now)
+        .filter(|(k, l)| survives(k) && l.expires_at >= now && !superseded.contains(*k))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     // Rebuild claims from the NEW definitions in graph order.
@@ -354,6 +401,10 @@ pub(crate) fn plan_revision(
         }
     }
     diff.released_locks.sort();
+    diff.released_locks.dedup();
+    if !superseded.is_empty() {
+        diff.superseded_revision = Some(Box::new(superseded.into_iter().collect()));
+    }
     // Every lease that did not survive ended now (or at its expiry, if it
     // had lapsed); lease hours already ended on `old` carry over.
     for (id, hours) in &old.leased_hours {
@@ -552,11 +603,53 @@ mod tests {
 
     #[test]
     fn leased_deliverable_keeps_status_when_prerequisites_change() {
-        let (new, _) = revise(
+        let Err(err) = plan_revision(
             &leased(),
-            graph(vec![dl("a", &["b"], 1.0), dl("b", &[], 1.0)]),
+            &graph(vec![dl("a", &["b"], 1.0), dl("b", &[], 1.0)]),
+            false,
+            Utc::now(),
+        ) else {
+            panic!("stale lease must be refused");
+        };
+        assert!(matches!(err, PlannerError::LockHeld { .. }));
+    }
+
+    #[test]
+    fn forced_prerequisite_change_supersedes_active_lease() {
+        let (new, diff) = plan_revision(
+            &leased(),
+            &graph(vec![dl("a", &["b"], 1.0), dl("b", &[], 1.0)]),
+            true,
+            Utc::now(),
+        )
+        .expect("forced revision succeeds");
+        assert_eq!(
+            diff.superseded_revision.as_deref().map(Vec::as_slice),
+            Some(["a".to_string()].as_slice())
         );
-        assert_eq!(new.statuses["a"], InProgress);
+        assert!(!new.locks.contains_key("a"));
+        assert_eq!(new.statuses["a"], DeliverableStatus::SupersededRevision);
+    }
+
+    #[test]
+    fn forced_revision_barrier_change_supersedes_active_lease() {
+        let mut old_a = dl("a", &[], 1.0);
+        old_a.metadata = json!({});
+        let barrier = dl("barrier", &[], 1.0);
+        let mut old = state(
+            graph(vec![barrier.clone(), old_a]),
+            &[("barrier", Complete), ("a", InProgress)],
+        );
+        old.locks.insert("a".into(), lock("a"));
+        let mut revised_a = dl("a", &["barrier"], 1.0);
+        revised_a.metadata = json!({"consumes_revision_from": "barrier"});
+        let (new, diff) = plan_revision(&old, &graph(vec![barrier, revised_a]), true, Utc::now())
+            .expect("forced barrier revision succeeds");
+        assert_eq!(
+            diff.superseded_revision.as_deref().map(Vec::as_slice),
+            Some(["a".to_string()].as_slice())
+        );
+        assert_eq!(new.statuses["a"], DeliverableStatus::SupersededRevision);
     }
 
     #[test]
@@ -785,7 +878,10 @@ mod tests {
 
     fn two_leases() -> (PlanState, PlanGraph) {
         let mut old = state(
-            graph(vec![claiming(dl("x", &[], 1.0), "f.rs"), dl("y", &[], 1.0)]),
+            graph(vec![
+                claiming(dl("x", &[], 1.0), "f.rs"),
+                dl("y", &["x"], 1.0),
+            ]),
             &[("x", InProgress), ("y", InProgress)],
         );
         old.locks.insert("x".into(), lock("x"));
@@ -889,7 +985,7 @@ mod tests {
         let mut old = state(
             graph(vec![
                 claiming(dl("x", &[], 1.0), "a.rs"),
-                claiming(dl("y", &[], 1.0), "f.rs"),
+                claiming(dl("y", &["x"], 1.0), "f.rs"),
             ]),
             &[("x", InProgress), ("y", InProgress)],
         );

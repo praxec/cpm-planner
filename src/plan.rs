@@ -405,6 +405,10 @@ pub enum DeliverableStatus {
     Ready,
     /// A caller holds an active lock and is working on this deliverable.
     InProgress,
+    /// A forced plan revision invalidated the active lease because its
+    /// prerequisite or revision-barrier contract changed. The prior evidence
+    /// remains diagnostic, but only a fresh lease may complete this work.
+    SupersededRevision,
     /// The caller marked this deliverable complete. The lock has been
     /// released.
     Complete,

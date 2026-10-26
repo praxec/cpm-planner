@@ -519,6 +519,56 @@ async fn leased_deliverable_survives_revision_and_can_complete() {
 }
 
 #[tokio::test]
+async fn superseded_revision_requires_a_fresh_lease_before_completion() {
+    let planner = BasicCpmPlanner::new();
+    let initial = graph(vec![
+        deliverable("a", &["src/a.rs"], &[], 1.0),
+        deliverable("barrier", &["src/barrier.rs"], &[], 1.0),
+    ]);
+    let plan_id = planner.submit_plan(initial).await.unwrap();
+    acquire_a(&planner, &plan_id).await;
+    let mut consumer = deliverable("a", &["src/a.rs"], &["barrier"], 1.0);
+    consumer.metadata = serde_json::json!({"consumes_revision_from": "barrier"});
+    planner
+        .revise_plan(
+            ReviseRequest::new(
+                plan_id.clone(),
+                graph(vec![
+                    consumer,
+                    deliverable("barrier", &["src/barrier.rs"], &[], 1.0),
+                ]),
+            )
+            .force(true),
+        )
+        .await
+        .unwrap();
+    planner
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
+            "barrier",
+            CallerId("owner".into()),
+            DeliverableStatus::Complete,
+        ))
+        .await
+        .unwrap();
+    let err = planner
+        .mark_status(MarkStatusRequest::new(
+            plan_id.clone(),
+            "a",
+            CallerId("w1".into()),
+            DeliverableStatus::Complete,
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PlannerError::LockNotHeld { .. }));
+    let cohort = planner
+        .acquire_cohort(AcquireRequest::new(plan_id, CallerId("w2".into()), 1))
+        .await
+        .unwrap();
+    assert_eq!(cohort.rows[0].deliverable.id, "a");
+}
+
+#[tokio::test]
 async fn revision_number_increments() {
     let planner = BasicCpmPlanner::new();
     let plan_id = sync(&planner, "web", "main", chain()).await;

@@ -145,6 +145,7 @@ pub enum EvRowStatus {
     Pending,
     Ready,
     InProgress,
+    SupersededRevision,
     Complete,
     Failed {
         reason: String,
@@ -160,6 +161,7 @@ impl From<DeliverableStatus> for EvRowStatus {
             DeliverableStatus::Pending => Self::Pending,
             DeliverableStatus::Ready => Self::Ready,
             DeliverableStatus::InProgress => Self::InProgress,
+            DeliverableStatus::SupersededRevision => Self::SupersededRevision,
             DeliverableStatus::Complete => Self::Complete,
             DeliverableStatus::Failed { reason } => Self::Failed { reason },
         }
@@ -172,6 +174,7 @@ impl PartialEq<DeliverableStatus> for EvRowStatus {
             (Self::Pending, DeliverableStatus::Pending)
             | (Self::Ready, DeliverableStatus::Ready)
             | (Self::InProgress, DeliverableStatus::InProgress)
+            | (Self::SupersededRevision, DeliverableStatus::SupersededRevision)
             | (Self::Complete, DeliverableStatus::Complete) => true,
             (Self::Failed { reason: a }, DeliverableStatus::Failed { reason: b }) => a == b,
             _ => false,
