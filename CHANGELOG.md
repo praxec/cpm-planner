@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The planning and improvement skills now model software delivery as dependency-compatible
+  integration waves with explicit fixed-cost CI/promotion gates, report gate cardinality, and reuse
+  immutable evidence only under a complete governed identity. This avoids paying a full build/test
+  cycle for every small deliverable while preserving independent proofs where policy requires them.
+- CI and contributor guidance now use cargo-nextest for Rust test binaries, with rustdoc tests kept
+  as a separate gate because nextest does not execute doctests. The default nextest profile does
+  not fail fast, so a single run reports all failures.
+
 ## [0.4.4] - 2026-10-26
 
 ### Changed
