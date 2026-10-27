@@ -89,6 +89,33 @@ Recorded outcomes are definition/evidence metadata, not runtime completion
 claims. Compiling a prior successful run does not accept its generated node;
 the normal evidence review and `plan.accept` workflow still applies.
 
+## Native delivery gates and integration waves
+
+`delivery_gates` is an optional bounded collection of first-class fixed-cost
+integration gates. A gate has a stable `id`, a descriptive `class`, bounded
+distinct `members` (`repository` and `promotion`), immutable `identity`, and
+`economics`. `economics` declares `fixed_cost_hours`,
+`integration_effort_hours`, `feedback_delay_hours`, and `max_wave_size`.
+Members may not exceed that bound. One gate produces one runner node for the
+whole wave rather than duplicating ordinary check nodes per member.
+
+The compiler reports gate executions, wave-member cardinality, reuse
+hits/misses, skipped changes, the per-change fixed-gate alternative, batched
+gate time, integration effort, feedback delay, and the gate share of the
+unconstrained makespan. This makes the batching trade-off inspectable before a
+plan is submitted: the saved repeated fixed cost must be weighed against the
+declared integration effort and delayed defect feedback. Repeated gate runs
+whose combined duration is at least half the driving-chain duration emit the
+`FIXED_GATES_DOMINATE_DRIVING_CHAIN` warning.
+
+`identity` contains the exact tree or image, dependency lock/toolchain,
+test-contract version, and environment. `retained_identity` reuses evidence
+only when every field is exactly equal; a mismatch schedules the gate and is
+counted as a reuse miss. A `trigger` uses the same `{matched, paths, evidence}`
+contract as a producer: `matched: false` emits a zero-cost decision receipt,
+not runner work. Reused evidence also emits a zero-cost receipt. Gate receipts
+join central acceptance, so no integration evidence can be silently omitted.
+
 ## Resources and duration provenance
 
 `estimates` maps each used stage (`pr`, `check`, `join`, `approval_wait`,
