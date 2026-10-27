@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 
 use crate::lint::{LintFinding, LintReport, Severity};
 use crate::plan::{Deliverable, Estimate, OwnedFile, PlanGraph, PlannerError, Prerequisite};
+use crate::schedule::compute_cpm;
 
 /// The supported input contract. Unknown versions fail closed.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -198,6 +199,67 @@ pub struct CentralAcceptance {
     pub dependencies: Expansion<AcceptanceDependency>,
 }
 
+/// A promotion whose change is admitted to a shared integration wave.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WaveMember {
+    pub repository: String,
+    pub promotion: String,
+}
+
+/// Immutable inputs that govern whether retained gate evidence may be reused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceIdentity {
+    pub tree: String,
+    pub dependency_lock: String,
+    pub test_contract: String,
+    pub environment: String,
+}
+
+/// Explicit economics and feedback bounds for one integration-wave gate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GateEconomics {
+    pub fixed_cost_hours: f32,
+    pub integration_effort_hours: f32,
+    pub feedback_delay_hours: f32,
+    pub max_wave_size: usize,
+}
+
+/// One fixed-cost gate shared by a bounded integration wave.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryGate {
+    pub id: String,
+    pub class: String,
+    pub members: Expansion<WaveMember>,
+    pub economics: GateEconomics,
+    pub identity: EvidenceIdentity,
+    #[serde(default)]
+    pub retained_identity: Option<EvidenceIdentity>,
+    #[serde(default)]
+    pub trigger: Option<ChangeTrigger>,
+}
+
+/// Auditable cardinality and reuse facts for native delivery gates.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DeliveryGateMetrics {
+    pub gate_executions: usize,
+    pub wave_members: usize,
+    pub reuse_hits: usize,
+    pub reuse_misses: usize,
+    pub change_skipped: usize,
+    /// Cost of rerunning each matched member through its fixed gate alone.
+    pub per_change_fixed_gate_hours: f32,
+    /// Scheduled gate time after batch integration and feedback delay.
+    pub batched_gate_hours: f32,
+    pub integration_effort_hours: f32,
+    pub feedback_delay_hours: f32,
+    /// Portion of the compiled unlimited-capacity makespan spent in gate runs.
+    pub gate_makespan_fraction: f32,
+}
+
 /// Versioned, offline importer contract. All expansion inputs are retained here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -208,6 +270,8 @@ pub struct ReleaseWorkflow {
     pub acceptance: CentralAcceptance,
     #[serde(default)]
     pub history: Vec<RetainedRun>,
+    #[serde(default)]
+    pub delivery_gates: Expansion<DeliveryGate>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -216,6 +280,7 @@ pub struct ReleaseCompilation {
     pub policy_digest: String,
     pub graph: PlanGraph,
     pub lint: LintReport,
+    pub delivery_gate_metrics: DeliveryGateMetrics,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -275,12 +340,24 @@ pub fn workflow_schema() -> Value {
         json!({"id":id,"workflow":text,"promotion":id,"trigger":object(json!({"matched":{"type":"boolean"},"evidence":text,"paths":array(text.clone())}), &["matched","evidence","paths"]),"attempts":expansion(object(json!({"id":id,"outcome":outcome}), &["id","outcome"])),"artifacts":expansion(object(json!({"id":id,"path":text}), &["id","path"]))}),
         &["id", "workflow", "promotion", "attempts", "artifacts"],
     );
+    let trigger = object(
+        json!({"matched":{"type":"boolean"},"evidence":text,"paths":array(text.clone())}),
+        &["matched", "evidence", "paths"],
+    );
+    let evidence_identity = object(
+        json!({"tree":text,"dependency_lock":text,"test_contract":text,"environment":text}),
+        &["tree", "dependency_lock", "test_contract", "environment"],
+    );
+    let delivery_gate = object(
+        json!({"id":id,"class":text,"members":expansion(object(json!({"repository":id,"promotion":id}), &["repository", "promotion"])),"economics":object(json!({"fixed_cost_hours":{"type":"number","minimum":0,"maximum":crate::plan::MAX_HOURS},"integration_effort_hours":{"type":"number","minimum":0,"maximum":crate::plan::MAX_HOURS},"feedback_delay_hours":{"type":"number","minimum":0,"maximum":crate::plan::MAX_HOURS},"max_wave_size":{"type":"integer","minimum":1,"maximum":5000}}), &["fixed_cost_hours", "integration_effort_hours", "feedback_delay_hours", "max_wave_size"]),"identity":evidence_identity,"retained_identity":evidence_identity,"trigger":trigger}),
+        &["id", "class", "members", "economics", "identity"],
+    );
     let repo = object(
         json!({"id":id,"repository":text,"allowed_edges":array(object(json!({"from":text,"to":text}), &["from","to"])),"promotions":expansion(promotion),"producers":expansion(producer)}),
         &["id", "repository", "allowed_edges", "promotions"],
     );
     object(
-        json!({"schema_version":{"type":"integer","const":SCHEMA_VERSION},"repositories":expansion(repo),"estimates":object(Value::Object(estimates), &[]),"acceptance":object(json!({"id":id,"dependencies":expansion(object(json!({"repository":id,"promotion":id,"producer":id,"artifact":id}), &["repository","promotion"]))}), &["id","dependencies"]),"history":{"type":"array","maxItems":50000,"items":object(json!({"node_id":text,"duration_hours":{"type":"number","minimum":0,"maximum":crate::plan::MAX_HOURS},"outcome":outcome,"evidence":text,"confidence":{"type":"number","minimum":0,"maximum":1}}), &["node_id","duration_hours","outcome","evidence","confidence"])}}),
+        json!({"schema_version":{"type":"integer","const":SCHEMA_VERSION},"repositories":expansion(repo),"delivery_gates":expansion(delivery_gate),"estimates":object(Value::Object(estimates), &[]),"acceptance":object(json!({"id":id,"dependencies":expansion(object(json!({"repository":id,"promotion":id,"producer":id,"artifact":id}), &["repository","promotion"]))}), &["id","dependencies"]),"history":{"type":"array","maxItems":50000,"items":object(json!({"node_id":text,"duration_hours":{"type":"number","minimum":0,"maximum":crate::plan::MAX_HOURS},"outcome":outcome,"evidence":text,"confidence":{"type":"number","minimum":0,"maximum":1}}), &["node_id","duration_hours","outcome","evidence","confidence"])}}),
         &["schema_version", "repositories", "estimates", "acceptance"],
     )
 }
@@ -404,6 +481,101 @@ pub fn lint_workflow(w: &ReleaseWorkflow) -> LintReport {
         "EMPTY_ACCEPTANCE",
         "central acceptance needs explicit dependencies",
     );
+    v.expansion(&w.delivery_gates, "delivery_gates");
+    v.ids(
+        w.delivery_gates.items.iter().map(|gate| gate.id.as_str()),
+        "delivery_gates",
+    );
+    for gate in &w.delivery_gates.items {
+        v.text(&gate.class, "delivery_gate.class");
+        for value in [
+            &gate.identity.tree,
+            &gate.identity.dependency_lock,
+            &gate.identity.test_contract,
+            &gate.identity.environment,
+        ] {
+            v.text(value, "delivery_gate.identity");
+        }
+        if let Some(retained) = &gate.retained_identity {
+            for value in [
+                &retained.tree,
+                &retained.dependency_lock,
+                &retained.test_contract,
+                &retained.environment,
+            ] {
+                v.text(value, "delivery_gate.retained_identity");
+            }
+        }
+        let economics = &gate.economics;
+        v.require(
+            economics.fixed_cost_hours.is_finite()
+                && economics.integration_effort_hours.is_finite()
+                && economics.feedback_delay_hours.is_finite()
+                && economics.fixed_cost_hours >= 0.0
+                && economics.integration_effort_hours >= 0.0
+                && economics.feedback_delay_hours >= 0.0
+                && economics.fixed_cost_hours <= crate::plan::MAX_HOURS
+                && economics.integration_effort_hours <= crate::plan::MAX_HOURS
+                && economics.feedback_delay_hours <= crate::plan::MAX_HOURS,
+            "INVALID_GATE_ECONOMICS",
+            "delivery gate economics must be finite, nonnegative hours",
+        );
+        v.require(
+            economics.max_wave_size > 0 && economics.max_wave_size <= crate::plan::MAX_DELIVERABLES,
+            "INVALID_WAVE_BOUND",
+            "delivery gate max_wave_size must be within 1..=5000",
+        );
+        v.expansion(&gate.members, "delivery_gate.members");
+        v.require(
+            !gate.members.items.is_empty(),
+            "EMPTY_INTEGRATION_WAVE",
+            "a delivery gate needs at least one wave member",
+        );
+        v.require(
+            gate.members.items.len() <= economics.max_wave_size,
+            "WAVE_BOUND_EXCEEDED",
+            format!(
+                "delivery gate {} has {} members but max_wave_size is {}",
+                gate.id,
+                gate.members.items.len(),
+                economics.max_wave_size
+            ),
+        );
+        let mut member_ids = BTreeSet::new();
+        for member in &gate.members.items {
+            v.require(
+                member_ids.insert((&member.repository, &member.promotion)),
+                "DUPLICATE_WAVE_MEMBER",
+                format!(
+                    "delivery gate {} repeats member {}/{}",
+                    gate.id, member.repository, member.promotion
+                ),
+            );
+            v.require(
+                w.repositories.items.iter().any(|repo| {
+                    repo.id == member.repository
+                        && repo
+                            .promotions
+                            .items
+                            .iter()
+                            .any(|p| p.id == member.promotion)
+                }),
+                "UNKNOWN_WAVE_MEMBER",
+                format!(
+                    "delivery gate {} names unknown member {}/{}",
+                    gate.id, member.repository, member.promotion
+                ),
+            );
+        }
+        if let Some(trigger) = &gate.trigger {
+            v.text(&trigger.evidence, "delivery_gate.trigger.evidence");
+            v.require(
+                !trigger.paths.is_empty(),
+                "INVALID_TRIGGER",
+                "delivery gate trigger needs a bounded, nonempty path list",
+            );
+        }
+    }
     for (stage, e) in &w.estimates {
         v.text(&e.source, "estimate.source");
         v.require(
@@ -688,6 +860,20 @@ impl Compiler<'_> {
         }
         Ok(id)
     }
+
+    /// Set a deterministic fixed elapsed duration after retaining the standard
+    /// stage provenance. Gate receipts use zero; gate runs use their declared
+    /// fixed cost plus integration and feedback effects.
+    fn set_duration(&mut self, id: &str, hours: f32) -> Result<(), PlannerError> {
+        let node = self
+            .nodes
+            .get_mut(id)
+            .ok_or_else(|| invalid(format!("MISSING_RELEASE_NODE: {id}")))?;
+        node.estimated_effort_hours = Some(0.0);
+        node.duration_hours = Some(hours);
+        node.estimate = None;
+        Ok(())
+    }
 }
 
 fn promotion_id(repo: &str, promotion: &str, suffix: &str) -> String {
@@ -830,7 +1016,86 @@ pub fn compile(w: &ReleaseWorkflow) -> Result<ReleaseCompilation, PlannerError> 
             }
         }
     }
+    let mut delivery_gate_metrics = DeliveryGateMetrics::default();
+    let mut gate_nodes = Vec::new();
+    for gate in &w.delivery_gates.items {
+        let prerequisites = gate
+            .members
+            .items
+            .iter()
+            .map(|member| promotion_id(&member.repository, &member.promotion, "pr"))
+            .collect::<Vec<_>>();
+        let changed = gate.trigger.as_ref().is_none_or(|trigger| trigger.matched);
+        let reused = changed
+            && gate
+                .retained_identity
+                .as_ref()
+                .is_some_and(|identity| identity == &gate.identity);
+        delivery_gate_metrics.wave_members += gate.members.items.len();
+        if changed {
+            delivery_gate_metrics.per_change_fixed_gate_hours +=
+                gate.economics.fixed_cost_hours * gate.members.items.len() as f32;
+        }
+        let detail = json!({
+            "class": gate.class,
+            "members": gate.members.items,
+            "economics": gate.economics,
+            "identity": gate.identity,
+            "trigger": gate.trigger,
+            "reused": reused,
+        });
+        let (node, scheduled_hours) = if !changed {
+            delivery_gate_metrics.change_skipped += 1;
+            (
+                c.node(
+                    format!("release/delivery-gate/{}/skipped", gate.id),
+                    Stage::Receipt,
+                    Resource::Agent,
+                    prerequisites,
+                    detail,
+                )?,
+                0.0,
+            )
+        } else if reused {
+            delivery_gate_metrics.reuse_hits += 1;
+            (
+                c.node(
+                    format!("release/delivery-gate/{}/reused", gate.id),
+                    Stage::Receipt,
+                    Resource::Agent,
+                    prerequisites,
+                    detail,
+                )?,
+                0.0,
+            )
+        } else {
+            delivery_gate_metrics.gate_executions += 1;
+            delivery_gate_metrics.reuse_misses += usize::from(gate.retained_identity.is_some());
+            let hours = gate.economics.fixed_cost_hours
+                + gate.economics.integration_effort_hours
+                + gate.economics.feedback_delay_hours;
+            delivery_gate_metrics.batched_gate_hours += hours;
+            delivery_gate_metrics.integration_effort_hours +=
+                gate.economics.integration_effort_hours;
+            delivery_gate_metrics.feedback_delay_hours += gate.economics.feedback_delay_hours;
+            (
+                c.node(
+                    format!("release/delivery-gate/{}/run", gate.id),
+                    Stage::Check,
+                    Resource::Runner,
+                    prerequisites,
+                    detail,
+                )?,
+                hours,
+            )
+        };
+        c.set_duration(&node, scheduled_hours)?;
+        gate_nodes.push(node);
+    }
     let mut deps = BTreeSet::new();
+    for gate in gate_nodes {
+        deps.insert(gate);
+    }
     for d in &w.acceptance.dependencies.items {
         let repo = w
             .repositories
@@ -891,7 +1156,7 @@ pub fn compile(w: &ReleaseWorkflow) -> Result<ReleaseCompilation, PlannerError> 
             "RELEASE_GRAPH_TOO_LARGE: generated plan file exceeds 8 MiB",
         ));
     }
-    let lint = crate::lint::lint(&graph);
+    let mut lint = crate::lint::lint(&graph);
     if !lint.clean {
         return Err(invalid(format!(
             "generated graph is not lint clean: {}",
@@ -904,11 +1169,56 @@ pub fn compile(w: &ReleaseWorkflow) -> Result<ReleaseCompilation, PlannerError> 
         )));
     }
     crate::planner::validate_graph(&graph)?;
+    let cpm = compute_cpm(&graph)?;
+    let critical_gate_hours: f32 = cpm
+        .critical_path
+        .iter()
+        .filter(|id| id.starts_with("release/delivery-gate/") && id.ends_with("/run"))
+        .filter_map(|id| {
+            graph
+                .deliverables
+                .iter()
+                .find(|node| node.id == *id)
+                .and_then(|node| node.duration_hours)
+        })
+        .sum();
+    delivery_gate_metrics.gate_makespan_fraction = if cpm.critical_path_duration > 0.0 {
+        critical_gate_hours / cpm.critical_path_duration
+    } else {
+        0.0
+    };
+    let gate_driving_fraction = if cpm.critical_path_duration > 0.0 {
+        delivery_gate_metrics.batched_gate_hours / cpm.critical_path_duration
+    } else {
+        0.0
+    };
+    if delivery_gate_metrics.gate_executions >= 2 && gate_driving_fraction >= 0.5 {
+        lint.findings.push(LintFinding {
+            code: "FIXED_GATES_DOMINATE_DRIVING_CHAIN".into(),
+            severity: Severity::Warning,
+            message: format!(
+                "{} fixed gate runs total {:.1}% of the critical path; compare a larger bounded wave against feedback risk",
+                delivery_gate_metrics.gate_executions,
+                gate_driving_fraction * 100.0
+            ),
+            ids: graph
+                .deliverables
+                .iter()
+                .filter(|node| {
+                    node.id.starts_with("release/delivery-gate/") && node.id.ends_with("/run")
+                })
+                .map(|node| node.id.clone())
+                .collect(),
+            path: None,
+        });
+        lint.clean = false;
+    }
     Ok(ReleaseCompilation {
         schema_version: SCHEMA_VERSION,
         policy_digest,
         graph,
         lint,
+        delivery_gate_metrics,
     })
 }
 

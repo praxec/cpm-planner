@@ -1,6 +1,6 @@
 ---
 name: cpm-plan
-description: Use when planning work as artifact deliverables with dependencies, estimating effort, finding the critical path (CPM), checking milestones, or levelling the schedule against real capacity to see the critical path and the levelled bottleneck (resource levelling, makespan). Covers authoring a .cpm-planner/plans/<name>/<variant>.json plan file of artifact deliverables and consumption edges, plan.lint until clean, plan.sync, reading critical_path and milestones in plan.status, and plan.schedule with capacities.
+description: Use when planning work as artifact deliverables with dependencies, estimating effort, finding the critical path (CPM), checking milestones, or levelling the schedule against real capacity to see the critical path and the levelled bottleneck (resource levelling, makespan). Covers authoring a cpm-planner plan file of artifact deliverables and consumption edges, plan.lint until clean, plan.sync, reading critical_path and milestones in plan.status, and plan.schedule with capacities.
 ---
 
 # cpm-plan: author, lint, sync and level a plan
@@ -46,6 +46,22 @@ That file is the only definition. Never keep a scratch graph elsewhere. Rules in
   `{"id": "A", "consumes": "request/response schema", "kind": "interface"}`. `kind` is
   `artifact` (default) or `interface` (target sets `metadata.contract: true`). Both are
   finish-to-start. `lag_hours` is a minimum wait.
+
+### Model delivery waves, not one CI cycle per code task
+
+For software, map branch integration, build/test, promotion, approvals, deployment and acceptance
+as artifacts with observed durations. Keep implementation parallel, join compatible changes into
+one integration-wave artifact, then run the expensive full gate once per wave. Keep fast
+changed-scope checks near each change.
+
+A gate artifact is its immutable evidence. Record the governed tree/image, dependency
+lock/toolchain, test-contract version and environment in metadata; reuse evidence across commits
+only when that identity matches. Change-triggered campaigns create no new proof when unchanged.
+
+Before syncing, count each fixed-cost gate and its total wall time. If repeats dominate the
+makespan, author an integration-wave variant. Split waves for conflicting files, trust boundaries,
+shared-fixture invalidation or excessive feedback batches. See the software-delivery section of
+[deliverable-cpm](../deliverable-cpm/SKILL.md) for the full method.
 
 A worked file: [small-plan.json](../deliverable-cpm/examples/small-plan.json).
 
@@ -115,13 +131,15 @@ Read:
 - `driving_chain`: steps with `waited_on: "resource"` wait for capacity, not a dependency;
 - `load`: a resource near `utilisation` 1.0 is the bottleneck;
 - `project_buffer_hours` and `feeding_buffers`: the buffers to protect.
+- gate cardinality: how many times each fixed build/test/promotion gate executes, and what fraction
+  of the levelled makespan is repeated gate time rather than implementation.
 
 ## Stop when
 
 - lint is `clean`, the file is synced, `definition_drift` is `false`;
 - the critical path and milestones match your expectation, or you have explained why not;
-- you have reported the critical path, CPM and levelled makespan, and the bottleneck, and
-  offered `cpm-improve` if the user wants it shorter.
+- you have reported the critical path, CPM and levelled makespan, the bottleneck and fixed-gate
+  cardinality, and offered `cpm-improve` if the user wants it shorter.
 
 ## Pitfalls
 

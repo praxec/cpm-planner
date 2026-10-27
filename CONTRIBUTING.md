@@ -19,7 +19,8 @@ Run these before opening a pull request; CI runs them too.
 ```sh
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
-cargo test
+cargo nextest run --all-targets
+cargo test --doc
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 cargo publish --dry-run --locked
 cargo deny check
@@ -29,6 +30,10 @@ node --test "npm/test/*.test.mjs"
 
 Prerequisites beyond the Rust toolchain:
 
+- `cargo nextest` is [cargo-nextest](https://nexte.st/)
+  (`cargo install cargo-nextest --locked`). Nextest runs the Rust test binaries;
+  `.config/nextest.toml` keeps the suite running after a failure so one cycle reports every
+  defect. `cargo test --doc` remains a separate gate because nextest does not run doctests.
 - `cargo deny` is [cargo-deny](https://github.com/EmbarkStudios/cargo-deny)
   (`cargo install cargo-deny`).
 - `scripts/check-version-sync.sh` needs `bash` and
@@ -112,7 +117,8 @@ template.
 - The live OpenRouter test is opt-in and costs money:
 
   ```sh
-  OPENROUTER_API_KEY=... cargo test --test server_review -- --ignored
+  OPENROUTER_API_KEY=... cargo nextest run --test server_review \
+    -E 'test(review_against_openrouter_live)' --ignored
   ```
 
 ## Reporting issues

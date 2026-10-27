@@ -1,6 +1,6 @@
 ---
 name: deliverable-cpm
-description: "Use when you need the full method reference behind the cpm-plan, cpm-improve, cpm-run, cpm-ev and cpm-revise skills, or when no narrower cpm-* skill fits a cpm-planner (plan.* tools) task that spans the whole lifecycle. Covers the deliverable-based CPM method end to end: deliverables as artifacts, consumption edges, lint findings, sync and drift, resource levelling, the review/fork/simulate/compare/select improvement loop, leases and acceptance, baselines and earned value, and revising a plan file under .cpm-planner/plans/<name>/<variant>.json."
+description: "Use when you need the full method reference behind the cpm-plan, cpm-improve, cpm-run, cpm-ev and cpm-revise skills, or when no narrower cpm-* skill fits a cpm-planner (plan.* tools) task that spans the whole lifecycle. Covers the deliverable-based CPM method end to end: deliverables as artifacts, consumption edges, lint findings, sync and drift, resource levelling, the review/fork/simulate/compare/select improvement loop, leases and acceptance, baselines and earned value, and revising a tracked cpm-planner plan file."
 ---
 
 # Deliverable-based CPM with cpm-planner
@@ -137,6 +137,26 @@ If nothing is consumed, there is no edge.
 | `FEEDS_NO_MILESTONE` | warning | cut the deliverable, or add the milestone it really serves |
 | `NO_ARTIFACT`, `NO_MILESTONE` | info | add `metadata.artifact` or a milestone |
 
+### Software delivery: integrate once, prove the governed candidate
+
+For software work, first map the actual branch-to-production pipeline. Parallel code artifacts
+normally converge into an integration-wave artifact; the expensive build/test artifact consumes
+that integrated candidate once, followed by promotion, approval, deployment and acceptance
+artifacts. Estimate their observed wall time explicitly instead of hiding CI and approvals inside
+implementation effort.
+
+Keep cheap deterministic changed-scope checks adjacent to each implementation artifact. Put the
+full fixed-cost gate after the wave unless policy requires independent evidence per change. Record
+the evidence identity in metadata: complete tree or image, dependency lock/toolchain, test-contract
+version and environment. Evidence may be reused across different commits only when that governed
+identity is identical. Change-triggered scheduled campaigns produce no new proof for unchanged
+candidates.
+
+Count fixed-gate executions and their total duration before syncing. If repeated gate time dominates
+the makespan, create an integration-wave variant. Do not batch changes that conflict in owned files,
+cross trust/approval boundaries, invalidate shared fixtures or create an unacceptably large feedback
+batch.
+
 ## 4. Sync and verify the critical path
 
 1. Run `plan.sync {path}`. It returns `plan_id`, `name`, `variant`, `revision`, `created`,
@@ -203,6 +223,12 @@ Design several variants and pick one. Never edit the selected variant to try an 
    | Contract first | `add_deliverable` with `metadata.contract`; then for each consumer `remove_edge` its dependents, `remove_deliverable` + `add_deliverable` with an `interface` edge (`add_edge` has no `kind`), and `add_edge` the dependents back | the contract must be accepted, not just drafted |
    | Fast-track by removing an edge | `remove_edge` | only if nothing was actually consumed |
    | Split scope into milestones | `add_deliverable` with `"milestone": true` | each milestone needs an acceptance artifact |
+   | Batch an integration wave | join compatible implementation artifacts into one candidate and replace repeated fixed-cost gates with one gate after the join | count added integration/review effort and the longer defect-feedback batch |
+   | Reuse immutable evidence | make the consumer depend on a prior evidence artifact and remove the duplicate gate | the complete tree/image, lock/toolchain, test contract and environment identity must all match |
+
+   The current graph has no native setup-cost, cache-hit or conditional-execution primitive. Model
+   fixed gates as artifacts and reuse as explicit edges/metadata, and disclose that approximation
+   when it materially affects the forecast.
 3. **Fork.** Run `plan.fork {plan_id, variant, edits}`. The edit ops are `remove_edge
    {from, to}`, `add_edge {from, to, consumes}`, `set_effort {id, hours}`, `set_duration
    {id, hours}`, `set_estimate {id, estimate}`, `set_metadata {id, key, value}`,

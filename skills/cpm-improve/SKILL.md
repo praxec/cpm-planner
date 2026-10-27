@@ -49,8 +49,30 @@ plan.review {"path": ".cpm-planner/plans/<name>/main.json", "capacities": {"agen
 | Split along file or contract seams | `remove_edge` its dependents, `remove_deliverable`, `add_deliverable` the parts, `add_edge` the dependents back |
 | Contract first | `add_deliverable` with `metadata.contract`; for each consumer, `remove_edge` its dependents, `remove_deliverable`, `add_deliverable` with an `interface` edge, `add_edge` the dependents back |
 | Fast-track | `remove_edge`, only if nothing was actually consumed |
+| Batch an integration wave | Join compatible implementation artifacts into one integration-candidate artifact and replace their repeated fixed-cost gates with one gate after the join; retain per-change fast checks |
+| Reuse immutable evidence | Remove a repeated gate only when a prior evidence artifact has the same governed identity (complete tree/image, dependency lock/toolchain, test-contract version and environment); make the consumer depend on that evidence |
 
 Use the levelled `driving_chain`, `load` and Monte Carlo `sensitivity` to pick moves.
+
+### Audit fixed-cost delivery gates
+
+For a software-delivery plan, inspect the remaining graph before choosing a move:
+
+1. Count executions of each build, test, promotion and acceptance gate. Sum their scheduled wall
+   time and identify repeated gates on the driving chain.
+2. Distinguish change-proportional checks from fixed-cost full gates. Keep fast changed-scope checks
+   close to each change; consider one full gate for each dependency-compatible integration wave.
+3. Check whether apparently different revisions have an identical governed evidence identity. A
+   commit SHA alone is neither sufficient nor necessary when the policy governs a complete tree or
+   image. Never reuse evidence across a changed lockfile/toolchain, test contract or environment.
+4. Fork a batching or evidence-reuse variant and compare it with the current plan. Count the added
+   integration/review effort and the longer defect-feedback batch; do not report only gate savings.
+5. Prefer the smallest wave whose saved fixed-gate time exceeds its added integration and feedback
+   risk. Keep independent waves for conflicting files, trust boundaries or fixtures.
+
+The planner currently models a fixed gate as an ordinary artifact and evidence reuse as explicit
+edges/metadata. State that approximation when it materially limits the forecast; do not silently
+pretend setup cost, cache hits or conditional execution are native schedule semantics.
 
 ## 3. Fork
 
