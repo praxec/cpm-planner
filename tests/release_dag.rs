@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use cpm_planner::plan::{Deliverable, PlanGraph};
 use cpm_planner::ports::Planner;
-use cpm_planner::release_dag::{ReleaseWorkflow, compile, diff, lint_workflow};
+use cpm_planner::release_dag::{ReleaseWorkflow, compile, diff, lint_workflow, workflow_schema};
 use cpm_planner::resource_schedule::{ScheduleRequest, resource_schedule};
 use cpm_planner::simulate::{SimulateRequest, simulate};
 use cpm_planner::{BasicCpmPlanner, PlanServer};
@@ -142,6 +142,167 @@ fn change_skipped_campaign_keeps_a_decision_receipt_without_runner_work() {
             "release/app/producer/proof/artifact/receipt",
             "release/app/producer/proof/skipped"
         ]
+    );
+}
+
+#[test]
+fn one_native_gate_covers_a_bounded_wave_and_reuses_only_exact_identity() {
+    let mut v = input();
+    v["repositories"]["items"][0]["promotions"]["items"][0]["checks"] =
+        json!({"cardinality":0,"items":[]});
+    // This deliberately removes the normal check node; its retained timing
+    // receipt cannot be attached to a graph that no longer contains it.
+    v["history"] = json!([]);
+    v["delivery_gates"] = json!({
+        "cardinality": 1,
+        "items": [{
+            "id":"integration",
+            "class":"full-suite",
+            "members":{"cardinality":1,"items":[{"repository":"app","promotion":"stage"}]},
+            "economics":{"fixed_cost_hours":2.0,"integration_effort_hours":0.5,"feedback_delay_hours":0.25,"max_wave_size":2},
+            "identity":{"tree":"sha256:tree","dependency_lock":"sha256:lock","test_contract":"v1","environment":"ubuntu"},
+            "retained_identity":{"tree":"sha256:tree","dependency_lock":"sha256:lock","test_contract":"v1","environment":"ubuntu"},
+            "trigger":{"matched":true,"paths":["src/**"],"evidence":"retained/diff.json"}
+        }]
+    });
+    let compiled = compile(&workflow(v)).unwrap();
+    assert!(
+        compiled
+            .graph
+            .deliverables
+            .iter()
+            .any(|node| node.id == "release/delivery-gate/integration/reused")
+    );
+    assert_eq!(
+        compiled.delivery_gate_metrics,
+        cpm_planner::release_dag::DeliveryGateMetrics {
+            gate_executions: 0,
+            wave_members: 1,
+            reuse_hits: 1,
+            reuse_misses: 0,
+            change_skipped: 0,
+            per_change_fixed_gate_hours: 2.0,
+            batched_gate_hours: 0.0,
+            integration_effort_hours: 0.0,
+            feedback_delay_hours: 0.0,
+            gate_makespan_fraction: 0.0,
+        }
+    );
+}
+
+#[test]
+fn changed_identity_runs_the_gate_and_counts_a_reuse_miss() {
+    let mut v = input();
+    v["delivery_gates"] = json!({
+        "cardinality": 1,
+        "items": [{
+            "id":"integration",
+            "class":"full-suite",
+            "members":{"cardinality":1,"items":[{"repository":"app","promotion":"stage"}]},
+            "economics":{"fixed_cost_hours":2.0,"integration_effort_hours":0.5,"feedback_delay_hours":0.25,"max_wave_size":2},
+            "identity":{"tree":"sha256:new","dependency_lock":"sha256:lock","test_contract":"v1","environment":"ubuntu"},
+            "retained_identity":{"tree":"sha256:old","dependency_lock":"sha256:lock","test_contract":"v1","environment":"ubuntu"}
+        }]
+    });
+    let compiled = compile(&workflow(v)).unwrap();
+    assert!(
+        compiled
+            .graph
+            .deliverables
+            .iter()
+            .any(|node| node.id == "release/delivery-gate/integration/run")
+    );
+    assert_eq!(compiled.delivery_gate_metrics.gate_executions, 1);
+    assert_eq!(compiled.delivery_gate_metrics.reuse_misses, 1);
+    assert_eq!(
+        compiled.delivery_gate_metrics.per_change_fixed_gate_hours,
+        2.0
+    );
+    assert_eq!(compiled.delivery_gate_metrics.batched_gate_hours, 2.75);
+    assert_eq!(compiled.delivery_gate_metrics.integration_effort_hours, 0.5);
+    assert_eq!(compiled.delivery_gate_metrics.feedback_delay_hours, 0.25);
+}
+
+#[test]
+fn unchanged_delivery_gate_emits_a_receipt_without_runner_work() {
+    let mut v = input();
+    v["delivery_gates"] = json!({
+        "cardinality": 1,
+        "items": [{
+            "id":"integration",
+            "class":"full-suite",
+            "members":{"cardinality":1,"items":[{"repository":"app","promotion":"stage"}]},
+            "economics":{"fixed_cost_hours":2.0,"integration_effort_hours":0.5,"feedback_delay_hours":0.25,"max_wave_size":2},
+            "identity":{"tree":"sha256:tree","dependency_lock":"sha256:lock","test_contract":"v1","environment":"ubuntu"},
+            "trigger":{"matched":false,"paths":["docs/**"],"evidence":"retained/diff.json"}
+        }]
+    });
+    let compiled = compile(&workflow(v)).unwrap();
+    assert!(
+        compiled
+            .graph
+            .deliverables
+            .iter()
+            .any(|node| node.id == "release/delivery-gate/integration/skipped")
+    );
+    assert_eq!(compiled.delivery_gate_metrics.change_skipped, 1);
+    assert_eq!(compiled.delivery_gate_metrics.gate_executions, 0);
+}
+
+#[test]
+fn repeated_fixed_gates_emit_a_driving_chain_warning() {
+    let mut v = input();
+    v["delivery_gates"] = json!({
+        "cardinality": 2,
+        "items": [
+            {
+                "id":"integration-a",
+                "class":"full-suite",
+                "members":{"cardinality":1,"items":[{"repository":"app","promotion":"stage"}]},
+                "economics":{"fixed_cost_hours":100.0,"integration_effort_hours":0.0,"feedback_delay_hours":0.0,"max_wave_size":1},
+                "identity":{"tree":"sha256:a","dependency_lock":"sha256:lock","test_contract":"v1","environment":"ubuntu"}
+            },
+            {
+                "id":"integration-b",
+                "class":"full-suite",
+                "members":{"cardinality":1,"items":[{"repository":"app","promotion":"stage"}]},
+                "economics":{"fixed_cost_hours":100.0,"integration_effort_hours":0.0,"feedback_delay_hours":0.0,"max_wave_size":1},
+                "identity":{"tree":"sha256:b","dependency_lock":"sha256:lock","test_contract":"v1","environment":"ubuntu"}
+            }
+        ]
+    });
+    let compiled = compile(&workflow(v)).unwrap();
+    assert!(compiled.lint.findings.iter().any(|finding| {
+        finding.code == "FIXED_GATES_DOMINATE_DRIVING_CHAIN"
+            && finding.severity == cpm_planner::lint::Severity::Warning
+    }));
+}
+
+#[test]
+fn wave_bound_and_member_identity_are_enforced() {
+    let mut v = input();
+    v["delivery_gates"] = json!({
+        "cardinality": 1,
+        "items": [{
+            "id":"integration",
+            "class":"full-suite",
+            "members":{"cardinality":2,"items":[{"repository":"app","promotion":"stage"},{"repository":"app","promotion":"stage"}]},
+            "economics":{"fixed_cost_hours":2.0,"integration_effort_hours":0.0,"feedback_delay_hours":0.0,"max_wave_size":1},
+            "identity":{"tree":"sha256:tree","dependency_lock":"sha256:lock","test_contract":"v1","environment":"ubuntu"}
+        }]
+    });
+    let report = lint_workflow(&workflow(v));
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.code == "WAVE_BOUND_EXCEEDED")
+    );
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.code == "DUPLICATE_WAVE_MEMBER")
     );
 }
 
@@ -344,6 +505,23 @@ async fn mcp_compile_and_diff_do_not_submit_plans() {
 fn unknown_wire_keys_fail_closed() {
     let mut v = input();
     v["repositories"]["items"][0]["producers"]["items"][0]["attemptz"] = json!([]);
+    assert!(serde_json::from_value::<ReleaseWorkflow>(v).is_err());
+}
+
+#[test]
+fn delivery_gates_are_exposed_to_mcp_and_reject_unknown_keys() {
+    assert!(workflow_schema()["properties"]["delivery_gates"].is_object());
+    let mut v = input();
+    v["delivery_gates"] = json!({
+        "items": [{
+            "id":"integration",
+            "class":"full-suite",
+            "members":{"items":[{"repository":"app","promotion":"stage"}]},
+            "economics":{"fixed_cost_hours":2.0,"integration_effort_hours":0.5,"feedback_delay_hours":0.25,"max_wave_size":2},
+            "identity":{"tree":"sha256:tree","dependency_lock":"sha256:lock","test_contract":"v1","environment":"ubuntu"},
+            "unknown":true
+        }]
+    });
     assert!(serde_json::from_value::<ReleaseWorkflow>(v).is_err());
 }
 

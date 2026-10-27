@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Native release delivery gates and bounded integration waves: fixed gate cost,
+  integration effort, feedback-delay economics, immutable tree/lock/contract/
+  environment identity, exact retained-evidence reuse, change-triggered
+  zero-cost receipts, and auditable batched-versus-per-change metrics. The
+  release compiler warns when repeated fixed gates dominate the driving chain
+  ([#110](https://github.com/praxec/cpm-planner/issues/110)).
+
 ### Changed
 
 - The planning and improvement skills now model software delivery as dependency-compatible
