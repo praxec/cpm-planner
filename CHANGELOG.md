@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Upgrade bundled SQLite through `rusqlite` 0.41 and require `rmcp` 3.9 or newer to
+  address RUSTSEC-2026-0459 and RUSTSEC-2026-0462 without advisory exceptions.
+
 ### Changed
 
 - CPM skills now specify changed-code and affected-contract tests during development, with full
