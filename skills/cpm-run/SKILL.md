@@ -92,8 +92,11 @@ plan.mark_status {"plan_id": "<plan_id>", "deliverable_id": "<id>", "caller_id":
   any mark carrying `evidence` (including `complete`) is refused with `INVALID_ACTUALS`, so
   omit `evidence` then.
 - Bad values are `INVALID_ACTUALS`.
-- Mark `complete` only when the artifact meets its acceptance criteria, with evidence. A
-  report of done is not acceptance.
+- Mark `complete` only when the artifact meets its acceptance criteria, with evidence.
+- During development, run changed-code and affected-contract/consumer tests. Full regression
+  belongs on the integrated milestone's PR candidate before merge, not every task/handoff.
+- Report implementation-complete separately from verification-pending; unrun checks earn no
+  verification credit. Broaden scope for impact/failures; follow the shared software-delivery method.
 - A `failed` mark leaves the deliverable Failed (acquire reports `NOT_READY`). To retry,
   hand it back with a lockless `{"status": "ready"}` mark, then acquire it again.
 - Three explicit `failed` marks trip the circuit breaker, counted across those retries: the

@@ -80,6 +80,10 @@ plan.ev {"plan_id": "<plan_id>", "as_of": "2026-10-14T18:00:00Z"}
 - AC sums every recorded hour, including removed and unbaselined deliverables. Unbaselined
   ids (added after the baseline) are listed in `excluded_unbaselined`.
 
+Report implementation-complete and verification-pending separately when gates are batched.
+Earn only the predeclared implementation weight until verification passes; code completion does
+not earn the verification or release milestone's budget. Do not re-baseline to hide pending tests.
+
 ## 3. Snapshot
 
 ```text

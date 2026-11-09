@@ -145,10 +145,29 @@ that integrated candidate once, followed by promotion, approval, deployment and 
 artifacts. Estimate their observed wall time explicitly instead of hiding CI and approvals inside
 implementation effort.
 
-Keep cheap deterministic changed-scope checks adjacent to each implementation artifact. Put the
-full fixed-cost gate after the wave unless policy requires independent evidence per change. Record
-the evidence identity in metadata: complete tree or image, dependency lock/toolchain, test-contract
-version and environment. Evidence may be reused across different commits only when that governed
+Use two validation scopes for each bounded milestone:
+
+- **Development:** author tests alongside the implementation and run tests for the changed code
+  and affected contracts/consumers, plus necessary scoped compile, lint and type checks. Choose
+  scope from the dependency/contract impact, not just changed filenames. Do not run the full
+  regression suite after every task, agent handoff or small commit. Broaden a targeted run when a
+  failure, shared dependency, migration, auth/privacy boundary or uncertain blast radius warrants it.
+- **Integration PR:** finish and integrate the milestone's compatible implementation artifacts on
+  the integration branch, then run the required full regression suite and release gates against
+  that integrated PR candidate before merge. Keep the PR unmergeable until required checks pass.
+  After a fix, run its focused checks first; rerun affected integration gates for the final candidate
+  as required by their evidence identity and repository policy. A passing earlier candidate does
+  not prove a changed final tree.
+
+Code completion is distinct from verification and acceptance. Give implementation artifacts their
+own source/test acceptance criteria and make a separate verification artifact consume them; the
+milestone consumes passing verification evidence. A frozen interface can unblock consumers without
+claiming the feature is verified. Both artifact and interface edges remain finish-to-start. Report
+implementation-complete, verification-pending explicitly; never award unrun-test or release credit.
+Do not postpone all testing until the whole project is coded or weaken existing acceptance criteria.
+
+Record the evidence identity in metadata: complete tree or image, dependency lock/toolchain,
+test-contract version and environment. Reuse evidence across different commits only when that
 identity is identical. Change-triggered scheduled campaigns produce no new proof for unchanged
 candidates.
 

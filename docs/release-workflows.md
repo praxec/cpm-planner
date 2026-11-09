@@ -91,6 +91,11 @@ the normal evidence review and `plan.accept` workflow still applies.
 
 ## Native delivery gates and integration waves
 
+During development, run tests for changed code and affected contracts/consumers. Finish and
+integrate a bounded milestone before running its full regression suite on the integration PR
+candidate, and require passing gates before merge. Keep code completion separate from verified
+acceptance; see the [software-delivery skill guidance](../skills/deliverable-cpm/SKILL.md#software-delivery-integrate-once-prove-the-governed-candidate).
+
 `delivery_gates` is an optional bounded collection of first-class fixed-cost
 integration gates. A gate has a stable `id`, a descriptive `class`, bounded
 distinct `members` (`repository` and `promotion`), immutable `identity`, and

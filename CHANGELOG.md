@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- CPM skills now specify changed-code and affected-contract tests during development, with full
+  regression on the integrated milestone's PR candidate before merge. Implementation completion
+  and verified acceptance have separate evidence and earned-value credit.
+
 ## [0.5.0] - 2026-10-27
 
 ### Added

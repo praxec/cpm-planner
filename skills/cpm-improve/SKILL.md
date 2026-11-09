@@ -60,8 +60,10 @@ For a software-delivery plan, inspect the remaining graph before choosing a move
 
 1. Count executions of each build, test, promotion and acceptance gate. Sum their scheduled wall
    time and identify repeated gates on the driving chain.
-2. Distinguish change-proportional checks from fixed-cost full gates. Keep fast changed-scope checks
-   close to each change; consider one full gate for each dependency-compatible integration wave.
+2. Keep changed-code and affected-contract/consumer tests during development. Put full regression
+   on the integrated milestone's PR candidate before merge, rather than per task or agent handoff.
+   Split implementation completion from verification acceptance; broaden checks when impact or
+   failures warrant it. Batch a bounded milestone, not all project code before any testing.
 3. Check whether apparently different revisions have an identical governed evidence identity. A
    commit SHA alone is neither sufficient nor necessary when the policy governs a complete tree or
    image. Never reuse evidence across a changed lockfile/toolchain, test contract or environment.

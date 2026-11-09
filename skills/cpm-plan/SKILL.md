@@ -51,8 +51,10 @@ That file is the only definition. Never keep a scratch graph elsewhere. Rules in
 
 For software, map branch integration, build/test, promotion, approvals, deployment and acceptance
 as artifacts with observed durations. Keep implementation parallel, join compatible changes into
-one integration-wave artifact, then run the expensive full gate once per wave. Keep fast
-changed-scope checks near each change.
+one integration-wave artifact. During development, run tests for changed code and affected
+contracts/consumers; author tests alongside code. Run full regression on the integrated milestone's
+PR candidate before merge. Separate implementation-complete artifacts from passing verification;
+the milestone consumes verification. Broaden targeted checks when impact or failures warrant it.
 
 A gate artifact is its immutable evidence. Record the governed tree/image, dependency
 lock/toolchain, test-contract version and environment in metadata; reuse evidence across commits
