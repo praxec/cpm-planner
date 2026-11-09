@@ -35,6 +35,7 @@ use std::time::Duration;
 use cpm_planner::audit::{AuditSink, NullAuditSink};
 use cpm_planner::earned_value::BaselineMode;
 use cpm_planner::llm::LlmConfig;
+use cpm_planner::llm::command::{ReviewProvider, readiness};
 use cpm_planner::planner::{DEFAULT_MAX_TTL, MAX_TTL_CEILING};
 use cpm_planner::project::{PROJECT_ROOT_ENV, ProjectRoot};
 use cpm_planner::{BasicCpmPlanner, PlanServer, STATE_MODE_ENV, SqlitePlanStore, StateOpenMode};
@@ -47,6 +48,7 @@ Usage:
   cpm-planner                 Run the MCP server on stdio (how MCP clients start it)
   cpm-planner skills <cmd>    Install, uninstall or list the agent skills
   cpm-planner release <cmd>   Compile, lint or diff a bounded release workflow
+  cpm-planner review doctor   Report plan.review readiness by setting name, no values
   cpm-planner --version       Print the version
   cpm-planner --help          Print this help
 ";
@@ -81,6 +83,15 @@ fn main() -> ExitCode {
         }
         "skills" => ExitCode::from(cpm_planner::skills::run(&args[1..])),
         "release" => ExitCode::from(cpm_planner::release_cli::run(&args[1..])),
+        "review" if args.len() == 2 && args[1] == "doctor" => {
+            let report = readiness(|name| std::env::var(name).ok());
+            println!("{report}");
+            if report["ready"] == true {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
         _ => {
             eprintln!(
                 "cpm-planner: unexpected arguments `{}`\n\n{USAGE}",
@@ -127,7 +138,11 @@ async fn serve() -> anyhow::Result<()> {
     // (":memory:" gives the old ephemeral behaviour).
     let db_path = SqlitePlanStore::default_db_path()?;
     let state_mode = resolve_state_mode()?;
-    tracing::info!(db = %db_path.display(), ?state_mode, "opening planner database");
+    // Supervisors confirm the database by reading from "opening planner
+    // database db=" to the end of the line, and the path is unquoted, so this
+    // line must carry `db` first and nothing after it (#117).
+    tracing::info!(db = %db_path.display(), "opening planner database");
+    tracing::info!(?state_mode, "durable state mode");
     let (store, state_report) = SqlitePlanStore::open_with_report(&db_path, state_mode)?;
     let max_ttl = resolve_max_ttl()?;
     tracing::info!(max_ttl_secs = max_ttl.as_secs(), "lease TTL ceiling");
@@ -155,13 +170,13 @@ async fn serve() -> anyhow::Result<()> {
     // plan.review's judge: the LLM settings are read once, here. A bad
     // setting is logged and only disables plan.review (it reports
     // review_unavailable naming the setting); it never stops the server.
-    let llm_config = LlmConfig::from_env();
+    let review_provider = ReviewProvider::from_env();
 
     tracing::info!("starting cpm-planner stdio server");
     // The server reads the project root from the planner.
     PlanServer::new(planner)
         .with_durable_state_report(state_report)
-        .with_llm_config(llm_config)
+        .with_review_provider(review_provider, LlmConfig::from_env)
         .serve_stdio()
         .await?;
     Ok(())

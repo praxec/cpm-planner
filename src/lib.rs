@@ -154,6 +154,7 @@ pub mod server;
 pub mod simulate;
 pub mod skills;
 pub mod task;
+pub mod waves;
 
 pub use algorithm::CpmAlgorithm;
 pub use drag::{DragResult, diameter, drag};

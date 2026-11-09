@@ -54,6 +54,65 @@ use crate::locks::PlanState;
 use crate::plan::{CallerId, DeliverableStatus, LockInfo, PlanGraph, PlanId, PlannerError};
 use crate::task::CriticalPathResult;
 
+fn is_readonly_sqlite_error(err: &rusqlite::Error) -> bool {
+    err.sqlite_error_code() == Some(rusqlite::ErrorCode::ReadOnly)
+}
+
+/// Whether any cause of `err` is SQLite's "attempt to write a readonly
+/// database".
+fn is_readonly_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<rusqlite::Error>()
+            .is_some_and(is_readonly_sqlite_error)
+            // The earned-value store flattens its errors into text.
+            || cause.to_string().contains("readonly database")
+    })
+}
+
+/// SQLite's extended code for a database in a directory it cannot write.
+const SQLITE_READONLY_DIRECTORY: i32 = 1544;
+
+/// Whether opening failed because SQLite could not create the WAL index.
+fn is_wal_index_unavailable(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.downcast_ref::<rusqlite::Error>().is_some_and(|e| {
+            e.sqlite_error_code() == Some(rusqlite::ErrorCode::CannotOpen)
+                || matches!(
+                    e,
+                    rusqlite::Error::SqliteFailure(failure, _)
+                        if failure.extended_code == SQLITE_READONLY_DIRECTORY
+                )
+        })
+    })
+}
+
+/// Whether the filesystem refused a write, rather than the write being broken.
+fn is_io_refusal(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|e| {
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+            )
+        })
+    })
+}
+
+/// A read-only connection that needs no WAL index or lock files.
+fn open_immutable(path: &Path) -> anyhow::Result<Connection> {
+    let absolute = std::path::absolute(path)
+        .with_context(|| format!("resolving database path {}", path.display()))?;
+    let mut uri = url::Url::from_file_path(&absolute)
+        .map_err(|()| anyhow!("database path {} is not a file path", path.display()))?;
+    uri.set_query(Some("immutable=1"));
+    Connection::open_with_flags(
+        uri.as_str(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("opening sqlite database read-only at {}", path.display()))
+}
+
 /// Environment variable that overrides the default database path.
 /// The special value `:memory:` selects a private in-memory database
 /// (useful for tests / ephemeral runs).
@@ -270,7 +329,19 @@ impl SqlitePlanStore {
             .with_context(|| format!("opening sqlite database at {}", path.display()))?;
         let receipt_path = receipt_path(path);
         let prior_receipt = read_receipt(&receipt_path)?;
-        let store = Self::init(conn, Some(receipt_path.clone()))?;
+        let store = match Self::init(conn, Some(receipt_path.clone())) {
+            Ok(store) => store,
+            // WAL needs its index beside the database. In a read-only directory
+            // without one, SQLite cannot open the file for reading, so read the
+            // file as it stands. Writes are impossible on this connection.
+            Err(err) if existed && is_wal_index_unavailable(&err) => {
+                tracing::warn!(
+                    "planner database directory is read-only; reading the database as a snapshot"
+                );
+                Self::init(open_immutable(path)?, None)?
+            }
+            Err(err) => return Err(err),
+        };
         let actual = store.plan_ids()?;
         let missing: Vec<_> = prior_receipt
             .as_ref()
@@ -295,7 +366,12 @@ impl SqlitePlanStore {
         } else {
             backup_path
         };
-        store.refresh_receipt()?;
+        if let Err(err) = store.refresh_receipt() {
+            if !is_io_refusal(&err) {
+                return Err(err);
+            }
+            tracing::warn!("could not update the durable-state receipt; location is read-only");
+        }
         let outcome = if !missing.is_empty() || was_empty {
             StateOpenOutcome::Recovered
         } else if existed {
@@ -339,22 +415,46 @@ impl SqlitePlanStore {
         // lock instead of failing; readers never block the writer.
         // (`execute_batch` tolerates pragmas that return a row.)
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA busy_timeout=5000;
+            "PRAGMA busy_timeout=5000;
              PRAGMA synchronous=NORMAL;
              PRAGMA foreign_keys=ON;",
         )
         .context("applying sqlite pragmas")?;
+        // A read-only database keeps the journal mode it already has.
+        if let Err(err) = conn.execute_batch("PRAGMA journal_mode=WAL;")
+            && !is_readonly_sqlite_error(&err)
+        {
+            return Err(anyhow::Error::new(err).context("applying sqlite pragmas"));
+        }
 
-        migrate(&mut conn)?;
+        if let Err(err) = migrate(&mut conn) {
+            // A read-only database can't migrate, but one already at the
+            // current schema doesn't need to.
+            let current: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap_or(-1);
+            if !is_readonly_error(&err) || current != MIGRATIONS.len() as i64 {
+                return Err(err);
+            }
+        }
 
-        let store = Self {
+        let mut store = Self {
             conn: Mutex::new(conn),
             receipt_path,
         };
-        store
-            .quarantine_expired(Utc::now())
-            .context("quarantining expired locks at startup")?;
+        match store.quarantine_expired(Utc::now()) {
+            Ok(_) => {}
+            Err(err) if is_readonly_error(&err) => {
+                // Reads stay available and change nothing; every write still
+                // fails on the database itself. A later writable open reaps.
+                tracing::warn!(
+                    "planner database is read-only; skipped expired-lock quarantine and \
+                     state receipt; writes will fail"
+                );
+                store.receipt_path = None;
+            }
+            Err(err) => return Err(err.context("quarantining expired locks at startup")),
+        }
         Ok(store)
     }
 

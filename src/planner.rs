@@ -1589,8 +1589,11 @@ impl Planner for BasicCpmPlanner {
                 }
             }
             let is_requested = |id: &str| ids.as_ref().is_some_and(|v| v.iter().any(|r| r == id));
-            let is_manual =
-                |d: &Deliverable| d.metadata.get("kind").and_then(|k| k.as_str()) == Some("manual");
+            // A gate runs outside any agent's lease and closes with evidence.
+            let is_manual = |d: &Deliverable| {
+                d.metadata.get("kind").and_then(|k| k.as_str()) == Some("manual")
+                    || crate::waves::is_gate(d)
+            };
             let matches_filter = |d: &Deliverable| {
                 metadata_filter
                     .as_ref()
@@ -1706,7 +1709,15 @@ impl Planner for BasicCpmPlanner {
                     };
                     let status = state.statuses.get(&d.id);
                     if is_manual(d) {
-                        block("MANUAL", "manual deliverable; never leased".to_string());
+                        block(
+                            "MANUAL",
+                            if crate::waves::is_gate(d) {
+                                "gate deliverable; never leased, close it with plan.accept"
+                            } else {
+                                "manual deliverable; never leased"
+                            }
+                            .to_string(),
+                        );
                     } else if state.locks.contains_key(&d.id) {
                         block("LOCKED", "held by an active lease".to_string());
                     } else if !is_reacquirable(state, d) {

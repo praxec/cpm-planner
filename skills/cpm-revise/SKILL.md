@@ -86,6 +86,8 @@ plan.export {"plan_id": "<plan_id>"}
 
 - Check `critical_path` and `milestones` again (`cpm-plan` section 4); level again with
   `plan.schedule` if capacity matters.
+- Adding work to a wave whose gate already passed invalidates that evidence: make the gate consume
+  it and run the gate again. Re-optimising remaining work must not touch leased or complete work.
 - If scope changed, re-baseline with a reason: `plan.baseline {plan_id, reason}` (`cpm-ev`).
 - Commit the plan file with the code it describes.
 

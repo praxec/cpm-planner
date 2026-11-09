@@ -47,21 +47,22 @@ That file is the only definition. Never keep a scratch graph elsewhere. Rules in
   `artifact` (default) or `interface` (target sets `metadata.contract: true`). Both are
   finish-to-start. `lag_hours` is a minimum wait.
 
-### Model delivery waves, not one CI cycle per code task
+### Code in bulk; put heavy work in gates
 
-For software, map branch integration, build/test, promotion, approvals, deployment and acceptance
-as artifacts with observed durations. Keep implementation parallel, join compatible changes into
-one integration-wave artifact, then run the expensive full gate once per wave. Keep fast
-changed-scope checks near each change.
+Anything slow and fixed-cost is a gate deliverable with `metadata.kind: "gate"`: full build, full
+regression, a push or PR that starts CI, merge, deploy, release. Give it an observed `duration_hours`
+or `estimate`. Work deliverables list only cheap targeted checks in `metadata.verify` (changed code,
+affected contracts and consumers) and never push, open a PR or run the full suite. Read the CI
+triggers first, so you know which actions start a pipeline.
 
-A gate artifact is its immutable evidence. Record the governed tree/image, dependency
-lock/toolchain, test-contract version and environment in metadata; reuse evidence across commits
-only when that identity matches. Change-triggered campaigns create no new proof when unchanged.
-
-Before syncing, count each fixed-cost gate and its total wall time. If repeats dominate the
-makespan, author an integration-wave variant. Split waves for conflicting files, trust boundaries,
-shared-fixture invalidation or excessive feedback batches. See the software-delivery section of
-[deliverable-cpm](../deliverable-cpm/SKILL.md) for the full method.
+Shape: work deliverables → integration candidate (one build and lint on the merged tree) →
+regression gate → PR and release. Default to **one wave for the whole project**. Add a boundary only
+for a concrete reason in `metadata.boundary_reason`: later work consumes a released artifact, a human
+decision changes scope, an irreversible migration, or a trust boundary. Edges are physical hand-overs
+only; worker limits go in `plan.schedule`, never in an edge. Later work consumes code and contracts
+rather than a gate's receipt where it can. Example:
+[milestone-plan.json](../deliverable-cpm/examples/milestone-plan.json); full method in
+[deliverable-cpm](../deliverable-cpm/SKILL.md#software-delivery-code-in-bulk-gate-at-milestones).
 
 A worked file: [small-plan.json](../deliverable-cpm/examples/small-plan.json).
 
@@ -76,7 +77,7 @@ Fix every finding and lint again until `clean` is true. Never work around a find
 | Code | Fix |
 |---|---|
 | `CYCLE` | break the loop it lists; one edge is not real consumption |
-| `UNKNOWN_PREREQUISITE`, `DUPLICATE_ID`, `RESERVED_ID`, `INVALID_VALUE` | fix the id or value (`__start__`, `__finish__` are reserved) |
+| `UNKNOWN_PREREQUISITE`, `DUPLICATE_ID`, `RESERVED_ID`, `INVALID_VALUE` | fix the id or value |
 | `UNORDERED_FILE_OVERLAP` | order the two, split the file, or make every claim `{path, mode: "append"}` |
 | `TOO_MANY_DELIVERABLES` | at most 5000; split into several plan lines |
 | `REDUNDANT_EDGE` | delete it; another path implies it |
@@ -84,6 +85,13 @@ Fix every finding and lint again until `clean` is true. Never work around a find
 | `INTERFACE_EDGE_NOT_CONTRACT` | set `metadata.contract: true` on the target, or use `artifact` |
 | `FEEDS_NO_MILESTONE` | cut the deliverable, or add the milestone it serves |
 | `NO_ARTIFACT`, `NO_MILESTONE` | add `metadata.artifact` or a milestone |
+| `RESOURCE_CONSTRAINT_EDGE` | delete the edge; set the limit in `plan.schedule` capacities |
+| `UNDECLARED_GATE`, `UNGATED_WORK` | move heavy work to a gate (`metadata.heavy: false` if only mentioned); make a gate consume the work |
+| `WAVE_TOO_SMALL`, `GATE_TIME_DOMINATES`, `WAVE_BOUNDARY_UNJUSTIFIED` | merge waves, or state a real `metadata.boundary_reason` |
+| `GATE_NO_DURATION`, `GATE_WITHOUT_MILESTONE` | add the gate's observed time; add the milestone it proves |
+
+Read `waves` in the result: each wave's `gates`, `deliverables` and `work_per_gate_hour`, each
+milestone's `class` (`wave` or `checkpoint`), and `gate_fraction`. Don't judge heaviness from prose.
 
 ## 3. Sync
 
@@ -92,9 +100,8 @@ plan.sync {"path": ".cpm-planner/plans/<name>/main.json"}
 ```
 
 It returns `plan_id`, `name`, `variant`, `revision`, `created`, `changed` and `diff`. Keep the
-`plan_id`; every later call uses it. Any `name`, `variant` or `project` you pass must match the
-path. Always sync a named line from its file: an unnamed `plan.submit` plan cannot be
-adopted into a named line later, and its completions would have to be re-accepted.
+`plan_id`. Any `name`, `variant` or `project` you pass must match the path. Always sync a named line
+from its file: an unnamed `plan.submit` plan cannot be adopted into a named line later.
 
 ## 4. Check the critical path and milestones
 
@@ -122,31 +129,26 @@ plan.schedule {"plan_id": "<plan_id>", "capacities": {"agent": 1, "worker": 2, "
 ```
 
 - `plan.schedule` takes `graph` or `plan_id`, not `path`. Optional: `resource_key` (default
-  `owner`, read from `metadata`) and `project_buffer_pct` (0..100, default 25).
-- Every resource that carries work needs at least 1 unit, else `INVALID_CAPACITIES` (it
-  lists the missing ones).
+  `owner`) and `project_buffer_pct` (0..100, default 25).
+- Every resource that carries work needs at least 1 unit, else `INVALID_CAPACITIES`.
 
 Read:
 - `makespan` against `cpm_makespan`: the levelled one is the real schedule;
 - `driving_chain`: steps with `waited_on: "resource"` wait for capacity, not a dependency;
 - `load`: a resource near `utilisation` 1.0 is the bottleneck;
 - `project_buffer_hours` and `feeding_buffers`: the buffers to protect.
-- gate cardinality: how many times each fixed build/test/promotion gate executes, and what fraction
-  of the levelled makespan is repeated gate time rather than implementation.
 
 ## Stop when
 
 - lint is `clean`, the file is synced, `definition_drift` is `false`;
 - the critical path and milestones match your expectation, or you have explained why not;
-- you have reported the critical path, CPM and levelled makespan, the bottleneck and fixed-gate
-  cardinality, and offered `cpm-improve` if the user wants it shorter.
+- you have reported the critical path, CPM and levelled makespan, the bottleneck and the wave
+  count with `gate_fraction`, and offered `cpm-improve` if the user wants it shorter.
 
 ## Pitfalls
 
 - Planner refusals come back as JSON-RPC `-32603` internal errors, not tool errors. Read
   the message: it names the code (`INVALID_GRAPH`, `INVALID_CAPACITIES`, ...).
-- Monte Carlo on point estimates has no spread, so P80 equals the deterministic makespan
-  and the response does not say so. Use three-point `estimate`s where risk matters.
-- A false "do A first" edge with nothing consumed lengthens the critical path; a missing
-  edge shows up later as rework. See section 2 of
-  [deliverable-cpm](../deliverable-cpm/SKILL.md) for the common cases.
+- Monte Carlo on point estimates has no spread, so P80 equals the deterministic makespan.
+- A false "do A first" edge lengthens the critical path; a missing edge shows up later as
+  rework. See section 2 of [deliverable-cpm](../deliverable-cpm/SKILL.md).
