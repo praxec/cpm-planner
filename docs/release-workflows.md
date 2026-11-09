@@ -91,6 +91,10 @@ the normal evidence review and `plan.accept` workflow still applies.
 
 ## Native delivery gates and integration waves
 
+Plan files express the same idea with `metadata.kind: "gate"` deliverables, whose wave structure
+`plan.lint` computes; see the [software-delivery skill guidance](../skills/deliverable-cpm/SKILL.md#software-delivery-code-in-bulk-gate-at-milestones).
+Run targeted tests during development, then the full regression once on the integrated candidate.
+
 `delivery_gates` is an optional bounded collection of first-class fixed-cost
 integration gates. A gate has a stable `id`, a descriptive `class`, bounded
 distinct `members` (`repository` and `promotion`), immutable `identity`, and

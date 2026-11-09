@@ -1113,3 +1113,136 @@ async fn ancestor_with_a_large_subtree_carries_no_signal() {
             .any(|(k, ids)| k == "missing_dependency" && ids.contains(&"hub".to_string()))
     );
 }
+
+// ---------------------------------------------------------------- waves and critical path
+
+fn gate_dv(id: &str, prereqs: &[&str], hours: f32, reason: Option<&str>) -> Value {
+    let edges: Vec<Value> = prereqs
+        .iter()
+        .map(|p| json!({ "id": p, "consumes": format!("{p} output") }))
+        .collect();
+    let mut metadata = json!({ "artifact": "receipt", "owner": "ci", "kind": "gate" });
+    if let Some(reason) = reason {
+        metadata["boundary_reason"] = json!(reason);
+    }
+    json!({ "id": id, "owned_files": [], "prerequisites": edges, "duration_hours": hours,
+            "metadata": metadata })
+}
+
+fn two_wave_graph() -> PlanGraph {
+    graph(vec![
+        dv("a", &[], 4.0),
+        dv("b", &["a"], 4.0),
+        gate_dv("g1", &["b"], 40.0, Some("published crate")),
+        dv("c", &["g1"], 4.0),
+        gate_dv("g2", &["c"], 1.0, None),
+    ])
+}
+
+#[tokio::test]
+async fn consecutive_waves_are_asked_whether_they_can_share_a_gate() {
+    let judge = FakeJudge::new();
+    run(&two_wave_graph(), &judge).await;
+    assert!(
+        judge
+            .kinds_sent()
+            .contains(&("wave_merge".to_string(), vec!["g1".into(), "g2".into()]))
+    );
+}
+
+#[tokio::test]
+async fn a_confident_wave_merge_answer_is_a_finding() {
+    let judge = FakeJudge::new().with("wave_merge", &["g1", "g2"], Answer::Noul { noul: 0.9 });
+    let report = run(&two_wave_graph(), &judge).await;
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| f.kind == cpm_planner::review::FindingKind::WaveMerge)
+    );
+}
+
+#[tokio::test]
+async fn a_gate_is_never_a_split_candidate() {
+    let judge = FakeJudge::new();
+    run(&two_wave_graph(), &judge).await;
+    assert!(
+        !judge
+            .kinds_sent()
+            .contains(&("split_candidate".to_string(), vec!["g1".to_string()]))
+    );
+}
+
+#[tokio::test]
+async fn adjacent_small_deliverables_on_a_gated_plan_are_merge_candidates() {
+    let g = graph(vec![
+        dv("a", &[], 1.0),
+        dv("b", &["a"], 1.0),
+        gate_dv("g", &["b"], 1.0, None),
+    ]);
+    let judge = FakeJudge::new();
+    run(&g, &judge).await;
+    assert!(
+        judge
+            .kinds_sent()
+            .contains(&("merge_candidate".to_string(), vec!["a".into(), "b".into()]))
+    );
+}
+
+#[tokio::test]
+async fn a_plan_without_gates_is_never_asked_about_merging_deliverables() {
+    let g = graph(vec![dv("a", &[], 1.0), dv("b", &["a"], 1.0)]);
+    let judge = FakeJudge::new();
+    run(&g, &judge).await;
+    assert!(
+        !judge
+            .kinds_sent()
+            .iter()
+            .any(|(kind, _)| kind == "merge_candidate")
+    );
+}
+
+fn critical_path_request() -> ReviewRequest {
+    ReviewRequest {
+        scope: cpm_planner::review::ReviewScope::CriticalPath,
+        ..ReviewRequest::default()
+    }
+}
+
+#[tokio::test]
+async fn a_critical_path_review_asks_only_about_false_dependencies() {
+    let judge = FakeJudge::new();
+    run_with(&two_chains(), &critical_path_request(), &judge).await;
+    assert!(
+        judge
+            .kinds_sent()
+            .iter()
+            .all(|(kind, _)| kind == "false_dependency")
+    );
+}
+
+#[tokio::test]
+async fn a_critical_path_review_skips_edges_off_the_critical_path() {
+    // a(4) -> c(2) is critical; x(1) -> y(1) has float.
+    let g = graph(vec![
+        dv("a", &[], 4.0),
+        dv("c", &["a"], 2.0),
+        dv("x", &[], 1.0),
+        dv("y", &["x"], 1.0),
+    ]);
+    let judge = FakeJudge::new();
+    run_with(&g, &critical_path_request(), &judge).await;
+    assert!(
+        judge
+            .kinds_sent()
+            .iter()
+            .all(|(_, ids)| ids == &["a".to_string(), "c".to_string()])
+    );
+}
+
+#[tokio::test]
+async fn a_review_reports_the_critical_path_it_saw() {
+    let judge = FakeJudge::new();
+    let report = run_with(&two_chains(), &critical_path_request(), &judge).await;
+    assert_eq!(report.critical_path, ["a", "c"]);
+}

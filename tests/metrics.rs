@@ -34,6 +34,7 @@ fn clean() -> LintReport {
     LintReport {
         clean: true,
         findings: vec![],
+        waves: None,
     }
 }
 
@@ -191,6 +192,7 @@ fn lint_counts_are_copied_from_report() {
             finding(Severity::Warning),
             finding(Severity::Info),
         ],
+        waves: None,
     };
     let s = scorecard(&g, &cpm(&g), None, &lint);
     assert_eq!((s.lint_errors, s.lint_warnings), (2, 1));

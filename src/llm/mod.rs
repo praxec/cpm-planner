@@ -17,6 +17,7 @@
 //! before they are built, so neither logs, errors, audit records nor tool
 //! output can carry it.
 
+pub mod command;
 pub mod jev;
 pub mod openrouter;
 
@@ -148,6 +149,9 @@ pub enum ConfigError {
     /// configured" so callers can say why. The path is not kept.
     #[error("{OPENROUTER_KEY_FILE_ENV}: key file ignored: {reason}")]
     KeyFileIgnored { reason: KeyFileIgnoredReason },
+    /// The review provider settings are unusable. No value is kept.
+    #[error("CPM_REVIEW_PROVIDER: {reason}")]
+    InvalidReviewProvider { reason: &'static str },
 }
 
 impl ConfigError {
@@ -169,6 +173,9 @@ impl ConfigError {
             }
             Self::KeyFileIgnored { reason } => {
                 format!("key file ignored: {reason} ({OPENROUTER_KEY_FILE_ENV})")
+            }
+            Self::InvalidReviewProvider { reason } => {
+                format!("review provider invalid: {reason}")
             }
         }
     }
@@ -462,6 +469,8 @@ pub enum JudgmentErrorKind {
     Transport,
     /// The questions or state were rejected locally before sending.
     InvalidRequest,
+    /// A delegated review adapter declined to answer.
+    Refused,
 }
 
 impl JudgmentErrorKind {
@@ -475,6 +484,7 @@ impl JudgmentErrorKind {
             Self::Decode => "decode",
             Self::Transport => "transport",
             Self::InvalidRequest => "invalid_request",
+            Self::Refused => "refused",
         }
     }
 }
@@ -500,6 +510,19 @@ pub struct JudgmentError {
 }
 
 impl JudgmentError {
+    /// Build an error from text that holds no secret, cut to
+    /// [`MAX_ERROR_MESSAGE_CHARS`].
+    pub fn new(kind: JudgmentErrorKind, message: impl AsRef<str>) -> Self {
+        Self {
+            kind,
+            message: message
+                .as_ref()
+                .chars()
+                .take(MAX_ERROR_MESSAGE_CHARS)
+                .collect(),
+        }
+    }
+
     /// Build an error whose message is [`ApiKey::excerpt`]ed: scrubbed of
     /// `key`, then cut to [`MAX_ERROR_MESSAGE_CHARS`].
     pub fn scrubbed(kind: JudgmentErrorKind, message: impl AsRef<str>, key: &ApiKey) -> Self {

@@ -1,6 +1,6 @@
 ---
 name: cpm-ev
-description: Use when tracking a cpm-planner plan (plan.* tools) against a baseline with earned value; when asked to baseline or re-baseline a plan, report schedule or cost performance (PV, EV, AC, SV, CV, SPI, CPI, EAC, ETC, VAC, TCPI), take a status snapshot, explain SPI_BELOW_0_9 or CPI_BELOW_0_9 alerts, or read null or undefined ratios. Covers plan.baseline (start, working calendar, reason), plan.ev (as_of), plan.snapshot (json or markdown, backfilled) and acting on alerts.
+description: Use when tracking a cpm-planner plan (plan.* tools) against a baseline with earned value; when asked to baseline or re-baseline a plan, report schedule or cost performance (PV, EV, AC, SV, CV, SPI, CPI, EAC, ETC, VAC, TCPI), take a status snapshot, explain SPI_BELOW_0_9 or CPI_BELOW_0_9 alerts, or read null or undefined ratios. Covers plan.baseline (start, working calendar, reason), plan.ev (as_of), plan.snapshot (json or markdown, backfilled) and acting on alerts. Never hand-calculate these numbers; always read them from plan.ev.
 ---
 
 # cpm-ev: baseline, measure, snapshot, act
@@ -62,7 +62,13 @@ plan.baseline {"plan_id": "<plan_id>", "start": "2026-10-12T00:00:00+02:00",
   retroactively and marks it `backfilled: true` (reported by `plan.ev`). It must not be in
   the future or before the plan's creation (`INVALID_VALUE`).
 
-## 2. Read
+## 2. Read, never calculate
+
+`plan.ev` is the only source of these numbers. Never compute PV, EV, AC, SPI or CPI yourself from
+`plan.status`, estimates or memory, even for a quick answer: the tool holds earning rules, leased
+hours, calendars and baselines that a hand calculation misses. If it fails, report the error and fix
+the cause (`NOT_BASELINED`: take the baseline in section 1). Don't substitute an estimate. The tool is
+`plan.ev`.
 
 ```text
 plan.ev {"plan_id": "<plan_id>", "as_of": "2026-10-14T18:00:00Z"}
@@ -79,6 +85,11 @@ plan.ev {"plan_id": "<plan_id>", "as_of": "2026-10-14T18:00:00Z"}
   0: cost spent, nothing earned). Report "not yet measurable", not zero.
 - AC sums every recorded hour, including removed and unbaselined deliverables. Unbaselined
   ids (added after the baseline) are listed in `excluded_unbaselined`.
+
+Each deliverable earns only its own budget. So with batched gates, finished code shows as earned
+while the gate's budget stays unearned, which is "verification pending", as long as the gate has
+effort: a gate with `duration_hours` and no effort or `estimate` has zero budget and earns nothing.
+A long wave lowers SPI until its gate closes. Never re-baseline to hide pending tests.
 
 ## 3. Snapshot
 

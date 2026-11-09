@@ -314,3 +314,17 @@ fn every_skill_body_is_at_most_150_lines() {
         "bodies over {BODY_LINE_LIMIT} lines: {long:?}"
     );
 }
+
+#[test]
+fn milestone_plan_example_lints_clean_with_a_single_wave() {
+    let text = std::fs::read_to_string(skill_dir().join("examples/milestone-plan.json"))
+        .expect("readable example plan");
+    let graph: PlanGraph = serde_json::from_str(&text).expect("example parses as a plan file");
+    let report = lint(&graph);
+    let waves = report.waves.as_ref().map_or(0, |w| w.wave_count);
+    assert!(
+        report.findings.is_empty() && waves == 1,
+        "waves {waves}: {:#?}",
+        report.findings
+    );
+}

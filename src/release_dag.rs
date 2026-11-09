@@ -736,6 +736,7 @@ pub fn lint_workflow(w: &ReleaseWorkflow) -> LintReport {
     LintReport {
         clean: v.findings.is_empty(),
         findings: v.findings,
+        waves: None,
     }
 }
 

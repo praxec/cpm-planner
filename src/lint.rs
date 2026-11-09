@@ -13,6 +13,7 @@ use crate::graph::{prerequisite_ids, reachability};
 use crate::plan::{
     Deliverable, FINISH_ID, FileMode, MAX_DELIVERABLES, PlanGraph, PrerequisiteKind, START_ID,
 };
+use crate::waves::{self, WaveReport};
 
 /// How serious a finding is. Orders errors first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -42,6 +43,10 @@ pub struct LintFinding {
 pub struct LintReport {
     pub clean: bool,
     pub findings: Vec<LintFinding>,
+    /// The computed delivery-wave structure; absent when the graph is too
+    /// malformed to analyse (a cycle, an unknown or duplicate id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waves: Option<WaveReport>,
 }
 
 fn finding(code: &str, severity: Severity, message: String, ids: Vec<String>) -> LintFinding {
@@ -262,8 +267,41 @@ fn is_low_information_consumes(consumes: &str) -> bool {
     ) || normalized.starts_with("dev head with ")
 }
 
+/// Consumes text describing who is free rather than what is handed over.
+/// Capacity belongs in `plan.schedule`; as an edge it fixes a worker limit
+/// into the critical path. Whole words, on the normalised lower-case text.
+fn names_resource_constraint(consumes: &str) -> bool {
+    const PHRASES: [&str; 12] = [
+        "agent availability",
+        "agent available",
+        "capacity",
+        "free worker",
+        "one at a time",
+        "same agent",
+        "same worker",
+        "scheduling",
+        "sequencing",
+        "worker availability",
+        "worker available",
+        "worker slot",
+    ];
+    let lowered = normalized_consumes(consumes).to_ascii_lowercase();
+    let spaced: String = lowered
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
+        .collect();
+    let text = format!(
+        " {} ",
+        spaced.split_whitespace().collect::<Vec<_>>().join(" ")
+    );
+    PHRASES
+        .iter()
+        .any(|phrase| text.contains(&format!(" {phrase} ")))
+}
+
 fn is_manual_merge(d: &Deliverable) -> bool {
     d.metadata.get("kind").and_then(serde_json::Value::as_str) == Some("manual")
+        || waves::is_gate(d)
 }
 
 /// Advisory findings for rationale text which technically exists, but does not
@@ -285,6 +323,19 @@ fn consumes_quality_findings(graph: &PlanGraph) -> Vec<LintFinding> {
                 continue;
             };
             let normalized = normalized_consumes(consumes);
+            if names_resource_constraint(&normalized) {
+                out.push(finding(
+                    "RESOURCE_CONSTRAINT_EDGE",
+                    Severity::Warning,
+                    format!(
+                        "'{}' <- '{}' consumes '{consumes}', a resource constraint rather than an \
+                         artifact; delete the edge and set capacity in plan.schedule",
+                        dependent.id,
+                        prerequisite.id()
+                    ),
+                    vec![dependent.id.clone(), prerequisite.id().to_string()],
+                ));
+            }
             if is_low_information_consumes(&normalized) {
                 out.push(finding(
                     "LOW_INFORMATION_CONSUMES",
@@ -377,6 +428,7 @@ pub fn lint(graph: &PlanGraph) -> LintReport {
         return LintReport {
             clean: false,
             findings: out,
+            waves: None,
         };
     }
 
@@ -532,9 +584,15 @@ pub fn lint(graph: &PlanGraph) -> LintReport {
     out.extend(consumes_quality_findings(graph));
 
     // Structure checks need a well-formed DAG with unique ids.
+    let mut wave_report = None;
     if !cyclic && !unknown && !duplicated {
         out.extend(structure_findings(graph));
+        wave_report = waves::analyze(graph);
+        if let Some(report) = &wave_report {
+            out.extend(waves::wave_findings(graph, report));
+        }
     }
+    out.extend(waves::undeclared_gate_findings(graph));
 
     if !graph.deliverables.iter().any(Deliverable::is_milestone) {
         out.push(finding(
@@ -564,6 +622,7 @@ pub fn lint(graph: &PlanGraph) -> LintReport {
     LintReport {
         clean,
         findings: out,
+        waves: wave_report,
     }
 }
 
