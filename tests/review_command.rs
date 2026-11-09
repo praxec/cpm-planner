@@ -1,10 +1,6 @@
 //! `plan.review` through a delegated adapter process (`CPM_REVIEW_PROVIDER=command`).
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
-
-use cpm_planner::llm::command::{CommandConfig, ReviewProvider, readiness};
+use cpm_planner::llm::command::{ReviewProvider, readiness};
 
 fn lookup(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
     move |name| {
@@ -74,23 +70,25 @@ fn a_disabled_provider_is_not_ready() {
     assert_eq!(report["ready"], false);
 }
 
-fn config(path: &Path, timeout_ms: u64) -> CommandConfig {
-    CommandConfig {
-        path: PathBuf::from(path),
-        forward_env: Vec::new(),
-        timeout: Duration::from_millis(timeout_ms),
-    }
-}
-
 #[cfg(unix)]
 mod adapter {
-    use super::*;
-    use cpm_planner::llm::command::CommandJudge;
+    use cpm_planner::llm::command::{CommandConfig, CommandJudge};
     use cpm_planner::llm::{JudgmentErrorKind, JudgmentModel, Question};
     use cpm_planner::plan::PlanGraph;
     use cpm_planner::review::{Judge, ReviewRequest, ReviewStatus, review};
     use serde_json::json;
+    use std::collections::BTreeMap;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    fn config(path: &Path, timeout_ms: u64) -> CommandConfig {
+        CommandConfig {
+            path: PathBuf::from(path),
+            forward_env: Vec::new(),
+            timeout: Duration::from_millis(timeout_ms),
+        }
+    }
 
     fn script(dir: &Path, body: &str) -> PathBuf {
         let path = dir.join("adapter.sh");
