@@ -425,6 +425,9 @@ Set these in a client's `env` block (or `-e`/`--env` flag, or `docker run -e`). 
 | `CPM_MAX_TTL_SECS` | `28800` (8h) | Server-side ceiling for `ttl_seconds` on `plan.acquire_cohort` and `plan.heartbeat`; larger requested values are clamped. Must be an integer in 1..=2592000 (at most 30 days) — any other value aborts startup. |
 | `OPENROUTER_API_KEY` | unset | OpenRouter key for `plan.review`. Unset or blank: `plan.review` reports `review_unavailable` ("no OpenRouter key configured"). Never logged or returned. |
 | `CPM_OPENROUTER_KEY_FILE` | unset | File holding the OpenRouter key (contents trimmed; at most 4096 bytes), used when `OPENROUTER_API_KEY` is unset. On unix a world-readable (`o+r`) or empty file is ignored with a warning (`chmod 600` it). |
+| `CPM_REVIEW_PROVIDER` | `direct` | Who answers `plan.review`: `direct` (OpenRouter, using the key settings here), `command` (the adapter below) or `disabled`. There is no fallback between providers. `cpm-planner review doctor` reports readiness by setting name, never by value. |
+| `CPM_REVIEW_COMMAND` | unset | Absolute path of the review adapter for `CPM_REVIEW_PROVIDER=command`. See [docs/review-provider.md](docs/review-provider.md). |
+| `CPM_REVIEW_COMMAND_ENV` | unset | Comma-separated variable names to pass to the adapter, whose environment is otherwise cleared. It may not name the OpenRouter key variables. |
 | `CPM_JEV_MODEL` | `typesafe/jev-1.13` | Jev model id for `plan.review`: at most 128 characters of `A-Z a-z 0-9 . _ : / -`, and never containing the key; anything else is logged (naming the variable, not the value) and makes `plan.review` unavailable. |
 | `CPM_JEV_ENDPOINT` | `https://openrouter.ai/api/v1/systemone` | Jev endpoint URL: `https://`, or `http://` only for a loopback host, with no credentials. |
 | `CPM_LLM_TIMEOUT_SECS` | `30` | Bound on each LLM call, integer seconds in 1..=300. |

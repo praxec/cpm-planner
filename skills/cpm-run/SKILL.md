@@ -17,23 +17,17 @@ Calling the tools: see [Calling the tools](../deliverable-cpm/SKILL.md#calling-t
 - The variant is selected (`cpm-improve`, or the only variant) and, for earned value,
   baselined (`cpm-ev`). Only the selected variant executes; others refuse with
   `VARIANT_NOT_SELECTED`.
-- `plan.status {plan_id}` shows the `ready` set, `plan_complete` and `locks_held`.
+- `plan.status {plan_id}` shows `ready`, `plan_complete` and `locks_held`.
 - Not for: changing what a deliverable is or adding work → use cpm-revise.
 
-**Selecting the plan.** Every execution call takes exactly one of `plan_id`, `plan`
-(a plan line name, resolved to its selected variant) or `active: true` (the project's
-single unarchived line whose selected variant is unarchived and not complete), plus an
-optional `project` (default: the discovered root) for `plan` and `active`; `plan_id`
-refuses `project`. A recurring job or a fresh agent should find its plan with
-`{"active": true}` (or `{"plan": "<line>"}`) rather than a remembered `plan_id`, so it
-follows the work to the next line. Once you hold a lease, use the `plan_id` that
-`plan.acquire_cohort` returned for `plan.heartbeat`, `plan.mark_status` and the final
-`plan.status`: `active` changes, or becomes `AMBIGUOUS_ACTIVE_PLAN`, as soon as another
-line goes live, and it stops matching once the plan is complete. A pinned id of an
-archived variant still reads through `plan.status` and `plan.ev`, which report
-`archived: true` and `active_plan` naming where the live work is, while an execution
-call on it refuses with `ARCHIVE_REFUSED`. `active` with no such line is
-`NO_ACTIVE_PLAN`; with several it is `AMBIGUOUS_ACTIVE_PLAN`, naming them.
+**Selecting the plan.** Every execution call takes exactly one of `plan_id`, `plan` (a line name,
+resolved to its selected variant) or `active: true` (the project's single live line), plus an optional
+`project` for `plan` and `active`. A fresh agent finds its plan with `{"active": true}` or
+`{"plan": "<line>"}`. Once you hold a lease, use the `plan_id` that `plan.acquire_cohort` returned:
+`active` changes or becomes `AMBIGUOUS_ACTIVE_PLAN` when another line goes live, and stops matching
+a complete plan. `NO_ACTIVE_PLAN` means no live line. An archived variant's id still reads through
+`plan.status` and `plan.ev` (with `archived: true` and `active_plan`), and refuses execution with
+`ARCHIVE_REFUSED`.
 
 ## 1. Claim a cohort
 
@@ -42,8 +36,8 @@ plan.acquire_cohort {"plan_id": "<plan_id>", "caller_id": "agent-7", "max_count"
                      "filter": {"metadata": {"owner": "agent"}}, "ttl_seconds": 1800}
 ```
 
-- Required: `plan_id`, `caller_id` (stable per worker), `max_count`.
-- Optional: `ids: [...]` (only those; unknown id is `DELIVERABLE_NOT_FOUND`),
+- Required: `plan_id`, `caller_id` (stable per worker).
+- Optional: `max_count` (default: the number of `ids`, else 1), `ids: [...]` (only those; unknown id is `DELIVERABLE_NOT_FOUND`),
   `filter: {"metadata": {key: value}}` (every pair must match; ids that don't match are
   ignored, not reported), `ttl_seconds` (default 300, clamped to the server maximum).
 - It hands out ready deliverables whose `owned_files` don't conflict, in priority order.
@@ -58,10 +52,9 @@ plan.force_release {"plan_id": "<plan_id>", "deliverable_id": "<id>",
                     "reason": "runner crashed; fixed disk", "reset_counters": true}
 ```
 
-The first acquire or mark on a plan with no baseline may take one automatically and report
-`baseline_taken` (with `CPM_BASELINE_MODE=refuse` it fails with `BASELINE_REQUIRED`).
-`plan.status` lists `ready` by ascending float, while `plan.acquire_cohort` leases by
-latest start, so the two orders can differ.
+The first acquire or mark with no baseline may take one and report `baseline_taken`
+(`CPM_BASELINE_MODE=refuse` fails with `BASELINE_REQUIRED`). `plan.status` lists `ready` by
+ascending float, while `plan.acquire_cohort` leases by latest start.
 
 ## 2. Keep the lease
 
@@ -86,26 +79,22 @@ plan.mark_status {"plan_id": "<plan_id>", "deliverable_id": "<id>", "caller_id":
   `{"status": "failed", "reason": "..."}`. Complete and failed release the lock.
 - `earned_pct`: integer 0..100, only meaningful with `in_progress`; ignored with `complete`,
   and refused with `INVALID_ACTUALS` with `ready` or `failed`.
-- `actual_effort_hours`: total so far (not a delta), 0..1000000; it replaces the leased
-  hours as actual cost.
-- `evidence`: up to 2048 chars, appended; at most 100 entries per deliverable. Past that,
-  any mark carrying `evidence` (including `complete`) is refused with `INVALID_ACTUALS`, so
-  omit `evidence` then.
+- `actual_effort_hours`: total so far (not a delta), 0..1000000; replaces leased hours as AC.
+- `evidence`: up to 2048 chars, appended; at most 100 entries, then any mark carrying `evidence`
+  (including `complete`) is `INVALID_ACTUALS`, so omit it then.
 - Bad values are `INVALID_ACTUALS`.
 - Mark `complete` only when the artifact meets its acceptance criteria, with evidence.
-- During development, run changed-code and affected-contract/consumer tests. Full regression
-  belongs on the integrated milestone's PR candidate before merge, not every task/handoff.
-- Report implementation-complete separately from verification-pending; unrun checks earn no
-  verification credit. Broaden scope for impact/failures; follow the shared software-delivery method.
-- A `failed` mark leaves the deliverable Failed (acquire reports `NOT_READY`). To retry,
-  hand it back with a lockless `{"status": "ready"}` mark, then acquire it again.
+  A report of done is not acceptance.
+- For work deliverables, run only `metadata.verify` (returned with the lease). Never push, open a
+  PR or run the full suite in one; broaden targeted checks when a failure or blast radius warrants.
+- A `failed` mark leaves it Failed (`NOT_READY`). Retry with a lockless `{"status": "ready"}` mark.
 - Three explicit `failed` marks trip the circuit breaker, counted across those retries: the
   next acquire auto-fails it. Revive it with `plan.force_release {..., reset_counters: true}`
   after fixing the cause.
 
 ## 4. Owner and manual work (no lease)
 
-`metadata.kind: "manual"` work is never leased. Close it, and any owner sign-off, with:
+`metadata.kind: "manual"` and `"gate"` work is never leased. Close it, and any owner sign-off, with:
 
 ```text
 plan.accept {"plan_id": "<plan_id>", "deliverable_id": "<id>", "accepted_by": "matthew",
@@ -122,6 +111,15 @@ plan.mark_status {"plan_id": "<plan_id>", "deliverable_id": "<id>", "caller_id":
                   "status": {"status": "complete"}, "actual_effort_hours": 1.5}
 ```
 
+## Gates: the expensive operations
+
+- Start a gate only when `plan.status` lists it `ready`: a lockless `in_progress`, then one run.
+  Take other ready work while it runs; the wait belongs to the runner.
+- A red run is not a `failed` mark, which counts toward the circuit breaker. Add the run as `evidence`
+  on a lockless `in_progress`, read the whole run, fix every failure with focused checks, re-run once.
+- Close with `plan.accept` and the green run for the final tree. After 2 red runs or a fix that
+  changes scope or a contract, use `cpm-revise`. After the merge, delete merged worktrees and branches.
+
 ## Lockless marks
 
 A `plan.mark_status` without a lease is allowed and audited:
@@ -134,19 +132,23 @@ A `plan.mark_status` without a lease is allowed and audited:
 ## Loop and stop
 
 1. `plan.acquire_cohort`; if nothing was leased, read `blocked` and `needs_operator`.
-2. Do the work, heartbeating; mark `complete` with evidence, or `failed` with a reason.
+2. Do the work, heartbeating; mark `complete` with evidence, or `failed` with a reason. A subagent
+   gets the artifact, `owned_files`, `metadata.verify`, the branch, and the no-heavy-work rule.
 3. Accept manual work as it becomes ready (`plan.status` `ready` set).
 4. Repeat until `plan.status` shows `plan_complete: true`, or you are blocked on a person,
    a lapse limit or a failure that needs a decision. Report which.
 
-Take snapshots at a steady cadence while running (`cpm-ev`). If the definition must change
-mid-run, use `cpm-revise`.
+Take snapshots at a steady cadence (`cpm-ev`). If the definition must change, use `cpm-revise`.
+
+**Adapt at natural pauses.** When a cohort closes or a gate returns, check: `plan.ev` SPI or CPI
+below 0.9, a gate over 1.5 times its estimate, a moved `critical_path`, a 50% overrun, or ready work
+waiting only on capacity. On a signal, run `cpm-improve` on remaining work. Change only unleased,
+incomplete work, never interrupt a lease or running gate, and keep the plan if the saving is small.
 
 ## Pitfalls
 
 - Planner refusals (`PREREQUISITES_INCOMPLETE`, `LOCK_HELD`, ...) come back as JSON-RPC
   `-32603` internal errors, not tool errors. Read the code at the start of the message.
-- Work started before its prerequisites are complete cannot record actual cost until they
-  close: a lockless mark is refused until then. Note the hours and record them afterwards.
-- `plan.accept` needs the second lockless mark for AC every time; it is easy to forget.
+- A lockless mark is refused until prerequisites close: note early hours and record them later.
+- `plan.accept` needs the second lockless mark for AC every time.
 - `actual_effort_hours` is cumulative; sending a delta understates AC.

@@ -7,16 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-09
+
+### Added
+
+- A gate deliverable type, `metadata.kind: "gate"`, for expensive fixed-cost operations such as full
+  regression, CI, merge and release. Gates are never leased and close with `plan.accept`.
+- `plan.lint` returns a computed `waves` report: each wave's gates, deliverables and hours,
+  `work_per_gate_hour`, `gate_fraction`, ungated work, and each milestone's class (`wave` or
+  `checkpoint`).
+- Lint findings `UNDECLARED_GATE`, `UNGATED_WORK`, `WAVE_TOO_SMALL`, `GATE_TIME_DOMINATES`,
+  `WAVE_BOUNDARY_UNJUSTIFIED`, `GATE_NO_DURATION`, `GATE_WITHOUT_MILESTONE`,
+  `RESOURCE_CONSTRAINT_EDGE` and `WORK_WAITS_ON_GATE`.
+- `plan.review` asks about `wave_merge` and `merge_candidate`, and `scope: "critical_path"` spends
+  the review on false dependencies along the critical path. Reports include `critical_path`, so an
+  agent can repeat the review until the path stabilises.
+- `CPM_REVIEW_PROVIDER=direct|command|disabled` and `CPM_REVIEW_COMMAND`, so a versioned adapter
+  process can answer `plan.review` without the key reaching this server (#119).
+- `cpm-planner review doctor` reports review readiness by setting name, never by value (#119).
+
+### Changed
+
+- CPM skills plan one large wave by default: work deliverables run only targeted `metadata.verify`
+  checks, and the full suite, CI, PR and release run at gates. Skills also add adaptive
+  re-optimisation at natural pauses, physical-only dependencies, a critical-path vetting loop, and
+  a rule to read earned value from `plan.ev` rather than calculate it.
+- `plan.acquire_cohort` `max_count` is optional: it defaults to the number of `ids`, else 1 (#118).
+- Plans whose text names a heavy operation in an ordinary deliverable, or whose edges name worker
+  capacity, now lint with a warning, so `clean` can become false for them.
+
+### Fixed
+
+- The server starts and serves reads on a read-only database holding expired locks, skipping
+  quarantine and the state receipt; writes still fail (#120).
+- The `opening planner database` log line now holds only the database path, with the state mode on
+  its own line, so supervisors no longer read `state_mode` as part of the path (#117).
+
 ### Security
 
 - Upgrade bundled SQLite through `rusqlite` 0.41 and require `rmcp` 3.9 or newer to
   address RUSTSEC-2026-0459 and RUSTSEC-2026-0462 without advisory exceptions.
-
-### Changed
-
-- CPM skills now specify changed-code and affected-contract tests during development, with full
-  regression on the integrated milestone's PR candidate before merge. Implementation completion
-  and verified acceptance have separate evidence and earned-value credit.
 
 ## [0.5.0] - 2026-10-27
 

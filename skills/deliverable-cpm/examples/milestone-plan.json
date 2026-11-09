@@ -1,0 +1,170 @@
+{
+  "deliverables": [
+    {
+      "id": "export-contract",
+      "owned_files": [
+        "docs/export-api.md"
+      ],
+      "prerequisites": [],
+      "estimated_effort_hours": 1.0,
+      "metadata": {
+        "artifact": "docs/export-api.md: request and response schema",
+        "owner": "agent",
+        "contract": true,
+        "verify": [
+          "markdown link check on docs/export-api.md"
+        ]
+      }
+    },
+    {
+      "id": "export-service",
+      "owned_files": [
+        "src/export/service.rs",
+        "tests/export_service.rs"
+      ],
+      "prerequisites": [
+        {
+          "id": "export-contract",
+          "consumes": "export service response schema",
+          "kind": "interface"
+        }
+      ],
+      "estimate": {
+        "optimistic": 4.0,
+        "likely": 6.0,
+        "pessimistic": 12.0
+      },
+      "earning_rule": "fifty_fifty",
+      "metadata": {
+        "artifact": "src/export/service.rs with its targeted tests passing",
+        "owner": "agent",
+        "verify": [
+          "cargo nextest run --test export_service"
+        ]
+      }
+    },
+    {
+      "id": "export-ui",
+      "owned_files": [
+        "web/src/export/ExportDialog.tsx",
+        "web/src/export/ExportDialog.test.tsx"
+      ],
+      "prerequisites": [
+        {
+          "id": "export-contract",
+          "consumes": "export dialog request schema",
+          "kind": "interface"
+        }
+      ],
+      "estimate": {
+        "optimistic": 3.0,
+        "likely": 5.0,
+        "pessimistic": 8.0
+      },
+      "earning_rule": "fifty_fifty",
+      "metadata": {
+        "artifact": "ExportDialog with its targeted tests passing, built against a fake of the contract",
+        "owner": "agent",
+        "verify": [
+          "npm test -- ExportDialog"
+        ]
+      }
+    },
+    {
+      "id": "export-cli",
+      "owned_files": [
+        "src/cli/export.rs",
+        "tests/export_cli.rs"
+      ],
+      "prerequisites": [
+        {
+          "id": "export-contract",
+          "consumes": "export command flags and schema",
+          "kind": "interface"
+        }
+      ],
+      "estimated_effort_hours": 3.0,
+      "metadata": {
+        "artifact": "export subcommand with its targeted tests passing",
+        "owner": "agent",
+        "verify": [
+          "cargo nextest run --test export_cli"
+        ]
+      }
+    },
+    {
+      "id": "export-candidate",
+      "owned_files": [
+        {
+          "path": "CHANGELOG.md",
+          "mode": "append"
+        }
+      ],
+      "prerequisites": [
+        {
+          "id": "export-service",
+          "consumes": "service commits"
+        },
+        {
+          "id": "export-ui",
+          "consumes": "dialog commits"
+        },
+        {
+          "id": "export-cli",
+          "consumes": "subcommand commits"
+        }
+      ],
+      "estimated_effort_hours": 1.0,
+      "metadata": {
+        "artifact": "integrate/export branch holding every commit of the wave, with build and lint passing once on the merged tree",
+        "owner": "agent",
+        "verify": [
+          "cargo build",
+          "cargo clippy --all-targets -- -D warnings"
+        ]
+      }
+    },
+    {
+      "id": "export-regression",
+      "owned_files": [],
+      "prerequisites": [
+        {
+          "id": "export-candidate",
+          "consumes": "integrate/export tree"
+        }
+      ],
+      "estimate": {
+        "optimistic": 1.0,
+        "likely": 1.5,
+        "pessimistic": 4.0
+      },
+      "metadata": {
+        "artifact": "green required-check run for the integrate/export tree",
+        "owner": "ci",
+        "kind": "gate",
+        "gate_class": "regression",
+        "verify": [
+          "push integrate/export once and open its pull request"
+        ]
+      }
+    },
+    {
+      "id": "export-release",
+      "owned_files": [],
+      "prerequisites": [
+        {
+          "id": "export-regression",
+          "consumes": "green run for the merged tree"
+        }
+      ],
+      "milestone": true,
+      "duration_hours": 0.5,
+      "metadata": {
+        "artifact": "merged, tagged and published export release",
+        "owner": "ci",
+        "kind": "gate",
+        "gate_class": "release"
+      }
+    }
+  ]
+}

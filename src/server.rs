@@ -85,6 +85,7 @@ use crate::earned_value::{
 };
 use crate::edits::GraphEdit;
 use crate::lint::{LintFinding, Severity};
+use crate::llm::command::{CommandJudge, ReviewProvider};
 use crate::llm::jev::JevJudge;
 use crate::llm::{ConfigError, JudgmentModel, LlmConfig};
 use crate::monte_carlo::MonteCarloRequest;
@@ -96,7 +97,7 @@ use crate::plan::{
 use crate::ports::Planner;
 use crate::project::ProjectRoot;
 use crate::resource_schedule::{ScheduleRequest, resource_schedule};
-use crate::review::{Judge, ReviewReport, ReviewRequest};
+use crate::review::{Judge, ReviewReport, ReviewRequest, ReviewScope};
 use crate::simulate::SimulateRequest;
 use chrono::{DateTime, Utc};
 use rmcp::ErrorData as McpError;
@@ -220,7 +221,9 @@ struct AcquireCohortArgs {
     #[serde(default)]
     project: Option<String>,
     caller_id: String,
-    max_count: usize,
+    /// Defaults to the number of `ids`, else 1.
+    #[serde(default)]
+    max_count: Option<usize>,
     #[serde(default)]
     ids: Option<Vec<String>>,
     #[serde(default)]
@@ -573,6 +576,8 @@ struct ReviewToolArgs {
     project_buffer_pct: Option<f32>,
     #[serde(default)]
     max_questions: Option<u16>,
+    #[serde(default)]
+    scope: ReviewScope,
 }
 
 // ---------------------------------------------------------------------------
@@ -851,7 +856,7 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                  Optional ttl_seconds sets the lease TTL (clamped to the \
                  server maximum). Optional ids targets specific deliverables \
                  and filter.metadata narrows by metadata equality; \
-                 deliverables with metadata.kind = \"manual\" are never \
+                 deliverables with metadata.kind = \"manual\" or \"gate\" are never \
                  leased. ids that do not match filter.metadata are ignored \
                  (not reported in blocked). The response carries blocked \
                  [{id, code, reason}], blocked_count, and needs_operator \
@@ -863,7 +868,7 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                 "type": "object",
                 "properties": with_plan_selector(json!({
                     "caller_id": { "type": "string" },
-                    "max_count": { "type": "integer", "minimum": 1 },
+                    "max_count": { "type": "integer", "minimum": 1, "description": "Most deliverables to lease. Default: the number of ids, else 1." },
                     "ids":       { "type": "array", "minItems": 1, "items": { "type": "string" } },
                     "ttl_seconds": { "type": "integer", "minimum": 1 },
                     "filter":    {
@@ -872,7 +877,7 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                         "additionalProperties": false
                     }
                 })),
-                "required": ["caller_id", "max_count"]
+                "required": ["caller_id"]
             })),
         ),
         Tool::new(
@@ -1405,7 +1410,8 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                     },
                     "resource_key": { "type": "string", "description": "Metadata key naming a deliverable's resource (default \"owner\"); requires capacities." },
                     "project_buffer_pct": { "type": "number", "minimum": 0, "maximum": 100, "description": "Project buffer percentage (default 25); requires capacities." },
-                    "max_questions": { "type": "integer", "minimum": 1, "maximum": 64, "description": "Question cap for the single Jev call (default 64); extra candidates are dropped and truncated is true." }
+                    "max_questions": { "type": "integer", "minimum": 1, "maximum": 64, "description": "Question cap for the single Jev call (default 64); extra candidates are dropped and truncated is true." },
+                    "scope": { "type": "string", "enum": ["full", "critical_path"], "description": "full (default) asks every kind. critical_path asks only false_dependency, only on edges between zero-float deliverables; re-run after applying a fix until the reported critical_path stops changing." }
                 },
                 "additionalProperties": false
             })),
@@ -1528,6 +1534,34 @@ impl PlanServer {
                 ReviewJudge::Unusable(reason)
             }
         };
+        self
+    }
+
+    /// Configure `plan.review` from the selected provider. A configured
+    /// provider never falls back to another: `direct` alone reads the
+    /// OpenRouter settings, through `direct_config`, and an unusable or
+    /// disabled provider leaves review unavailable with a stable reason.
+    pub fn with_review_provider(
+        mut self,
+        provider: Result<ReviewProvider, ConfigError>,
+        direct_config: impl FnOnce() -> Result<Option<LlmConfig>, ConfigError>,
+    ) -> Self {
+        match provider {
+            Ok(ReviewProvider::Direct) => return self.with_llm_config(direct_config()),
+            Ok(ReviewProvider::Command(config)) => {
+                tracing::info!("plan.review delegated to the configured command adapter");
+                self.judge = ReviewJudge::Model(Arc::new(CommandJudge::new(config)));
+            }
+            Ok(ReviewProvider::Disabled) => {
+                self.judge =
+                    ReviewJudge::Unusable("plan.review disabled by CPM_REVIEW_PROVIDER".into());
+            }
+            Err(err) => {
+                let reason = err.review_reason();
+                tracing::warn!(%reason, "review provider unusable; plan.review is unavailable");
+                self.judge = ReviewJudge::Unusable(reason);
+            }
+        }
         self
     }
 
@@ -1792,8 +1826,10 @@ impl PlanServer {
         let plan_id = self
             .resolve_plan_selector(parsed.plan_id, parsed.plan, parsed.active, parsed.project)
             .await?;
-        let mut request =
-            AcquireRequest::new(plan_id, CallerId(parsed.caller_id), parsed.max_count);
+        let max_count = parsed
+            .max_count
+            .unwrap_or_else(|| parsed.ids.as_ref().map_or(1, Vec::len));
+        let mut request = AcquireRequest::new(plan_id, CallerId(parsed.caller_id), max_count);
         if let Some(ids) = parsed.ids {
             request = request.with_ids(ids);
         }
@@ -2291,8 +2327,15 @@ impl PlanServer {
             resource_key,
             project_buffer_pct,
             max_questions,
+            scope,
         } = parse_args(args)?;
-        let request = review_request(capacities, resource_key, project_buffer_pct, max_questions)?;
+        let request = review_request(
+            capacities,
+            resource_key,
+            project_buffer_pct,
+            max_questions,
+            scope,
+        )?;
         let audited_plan_id = plan_id.clone();
         let graph = match self.resolve_graph(graph, plan_id, path).await {
             Ok(graph) => graph,
@@ -2343,6 +2386,7 @@ fn review_request(
     resource_key: Option<String>,
     project_buffer_pct: Option<f32>,
     max_questions: Option<u16>,
+    scope: ReviewScope,
 ) -> Result<ReviewRequest, McpError> {
     if let Some(cap) = max_questions {
         crate::review::check_max_questions(cap)
@@ -2371,6 +2415,7 @@ fn review_request(
     Ok(ReviewRequest {
         capacities,
         max_questions,
+        scope,
     })
 }
 
@@ -2629,7 +2674,7 @@ Tools (twenty-five total, all in the `plan` namespace):
   through plan.status/plan.ev with archived: true and active_plan.
   plan.submit          — submit a PlanGraph, get a plan_id (idempotent on identical graphs)
                         a prerequisite is an id string or {id, consumes?, kind?: artifact|interface, lag_hours?}; a deliverable's duration_hours (calendar time; when absent the default is the effort estimate, explicit or estimator-derived) and lag_hours (minimum wait after a prerequisite finishes) drive the schedule
-                        a milestone (milestone: true) is zero-length unless you give it an estimate or duration; it is still an ordinary deliverable someone must complete (accept or mark Complete), and it is not leased if metadata.kind=manual
+                        a milestone (milestone: true) is zero-length unless you give it an estimate or duration; it is still an ordinary deliverable someone must complete (accept or mark Complete), and it is not leased if metadata.kind=manual or gate
                         an optional earning_rule (zero_hundred default: 100% only when complete; fifty_fifty: 50% once in progress or any earned_pct is reported; weighted: the reported earned_pct) sets how earned value credits progress; it is part of the plan's identity
                         an optional estimate {optimistic, likely, pessimistic} (0 <= optimistic <= likely <= pessimistic) is a three-point effort estimate; scheduled length precedence is duration_hours > estimated_effort_hours > estimate.likely > 0 for a milestone > estimator default, and Monte Carlo samples the estimate only when neither duration_hours nor estimated_effort_hours is set
                         limits: at most 5000 deliverables; every hour value (effort, duration, lag, estimate) must be finite and between 0 and 1000000 (INVALID_GRAPH)
@@ -2658,7 +2703,7 @@ Tools (twenty-five total, all in the `plan` namespace):
   plan.baseline        — freeze the plan's CPM schedule (es/ef) and budgets (effort basis x metadata.cost_rate, default 1) as its next numbered earned-value baseline; optional start (RFC 3339, default now) and calendar {hours_per_day (0 < h <= 24, default 8), workdays (default mon..fri), utc_offset_minutes (default 0)} (omitted: wall-clock hours on the first baseline, the previous baseline's calendar on a re-baseline); optional backfill_from (RFC 3339) sets start retroactively and marks the baseline backfilled:true (reported by plan.ev) and must not be in the future or before the plan's creation time (INVALID_VALUE); re-baselining needs a non-blank reason (<= 2048 chars, INVALID_GRAPH otherwise) and keeps actuals and snapshots; baselines, actuals and snapshots belong to one variant, so a newly selected variant takes its own baseline 1 with no reason needed; selected, unarchived variant only; audited as plan.ev.baselined
   plan.ev              — earned-value report against the latest baseline as of as_of (RFC 3339, default now; as_of is the PV status date, while EV and AC reflect progress and actuals recorded up to the moment the call runs): baseline_number, backfilled (true when plan.baseline was given backfill_from), bac, pv, ev, ac, sv, cv, spi, cpi, eac, etc, vac, tcpi, per-deliverable rows, critical_float_consumed_hours, alerts (SPI_BELOW_0_9 / CPI_BELOW_0_9 when below 0.9 on the two latest stored non-backfilled snapshots by as_of of the current baseline; the current reading is not one of them), excluded_unbaselined; AC sums every recorded hour of the plan (removed and unbaselined deliverables included, at rate 1 when the baseline has no row); a baselined deliverable removed by plan.revise reports status "removed" and keeps its earned percent at removal (100 if complete), and re-adding it restarts its earned percent (hours keep accumulating); a ratio with a zero denominator is null and explained in `undefined` (never NaN); read-only on any variant, including an archived one (which reports archived: true and, when the project has exactly one active line, its active_plan name); NOT_BASELINED before plan.baseline
   plan.snapshot        — compute the plan.ev report and append it as a snapshot (as_of is the PV status date; EV and AC are as recorded when the call runs, so a snapshot whose as_of is more than an hour before taken_at is marked backfilled: true, raises no alerts and is skipped by later alerts); returns summary (undefined explains each null ratio; alerts consider only readings up to its own position: this snapshot and the latest earlier one by as_of of the current baseline, so a backfill never takes alerts from newer readings), snapshot_count and export of the newest 100 snapshots by as_of (ties by taken_at), oldest first, so a backfilled as_of lands in date order; a backfill older than those 100 is stored and counted but not listed: a list of summaries (format "json", default) or a Markdown table with columns date, PV, EV, AC, SPI, CPI, EAC (format "markdown"); selected, unarchived variant only; NOT_BASELINED before plan.baseline
-  plan.review          — optional AI review (read-only; graph, plan_id or path; optional capacities/resource_key/project_buffer_pct and max_questions 1..64, default 64): lint always runs and lint errors return status invalid_graph with no judge call; otherwise ONE batched call to Jev (TypeSafe's calibrated-judgment model, via OpenRouter) scores likely false dependencies, missing dependencies, split and interface-split candidates and crash options. Probabilities are advisory, not facts. proposals are plan.fork edit lists, each verified by simulate (lints clean, shortens the makespan) and ranked by hours_saved / max(cost, 1). Without an OpenRouter key, or with an unusable LLM setting, status is review_unavailable with a reason, plus lint; a provider failure is review_unavailable with "<class>: <message>". The plan graph is sent to OpenRouter
+  plan.review          — optional AI review (read-only; graph, plan_id or path; optional capacities/resource_key/project_buffer_pct, max_questions 1..64, default 64, and scope full or critical_path): lint always runs and lint errors return status invalid_graph with no judge call; otherwise ONE batched call to Jev (TypeSafe's calibrated-judgment model, via OpenRouter) scores likely false dependencies, missing dependencies, split and interface-split candidates, crash options, wave merges and merge candidates. Probabilities are advisory, not facts. proposals are plan.fork edit lists, each verified by simulate (lints clean, shortens the makespan) and ranked by hours_saved / max(cost, 1). CPM_REVIEW_PROVIDER=command delegates the judgment to the CPM_REVIEW_COMMAND adapter, with no fallback. Without an OpenRouter key, or with an unusable LLM setting, status is review_unavailable with a reason, plus lint; a provider failure is review_unavailable with "<class>: <message>". The plan graph is sent to OpenRouter
   plan.submit with a `name` (optional `project`/`variant`, variant defaults to "main") registers a named variant instead of an unnamed plan
   plan.lint, plan.simulate and plan.review take exactly one of an inline graph, a stored plan_id, or a plan-file path; plan.schedule takes graph or plan_id; plan.schedule and plan.simulate reject what plan.submit rejects, and plan.lint reports it as findings
 
@@ -2717,7 +2762,7 @@ deliverables are considered; unknown id -> DELIVERABLE_NOT_FOUND) and
 `filter: {"metadata": {key: value}}` (only deliverables whose metadata
 equals every pair; others are silently skipped). ids that do not match
 filter.metadata are ignored (not reported in blocked). Deliverables with
-metadata.kind = "manual" are never leased. With `ids`, each requested id
+metadata.kind = "manual" or "gate" are never leased. With `ids`, each requested id
 that is not leased appears in `blocked` with code MANUAL, NOT_READY,
 LOCKED, LAPSE_LIMIT, FILE_CONFLICT or MAX_COUNT.
 "#

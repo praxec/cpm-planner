@@ -38,6 +38,8 @@
 //! | `interface_split` | Noul | edges whose ends are both critical and whose kind is not `interface` | prerequisite's `L` desc, ids |
 //! | `split_candidate` | Score, [`SPLIT_LEVELS`] (5 levels) | non-milestones with `L >= `[`SPLIT_MIN_HOURS`] or `L >= `[`SPLIT_MEDIAN_FACTOR`]` × median L` (median over non-milestones with `L > 0`) | `L` desc, id |
 //! | `missing_dependency` | Noul | unordered pairs (neither reaches the other) with a heuristic score `> 0`, top [`MISSING_DEPENDENCY_TOP_K`] | score desc, ids |
+//! | `wave_merge` | Noul | each pair of consecutive waves from [`crate::waves::analyze`] | wave order |
+//! | `merge_candidate` | Noul | on plans with gates: edges between two work deliverables of one owner, each `L <= `[`MERGE_MAX_HOURS`], where the edge is the producer's only dependent and the consumer's only prerequisite | combined `L`, ids |
 //!
 //! The missing-dependency score adds [`MENTION_WEIGHT`] when either
 //! deliverable's `metadata.description` contains the other's id as a token
@@ -55,7 +57,8 @@
 //! [`MAX_CANDIDATE_PAIRS`], so the work is bounded on any graph.
 //!
 //! The selected lists are interleaved round-robin in the table's order
-//! (crash, false dependency, interface split, split, missing dependency)
+//! (crash, false dependency, interface split, split, missing dependency, wave
+//! merge, merge candidate)
 //! until the cap is reached, so truncation keeps every kind represented;
 //! `truncated` is true when candidates were left out. Question ids are
 //! `q00`, `q01`, … in selection order; each question's `instructions` is
@@ -101,7 +104,8 @@
 //!     (`SetDuration` instead when the deliverable has `duration_hours`,
 //!     since effort would not change its scheduled length). Cost `0`.
 //!   - `fast_track` and `none` propose nothing.
-//! - Splits, interface splits and missing dependencies are findings only:
+//! - Splits, interface splits, missing dependencies, wave merges and merge
+//!   candidates are findings only:
 //!   the calling agent designs those edits.
 //!
 //! Each proposal is applied with [`apply_edits`] and simulated with the
@@ -194,6 +198,9 @@ const FAST_TRACK: &str = "fast_track";
 const REDUCE_SCOPE: &str = "reduce_scope";
 const NONE: &str = "none";
 
+/// Longest deliverable a `merge_candidate` question may name, in hours.
+pub const MERGE_MAX_HOURS: f32 = 2.0;
+
 /// `Ok` when `max_questions` is within `1..=MAX_QUESTIONS`.
 pub fn check_max_questions(max_questions: u16) -> Result<(), String> {
     if (1..=MAX_QUESTIONS).contains(&max_questions) {
@@ -215,6 +222,21 @@ pub struct ReviewRequest {
     /// Question cap, `1..=64`; default 64.
     #[serde(default)]
     pub max_questions: Option<u16>,
+    /// Which candidates to ask about; default every kind.
+    #[serde(default)]
+    pub scope: ReviewScope,
+}
+
+/// Which candidates a review asks about.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewScope {
+    /// Every candidate kind, across the whole plan.
+    #[default]
+    Full,
+    /// Only `false_dependency`, only on edges between zero-float deliverables,
+    /// so the cap is spent vetting the chain that sets the finish date.
+    CriticalPath,
 }
 
 /// The judge a review may use.
@@ -258,6 +280,10 @@ pub enum FindingKind {
     InterfaceSplit,
     /// A critical deliverable with a realistic crash technique.
     CrashOption,
+    /// Two consecutive delivery waves that could share one gate execution.
+    WaveMerge,
+    /// Two adjacent small deliverables too fine to be separate artifacts.
+    MergeCandidate,
 }
 
 impl FindingKind {
@@ -268,6 +294,8 @@ impl FindingKind {
             Self::SplitCandidate => "split_candidate",
             Self::InterfaceSplit => "interface_split",
             Self::CrashOption => "crash_option",
+            Self::WaveMerge => "wave_merge",
+            Self::MergeCandidate => "merge_candidate",
         }
     }
 }
@@ -360,6 +388,10 @@ pub struct ReviewReport {
     /// what a caller must revisit in a subsequent focused review.
     #[serde(default)]
     pub edge_coverage: ReviewCoverage,
+    /// The chain this review saw, real deliverables only. A later pass whose
+    /// chain differs has new edges to vet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub critical_path: Vec<String>,
 }
 
 impl ReviewReport {
@@ -379,6 +411,7 @@ impl ReviewReport {
             prompt_hash: None,
             question_count: 0,
             edge_coverage: ReviewCoverage::default(),
+            critical_path: Vec::new(),
         }
     }
 }
@@ -447,18 +480,40 @@ pub async fn review(
         by_id,
     };
 
-    let false_edges = ctx.false_dependency_candidates();
-    let lists = [
-        ctx.crash_candidates(),
-        false_edges.clone(),
-        ctx.interface_split_candidates(),
-        ctx.split_candidates(),
-        ctx.missing_dependency_candidates(),
-    ];
+    let mut false_edges = ctx.false_dependency_candidates();
+    let lists = match req.scope {
+        ReviewScope::Full => [
+            ctx.crash_candidates(),
+            false_edges.clone(),
+            ctx.interface_split_candidates(),
+            ctx.split_candidates(),
+            ctx.missing_dependency_candidates(),
+            ctx.wave_merge_candidates(),
+            ctx.merge_candidates(),
+        ],
+        ReviewScope::CriticalPath => {
+            false_edges.retain(|c| c.ids.iter().all(|id| ctx.critical(id)));
+            [
+                Vec::new(),
+                false_edges.clone(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ]
+        }
+    };
     let total: usize = lists.iter().map(Vec::len).sum();
     let selected = round_robin(lists, usize::from(cap));
 
     let mut report = ReviewReport::new(ReviewStatus::Ok, None, lint_report);
+    report.critical_path = cpm
+        .critical_path
+        .iter()
+        .filter(|id| ctx.deliverable(id).is_some())
+        .cloned()
+        .collect();
     report.truncated = total > selected.len();
     report.endpoint = model.endpoint_host();
     if selected.is_empty() {
@@ -885,6 +940,110 @@ impl Context<'_> {
             .collect()
     }
 
+    fn wave_merge_candidates(&self) -> Vec<Candidate> {
+        let Some(report) = crate::waves::analyze(self.graph) else {
+            return Vec::new();
+        };
+        report
+            .waves
+            .windows(2)
+            .filter_map(|pair| {
+                let (first, second) = (&pair[0], &pair[1]);
+                let ids = vec![first.gates.last()?.clone(), second.gates.first()?.clone()];
+                Some(Candidate {
+                    kind: FindingKind::WaveMerge,
+                    question: Question::Noul {
+                        instructions: instructions(
+                            FindingKind::WaveMerge,
+                            &ids,
+                            format!(
+                                "Wave {} proves {} deliverables ({} h) with {} h of gates; wave {} \
+                                 proves {} deliverables ({} h) with {} h of gates. The stated \
+                                 reason for the boundary is: {}. Could both waves share one gate \
+                                 execution at the end of wave {} without losing required evidence \
+                                 or an external commitment?",
+                                first.wave,
+                                first.deliverables.len(),
+                                fmt_hours(first.work_hours),
+                                fmt_hours(first.gate_hours),
+                                second.wave,
+                                second.deliverables.len(),
+                                fmt_hours(second.work_hours),
+                                fmt_hours(second.gate_hours),
+                                first.boundary_reason.as_deref().unwrap_or("none"),
+                                second.wave,
+                            ),
+                        ),
+                        criteria: None,
+                    },
+                    ids,
+                    edge_side: None,
+                })
+            })
+            .collect()
+    }
+
+    fn merge_candidates(&self) -> Vec<Candidate> {
+        let is_work = |d: &Deliverable| {
+            !d.is_milestone()
+                && !crate::waves::is_gate(d)
+                && d.metadata.get("kind").and_then(Value::as_str) != Some("manual")
+                && d.metadata.get("contract").and_then(Value::as_bool) != Some(true)
+        };
+        if !self.graph.deliverables.iter().any(crate::waves::is_gate) {
+            return Vec::new();
+        }
+        let mut dependents: HashMap<&str, usize> = HashMap::new();
+        for (from, _) in self.edges() {
+            *dependents.entry(from).or_default() += 1;
+        }
+        let mut pairs: Vec<(f32, &str, &Deliverable)> = self
+            .edges()
+            .into_iter()
+            .filter(|(from, to)| {
+                dependents.get(from) == Some(&1)
+                    && to.prerequisites.len() == 1
+                    && is_work(to)
+                    && self.deliverable(from).is_some_and(|producer| {
+                        is_work(producer)
+                            && producer.metadata.get("owner") == to.metadata.get("owner")
+                    })
+                    && (0.0..=MERGE_MAX_HOURS).contains(&self.length(from))
+                    && (0.0..=MERGE_MAX_HOURS).contains(&self.length(&to.id))
+            })
+            .map(|(from, to)| (self.length(from) + self.length(&to.id), from, to))
+            .collect();
+        pairs.sort_by(|a, b| {
+            a.0.total_cmp(&b.0)
+                .then_with(|| (a.1, &a.2.id).cmp(&(b.1, &b.2.id)))
+        });
+        pairs
+            .into_iter()
+            .map(|(hours, from, to)| {
+                let ids = vec![from.to_string(), to.id.clone()];
+                Candidate {
+                    kind: FindingKind::MergeCandidate,
+                    question: Question::Noul {
+                        instructions: instructions(
+                            FindingKind::MergeCandidate,
+                            &ids,
+                            format!(
+                                "'{from}' feeds only '{to}', '{to}' consumes only '{from}', they \
+                                 share an owner and total {} h. Should they be one deliverable \
+                                 with one inspectable artifact?",
+                                fmt_hours(hours),
+                                to = to.id
+                            ),
+                        ),
+                        criteria: None,
+                    },
+                    ids,
+                    edge_side: None,
+                }
+            })
+            .collect()
+    }
+
     fn split_candidates(&self) -> Vec<Candidate> {
         let mut lengths: Vec<f32> = self
             .graph
@@ -909,7 +1068,8 @@ impl Context<'_> {
             .graph
             .deliverables
             .iter()
-            .filter(|d| !d.is_milestone())
+            // A gate's length is the pipeline's, not parallelisable authoring.
+            .filter(|d| !d.is_milestone() && !crate::waves::is_gate(d))
             .map(|d| (d, self.length(&d.id)))
             .filter(|(_, l)| *l > 0.0 && *l >= threshold)
             .collect();
@@ -1231,7 +1391,9 @@ fn interpret(candidate: &Candidate, answer: &Answer) -> Option<Judged> {
         (
             FindingKind::FalseDependency
             | FindingKind::MissingDependency
-            | FindingKind::InterfaceSplit,
+            | FindingKind::InterfaceSplit
+            | FindingKind::WaveMerge
+            | FindingKind::MergeCandidate,
             Answer::Noul { noul },
         ) => {
             let p = probability(*noul)?;
@@ -1241,6 +1403,16 @@ fn interpret(candidate: &Candidate, answer: &Answer) -> Option<Judged> {
                 }
                 FindingKind::MissingDependency => {
                     format!("P('{}' and '{}' need an ordering) = {p:.2}", ids[0], ids[1])
+                }
+                FindingKind::WaveMerge => format!(
+                    "P(the waves ending at '{}' and '{}' can share one gate run) = {p:.2}",
+                    ids[0], ids[1]
+                ),
+                FindingKind::MergeCandidate => {
+                    format!(
+                        "P('{}' and '{}' should be one deliverable) = {p:.2}",
+                        ids[0], ids[1]
+                    )
                 }
                 _ => format!(
                     "P('{}' can start against an early interface of '{}') = {p:.2}",

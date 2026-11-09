@@ -28,16 +28,21 @@ plan.review {"path": ".cpm-planner/plans/<name>/main.json", "capacities": {"agen
 
 - Takes exactly one of `graph`, `plan_id` or `path`; optional `capacities`, `resource_key`,
   `project_buffer_pct`, `max_questions` (1..64, default 64).
-- Needs an OpenRouter key (`OPENROUTER_API_KEY`, or `CPM_OPENROUTER_KEY_FILE`). Without one,
-  `status` is `review_unavailable` plus lint: carry on without it.
+- Needs an OpenRouter key (`OPENROUTER_API_KEY`, or `CPM_OPENROUTER_KEY_FILE`) or an adapter
+  (`CPM_REVIEW_PROVIDER=command`). Without one, `status` is `review_unavailable` plus lint: carry on.
 - The graph is sent to OpenRouter. Skip review for plans you may not share.
 - Lint errors return `status: "invalid_graph"` and no judge call; fix them first.
-- `findings` (`false_dependency`, `missing_dependency`, `split_candidate`,
-  `interface_split`, `crash_option`) are advisory probabilities. Check each against what
-  you know.
+- `findings` (`false_dependency`, `missing_dependency`, `split_candidate`, `interface_split`,
+  `crash_option`, `wave_merge`, `merge_candidate`) are advisory probabilities. Check each.
 - `proposals` are ready `plan.fork` edit lists, simulation-checked and ranked by
   `hours_saved / max(cost, 1)`. An `add_capacity` crash proposal only has `set_duration`;
   append `set_effort {id, hours: <current effort + cost>}` so the cost is counted.
+
+**Then vet the critical path until it stabilises.** After one full review, loop on
+`plan.review {"plan_id": "<id>", "scope": "critical_path"}`, which asks only about false dependencies
+between zero-float deliverables. Check each finding against the artifact the edge claims to hand over
+and remove false edges. Review again: a moved `critical_path` has new edges to vet. Stop when a pass
+changes nothing, a chain repeats, or after 5 passes. Worker limits are never edges.
 
 ## 2. Reason: one move per variant
 
@@ -49,32 +54,19 @@ plan.review {"path": ".cpm-planner/plans/<name>/main.json", "capacities": {"agen
 | Split along file or contract seams | `remove_edge` its dependents, `remove_deliverable`, `add_deliverable` the parts, `add_edge` the dependents back |
 | Contract first | `add_deliverable` with `metadata.contract`; for each consumer, `remove_edge` its dependents, `remove_deliverable`, `add_deliverable` with an `interface` edge, `add_edge` the dependents back |
 | Fast-track | `remove_edge`, only if nothing was actually consumed |
-| Batch an integration wave | Join compatible implementation artifacts into one integration-candidate artifact and replace their repeated fixed-cost gates with one gate after the join; retain per-change fast checks |
+| Merge waves | Remove the earlier wave's gates, repoint dependents, let the later gate prove both; keep targeted checks |
 | Reuse immutable evidence | Remove a repeated gate only when a prior evidence artifact has the same governed identity (complete tree/image, dependency lock/toolchain, test-contract version and environment); make the consumer depend on that evidence |
 
 Use the levelled `driving_chain`, `load` and Monte Carlo `sensitivity` to pick moves.
 
-### Audit fixed-cost delivery gates
+### Audit delivery gates
 
-For a software-delivery plan, inspect the remaining graph before choosing a move:
-
-1. Count executions of each build, test, promotion and acceptance gate. Sum their scheduled wall
-   time and identify repeated gates on the driving chain.
-2. Keep changed-code and affected-contract/consumer tests during development. Put full regression
-   on the integrated milestone's PR candidate before merge, rather than per task or agent handoff.
-   Split implementation completion from verification acceptance; broaden checks when impact or
-   failures warrant it. Batch a bounded milestone, not all project code before any testing.
-3. Check whether apparently different revisions have an identical governed evidence identity. A
-   commit SHA alone is neither sufficient nor necessary when the policy governs a complete tree or
-   image. Never reuse evidence across a changed lockfile/toolchain, test contract or environment.
-4. Fork a batching or evidence-reuse variant and compare it with the current plan. Count the added
-   integration/review effort and the longer defect-feedback batch; do not report only gate savings.
-5. Prefer the smallest wave whose saved fixed-gate time exceeds its added integration and feedback
-   risk. Keep independent waves for conflicting files, trust boundaries or fixtures.
-
-The planner currently models a fixed gate as an ordinary artifact and evidence reuse as explicit
-edges/metadata. State that approximation when it materially limits the forecast; do not silently
-pretend setup cost, cache hits or conditional execution are native schedule semantics.
+Read `waves` from `plan.lint` before choosing a move. Target the fewest waves that real boundaries
+allow, and the highest `work_per_gate_hour`. For each boundary, ask whether a concrete
+`boundary_reason` survives `wave_merge`; if not, fork a merged variant and compare. Count added
+integration effort and the longer feedback batch rather than only gate savings. Never reuse evidence
+across a changed tree or image, lockfile or toolchain, test contract or environment: a commit SHA
+alone proves nothing here.
 
 ## 3. Fork
 

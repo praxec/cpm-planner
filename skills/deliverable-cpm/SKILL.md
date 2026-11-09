@@ -43,7 +43,7 @@ host already has.
 
 Each deliverable names what can be inspected when it is done, in `metadata.artifact`:
 - a document;
-- code with passing tests;
+- code with its targeted tests passing (the full suite belongs to a gate, section 3);
 - a published release;
 - a deployed service with evidence;
 - an evidence report;
@@ -53,7 +53,8 @@ Rules:
 - **Turn activities into artifacts.** "Review", "rulings", "gate" and "run" become what they
   produce: a sign-off recorded in the contract, a decision record, an evidence report.
 - **Fold acceptance review into the deliverable it accepts.** Don't make it a separate node.
-  Add the reviewer's time to that deliverable's estimate.
+  Add the reviewer's time to that deliverable's estimate. The exception is a fixed-cost
+  operation shared by many deliverables: that is a gate of its own (section 3).
 - **Mark acceptance points** with `"milestone": true`. A milestone is zero-length unless you
   give it an estimate, but someone still has to complete it.
 - **Give every deliverable an executor class** in `metadata.owner`, e.g. `agent`, `worker`
@@ -99,7 +100,10 @@ prerequisite on B:
     consumer has an interface edge to, and the implementation behind it.
 - `lag_hours` is a minimum wait after A finishes, such as a soak period.
 
-If nothing is consumed, there is no edge.
+If nothing is consumed, there is no edge. **Edges are physical hand-overs only.** "Only one
+agent is free" is not a dependency: capacity belongs in `plan.schedule`, where it can change
+without rewriting the graph. An edge that encodes it turns a worker limit into a false critical
+path, and lint flags the common wordings as `RESOURCE_CONSTRAINT_EDGE`.
 
 **Common false edges:**
 - "A should happen first" with nothing consumed, such as publishing a pipeline before its
@@ -135,46 +139,77 @@ If nothing is consumed, there is no edge.
 | `NO_RATIONALE` | warning | add `consumes`, or delete the edge if nothing is consumed |
 | `INTERFACE_EDGE_NOT_CONTRACT` | warning | set `metadata.contract: true` on the target, or make the edge `artifact` |
 | `FEEDS_NO_MILESTONE` | warning | cut the deliverable, or add the milestone it really serves |
+| `RESOURCE_CONSTRAINT_EDGE` | warning | delete the edge; set the limit in `plan.schedule` capacities |
+| `UNDECLARED_GATE` | warning | move the heavy operation to a gate and keep targeted checks here; `metadata.heavy: false` if it only mentions one |
+| `UNGATED_WORK` | warning | make a gate consume the work, or cut it |
+| `WAVE_TOO_SMALL`, `GATE_TIME_DOMINATES` | warning | merge waves so more work shares each gate run |
+| `WAVE_BOUNDARY_UNJUSTIFIED` | warning | merge into the next wave, or set `metadata.boundary_reason` on the gate |
+| `GATE_NO_DURATION` | warning | give the gate `duration_hours` or a three-point `estimate` from observed runs |
+| `GATE_WITHOUT_MILESTONE` | warning | add the milestone the gate proves, or cut the gate |
 | `NO_ARTIFACT`, `NO_MILESTONE` | info | add `metadata.artifact` or a milestone |
+| `WORK_WAITS_ON_GATE` | info | consume the code or contract instead, unless the work needs the proven result |
 
-### Software delivery: integrate once, prove the governed candidate
+### Software delivery: code in bulk, gate at milestones
 
-For software work, first map the actual branch-to-production pipeline. Parallel code artifacts
-normally converge into an integration-wave artifact; the expensive build/test artifact consumes
-that integrated candidate once, followed by promotion, approval, deployment and acceptance
-artifacts. Estimate their observed wall time explicitly instead of hiding CI and approvals inside
-implementation effort.
+The plan is the execution contract for LLM workers, who do what the deliverable in front of them
+says. So decide where every expensive operation happens when you author the plan, and maximise the
+coding between those points.
 
-Use two validation scopes for each bounded milestone:
+**Classify every operation.**
 
-- **Development:** author tests alongside the implementation and run tests for the changed code
-  and affected contracts/consumers, plus necessary scoped compile, lint and type checks. Choose
-  scope from the dependency/contract impact, not just changed filenames. Do not run the full
-  regression suite after every task, agent handoff or small commit. Broaden a targeted run when a
-  failure, shared dependency, migration, auth/privacy boundary or uncertain blast radius warrants it.
-- **Integration PR:** finish and integrate the milestone's compatible implementation artifacts on
-  the integration branch, then run the required full regression suite and release gates against
-  that integrated PR candidate before merge. Keep the PR unmergeable until required checks pass.
-  After a fix, run its focused checks first; rerun affected integration gates for the final candidate
-  as required by their evidence identity and repository policy. A passing earlier candidate does
-  not prove a changed final tree.
+| Cheap: inside any work deliverable | Heavy: only in a gate |
+|---|---|
+| incremental build of the touched package | full or release build, cross-platform matrix |
+| lint and format of touched files | full regression or end-to-end suite |
+| tests for changed code and affected contracts and consumers | any push or PR action that starts a pipeline |
+| local commits and local merges | opening or merging a PR, promotion, deploy, tag, publish |
 
-Code completion is distinct from verification and acceptance. Give implementation artifacts their
-own source/test acceptance criteria and make a separate verification artifact consume them; the
-milestone consumes passing verification evidence. A frozen interface can unblock consumers without
-claiming the feature is verified. Both artifact and interface edges remain finish-to-start. Report
-implementation-complete, verification-pending explicitly; never award unrun-test or release credit.
-Do not postpone all testing until the whole project is coded or weaken existing acceptance criteria.
+Read the repository's CI triggers before planning, so you know which actions start a pipeline.
 
-Record the evidence identity in metadata: complete tree or image, dependency lock/toolchain,
-test-contract version and environment. Reuse evidence across different commits only when that
-identity is identical. Change-triggered scheduled campaigns produce no new proof for unchanged
-candidates.
+**Make heavy work a gate.** A gate is a deliverable with `metadata.kind: "gate"`, an observed
+`duration_hours` or `estimate`, and usually its own `metadata.owner` pool such as `ci`. It is never
+leased and it closes with `plan.accept`, so it cannot close without evidence or before the work it
+consumes is complete. Work deliverables list their cheap checks in `metadata.verify`; the lease
+response returns them, so a worker's instructions come from the plan. See
+[examples/milestone-plan.json](examples/milestone-plan.json).
 
-Count fixed-gate executions and their total duration before syncing. If repeated gate time dominates
-the makespan, create an integration-wave variant. Do not batch changes that conflict in owned files,
-cross trust/approval boundaries, invalidate shared fixtures or create an unacceptably large feedback
-batch.
+**Use this shape.** Work deliverables commit to one integration branch, or to local branches merged
+into it. An integration-candidate deliverable consumes them and runs the build and lint once on the
+merged tree, so the gate isn't wasted on a compile error. The regression gate consumes that
+candidate, and the PR, merge and release gates or milestone follow it.
+
+**Run the full suite once per candidate, before the pull request.** If the regression can run on the
+integration branch, run it there, then open the PR. If it runs only as PR checks, opening the PR is
+the gate, so open it once, when the candidate is complete. Don't pay for the same suite twice on one
+tree: when PR checks repeat it, reuse the evidence if policy accepts it, otherwise model the second
+run as a gate so its cost is visible.
+
+**Fewer waves is better.** Start from one wave for the whole project. Add a boundary only for a
+concrete reason, and record it in `metadata.boundary_reason`: later work consumes a *released*
+artifact, a person's decision at that point changes later scope, an irreversible migration, or a
+trust or approval boundary. Size alone isn't a reason. Later work consumes code and contracts rather
+than a gate's receipt wherever it can, so coding keeps going while a gate runs.
+
+**Read the computed structure.** `plan.lint` returns `waves`, so nobody has to judge from prose
+whether a milestone is heavy:
+
+- each `waves[]` entry has its `gates`, the `deliverables` it proves, `work_hours`, `gate_hours` and
+  `work_per_gate_hour`;
+- each `milestones[]` entry has a `class`: `wave` when a gate proves it, `checkpoint` when nothing
+  heavy happens there;
+- `ungated` lists work no gate proves, and `gate_fraction` is gate time's share of all scheduled time.
+
+**Keep testing honest.** Author tests with the code. Batching delays the full suite, not testing.
+Choose targeted scope from dependency and contract impact, not just changed filenames, and broaden
+it when a failure, shared dependency, migration, auth or privacy boundary, or uncertain blast radius
+warrants it. If policy truly requires per-change evidence, say so and model those gates; if a
+repository rule or hook runs the full suite on every commit, raise the conflict rather than bypass
+it. Implementation-complete with the gate pending is what the graph itself shows.
+
+Record the evidence identity in gate metadata: complete tree or image, dependency lock/toolchain,
+test-contract version and environment. Reuse evidence across commits only when that identity is
+identical. Native release workflows compile to the same idea through `delivery_gates`; see
+[docs/release-workflows.md](https://github.com/praxec/cpm-planner/blob/main/docs/release-workflows.md).
 
 ## 4. Sync and verify the critical path
 
@@ -223,13 +258,24 @@ Design several variants and pick one. Never edit the selected variant to try an 
    key. Without one it returns `review_unavailable` plus lint; carry on without it. The
    graph is sent to OpenRouter, so skip review for plans you may not share.
    - `findings` are advisory probabilities: `false_dependency`, `missing_dependency`,
-     `split_candidate`, `interface_split`, `crash_option`. Check each one against what you
-     know.
+     `split_candidate`, `interface_split`, `crash_option`, `wave_merge` (two waves could share
+     one gate run) and `merge_candidate` (two small adjacent deliverables are one artifact).
+     Check each one against what you know.
+   - With `CPM_REVIEW_PROVIDER=command`, an operator's adapter answers instead of this process,
+     so this server needs no key; `cpm-planner review doctor` reports readiness by name only.
    - `proposals` are ready-made `plan.fork` edit lists. Each has been checked by simulation
      (it lints clean and shortens the makespan) and is ranked by `hours_saved / max(cost, 1)`.
    - An `add_capacity` crash proposal's edits are only `set_duration`. Its `cost` (the
      added effort) is not in the edits, so `plan.compare` understates `total_effort`.
      Before you fork it, append `set_effort {id, hours: <current effort + cost>}`.
+   - **Then vet the critical path until it stabilises.** Review the whole plan once, then
+     loop: run `plan.review {plan_id, scope: "critical_path"}`, which spends every question on
+     edges between zero-float deliverables. Check each `false_dependency` finding against the
+     artifact it claims to consume, and remove the false edges in a fork or the file. Review
+     again: if the reported `critical_path` moved to other deliverables, those edges are now the
+     ones to vet. Stop when a pass changes nothing, the chain repeats a chain you already vetted,
+     or after 5 passes, and report which. Remove an edge only on your own check of the hand-over;
+     a probability alone is not proof.
 2. **Reason.** Choose moves from the review, the levelled schedule and the Monte Carlo
    `sensitivity`. Use one move per variant, so each effect can be measured.
 
@@ -242,12 +288,11 @@ Design several variants and pick one. Never edit the selected variant to try an 
    | Contract first | `add_deliverable` with `metadata.contract`; then for each consumer `remove_edge` its dependents, `remove_deliverable` + `add_deliverable` with an `interface` edge (`add_edge` has no `kind`), and `add_edge` the dependents back | the contract must be accepted, not just drafted |
    | Fast-track by removing an edge | `remove_edge` | only if nothing was actually consumed |
    | Split scope into milestones | `add_deliverable` with `"milestone": true` | each milestone needs an acceptance artifact |
-   | Batch an integration wave | join compatible implementation artifacts into one candidate and replace repeated fixed-cost gates with one gate after the join | count added integration/review effort and the longer defect-feedback batch |
+   | Merge waves | remove the earlier wave's gates, repoint their dependents, and let the later gate prove both | count added integration effort and the longer feedback batch; keep a boundary only with a real `boundary_reason` |
    | Reuse immutable evidence | make the consumer depend on a prior evidence artifact and remove the duplicate gate | the complete tree/image, lock/toolchain, test contract and environment identity must all match |
 
-   The current graph has no native setup-cost, cache-hit or conditional-execution primitive. Model
-   fixed gates as artifacts and reuse as explicit edges/metadata, and disclose that approximation
-   when it materially affects the forecast.
+   The graph has no cache-hit or conditional-execution primitive. Model reuse as explicit
+   edges and metadata, and disclose that approximation when it materially affects the forecast.
 3. **Fork.** Run `plan.fork {plan_id, variant, edits}`. The edit ops are `remove_edge
    {from, to}`, `add_edge {from, to, consumes}`, `set_effort {id, hours}`, `set_duration
    {id, hours}`, `set_estimate {id, estimate}`, `set_metadata {id, key, value}`,
@@ -317,6 +362,27 @@ line and changes when another line goes live.
   (AC), follow it with a lockless `plan.mark_status {plan_id, deliverable_id, caller_id,
   status: {"status": "complete"}, actual_effort_hours}`.
 - `plan.status` shows progress, the ready set, `plan_complete` and the held locks.
+- **Hand work over with its contract.** A worker or subagent gets the deliverable's artifact,
+  `owned_files`, `metadata.verify` and integration branch, plus this rule: run only those checks,
+  and do not push, open a PR or run the full suite.
+- **Run a gate only when `plan.status` lists it as ready.** That is the graph's guard against an
+  early regression run. Mark it with a lockless `in_progress`, start it once and pick up other
+  ready work while it runs; the wait belongs to the runner, not to an agent.
+- **A red run is not a `failed` mark.** Failed marks trip the circuit breaker, and red runs are a
+  normal part of a gate. Record the run as `evidence` on a lockless `in_progress`, read the whole
+  run, fix every failure with focused checks, then re-run once. Close with `plan.accept` and the
+  green run's evidence for the final tree. After 2 red runs, or for a fix that changes scope or a
+  contract, stop and take it through section 9 so the gate consumes a new deliverable. Mark
+  `failed` only when it needs a decision. After the merge, delete the wave's merged worktrees and
+  branches.
+- **Re-optimise at natural pauses (adaptive execution).** When a cohort closes or a gate returns,
+  check for these signals: `plan.ev` shows SPI or CPI below 0.9, a gate took over 1.5 times its
+  estimate, the `critical_path` moved, a deliverable overran its estimate by 50%, or a ready
+  deliverable is waiting only on capacity. On a signal, run section 6 on the *remaining* work, and
+  apply the result when it saves more than it costs. Stay non-disruptive: change only unleased,
+  incomplete work, never interrupt a lease or a running gate, don't reopen completed work, and keep
+  the current plan when the saving is small or uncertain. With no signal, keep working. A scope
+  change still needs its usual approval.
 
 ## 8. Baseline and earned value
 
@@ -328,7 +394,9 @@ line and changes when another line goes live.
    - The working window opens at local midnight, local time being UTC shifted by
      `utc_offset_minutes`, and lasts `hours_per_day` hours. Give `start` as 00:00 local
      on a workday. A 09:00 start with 8 hours per day earns no PV that day.
-2. **Read** with `plan.ev {plan_id, as_of}`. It returns `bac`, `pv`, `ev`, `ac`, `sv`, `cv`,
+2. **Read** with `plan.ev {plan_id, as_of}`, and never calculate earned value by hand: progress,
+   budgets and actuals are all stored on the plan, and `plan.ev` is the only source of these
+   numbers. If it fails, report the error and fix the cause. It returns `bac`, `pv`, `ev`, `ac`, `sv`, `cv`,
    `spi`, `cpi`, `eac`, `etc`, `vac`, `tcpi`, per-deliverable rows and
    `critical_float_consumed_hours`. A ratio with a zero denominator is `null`; `undefined`
    explains why.
