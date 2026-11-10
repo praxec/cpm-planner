@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Per-resource working calendars for the levelled schedule, simulation and Monte Carlo (#131):
+  `calendar::Calendar` gains `day_start`, `CalendarSpec` takes one calendar or a map with a
+  `default` entry, and `resource_schedule_on_calendar`, `simulate_on_calendar` and
+  `monte_carlo_on_calendar` place each deliverable in its resource's windows, reporting
+  `waited_on: "calendar"`, `start_at`/`finish_at`, `calendars`, `calendar_wait_hours` and
+  `available_hours`. Without a calendar the output is unchanged.
+
 ## [0.6.0] - 2026-11-09
 
 ### Added
