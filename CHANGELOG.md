@@ -19,6 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ownership or milestones are rejected with reasons. See `docs/optimize.md`.
 ### Added
 
+- MCP tools `plan.overview`, `plan.explain` and `plan.optimize`, and the CLI commands
+  `cpm-planner overview`, `explain` (Markdown by default) and `optimize`. `plan.mark_status` and
+  `plan.accept` take an evidence record as well as a note; `plan.schedule` and `plan.simulate` take
+  `calendar` and `start`; `plan.baseline` takes `capacities`, `resource_key`, `project_buffer_pct`,
+  `schedule` and a per-resource `calendar` map (`null` clears it); `plan.acquire_cohort` takes
+  `thread` and `affinity_seconds`; `plan.status` reports `threads`; every `plan.review` reports
+  `provider` (`direct`, `command` or `disabled`) in its result and audit event. Without the new
+  arguments every existing call returns what it did before (#128, #129, #130, #131, #132, #133).
 - `cpm_planner::overview`: a one-call plan overview at a single `as_of` that joins `plan.status`,
   `plan.get` and `plan.ev`, with titles, milestone impact, a ready queue with float, owner and next
   milestone, blocked items with their incomplete prerequisite chain and blocker class (dependency,

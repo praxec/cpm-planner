@@ -5,7 +5,7 @@ changes a plan. It runs offline, makes no model, provider or network call, and r
 proposals and scores for the same graph and request. Each proposal is an edit list that
 `plan.fork { edits }` can apply, already checked by lint, the schedule and simulate.
 
-This page specifies the library API and the `plan.optimize` MCP tool and CLI command that will
+This page specifies the library API and the `plan.optimize` MCP tool and CLI command that
 expose it.
 
 ## What it looks for
@@ -69,7 +69,7 @@ Both return `PlannerError::InvalidGraph` when the input graph does not simulate.
 applies the same checks to an edit list you supply (kind `edits`, id `edits`). It compensates the
 same way, and anything a removed deliverable carried counts as lost.
 
-## `plan.optimize` (planned)
+## `plan.optimize`
 
 Request: exactly one of `graph`, `plan_id` or `path`, as for `plan.lint`, `plan.simulate` and
 `plan.review`. Optional fields:

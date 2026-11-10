@@ -14,7 +14,7 @@ Status of each part:
 | Library: `cpm_planner::overview` (`overview`, `read_snapshot`, `build_overview`, `render_markdown`, `evidence_text`, `PlanIndex`) | implemented |
 | Library: `cpm_planner::explain` (`explain`, `build_explanation`, `preview_cohort`, `classify_next_work`, `slack_to_milestone`, `render_markdown`) | implemented |
 | Evidence status on overview entries ([evidence contract](evidence.md#overview)) | implemented |
-| MCP tools `plan.overview` and `plan.explain`, and the CLI commands | specified here; wired by a later change |
+| MCP tools `plan.overview` and `plan.explain`, and the CLI commands `cpm-planner overview` and `cpm-planner explain` | implemented |
 
 ## `plan.overview`
 
@@ -29,7 +29,7 @@ Status of each part:
 | `filter.owner` | string | none | Keep only entries whose `metadata.owner` equals this. |
 | `filter.milestone` | id | none | Keep only that milestone and the deliverables it waits on. An unknown id is `DELIVERABLE_NOT_FOUND`; a deliverable that is not a milestone is `INVALID_VALUE`. |
 | `evidence_target` | [identity](evidence.md#evidence-identity-schema-version-1) | none | The target every evidence record is judged against ([target resolution](evidence.md#target-resolution), step 1). Without it, a gate is judged against its candidate's newest identity and other records against no target. A malformed identity is `INVALID_EVIDENCE`, checked before any read. |
-| `format` | `"json"` \| `"markdown"` | `"markdown"` for the CLI, `"json"` for MCP | Markdown is `render_markdown` of the same value. |
+| `format` | `"json"` \| `"markdown"` | `"markdown"` for the CLI, `"json"` for MCP | Markdown is `render_markdown` of the same value. Over MCP it is returned as `{"format": "markdown", "markdown": "<text>"}`; the CLI prints the text. |
 
 Filters narrow the lists only. `counts`, `evidence_counts`, `ev` and
 `critical_path_hours` always describe the whole plan.

@@ -41,6 +41,9 @@
 //! | `plan.ev`                | [`Planner::ev`]               |
 //! | `plan.snapshot`          | [`Planner::snapshot`]         |
 //! | `plan.review`            | [`crate::review::review`]     |
+//! | `plan.overview`          | [`crate::overview::overview`] |
+//! | `plan.explain`           | [`crate::explain::explain`]   |
+//! | `plan.optimize`          | [`crate::optimize::optimize`] |
 //!
 //! # Plan review
 //!
@@ -63,7 +66,9 @@
 //! `OVERLAP_DETECTED:`, `MISSING_PREREQUISITE:`, `PLAN_NOT_FOUND:`,
 //! `DELIVERABLE_NOT_FOUND:`, `LAPSE_LIMIT:`, `PREREQUISITES_INCOMPLETE:`, `INVALID_GRAPH:`,
 //! `INVALID_CAPACITIES:`, `VARIANT_NOT_SELECTED:`, `ARCHIVE_REFUSED:`,
-//! `INVALID_PATH:`, `INVALID_ACTUALS:`, `NOT_BASELINED:`, `BACKEND_ERROR:`) are
+//! `INVALID_PATH:`, `INVALID_ACTUALS:`, `INVALID_VALUE:`, `INVALID_EVIDENCE:`,
+//! `EVIDENCE_SCOPE_MISMATCH:`, `EVIDENCE_REQUIRED:`, `EVIDENCE_STALE:`,
+//! `NOT_BASELINED:`, `BACKEND_ERROR:`) are
 //! stable machine-parseable signals — see `core::plan` for the contract.
 //! Malformed arguments yield `invalid_params` with the serde error.
 //!
@@ -79,16 +84,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::audit::AuditEvent;
+use crate::calendar::{CalendarArgError, CalendarSpec, ScheduleCalendar};
 use crate::compare::{CompareRequest, CompareWeights};
 use crate::earned_value::{
-    BaselineRequest, BaselineTaken, Calendar, SnapshotFormat, SnapshotRequest,
+    BaselineCalendar, BaselineRequest, BaselineTaken, ScheduleKind, SnapshotFormat, SnapshotRequest,
 };
 use crate::edits::GraphEdit;
+use crate::evidence::{Evidence, Identity};
+use crate::explain::ExplainRequest;
 use crate::lint::{LintFinding, Severity};
 use crate::llm::command::{CommandJudge, ReviewProvider};
 use crate::llm::jev::JevJudge;
 use crate::llm::{ConfigError, JudgmentModel, LlmConfig};
 use crate::monte_carlo::MonteCarloRequest;
+use crate::optimize::OptimizeRequest;
+use crate::overview::{Detail, OverviewFilter, OverviewOptions, OverviewRequest};
 use crate::plan::{
     AcceptRequest, AcquireRequest, CallerId, Cohort, ComparePlansRequest, DeliverableStatus,
     ForceReleaseRequest, ForkRequest, HeartbeatRequest, MarkStatusRequest, PlanDefinition,
@@ -96,7 +106,7 @@ use crate::plan::{
 };
 use crate::ports::Planner;
 use crate::project::ProjectRoot;
-use crate::resource_schedule::{ScheduleRequest, resource_schedule};
+use crate::resource_schedule::{ScheduleRequest, resource_schedule_on_calendar};
 use crate::review::{Judge, ReviewReport, ReviewRequest, ReviewScope};
 use crate::simulate::SimulateRequest;
 use chrono::{DateTime, Utc};
@@ -142,6 +152,9 @@ pub const TOOL_BASELINE: &str = "plan.baseline";
 pub const TOOL_EV: &str = "plan.ev";
 pub const TOOL_SNAPSHOT: &str = "plan.snapshot";
 pub const TOOL_REVIEW: &str = "plan.review";
+pub const TOOL_OVERVIEW: &str = "plan.overview";
+pub const TOOL_EXPLAIN: &str = "plan.explain";
+pub const TOOL_OPTIMIZE: &str = "plan.optimize";
 
 /// Most `plan.review` calls running at once; further calls wait for a slot.
 /// Each review is one billed OpenRouter request plus up to 65 simulates.
@@ -174,6 +187,9 @@ pub const PLAN_TOOL_NAMES: &[&str] = &[
     TOOL_EV,
     TOOL_SNAPSHOT,
     TOOL_REVIEW,
+    TOOL_OVERVIEW,
+    TOOL_EXPLAIN,
+    TOOL_OPTIMIZE,
 ];
 
 // ---------------------------------------------------------------------------
@@ -230,6 +246,10 @@ struct AcquireCohortArgs {
     filter: Option<AcquireFilter>,
     #[serde(default)]
     ttl_seconds: Option<u64>,
+    #[serde(default)]
+    thread: Option<String>,
+    #[serde(default)]
+    affinity_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -252,7 +272,7 @@ struct AcceptArgs {
     project: Option<String>,
     deliverable_id: String,
     accepted_by: String,
-    evidence: String,
+    evidence: EvidenceArg,
     #[serde(default)]
     override_lock: bool,
 }
@@ -295,7 +315,29 @@ struct MarkStatusArgs {
     #[serde(default)]
     actual_effort_hours: Option<f64>,
     #[serde(default)]
-    evidence: Option<String>,
+    evidence: Option<EvidenceArg>,
+}
+
+/// The `evidence` argument of `plan.mark_status` and `plan.accept`: a note
+/// or an evidence record object. Any other JSON type stays an argument
+/// parsing error (`invalid_params`), as it was when the field was a string;
+/// the record itself is checked by [`Evidence::from_json`]
+/// (`INVALID_EVIDENCE`).
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum EvidenceArg {
+    Note(String),
+    Record(serde_json::Map<String, Value>),
+}
+
+impl EvidenceArg {
+    fn into_evidence(self) -> Result<Evidence, McpError> {
+        let value = match self {
+            Self::Note(note) => Value::String(note),
+            Self::Record(record) => Value::Object(record),
+        };
+        Evidence::from_json(value).map_err(planner_error_to_mcp)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -369,6 +411,13 @@ struct ScheduleToolArgs {
     resource_key: String,
     #[serde(default = "crate::resource_schedule::default_buffer_pct")]
     project_buffer_pct: f32,
+    /// One calendar or a per-resource map ([`CalendarSpec::parse`]); places
+    /// the schedule on the resource clock.
+    #[serde(default)]
+    calendar: Option<Value>,
+    /// Plan start for a calendar placement; defaults to the planner clock.
+    #[serde(default)]
+    start: Option<DateTime<Utc>>,
 }
 
 /// `plan.simulate`: the graph/plan selector plus optional leveling and
@@ -386,6 +435,12 @@ struct SimulateToolArgs {
     schedule: Option<ScheduleRequest>,
     #[serde(default)]
     monte_carlo: Option<MonteCarloRequest>,
+    /// As on `plan.schedule`; applies to the levelled schedule and Monte
+    /// Carlo.
+    #[serde(default)]
+    calendar: Option<Value>,
+    #[serde(default)]
+    start: Option<DateTime<Utc>>,
 }
 
 // ── Portfolio tool args ─────────────────────────────────────────────────────
@@ -515,12 +570,22 @@ struct BaselineArgs {
     project: Option<String>,
     #[serde(default)]
     start: Option<DateTime<Utc>>,
+    /// Absent inherits the previous baseline's calendar, `null` counts
+    /// wall-clock hours, an object is one calendar or a per-resource map.
     #[serde(default)]
-    calendar: Option<Calendar>,
+    calendar: BaselineCalendar,
     #[serde(default)]
     reason: Option<String>,
     #[serde(default)]
     backfill_from: Option<DateTime<Utc>>,
+    #[serde(default)]
+    capacities: Option<std::collections::BTreeMap<String, u32>>,
+    #[serde(default)]
+    resource_key: Option<String>,
+    #[serde(default)]
+    project_buffer_pct: Option<f32>,
+    #[serde(default)]
+    schedule: Option<ScheduleKind>,
 }
 
 /// `plan.ev`: the earned-value report against the latest baseline.
@@ -578,6 +643,88 @@ struct ReviewToolArgs {
     max_questions: Option<u16>,
     #[serde(default)]
     scope: ReviewScope,
+}
+
+/// Output format of the read tools `plan.overview` and `plan.explain`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ReadFormat {
+    /// The schema-versioned JSON value (the MCP default).
+    #[default]
+    Json,
+    /// `{"format": "markdown", "markdown": "<text>"}`, the rendering of the
+    /// same value.
+    Markdown,
+}
+
+/// `plan.overview`: one snapshot joining status, graph, EV and evidence.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OverviewArgs {
+    #[serde(default)]
+    plan_id: Option<String>,
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    as_of: Option<DateTime<Utc>>,
+    #[serde(default)]
+    detail: Detail,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    filter: OverviewFilter,
+    /// An evidence identity, parsed with [`Identity::from_json`].
+    #[serde(default)]
+    evidence_target: Option<Value>,
+    #[serde(default)]
+    format: ReadFormat,
+}
+
+/// `plan.explain`: why one deliverable is not moving, and the next work.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExplainArgs {
+    #[serde(default)]
+    plan_id: Option<String>,
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    deliverable_id: Option<String>,
+    #[serde(default)]
+    as_of: Option<DateTime<Utc>>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    format: ReadFormat,
+}
+
+/// `plan.optimize`: the graph selector, optional flat leveling inputs (as
+/// `plan.review`) and the proposal cap.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OptimizeToolArgs {
+    #[serde(default)]
+    graph: Option<PlanGraph>,
+    #[serde(default)]
+    plan_id: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    capacities: Option<std::collections::BTreeMap<String, u32>>,
+    #[serde(default)]
+    resource_key: Option<String>,
+    #[serde(default)]
+    project_buffer_pct: Option<f32>,
+    #[serde(default)]
+    max_proposals: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -772,16 +919,103 @@ fn weights_schema() -> Value {
     })
 }
 
-fn calendar_schema() -> Value {
+/// The properties of one working calendar (`docs/calendars.md`, 2.1).
+fn calendar_properties() -> Value {
+    json!({
+        "hours_per_day": { "type": "number", "exclusiveMinimum": 0, "maximum": 24, "description": "Default 8." },
+        "day_start": { "type": "string", "description": "Local HH:MM the workday window opens (00:00..23:59, default \"00:00\"); anything else is INVALID_VALUE." },
+        "workdays": { "type": "array", "minItems": 1, "items": { "type": "string", "enum": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] }, "description": "Default mon..fri." },
+        "utc_offset_minutes": { "type": "integer", "minimum": -1440, "maximum": 1440, "description": "Local offset from UTC; default 0." }
+    })
+}
+
+/// `plan.baseline`'s `calendar`: absent, `null`, one calendar, or a
+/// per-resource map (an object with a `default` key).
+fn baseline_calendar_schema() -> Value {
+    json!({
+        "type": ["object", "null"],
+        "description": "Working-time calendar. Omitted: the previous baseline's calendar (wall-clock hours on the first baseline). null: wall-clock hours, clearing a previous calendar. One calendar {hours_per_day, day_start, workdays, utc_offset_minutes} keeps the plan clock: only working hours advance PV. An object with a `default` key is a per-resource map {default: calendar, <resource>: calendar, ...} keyed by resource_key values; it freezes the resource clock, where each deliverable advances only inside its own resource's windows. A single calendar with an unknown field is invalid params; a map entry error is INVALID_VALUE.",
+        "properties": calendar_properties()
+    })
+}
+
+/// `plan.schedule`'s and `plan.simulate`'s `calendar`: one calendar (meaning
+/// `{"default": C}`) or a per-resource map.
+fn schedule_calendar_schema() -> Value {
     json!({
         "type": "object",
-        "description": "Working-time calendar: only working hours advance the PV clock. Omitted: wall-clock hours. A workday contributes hours_per_day hours starting at 00:00 local time.",
+        "description": "Place the schedule on working calendars (the resource clock): hours become wall-clock hours from `start`, each deliverable advances only inside its resource's windows, and rows add start_at, finish_at, calendars and calendar_wait_hours. One calendar {hours_per_day, day_start, workdays, utc_offset_minutes} applies to every resource; an object with a `default` key is a per-resource map {default: calendar, <resource>: calendar, ...} keyed by resource_key values. Omitted: today's output exactly.",
+        "properties": calendar_properties()
+    })
+}
+
+fn schedule_start_schema() -> Value {
+    json!({
+        "type": "string",
+        "format": "date-time",
+        "description": "RFC 3339 plan start hour 0 refers to, with a calendar; defaults to now. Ignored without a calendar."
+    })
+}
+
+/// The `evidence` argument: a note or an evidence record object
+/// (`docs/evidence.md`). The top-level `maxLength` caps the note form.
+fn evidence_schema(description: &str) -> Value {
+    json!({
+        "oneOf": [
+            { "type": "string", "maxLength": 2048 },
+            {
+                "type": "object",
+                "description": "Evidence record, schema_version 1: {schema_version: 1, scope: focused|gate|manual_approval|external_signoff|merge|publish|activation, summary (1..2048 chars), ref?, party? (external_signoff only), identity? {schema_version: 1, tree, dependency_lock, toolchain, test_contract, environment}}. Malformed: INVALID_EVIDENCE.",
+                "properties": {
+                    "schema_version": { "type": "integer", "enum": [1] },
+                    "scope": { "type": "string", "enum": ["focused", "gate", "manual_approval", "external_signoff", "merge", "publish", "activation"] },
+                    "summary": { "type": "string", "minLength": 1, "maxLength": 2048 },
+                    "ref": { "type": "string", "maxLength": 2048 },
+                    "party": { "type": "string", "minLength": 1, "maxLength": 256 },
+                    "identity": identity_schema()
+                },
+                "required": ["schema_version", "scope", "summary"],
+                "additionalProperties": false
+            }
+        ],
+        "maxLength": 2048,
+        "description": description
+    })
+}
+
+/// An evidence identity, schema version 1 (`docs/evidence.md`).
+fn identity_schema() -> Value {
+    let field = || json!({ "type": "string", "minLength": 1, "maxLength": 256 });
+    json!({
+        "type": "object",
+        "description": "Evidence identity: the inputs a verification result depends on, compared byte for byte.",
         "properties": {
-            "hours_per_day": { "type": "number", "exclusiveMinimum": 0, "maximum": 24, "description": "Default 8." },
-            "workdays": { "type": "array", "minItems": 1, "items": { "type": "string", "enum": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] }, "description": "Default mon..fri." },
-            "utc_offset_minutes": { "type": "integer", "minimum": -1440, "maximum": 1440, "description": "Local offset from UTC; default 0." }
+            "schema_version": { "type": "integer", "enum": [1] },
+            "tree": field(),
+            "dependency_lock": field(),
+            "toolchain": field(),
+            "test_contract": field(),
+            "environment": field()
         },
+        "required": ["schema_version"],
         "additionalProperties": false
+    })
+}
+
+fn read_format_schema() -> Value {
+    json!({
+        "type": "string",
+        "enum": ["json", "markdown"],
+        "description": "json (default): the schema-versioned value. markdown: {format: \"markdown\", markdown: <text>} rendering the same value."
+    })
+}
+
+fn read_limit_schema(default: &str) -> Value {
+    json!({
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 1000,
+        "description": format!("Most entries per list ({default}); out of range is INVALID_VALUE.")
     })
 }
 
@@ -861,7 +1095,11 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                  (not reported in blocked). The response carries blocked \
                  [{id, code, reason}], blocked_count, and needs_operator \
                  (true when any blocked code is LAPSE_LIMIT: clear with \
-                 plan.force_release {reset_counters: true}). \
+                 plan.force_release {reset_counters: true}). Thread affinity: \
+                 the caller that last completed a metadata.thread deliverable is \
+                 offered that thread's next one first; optional thread prefers one \
+                 thread and affinity_seconds holds other callers' threads back \
+                 (blocked code AFFINITY_HOLD). \
                  Select the plan by plan_id, plan line name, or active: true.",
             ),
             schema_object(json!({
@@ -871,6 +1109,8 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                     "max_count": { "type": "integer", "minimum": 1, "description": "Most deliverables to lease. Default: the number of ids, else 1." },
                     "ids":       { "type": "array", "minItems": 1, "items": { "type": "string" } },
                     "ttl_seconds": { "type": "integer", "minimum": 1 },
+                    "thread":    { "type": "string", "description": "Offer this metadata.thread's ready deliverables first (a token of 1..64 ASCII letters, digits, '.', '_' and '-', starting with a letter or digit; INVALID_VALUE otherwise). Without it, the threads this caller last advanced come first." },
+                    "affinity_seconds": { "type": "integer", "minimum": 0, "description": "Defer to another caller's thread: a ready deliverable whose thread another caller advanced less than this many seconds ago is held back and reported in blocked with code AFFINITY_HOLD. Default 0 (no hold); clamped to the server maximum TTL." },
                     "filter":    {
                         "type": "object",
                         "properties": { "metadata": { "type": "object" } },
@@ -912,8 +1152,10 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                  Optional earned-value progress: \
                  earned_pct (0..100, only with in_progress; ignored with complete), \
                  actual_effort_hours (total so far, 0..1000000; replaces leased hours \
-                 as actual cost) and evidence (<= 2048 chars, appended to a list of \
-                 at most 100); \
+                 as actual cost) and evidence (a note of <= 2048 chars or an evidence \
+                 record object, appended to a list of at most 100; records are checked \
+                 as INVALID_EVIDENCE, EVIDENCE_SCOPE_MISMATCH, EVIDENCE_REQUIRED or \
+                 EVIDENCE_STALE); \
                  violations are INVALID_ACTUALS. Every lease that ends adds its hours \
                  to the deliverable's leased hours. \
                  Select the plan by plan_id, plan line name, or active: true.",
@@ -939,11 +1181,7 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                         "maximum": 1000000,
                         "description": "Total effort spent so far, in hours; replaces the stored value and takes precedence over leased hours for actual cost."
                     },
-                    "evidence": {
-                        "type": "string",
-                        "maxLength": 2048,
-                        "description": "One evidence note, appended to the deliverable's evidence list (at most 100 entries)."
-                    }
+                    "evidence": evidence_schema("One evidence entry, appended to the deliverable's evidence list (at most 100 entries): a note (<= 2048 chars) or an evidence record object. A record whose scope may not close the deliverable is EVIDENCE_SCOPE_MISMATCH; closing a deliverable with a declared metadata.evidence_scope needs a matching record (EVIDENCE_REQUIRED); a gate's record must match its candidate (EVIDENCE_STALE).")
                 })),
                 "required": ["deliverable_id", "caller_id", "status"]
             })),
@@ -1002,7 +1240,8 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
             Cow::Borrowed(
                 "Manager/owner acceptance: mark a deliverable Complete without \
                  holding its lease. Requires all prerequisites Complete and \
-                 evidence; audited. A live lease held by someone else is refused \
+                 evidence (a note or an evidence record object; records are checked \
+                 as on plan.mark_status); audited. A live lease held by someone else is refused \
                  (LOCK_HELD) unless override_lock is true. \
                  Select the plan by plan_id, plan line name, or active: true.",
             ),
@@ -1011,7 +1250,7 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                 "properties": with_plan_selector(json!({
                     "deliverable_id": { "type": "string" },
                     "accepted_by":    { "type": "string" },
-                    "evidence":       { "type": "string" },
+                    "evidence":       evidence_schema("Acceptance evidence: a note or an evidence record object (for example scope manual_approval, or gate for a gate deliverable), appended to the deliverable's evidence list and the audit event."),
                     "override_lock": {
                         "type": "boolean",
                         "description": "Take over a live lease held by another caller."
@@ -1053,7 +1292,11 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                  of graph or plan_id. capacities is required: every resource that \
                  carries work needs at least 1 unit (otherwise INVALID_CAPACITIES: \
                  lists the missing resources). plan.schedule rejects what \
-                 plan.submit rejects (INVALID_GRAPH:).",
+                 plan.submit rejects (INVALID_GRAPH:). Optional calendar (one \
+                 calendar or a per-resource map with a default entry) and start \
+                 place the schedule on working windows: wall-clock hours from start, \
+                 start_at/finish_at per row, calendar_wait_hours, cpm_makespan and \
+                 driving-chain links waited_on \"calendar\".",
             ),
             schema_object(json!({
                 "type": "object",
@@ -1070,7 +1313,9 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                         "minimum": 0,
                         "maximum": 100,
                         "description": "Project buffer as a percentage of the driving chain (default 25)."
-                    }
+                    },
+                    "calendar": schedule_calendar_schema(),
+                    "start": schedule_start_schema()
                 },
                 "required": ["capacities"],
                 "additionalProperties": false
@@ -1088,7 +1333,9 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                  and seed (default 0xC0FFEE); iterations × (deliverables + \
                  prerequisite edges) must not exceed 200000000. plan.simulate \
                  rejects what plan.submit rejects; lint errors or an invalid graph \
-                 are INVALID_GRAPH:.",
+                 are INVALID_GRAPH:. Optional calendar and start (as on \
+                 plan.schedule) apply to the resource schedule and Monte Carlo; \
+                 calendars are looked up by schedule.resource_key, else owner.",
             ),
             schema_object(json!({
                 "type": "object",
@@ -1115,7 +1362,9 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                             "seed": { "type": "integer", "minimum": 0, "description": "RNG seed (default 12648430 = 0xC0FFEE); the same seed reproduces the output on the same platform and build." }
                         },
                         "additionalProperties": false
-                    }
+                    },
+                    "calendar": schedule_calendar_schema(),
+                    "start": schedule_start_schema()
                 },
                 "additionalProperties": false
             })),
@@ -1303,12 +1552,16 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
         Tool::new(
             Cow::Borrowed(TOOL_BASELINE),
             Cow::Borrowed(
-                "Freeze the plan's current CPM schedule (earliest start/finish) and budgets \
+                "Freeze the plan's current CPM schedule (earliest start/finish), or with \
+                 capacities its levelled schedule, and budgets \
                  (effort basis x metadata.cost_rate) as its next numbered baseline for earned \
                  value. The first baseline is number 1; re-baselining needs a non-blank \
                  `reason` (INVALID_GRAPH otherwise) and keeps actuals and snapshots. \
                  Without `calendar`, a re-baseline keeps the previous baseline's calendar \
-                 (the first baseline counts wall-clock hours). `backfill_from` (RFC 3339) \
+                 (the first baseline counts wall-clock hours); `calendar: null` clears it, \
+                 and a map with a `default` entry gives each resource its own calendar. \
+                 capacities, resource_key and project_buffer_pct are reused the same way; \
+                 schedule: \"cpm\" returns to a CPM baseline. `backfill_from` (RFC 3339) \
                  sets the baseline's `start` retroactively and marks it `backfilled: true` \
                  (reported by plan.ev); it must not be in the future or before the plan's \
                  creation time (INVALID_VALUE). Execution-side: the plan must be its line's \
@@ -1320,9 +1573,17 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                 "type": "object",
                 "properties": with_plan_selector(json!({
                     "start": { "type": "string", "format": "date-time", "description": "RFC 3339 instant the PV clock starts from; defaults to now." },
-                    "calendar": calendar_schema(),
+                    "calendar": baseline_calendar_schema(),
                     "reason": { "type": "string", "maxLength": 2048, "description": "Why the plan is re-baselined; required when a baseline exists." },
-                    "backfill_from": { "type": "string", "format": "date-time", "description": "RFC 3339 instant to use as the baseline's start, marking it backfilled; must not be in the future or before the plan's creation time." }
+                    "backfill_from": { "type": "string", "format": "date-time", "description": "RFC 3339 instant to use as the baseline's start, marking it backfilled; must not be in the future or before the plan's creation time." },
+                    "capacities": {
+                        "type": "object",
+                        "description": "Freeze the capacity-levelled schedule plan.schedule computes for these units per resource (INVALID_CAPACITIES as there). Omitted on a re-baseline: the previous levelled baseline's capacities.",
+                        "additionalProperties": { "type": "integer", "minimum": 0 }
+                    },
+                    "resource_key": { "type": "string", "description": "Metadata key naming a deliverable's resource (default \"owner\"); also selects per-resource calendar entries. INVALID_VALUE when it has no effect." },
+                    "project_buffer_pct": { "type": "number", "description": "Project buffer percentage 0..100 (default 25), recorded and reported, never added to PV. INVALID_VALUE outside 0..100 or when it has no effect." },
+                    "schedule": { "type": "string", "enum": ["cpm", "levelled"], "description": "Force the frozen schedule: levelled needs capacities (given or inherited); cpm drops levelling and refuses capacities. Omitted: levelled when capacities resolve, else cpm." }
                 })),
                 "additionalProperties": false
             })),
@@ -1416,6 +1677,106 @@ pub fn plan_tool_definitions() -> Vec<Tool> {
                 "additionalProperties": false
             })),
         ),
+        Tool::new(
+            Cow::Borrowed(TOOL_OVERVIEW),
+            Cow::Borrowed(
+                "Read-only, deterministic snapshot of one plan at as_of (default now): \
+                 what plan.status, plan.get and plan.ev say, joined (schema \
+                 cpm-planner/overview/v1): plan identity, counts, the EV headline, \
+                 critical_path_hours, and bounded sections {total, omitted, items} for \
+                 critical_path (remaining hours, milestones fed), milestones, ready \
+                 (action acquire/accept/operator, float, file_conflicts), blocked \
+                 (class dependency/manual/external/gate, waiting_on, root_blockers), \
+                 leases, attention, and stale_evidence; every entry carries its evidence \
+                 status (current/stale/unknown/unbound/none). detail brief (default, 10 \
+                 per list) or full (100, adds chains, es/ef and owned files); limit \
+                 1..1000; filter {owner, milestone} narrows the lists only (an unknown \
+                 milestone is DELIVERABLE_NOT_FOUND, a non-milestone INVALID_VALUE). \
+                 evidence_target judges every evidence record against one identity \
+                 (malformed: INVALID_EVIDENCE). format json (default) or markdown. \
+                 No AI or network call; never writes. \
+                 Select the plan by plan_id, plan line name, or active: true.",
+            ),
+            schema_object(json!({
+                "type": "object",
+                "properties": with_plan_selector(json!({
+                    "as_of": { "type": "string", "format": "date-time", "description": "RFC 3339 instant of the whole snapshot (EV status date; leases judged against it); defaults to now." },
+                    "detail": { "type": "string", "enum": ["brief", "full"], "description": "brief (default) or full." },
+                    "limit": read_limit_schema("default 10 brief, 100 full"),
+                    "filter": {
+                        "type": "object",
+                        "description": "Narrow the lists; counts, EV and critical_path_hours still describe the whole plan.",
+                        "properties": {
+                            "owner": { "type": "string", "description": "Keep entries whose metadata.owner equals this." },
+                            "milestone": { "type": "string", "description": "Keep that milestone and the deliverables it waits on." }
+                        },
+                        "additionalProperties": false
+                    },
+                    "evidence_target": identity_schema(),
+                    "format": read_format_schema()
+                })),
+                "additionalProperties": false
+            })),
+        ),
+        Tool::new(
+            Cow::Borrowed(TOOL_EXPLAIN),
+            Cow::Borrowed(
+                "Read-only, deterministic: why one deliverable is not moving and what \
+                 completing it changes (schema cpm-planner/explain/v1). With \
+                 deliverable_id: its state (complete/leased/in_progress/ready/blocked/\
+                 failed), the blocker class, waiting_on, root_blockers and the driving \
+                 chain, unlocks (what becomes ready when it completes), the milestones \
+                 it feeds with slack_hours, and a one-sentence critical_path_impact. \
+                 Always: next_work, every ready or blocked deliverable in exactly one \
+                 class (ready_critical, ready_slack, blocked_dependency, blocked_manual, \
+                 blocked_external, blocked_gate, file_conflicting). An unknown id is \
+                 DELIVERABLE_NOT_FOUND; limit 1..1000 (default 10). format json \
+                 (default) or markdown. Agrees with plan.overview at the same as_of. \
+                 Select the plan by plan_id, plan line name, or active: true.",
+            ),
+            schema_object(json!({
+                "type": "object",
+                "properties": with_plan_selector(json!({
+                    "deliverable_id": { "type": "string", "description": "The deliverable to explain; omitted, the response has only next_work." },
+                    "as_of": { "type": "string", "format": "date-time", "description": "RFC 3339 snapshot instant; defaults to now." },
+                    "limit": read_limit_schema("default 10"),
+                    "format": read_format_schema()
+                })),
+                "additionalProperties": false
+            })),
+        ),
+        Tool::new(
+            Cow::Borrowed(TOOL_OPTIMIZE),
+            Cow::Borrowed(
+                "Offline, deterministic plan optimization (read-only; no model, \
+                 provider or network call; provide exactly one of graph, plan_id, or \
+                 path). Proposes plan.fork edit lists that make the plan shorter, \
+                 cheaper or simpler: merge (same-owner deliverables sharing a file), \
+                 false_dependency, parallel_cohort, gate_consolidation and gate_bypass. \
+                 Each proposal is checked by lint, the schedule and simulate, keeps \
+                 every acceptance criterion, gate, milestone, approval, interface \
+                 contract and owned file, never lengthens the makespan (the leveled one \
+                 with capacities) or adds effort, and is ranked by score; rejected \
+                 candidates are reported with their reasons. Optional capacities, \
+                 resource_key and project_buffer_pct level every candidate (as \
+                 plan.schedule); max_proposals caps proposals (default 32). A graph \
+                 that does not simulate is INVALID_GRAPH:. Run it before the optional \
+                 AI plan.review.",
+            ),
+            schema_object(json!({
+                "type": "object",
+                "properties": {
+                    "graph": graph_selector_schema(),
+                    "plan_id": plan_id_schema(),
+                    "path": path_schema(),
+                    "capacities": capacities_schema(),
+                    "resource_key": { "type": "string", "description": "Metadata key naming a deliverable's resource (default \"owner\"); requires capacities." },
+                    "project_buffer_pct": { "type": "number", "minimum": 0, "maximum": 100, "description": "Project buffer percentage (default 25); requires capacities." },
+                    "max_proposals": { "type": "integer", "minimum": 1, "description": "Most proposals returned (default 32); truncated is true when more were found." }
+                },
+                "additionalProperties": false
+            })),
+        ),
     ]
 }
 
@@ -1441,13 +1802,25 @@ fn schema_object(value: Value) -> Arc<rmcp::model::JsonObject> {
 // PlanServer
 // ---------------------------------------------------------------------------
 
+/// The `provider` a review reports when the direct OpenRouter path is the
+/// selected provider (the default, with or without a key).
+const PROVIDER_DIRECT: &str = "direct";
+/// The `provider` a review reports when `CPM_REVIEW_PROVIDER` turned review
+/// off, or named no known provider.
+const PROVIDER_DISABLED: &str = "disabled";
+
 /// What `plan.review` judges with, fixed when the server is built.
 #[derive(Clone)]
 enum ReviewJudge {
     Model(Arc<dyn JudgmentModel>),
+    /// The direct provider with no key.
     NotConfigured,
-    /// Unusable configuration; the key-free reason to report.
-    Unusable(String),
+    /// Unusable configuration: the provider it was meant for and the
+    /// key-free reason to report.
+    Unusable {
+        provider: &'static str,
+        reason: String,
+    },
 }
 
 impl ReviewJudge {
@@ -1455,19 +1828,29 @@ impl ReviewJudge {
         match self {
             Self::Model(model) => Judge::Model(model.as_ref()),
             Self::NotConfigured => Judge::NotConfigured,
-            Self::Unusable(reason) => Judge::ConfigError(reason),
+            Self::Unusable { reason, .. } => Judge::ConfigError(reason),
+        }
+    }
+
+    /// The review provider: `direct`, `command` or `disabled`, reported by
+    /// every review whatever its outcome.
+    fn provider(&self) -> &'static str {
+        match self {
+            Self::Model(model) => model.provider(),
+            Self::NotConfigured => PROVIDER_DIRECT,
+            Self::Unusable { provider, .. } => provider,
         }
     }
 
     fn configured_model(&self) -> Option<String> {
         match self {
             Self::Model(model) => model.model_id(),
-            Self::NotConfigured | Self::Unusable(_) => None,
+            Self::NotConfigured | Self::Unusable { .. } => None,
         }
     }
 }
 
-/// MCP server façade exposing a [`BasicCpmPlanner`] over twenty-five tools.
+/// MCP server façade exposing a [`BasicCpmPlanner`] over twenty-eight tools.
 #[derive(Clone)]
 pub struct PlanServer {
     planner: Arc<BasicCpmPlanner>,
@@ -1531,7 +1914,10 @@ impl PlanServer {
                 // its value or the key-file path.
                 let reason = err.review_reason();
                 tracing::warn!(%reason, "LLM configuration unusable; plan.review is unavailable");
-                ReviewJudge::Unusable(reason)
+                ReviewJudge::Unusable {
+                    provider: PROVIDER_DIRECT,
+                    reason,
+                }
             }
         };
         self
@@ -1553,13 +1939,18 @@ impl PlanServer {
                 self.judge = ReviewJudge::Model(Arc::new(CommandJudge::new(config)));
             }
             Ok(ReviewProvider::Disabled) => {
-                self.judge =
-                    ReviewJudge::Unusable("plan.review disabled by CPM_REVIEW_PROVIDER".into());
+                self.judge = ReviewJudge::Unusable {
+                    provider: PROVIDER_DISABLED,
+                    reason: "plan.review disabled by CPM_REVIEW_PROVIDER".into(),
+                };
             }
             Err(err) => {
                 let reason = err.review_reason();
                 tracing::warn!(%reason, "review provider unusable; plan.review is unavailable");
-                self.judge = ReviewJudge::Unusable(reason);
+                self.judge = ReviewJudge::Unusable {
+                    provider: unusable_provider(&err),
+                    reason,
+                };
             }
         }
         self
@@ -1705,6 +2096,25 @@ impl PlanServer {
         }
     }
 
+    /// The `calendar` and `start` arguments of `plan.schedule` and
+    /// `plan.simulate` (`docs/calendars.md`, section 3.1): `None` without a
+    /// calendar (then `start` is ignored and the output is exactly the
+    /// calendar-free one). `start` defaults to the planner clock. A single
+    /// calendar that does not decode is `invalid_params`, as a typed
+    /// calendar argument is; every other refusal keeps its planner code.
+    fn schedule_calendar(
+        &self,
+        calendar: Option<Value>,
+        start: Option<DateTime<Utc>>,
+    ) -> Result<Option<ScheduleCalendar>, McpError> {
+        let Some(calendar) = calendar else {
+            return Ok(None);
+        };
+        let spec = parse_calendar_arg(&calendar)?;
+        let start = start.unwrap_or_else(|| self.planner.now());
+        Ok(Some(ScheduleCalendar::new(spec, start)))
+    }
+
     /// Serve the MCP surface over stdio. Blocks until the peer disconnects.
     ///
     /// No SIGINT/drain handling is wired here yet; a future revision can
@@ -1768,6 +2178,9 @@ impl PlanServer {
             TOOL_EV => self.handle_ev(args).await,
             TOOL_SNAPSHOT => self.handle_snapshot(args).await,
             TOOL_REVIEW => self.handle_review(args).await,
+            TOOL_OVERVIEW => self.handle_overview(args).await,
+            TOOL_EXPLAIN => self.handle_explain(args).await,
+            TOOL_OPTIMIZE => self.handle_optimize(args).await,
             other => Err(McpError::invalid_params(
                 format!(
                     "Unknown tool '{other}'. Available: {}.",
@@ -1839,6 +2252,12 @@ impl PlanServer {
         if let Some(ttl) = ttl_from_seconds(parsed.ttl_seconds)? {
             request = request.with_ttl(ttl);
         }
+        if let Some(thread) = parsed.thread {
+            request = request.with_thread(thread);
+        }
+        if let Some(seconds) = parsed.affinity_seconds {
+            request = request.with_affinity_seconds(seconds);
+        }
         let cohort: Cohort = self
             .planner
             .acquire_cohort(request)
@@ -1881,11 +2300,15 @@ impl PlanServer {
 
     async fn handle_mark_status(&self, args: Value) -> Result<Value, McpError> {
         let parsed: MarkStatusArgs = parse_args(args)?;
+        let evidence = parsed
+            .evidence
+            .map(EvidenceArg::into_evidence)
+            .transpose()?;
         crate::planner::validate_actuals(
             &parsed.status,
             parsed.earned_pct,
             parsed.actual_effort_hours,
-            parsed.evidence.as_deref(),
+            evidence.as_ref().and_then(Evidence::as_note),
         )
         .map_err(planner_error_to_mcp)?;
         let plan_id = self
@@ -1905,7 +2328,7 @@ impl PlanServer {
         if let Some(hours) = parsed.actual_effort_hours {
             request = request.with_actual_effort_hours(hours as f32);
         }
-        if let Some(evidence) = parsed.evidence {
+        if let Some(evidence) = evidence {
             request = request.with_evidence(evidence);
         }
         let baseline_taken = self
@@ -1944,18 +2367,14 @@ impl PlanServer {
 
     async fn handle_accept(&self, args: Value) -> Result<Value, McpError> {
         let parsed: AcceptArgs = parse_args(args)?;
+        let evidence = parsed.evidence.into_evidence()?;
         let plan_id = self
             .resolve_plan_selector(parsed.plan_id, parsed.plan, parsed.active, parsed.project)
             .await?;
         self.planner
             .accept(
-                AcceptRequest::new(
-                    plan_id,
-                    parsed.deliverable_id,
-                    parsed.accepted_by,
-                    parsed.evidence,
-                )
-                .override_lock(parsed.override_lock),
+                AcceptRequest::new(plan_id, parsed.deliverable_id, parsed.accepted_by, evidence)
+                    .override_lock(parsed.override_lock),
             )
             .await
             .map_err(planner_error_to_mcp)?;
@@ -2027,10 +2446,14 @@ impl PlanServer {
             project_buffer_pct: parsed.project_buffer_pct,
         };
         check_schedule_params(&request)?;
+        let calendar = self.schedule_calendar(parsed.calendar, parsed.start)?;
         let graph = self
             .resolve_graph(parsed.graph, parsed.plan_id, None)
             .await?;
-        let schedule = run_blocking(move || resource_schedule(&graph, &request)).await?;
+        let schedule = run_blocking(move || {
+            resource_schedule_on_calendar(&graph, &request, calendar.as_ref())
+        })
+        .await?;
         to_value(&schedule)
     }
 
@@ -2047,10 +2470,14 @@ impl PlanServer {
             crate::monte_carlo::check_iterations(mc.iterations)
                 .map_err(|reason| McpError::invalid_params(reason, None))?;
         }
+        let calendar = self.schedule_calendar(parsed.calendar, parsed.start)?;
         let graph = self
             .resolve_graph(parsed.graph, parsed.plan_id, parsed.path)
             .await?;
-        let result = run_blocking(move || crate::simulate::simulate(&graph, &request)).await?;
+        let result = run_blocking(move || {
+            crate::simulate::simulate_on_calendar(&graph, &request, calendar.as_ref())
+        })
+        .await?;
         to_value(&result)
     }
 
@@ -2269,11 +2696,14 @@ impl PlanServer {
         let plan_id = self
             .resolve_plan_selector(parsed.plan_id, parsed.plan, parsed.active, parsed.project)
             .await?;
-        let mut request = BaselineRequest::new(plan_id);
+        let mut request = BaselineRequest::new(plan_id).with_calendar_input(parsed.calendar);
         request.start = parsed.start;
-        request.calendar = parsed.calendar;
         request.reason = parsed.reason;
         request.backfill_from = parsed.backfill_from;
+        request.capacities = parsed.capacities;
+        request.resource_key = parsed.resource_key;
+        request.project_buffer_pct = parsed.project_buffer_pct;
+        request.schedule = parsed.schedule;
         let outcome = self
             .planner
             .baseline(request)
@@ -2310,6 +2740,92 @@ impl PlanServer {
         to_value(&outcome)
     }
 
+    /// `plan.overview`. The evidence target and the list options are
+    /// checked before any read (`INVALID_EVIDENCE` / `INVALID_VALUE`); the
+    /// snapshot is read off the runtime's worker threads, at `as_of` or the
+    /// planner clock's now.
+    async fn handle_overview(&self, args: Value) -> Result<Value, McpError> {
+        let parsed: OverviewArgs = parse_args(args)?;
+        let evidence_target = parsed
+            .evidence_target
+            .map(Identity::from_json)
+            .transpose()
+            .map_err(planner_error_to_mcp)?;
+        let options = OverviewOptions {
+            detail: parsed.detail,
+            limit: parsed.limit,
+            filter: parsed.filter,
+            evidence_target,
+        };
+        options.validate().map_err(planner_error_to_mcp)?;
+        let plan_id = self
+            .resolve_plan_selector(parsed.plan_id, parsed.plan, parsed.active, parsed.project)
+            .await?;
+        let mut request = OverviewRequest::new(PlanRef::Id(plan_id))
+            .with_as_of(parsed.as_of.unwrap_or_else(|| self.planner.now()));
+        request.options = options;
+        let planner = Arc::clone(&self.planner);
+        let overview = run_blocking_planner("overview", async move {
+            crate::overview::overview(&*planner, request).await
+        })
+        .await?;
+        match parsed.format {
+            ReadFormat::Json => to_value(&overview),
+            ReadFormat::Markdown => Ok(markdown_response(crate::overview::render_markdown(
+                &overview,
+            ))),
+        }
+    }
+
+    /// `plan.explain`, read like `plan.overview`.
+    async fn handle_explain(&self, args: Value) -> Result<Value, McpError> {
+        let parsed: ExplainArgs = parse_args(args)?;
+        let plan_id = self
+            .resolve_plan_selector(parsed.plan_id, parsed.plan, parsed.active, parsed.project)
+            .await?;
+        let mut request = ExplainRequest::new(PlanRef::Id(plan_id))
+            .with_as_of(parsed.as_of.unwrap_or_else(|| self.planner.now()));
+        request.deliverable_id = parsed.deliverable_id;
+        request.limit = parsed.limit;
+        let planner = Arc::clone(&self.planner);
+        let explanation = run_blocking_planner("explain", async move {
+            crate::explain::explain(&*planner, request).await
+        })
+        .await?;
+        match parsed.format {
+            ReadFormat::Json => to_value(&explanation),
+            ReadFormat::Markdown => Ok(markdown_response(crate::explain::render_markdown(
+                &explanation,
+            ))),
+        }
+    }
+
+    /// `plan.optimize`: offline and deterministic. Params are range-checked
+    /// first (`invalid_params`); a graph that does not simulate is
+    /// `INVALID_GRAPH`, as from `plan.simulate`.
+    async fn handle_optimize(&self, args: Value) -> Result<Value, McpError> {
+        let parsed: OptimizeToolArgs = parse_args(args)?;
+        if parsed.max_proposals == Some(0) {
+            return Err(McpError::invalid_params(
+                "max_proposals must be >= 1 when provided",
+                None,
+            ));
+        }
+        let request = OptimizeRequest {
+            schedule: leveling_request(
+                parsed.capacities,
+                parsed.resource_key,
+                parsed.project_buffer_pct,
+            )?,
+            max_proposals: parsed.max_proposals,
+        };
+        let graph = self
+            .resolve_graph(parsed.graph, parsed.plan_id, parsed.path)
+            .await?;
+        let report = run_blocking(move || crate::optimize::optimize(&graph, &request)).await?;
+        to_value(&report)
+    }
+
     /// `plan.review`. Params are range-checked first (`invalid_params`).
     /// At most [`MAX_CONCURRENT_REVIEWS`] run at once (later calls wait).
     /// The whole review runs on the blocking pool, with the runtime handle
@@ -2343,8 +2859,12 @@ impl PlanServer {
                 // A selector mistake is a rejected param (unaudited); a
                 // missing plan or bad path is a failed review.
                 if err.code != rmcp::model::ErrorCode::INVALID_PARAMS {
-                    let event =
-                        review_audit_event(Err(mcp_error_code(&err)), audited_plan_id, None);
+                    let event = review_audit_event(
+                        Err(mcp_error_code(&err)),
+                        audited_plan_id,
+                        None,
+                        self.judge.provider(),
+                    );
                     self.planner.record_audit(event).await;
                 }
                 return Err(err);
@@ -2352,6 +2872,7 @@ impl PlanServer {
         };
         let judge = self.judge.clone();
         let configured_model = judge.configured_model();
+        let provider = judge.provider();
         let slots = self.review_slots.clone();
         let runtime = tokio::runtime::Handle::current();
         let outcome = spawn_analysis("review", move || {
@@ -2369,16 +2890,38 @@ impl PlanServer {
                 .flatten();
             runtime.block_on(crate::review::review(&graph, &request, judge.as_judge()))
         })
-        .await?;
+        .await?
+        .map(|mut report| {
+            // Provenance on every path, the no-judge and config-error
+            // reviews included.
+            report.provider.get_or_insert_with(|| provider.to_string());
+            report
+        });
         let audit_outcome = match &outcome {
             Ok(report) => Ok(report),
             Err(err) => Err(Some(error_code(err))),
         };
-        let event = review_audit_event(audit_outcome, audited_plan_id, configured_model);
+        let event = review_audit_event(audit_outcome, audited_plan_id, configured_model, provider);
         self.planner.record_audit(event).await;
         to_value(&outcome.map_err(planner_error_to_mcp)?)
     }
 }
+
+/// The provider an unusable `CPM_REVIEW_PROVIDER` setting stands for: an
+/// unknown provider name leaves review off (`disabled`); any other refusal
+/// comes from the command adapter's own settings (`command`).
+fn unusable_provider(err: &ConfigError) -> &'static str {
+    match err {
+        ConfigError::InvalidReviewProvider { reason } if *reason == UNKNOWN_PROVIDER_REASON => {
+            PROVIDER_DISABLED
+        }
+        _ => crate::llm::command::PROVIDER_NAME,
+    }
+}
+
+/// [`ReviewProvider::from_lookup`]'s reason for a provider name it does not
+/// know.
+const UNKNOWN_PROVIDER_REASON: &str = "must be direct, command or disabled";
 
 /// Build and range-check `plan.review`'s request (`invalid_params`).
 fn review_request(
@@ -2392,7 +2935,22 @@ fn review_request(
         crate::review::check_max_questions(cap)
             .map_err(|reason| McpError::invalid_params(reason, None))?;
     }
-    let capacities = match capacities {
+    Ok(ReviewRequest {
+        capacities: leveling_request(capacities, resource_key, project_buffer_pct)?,
+        max_questions,
+        scope,
+    })
+}
+
+/// The flat optional leveling inputs of `plan.review` and `plan.optimize`:
+/// `resource_key` and `project_buffer_pct` need `capacities`, and the
+/// buffer is range-checked (`invalid_params`).
+fn leveling_request(
+    capacities: Option<std::collections::BTreeMap<String, u32>>,
+    resource_key: Option<String>,
+    project_buffer_pct: Option<f32>,
+) -> Result<Option<ScheduleRequest>, McpError> {
+    match capacities {
         Some(capacities) => {
             let schedule = ScheduleRequest {
                 capacities,
@@ -2402,36 +2960,52 @@ fn review_request(
                     .unwrap_or_else(crate::resource_schedule::default_buffer_pct),
             };
             check_schedule_params(&schedule)?;
-            Some(schedule)
+            Ok(Some(schedule))
         }
         None if resource_key.is_some() || project_buffer_pct.is_some() => {
-            return Err(McpError::invalid_params(
+            Err(McpError::invalid_params(
                 "resource_key and project_buffer_pct require capacities",
                 None,
-            ));
+            ))
         }
-        None => None,
-    };
-    Ok(ReviewRequest {
-        capacities,
-        max_questions,
-        scope,
+        None => Ok(None),
+    }
+}
+
+/// Parse a `calendar` argument with [`CalendarSpec::parse`]: a single
+/// calendar that does not decode is `invalid_params`; an invalid value keeps
+/// its planner code (`INVALID_GRAPH` for a legacy field, `INVALID_VALUE`
+/// for `day_start` and the map form).
+fn parse_calendar_arg(value: &Value) -> Result<CalendarSpec, McpError> {
+    CalendarSpec::parse(value).map_err(|err| match err {
+        CalendarArgError::Params(reason) => {
+            McpError::invalid_params(format!("invalid arguments: {reason}"), None)
+        }
+        CalendarArgError::Invalid(err) => planner_error_to_mcp(err),
     })
+}
+
+/// The Markdown form of a read tool's response.
+fn markdown_response(markdown: String) -> Value {
+    json!({ "format": "markdown", "markdown": markdown })
 }
 
 /// The `plan.review` audit record: what was asked of whom and the outcome,
 /// never the key or the prompt (only its hash). `model` is the provider's,
 /// else the configured one when the judge was called; a failed review
 /// (`Err`, engine or graph-resolution error) is status `"error"` with its
-/// stable `code` (the error prefix, e.g. `PLAN_NOT_FOUND`).
+/// stable `code` (the error prefix, e.g. `PLAN_NOT_FOUND`). `provider` is
+/// always set (`direct`, `command` or `disabled`).
 fn review_audit_event(
     outcome: Result<&ReviewReport, Option<String>>,
     plan_id: Option<String>,
     configured_model: Option<String>,
+    provider: &str,
 ) -> AuditEvent {
     let payload = match outcome {
         Ok(report) => json!({
             "status": report.status,
+            "provider": report.provider.as_deref().unwrap_or(provider),
             "code": null,
             "failure_class": report.failure_class,
             "plan_id": plan_id,
@@ -2443,6 +3017,7 @@ fn review_audit_event(
         }),
         Err(code) => json!({
             "status": "error",
+            "provider": provider,
             "code": code,
             "failure_class": null,
             "plan_id": plan_id,
@@ -2553,7 +3128,7 @@ impl ServerHandler for PlanServer {
             Implementation::new(self.server_name.clone(), self.server_version.clone());
         server_info.title = Some("cpm-planner".to_string());
         server_info.description = Some(
-            "MCP server exposing the open-source Praxec CPM planner via twenty-five tools."
+            "MCP server exposing the open-source Praxec CPM planner via twenty-eight tools."
                 .to_string(),
         );
 
@@ -2655,9 +3230,10 @@ fn planner_error_to_mcp(err: PlannerError) -> McpError {
 fn instructions() -> &'static str {
     r#"This is the cpm-planner MCP server — the open-source CPM planner.
 
-Tools (twenty-five total, all in the `plan` namespace):
+Tools (twenty-eight total, all in the `plan` namespace):
   Selectors (plan.status, plan.get, plan.ev, plan.snapshot, plan.baseline,
-  plan.acquire_cohort, plan.heartbeat, plan.mark_status, plan.accept and
+  plan.overview, plan.explain, plan.acquire_cohort, plan.heartbeat,
+  plan.mark_status, plan.accept and
   plan.force_release): pass exactly one of plan_id, plan (a plan line name,
   resolved to its selected variant) or active: true (the project's single line
   that is unarchived and whose selected variant is unarchived and not complete).
@@ -2678,18 +3254,18 @@ Tools (twenty-five total, all in the `plan` namespace):
                         an optional earning_rule (zero_hundred default: 100% only when complete; fifty_fifty: 50% once in progress or any earned_pct is reported; weighted: the reported earned_pct) sets how earned value credits progress; it is part of the plan's identity
                         an optional estimate {optimistic, likely, pessimistic} (0 <= optimistic <= likely <= pessimistic) is a three-point effort estimate; scheduled length precedence is duration_hours > estimated_effort_hours > estimate.likely > 0 for a milestone > estimator default, and Monte Carlo samples the estimate only when neither duration_hours nor estimated_effort_hours is set
                         limits: at most 5000 deliverables; every hour value (effort, duration, lag, estimate) must be finite and between 0 and 1000000 (INVALID_GRAPH)
-  plan.acquire_cohort  — atomically acquire ready deliverables with no conflicting file claims (an owned_files entry may be {path, mode: "append"}: append claims on one path may be co-leased and are listed in the response's shared_paths; exclusive claims never overlap anything at once; plan.submit accepts a shared file only when the claimants are ordered by prerequisites, or all claims are append); a call that leases at least one deliverable is execution-starting: it takes the plan's first earned-value baseline in auto mode and reports baseline_taken {baseline_number, as_of, reason:"first_execution"} (in refuse mode it fails with BASELINE_REQUIRED unless the plan already has one)
+  plan.acquire_cohort  — atomically acquire ready deliverables with no conflicting file claims (an owned_files entry may be {path, mode: "append"}: append claims on one path may be co-leased and are listed in the response's shared_paths; exclusive claims never overlap anything at once; plan.submit accepts a shared file only when the claimants are ordered by prerequisites, or all claims are append); a call that leases at least one deliverable is execution-starting: it takes the plan's first earned-value baseline in auto mode and reports baseline_taken {baseline_number, as_of, reason:"first_execution"} (in refuse mode it fails with BASELINE_REQUIRED unless the plan already has one); thread affinity: a caller that completes a metadata.thread deliverable is offered that thread's next ready deliverable first, optional thread (a token) prefers one thread, and optional affinity_seconds (default 0) holds back deliverables of a thread another caller advanced less than that long ago, reported in blocked as AFFINITY_HOLD
   plan.heartbeat       — refresh a held lock's TTL
   plan.mark_status     — set a deliverable's status (Complete/Failed releases the lock); lockless Complete/Ready/InProgress requires complete prerequisites (PREREQUISITES_INCOMPLETE) and is audited; a lockless InProgress persists across restarts and is not leasable until handed back with a lockless Ready (plan.force_release does not affect it)
-                        optional earned-value progress: earned_pct (integer 0..100, only with in_progress; accepted and ignored with complete), actual_effort_hours (total so far, finite 0..1000000; replaces leased hours as actual cost), evidence (<= 2048 chars, appended to the deliverable's list, at most 100 entries); violations are INVALID_ACTUALS. plan.select copies the actuals of every deliverable whose Complete status it carries (leased hours add up; the carried deliverable's reported earned_pct and hours win; the newest 100 evidence entries are kept). Every lease that ends (complete, failed, force_release, expiry, accept override, forced revise/select/archive) adds its hours (up to expiry for a lapsed lease) to the deliverable's leased hours; a mark to in_progress or complete is execution-starting: in auto mode it takes the plan's first baseline (reported as baseline_taken) if none exists, in refuse mode it is BASELINE_REQUIRED
-  plan.status          — read-only snapshot ([id, status, attempt_count, failure_count, lapse_count] rows, critical_path (one real chain, always __start__ to __finish__), critical_ids, per-deliverable schedule (es/ef/ls/lf/float, hours; synthetic __start__/__finish__ endpoint rows have synthetic=true and critical=true; critical_ids lists only real deliverables), the ready set in float-ascending order (smallest float first, then smallest latest start, then id; acquire_cohort still leases by longest remaining tail), plan_complete, milestones (one row per `milestone: true` deliverable, or metadata.milestone == true: id, critical_path from __start__ to it, hours = its earliest finish, complete), held locks, baseline (the latest {baseline_number, as_of}, or null before the first); for a named variant also name, variant, selected, archived and active_plan (the project's single active line's name when the variant is archived; archived and active_plan are null for an unnamed plan), and definition_drift). __start__ and __finish__ are reserved deliverable ids (INVALID_GRAPH)
+                        optional earned-value progress: earned_pct (integer 0..100, only with in_progress; accepted and ignored with complete), actual_effort_hours (total so far, finite 0..1000000; replaces leased hours as actual cost), evidence (a note of <= 2048 chars, or an evidence record {schema_version: 1, scope, summary, ref?, party?, identity?}; appended to the deliverable's list, at most 100 entries); violations are INVALID_ACTUALS, a malformed record is INVALID_EVIDENCE, a record whose scope may not close the deliverable is EVIDENCE_SCOPE_MISMATCH, closing a deliverable with a declared metadata.evidence_scope without a matching record is EVIDENCE_REQUIRED, and a gate record that does not match its metadata.candidate's identity is EVIDENCE_STALE. plan.select copies the actuals of every deliverable whose Complete status it carries (leased hours add up; the carried deliverable's reported earned_pct and hours win; the newest 100 evidence entries are kept). Every lease that ends (complete, failed, force_release, expiry, accept override, forced revise/select/archive) adds its hours (up to expiry for a lapsed lease) to the deliverable's leased hours; a mark to in_progress or complete is execution-starting: in auto mode it takes the plan's first baseline (reported as baseline_taken) if none exists, in refuse mode it is BASELINE_REQUIRED
+  plan.status          — read-only snapshot ([id, status, attempt_count, failure_count, lapse_count] rows, critical_path (one real chain, always __start__ to __finish__), critical_ids, per-deliverable schedule (es/ef/ls/lf/float, hours; synthetic __start__/__finish__ endpoint rows have synthetic=true and critical=true; critical_ids lists only real deliverables), the ready set in float-ascending order (smallest float first, then smallest latest start, then id; acquire_cohort still leases by longest remaining tail), plan_complete, milestones (one row per `milestone: true` deliverable, or metadata.milestone == true: id, critical_path from __start__ to it, hours = its earliest finish, complete), held locks, baseline (the latest {baseline_number, as_of, schedule}, or null before the first), threads (one row per metadata.thread: holder, affine_caller, next_ready, completed, total; omitted for a plan without threads); for a named variant also name, variant, selected, archived and active_plan (the project's single active line's name when the variant is archived; archived and active_plan are null for an unnamed plan), and definition_drift). __start__ and __finish__ are reserved deliverable ids (INVALID_GRAPH)
                         definition_drift: null when unknown (no root for the variant's project, no tracked file, file missing/unreadable/over 8 MiB); false when the file matches the last synced/exported bytes or its graph equals the head graph (re-formatting is not drift); true when the file's graph differs from the head or does not parse — so after an inline revise it is true until plan.export or plan.sync {path}
   plan.get             — return the submitted PlanGraph (deliverables, estimates, files, metadata) for a plan_id, plan or active selector
   plan.force_release   — operator escape hatch; emits audit event with `reason`; optional reset_counters:true also clears lapse/failure counters and revives a circuit-broken deliverable
-  plan.accept          — a manager/owner marks a deliverable Complete without a lease (audited; evidence required; override_lock to take over a live lease)
+  plan.accept          — a manager/owner marks a deliverable Complete without a lease (audited; evidence required: a note or an evidence record, checked as on plan.mark_status and appended to the deliverable's evidence list; override_lock to take over a live lease)
   plan.lint            — static checks without submitting: cycles (with the loop), redundant edges, edges without rationale, interface edges not targeting a contract, deliverables feeding no milestone, unordered file overlaps; linting by plan_id also adds NO_BASELINE (warning) when the plan is executable and has progress but no earned-value baseline
-  plan.schedule        — level a graph against resource capacities (`metadata.owner` by default): makespan, per-deliverable start/finish, per-resource load, driving chain (dependency vs resource waits), project and feeding buffers; capacities is required and every resource carrying work needs >= 1 unit (INVALID_CAPACITIES: lists the missing ones); project_buffer_pct 0..100 (default 25)
-  plan.simulate        — read-only what-if: lint, critical path, schedule, milestones, optional resource schedule (schedule: same inputs as plan.schedule) and Monte Carlo (monte_carlo: iterations 1..50000, default 2000; seed, default 0xC0FFEE, reproducible on the same platform and build; iterations × (deliverables + prerequisite edges) must not exceed 200000000), and the scorecard; persists nothing
+  plan.schedule        — level a graph against resource capacities (`metadata.owner` by default): makespan, per-deliverable start/finish, per-resource load, driving chain (dependency vs resource waits), project and feeding buffers; capacities is required and every resource carrying work needs >= 1 unit (INVALID_CAPACITIES: lists the missing ones); project_buffer_pct 0..100 (default 25); optional calendar (one calendar {hours_per_day, day_start "HH:MM", workdays, utc_offset_minutes}, or a per-resource map {default: calendar, <resource>: calendar}) and start (RFC 3339, default now) place each deliverable in its resource's working windows: hours are wall-clock from start, rows add start_at/finish_at/calendars/calendar_wait_hours, cpm_makespan is the unlevelled makespan on the same calendars, and the driving chain reports waited_on "calendar"; without calendar the output is unchanged
+  plan.simulate        — read-only what-if: lint, critical path, schedule, milestones, optional resource schedule (schedule: same inputs as plan.schedule) and Monte Carlo (monte_carlo: iterations 1..50000, default 2000; seed, default 0xC0FFEE, reproducible on the same platform and build; iterations × (deliverables + prerequisite edges) must not exceed 200000000), and the scorecard; persists nothing; optional calendar and start (as on plan.schedule) apply to the resource schedule and to Monte Carlo
   plan.release.compile — offline bounded release-DAG compiler; workflow schema_version 1; outputs a lint-clean ordinary graph with per-node source/confidence and policy digest; never executes or accepts work
   plan.release.diff    — compare a retained graph with workflow/promotion policy and history; stale means revise/sync the plan before baselining or continuing
   plan.sync            — register or update one variant of a named plan line from a plan file (path: .cpm-planner/plans/<name>/<variant>.json, tracked by content hash for drift; any name/variant/project given must match the path) or an inline graph (requires name; variant defaults to "main"); project defaults to the discovered root; force releases live locks of removed deliverables
@@ -2700,12 +3276,15 @@ Tools (twenty-five total, all in the `plan` namespace):
   plan.select          — make a variant its line's selected (only executable) variant, carrying progress over (Complete statuses of identically defined deliverables, with their earned-value actuals); force releases locks on the previous variant; selecting a variant that gains progress is execution-starting, so in auto mode a variant with no baseline takes one (reported as baseline_taken) and in refuse mode it is BASELINE_REQUIRED
   plan.archive         — archive (archived defaults true) or unarchive a whole line or one variant; archived variants stay readable but refuse sync/select/execute
   plan.compare         — compare stored plans (plan_ids: 2..16 distinct ids, or plan line name in project, default the discovered root, for every live variant, at most 16) on the scorecard: Pareto front, weighted rank, recommended; weights must be finite and >= 0; the Monte Carlo budget (200000000) is shared across variants
-  plan.baseline        — freeze the plan's CPM schedule (es/ef) and budgets (effort basis x metadata.cost_rate, default 1) as its next numbered earned-value baseline; optional start (RFC 3339, default now) and calendar {hours_per_day (0 < h <= 24, default 8), workdays (default mon..fri), utc_offset_minutes (default 0)} (omitted: wall-clock hours on the first baseline, the previous baseline's calendar on a re-baseline); optional backfill_from (RFC 3339) sets start retroactively and marks the baseline backfilled:true (reported by plan.ev) and must not be in the future or before the plan's creation time (INVALID_VALUE); re-baselining needs a non-blank reason (<= 2048 chars, INVALID_GRAPH otherwise) and keeps actuals and snapshots; baselines, actuals and snapshots belong to one variant, so a newly selected variant takes its own baseline 1 with no reason needed; selected, unarchived variant only; audited as plan.ev.baselined
+  plan.baseline        — freeze the plan's CPM schedule (es/ef), or with capacities the levelled schedule plan.schedule computes, and budgets (effort basis x metadata.cost_rate, default 1) as its next numbered earned-value baseline; optional start (RFC 3339, default now) and calendar {hours_per_day (0 < h <= 24, default 8), day_start ("HH:MM", default 00:00), workdays (default mon..fri), utc_offset_minutes (default 0)} (omitted: wall-clock hours on the first baseline, the previous baseline's calendar on a re-baseline; null: wall-clock hours; a map with a default entry gives each resource its own calendar and PV accrues only inside each deliverable's windows); optional capacities, resource_key and project_buffer_pct (reused by a re-baseline that omits them) and schedule ("cpm" or "levelled"; omitted: levelled when capacities resolve; levelled without capacities, capacities with cpm, or resource_key/project_buffer_pct with no effect are INVALID_VALUE); optional backfill_from (RFC 3339) sets start retroactively and marks the baseline backfilled:true (reported by plan.ev) and must not be in the future or before the plan's creation time (INVALID_VALUE); re-baselining needs a non-blank reason (<= 2048 chars, INVALID_GRAPH otherwise) and keeps actuals and snapshots; baselines, actuals and snapshots belong to one variant, so a newly selected variant takes its own baseline 1 with no reason needed; selected, unarchived variant only; audited as plan.ev.baselined
   plan.ev              — earned-value report against the latest baseline as of as_of (RFC 3339, default now; as_of is the PV status date, while EV and AC reflect progress and actuals recorded up to the moment the call runs): baseline_number, backfilled (true when plan.baseline was given backfill_from), bac, pv, ev, ac, sv, cv, spi, cpi, eac, etc, vac, tcpi, per-deliverable rows, critical_float_consumed_hours, alerts (SPI_BELOW_0_9 / CPI_BELOW_0_9 when below 0.9 on the two latest stored non-backfilled snapshots by as_of of the current baseline; the current reading is not one of them), excluded_unbaselined; AC sums every recorded hour of the plan (removed and unbaselined deliverables included, at rate 1 when the baseline has no row); a baselined deliverable removed by plan.revise reports status "removed" and keeps its earned percent at removal (100 if complete), and re-adding it restarts its earned percent (hours keep accumulating); a ratio with a zero denominator is null and explained in `undefined` (never NaN); read-only on any variant, including an archived one (which reports archived: true and, when the project has exactly one active line, its active_plan name); NOT_BASELINED before plan.baseline
   plan.snapshot        — compute the plan.ev report and append it as a snapshot (as_of is the PV status date; EV and AC are as recorded when the call runs, so a snapshot whose as_of is more than an hour before taken_at is marked backfilled: true, raises no alerts and is skipped by later alerts); returns summary (undefined explains each null ratio; alerts consider only readings up to its own position: this snapshot and the latest earlier one by as_of of the current baseline, so a backfill never takes alerts from newer readings), snapshot_count and export of the newest 100 snapshots by as_of (ties by taken_at), oldest first, so a backfilled as_of lands in date order; a backfill older than those 100 is stored and counted but not listed: a list of summaries (format "json", default) or a Markdown table with columns date, PV, EV, AC, SPI, CPI, EAC (format "markdown"); selected, unarchived variant only; NOT_BASELINED before plan.baseline
-  plan.review          — optional AI review (read-only; graph, plan_id or path; optional capacities/resource_key/project_buffer_pct, max_questions 1..64, default 64, and scope full or critical_path): lint always runs and lint errors return status invalid_graph with no judge call; otherwise ONE batched call to Jev (TypeSafe's calibrated-judgment model, via OpenRouter) scores likely false dependencies, missing dependencies, split and interface-split candidates, crash options, wave merges and merge candidates. Probabilities are advisory, not facts. proposals are plan.fork edit lists, each verified by simulate (lints clean, shortens the makespan) and ranked by hours_saved / max(cost, 1). CPM_REVIEW_PROVIDER=command delegates the judgment to the CPM_REVIEW_COMMAND adapter, with no fallback. Without an OpenRouter key, or with an unusable LLM setting, status is review_unavailable with a reason, plus lint; a provider failure is review_unavailable with "<class>: <message>". The plan graph is sent to OpenRouter
+  plan.review          — optional AI review (read-only; graph, plan_id or path; optional capacities/resource_key/project_buffer_pct, max_questions 1..64, default 64, and scope full or critical_path): lint always runs and lint errors return status invalid_graph with no judge call; otherwise ONE batched call to Jev (TypeSafe's calibrated-judgment model, via OpenRouter) scores likely false dependencies, missing dependencies, split and interface-split candidates, crash options, wave merges and merge candidates. Probabilities are advisory, not facts. proposals are plan.fork edit lists, each verified by simulate (lints clean, shortens the makespan) and ranked by hours_saved / max(cost, 1). CPM_REVIEW_PROVIDER=command delegates the judgment to the CPM_REVIEW_COMMAND adapter, with no fallback. Without an OpenRouter key, or with an unusable LLM setting, status is review_unavailable with a reason, plus lint; a provider failure is review_unavailable with "<class>: <message>". Every review reports provider (direct, command or disabled), also when no judge was asked. The plan graph is sent to OpenRouter
+  plan.overview        — read-only, deterministic one-call snapshot at as_of (default now) joining plan.status, plan.get and plan.ev with each deliverable's evidence status: counts, EV headline, critical path with remaining hours, milestones, ready work (action acquire/accept/operator, file_conflicts), blocked work (class and root blockers), leases, attention and stale evidence; detail brief|full, limit 1..1000, filter {owner, milestone}, evidence_target (an identity, INVALID_EVIDENCE when malformed), format json (default) or markdown ({format, markdown})
+  plan.explain         — read-only, deterministic: for deliverable_id, why it is not moving (state, blocker class, root blockers, driving chain) and what completing it unlocks (unlocks, milestones fed with slack, critical_path_impact); always next_work in classes ready_critical, ready_slack, blocked_dependency, blocked_manual, blocked_external, blocked_gate, file_conflicting; as_of, limit 1..1000 (default 10), format json or markdown
+  plan.optimize        — offline, deterministic optimization (graph, plan_id or path; optional capacities/resource_key/project_buffer_pct and max_proposals, default 32): proposes plan.fork edit lists (merge, false_dependency, parallel_cohort, gate_consolidation, gate_bypass), each checked by lint, schedule and simulate, preserving acceptance criteria, gates, milestones, approvals, contracts and owned files, never lengthening the makespan or adding effort, ranked by score, with rejected candidates and their reasons; no model or network call; INVALID_GRAPH when the graph does not simulate
   plan.submit with a `name` (optional `project`/`variant`, variant defaults to "main") registers a named variant instead of an unnamed plan
-  plan.lint, plan.simulate and plan.review take exactly one of an inline graph, a stored plan_id, or a plan-file path; plan.schedule takes graph or plan_id; plan.schedule and plan.simulate reject what plan.submit rejects, and plan.lint reports it as findings
+  plan.lint, plan.simulate, plan.optimize and plan.review take exactly one of an inline graph, a stored plan_id, or a plan-file path; plan.schedule takes graph or plan_id; plan.schedule and plan.simulate reject what plan.submit rejects, and plan.lint reports it as findings
 
 Plan-as-code workflow: author the graph as
 .cpm-planner/plans/<name>/<variant>.json, check it with plan.lint {path},
@@ -2715,10 +3294,18 @@ plan.compare scores every live variant, and plan.select makes exactly one
 executable. Never keep untracked scratch graphs — the files under
 .cpm-planner/plans/ are the source of truth for definitions.
 
-Review workflow: plan.review {path} on a lint-clean plan; read findings as
-advisory judgments (check them against what you know), apply a proposal you
-agree with via plan.fork {edits} (or design the edits for split and
-missing-dependency findings yourself), then plan.compare and plan.select.
+Improvement workflow: run plan.optimize {path} first: it is free, offline
+and deterministic, and catches the structural waste the graph shows by
+itself. plan.review stays the optional AI step for judgments the graph cannot
+make alone: run it on a lint-clean plan and read its findings as advisory
+judgments (check them against what you know). Apply a proposal you agree with
+via plan.fork {edits} (or design the edits for split and missing-dependency
+findings yourself), then plan.compare and plan.select.
+
+Reading a plan: plan.overview is the one-call picture (what is critical, what
+is ready, what is blocked and on whom, which evidence is stale); plan.explain
+{deliverable_id} says why one deliverable is not moving and what finishing it
+unlocks.
 
 Leases default to 5 minutes. Pass ttl_seconds (≤ server max, default 8h)
 on acquire/heartbeat for long-running work, and heartbeat at least every
@@ -2735,7 +3322,9 @@ OVERLAP_DETECTED, MISSING_PREREQUISITE, PLAN_NOT_FOUND, NO_ACTIVE_PLAN,
 AMBIGUOUS_ACTIVE_PLAN, DELIVERABLE_NOT_FOUND, LAPSE_LIMIT,
 PREREQUISITES_INCOMPLETE, INVALID_GRAPH,
 INVALID_CAPACITIES, VARIANT_NOT_SELECTED, ARCHIVE_REFUSED, INVALID_PATH,
-INVALID_ACTUALS, BASELINE_REQUIRED, NOT_BASELINED, BACKEND_ERROR.
+INVALID_ACTUALS, INVALID_VALUE, INVALID_EVIDENCE, EVIDENCE_SCOPE_MISMATCH,
+EVIDENCE_REQUIRED, EVIDENCE_STALE, BASELINE_REQUIRED, NOT_BASELINED,
+BACKEND_ERROR. AFFINITY_HOLD is an acquire_cohort blocked code, not an error.
 
 DeliverableStatus is internally tagged on `status`:
   {"status":"pending"} | {"status":"ready"} | {"status":"in_progress"} |
@@ -2764,6 +3353,6 @@ equals every pair; others are silently skipped). ids that do not match
 filter.metadata are ignored (not reported in blocked). Deliverables with
 metadata.kind = "manual" or "gate" are never leased. With `ids`, each requested id
 that is not leased appears in `blocked` with code MANUAL, NOT_READY,
-LOCKED, LAPSE_LIMIT, FILE_CONFLICT or MAX_COUNT.
+LOCKED, LAPSE_LIMIT, FILE_CONFLICT, AFFINITY_HOLD or MAX_COUNT.
 "#
 }

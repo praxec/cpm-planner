@@ -352,7 +352,8 @@ impl BasicCpmPlanner {
         Ok(())
     }
 
-    fn now(&self) -> DateTime<Utc> {
+    /// The planner clock's now (the injected clock in tests).
+    pub fn now(&self) -> DateTime<Utc> {
         (self.clock)()
     }
 
