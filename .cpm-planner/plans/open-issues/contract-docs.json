@@ -490,12 +490,21 @@
         {
           "path": "CHANGELOG.md",
           "mode": "append"
-        }
+        },
+        {
+          "path": "src/plan_store.rs",
+          "mode": "append"
+        },
+        "tests/persistence.rs"
       ],
       "prerequisites": [
         {
           "id": "evidence-binding",
           "consumes": "planner.rs acquire and mark_status paths with evidence recording merged"
+        },
+        {
+          "id": "levelled-baseline",
+          "consumes": "schema v6 migration it appends v7 after"
         }
       ],
       "estimate": {
@@ -540,11 +549,6 @@
         {
           "id": "optimize-core",
           "consumes": "plan.optimize contract in docs/optimize.md"
-        },
-        {
-          "id": "calendar-contract",
-          "consumes": "calendar and levelled-baseline argument contract",
-          "kind": "interface"
         },
         {
           "id": "thread-affinity",
