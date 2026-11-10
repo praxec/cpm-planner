@@ -47,6 +47,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   close an approval, sign-off, merge, publish or activation. A declared `metadata.evidence_scope`
   must be met (`EVIDENCE_REQUIRED`), and a gate must close with evidence that matches its
   candidate (`EVIDENCE_STALE`). Malformed records are `INVALID_EVIDENCE`.
+- Levelled earned-value baselines (#132): the planner's `baseline` takes `capacities`,
+  `resource_key`, `project_buffer_pct` and `schedule` (`"cpm"` or `"levelled"`) and freezes the
+  start and finish that `plan.schedule` gives for the same inputs, so PV follows what a fixed pool
+  can do. The baseline records the kind and inputs (schema v6, `baselines.schedule`), `plan.ev`
+  reports `schedule` and `capacities`, the `plan.status` baseline summary reports `schedule`, and a
+  re-baseline without them reuses the previous ones. A baseline without capacities is CPM, as
+  before. `calendar: null` on a re-baseline now returns to wall-clock hours. The contract is
+  `docs/calendars.md`.
+- Thread affinity (#133, `docs/threads.md`): a `metadata.thread` token groups deliverables one agent
+  should do in order. The caller that completes a thread's deliverable is offered its next ready
+  deliverable first, and other callers take other work first; `AcquireRequest` gains `thread`
+  (offer that thread first) and `affinity_seconds` (defer to another caller's thread for that
+  long, reported as `AFFINITY_HOLD`; default 0, clamped to the max TTL). Affinity never bypasses
+  file conflicts, prerequisites, manual or gate exclusion, the lapse limit or the circuit breaker,
+  and unthreaded plans lease in the same order. Handoffs persist in `thread_handoffs` (schema v7)
+  and are ignored once a revision removes or re-threads their deliverable. `plan.status` lists
+  `threads` (holder, affine caller, next ready, completed and total) when a plan has any.
 
 ### Changed
 

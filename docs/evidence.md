@@ -184,7 +184,9 @@ transaction before anything is written.
    `metadata.candidate` and the candidate holds a record with an identity, the
    closing record (rule 2's record, or the newest allowed one) must be `current`
    against that identity. Otherwise the call is refused with `EVIDENCE_STALE`,
-   naming the changed fields.
+   naming the changed fields. If the gate has no allowed record at all, the
+   call is refused with `EVIDENCE_REQUIRED`, and an `unknown` verdict fails
+   this rule just as `stale` does.
 4. **Without a declaration, closing works as today**: `plan.mark_status
    complete` needs no evidence and `plan.accept` needs a string or a record.
    Rule 1 still applies.

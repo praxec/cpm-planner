@@ -1564,7 +1564,15 @@ impl Planner for BasicCpmPlanner {
             ids,
             metadata_filter,
             ttl,
+            thread,
+            affinity_seconds,
         } = req;
+        crate::affinity::validate_thread_argument(thread.as_deref())?;
+        // Deference window to other callers' threads, bounded by the max TTL.
+        let affinity_window = Duration::from_secs(
+            affinity_seconds.unwrap_or(crate::affinity::DEFAULT_AFFINITY_SECONDS),
+        )
+        .min(self.max_ttl);
         let now = self.now();
         let expires_at = now
             + chrono::Duration::from_std(self.effective_ttl(ttl))
@@ -1752,7 +1760,50 @@ impl Planner for BasicCpmPlanner {
                         && !lapse_blocked.iter().any(|b| b.id == d.id)
                 }));
             }
-            ready.sort_by_key(|d| priority_key(&d.id, &sched_by_id));
+            // 4b. Thread affinity (docs/threads.md): hold back deliverables
+            //     another caller's thread claims within this caller's
+            //     deference window, then rank affine work first. A plan
+            //     without threads skips this, so its order is unchanged.
+            let affinity = if crate::affinity::has_threads(&state.graph) {
+                let handoffs = crate::affinity::current_handoffs(
+                    state,
+                    crate::affinity::load_handoffs(tx, &plan_id)?,
+                );
+                Some(crate::affinity::AffinityView::new(
+                    handoffs,
+                    &caller_id.0,
+                    thread.as_deref(),
+                    affinity_window,
+                    now,
+                ))
+            } else {
+                None
+            };
+            if let Some(view) = &affinity {
+                ready.retain(|d| match view.hold(d) {
+                    Some(hold) => {
+                        blocked.push(BlockedDeliverable {
+                            id: d.id.clone(),
+                            code: "AFFINITY_HOLD".to_string(),
+                            reason: format!(
+                                "held for {} for another {}s (its thread's last step); \
+                                 lower affinity_seconds to take it now",
+                                hold.caller, hold.remaining_seconds
+                            ),
+                        });
+                        false
+                    }
+                    None => true,
+                });
+            }
+            ready.sort_by_key(|d| {
+                (
+                    affinity
+                        .as_ref()
+                        .map_or(crate::affinity::Rank::Neutral, |v| v.rank(d)),
+                    priority_key(&d.id, &sched_by_id),
+                )
+            });
 
             // 5. Greedy fill with file-disjointness check. Requested ids that
             //    are skipped are reported as FILE_CONFLICT / MAX_COUNT.
@@ -1984,6 +2035,27 @@ impl Planner for BasicCpmPlanner {
                 crate::evidence::Via::MarkStatus,
                 now,
             )?;
+
+            // Thread handoff: the caller that completes a threaded
+            // deliverable is offered the thread's next step first.
+            if is_complete
+                && !matches!(previous_status, DeliverableStatus::Complete)
+                && let Some(thread) = state
+                    .graph
+                    .deliverables
+                    .iter()
+                    .find(|d| d.id == deliverable_id)
+                    .and_then(crate::affinity::thread_of)
+            {
+                crate::affinity::record_handoff(
+                    tx,
+                    &plan_id,
+                    thread,
+                    &caller_id.0,
+                    deliverable_id,
+                    now,
+                )?;
+            }
 
             // Progress fields ride along with every accepted mark (also an
             // idempotent Complete); a refused mark rolls them back.
@@ -2252,10 +2324,26 @@ impl Planner for BasicCpmPlanner {
                     active_plan: None,
                     definition_drift: None,
                     baseline: None,
+                    threads: Vec::new(),
                 };
                 (status, hash_graph(&state.graph))
             })?;
         status.baseline = baseline;
+        // Threads come from one snapshot of their own, holding the handoffs
+        // too; an unthreaded plan pays nothing.
+        status.threads = self.store.read_tx(|tx| {
+            let Some(state) = crate::plan_store::load_plan_state(tx, plan_id)? else {
+                return Ok(Vec::new());
+            };
+            if !crate::affinity::has_threads(&state.graph) {
+                return Ok(Vec::new());
+            }
+            let handoffs = crate::affinity::current_handoffs(
+                &state,
+                crate::affinity::load_handoffs(tx, plan_id)?,
+            );
+            Ok(crate::affinity::thread_statuses(&state, &handoffs))
+        })?;
         if let Some(info) = info {
             // File I/O outside the read snapshot; the head hash is from it.
             status.definition_drift =
