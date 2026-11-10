@@ -1425,6 +1425,14 @@ impl Planner for BasicCpmPlanner {
         self.take_snapshot(req)
     }
 
+    async fn stored_evidence(
+        &self,
+        plan_id: &PlanId,
+    ) -> Result<HashMap<String, Vec<crate::evidence::StoredEvidence>>, PlannerError> {
+        // The inherent read in `crate::evidence`.
+        BasicCpmPlanner::evidence(self, plan_id).await
+    }
+
     async fn list_plans(
         &self,
         project: &str,

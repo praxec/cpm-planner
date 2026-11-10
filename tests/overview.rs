@@ -787,3 +787,292 @@ fn status_label_matches_the_deliverable_status_wire_tag() {
     let label = serde_json::to_value(StatusLabel::SupersededRevision).unwrap();
     assert_eq!(wire["status"], label);
 }
+
+// ---------------------------------------------------------------------------
+// Evidence (docs/evidence.md verdicts)
+// ---------------------------------------------------------------------------
+
+use cpm_planner::evidence::{EvidenceRecord, Identity, IdentityField, Scope, Verdict};
+use cpm_planner::overview::evidence_text;
+
+fn identity(lock: &str) -> Identity {
+    Identity::new()
+        .with(IdentityField::Tree, "tree:abc")
+        .with(IdentityField::DependencyLock, lock)
+        .with(IdentityField::Toolchain, "rustc 1.99.1")
+        .with(IdentityField::TestContract, "nextest:overview@v1")
+        .with(IdentityField::Environment, "linux-x86_64")
+}
+
+fn focused(lock: &str) -> EvidenceRecord {
+    EvidenceRecord::new(Scope::Focused, "cargo nextest run --test overview: green")
+        .with_identity(identity(lock))
+}
+
+/// Lease `id` and mark it `status` carrying `evidence`.
+async fn mark_with(
+    planner: &BasicCpmPlanner,
+    plan_id: &PlanId,
+    id: &str,
+    status: DeliverableStatus,
+    evidence: impl Into<cpm_planner::evidence::Evidence>,
+) {
+    lease(planner, plan_id, id).await;
+    planner
+        .mark_status(
+            MarkStatusRequest::new(plan_id.clone(), id, worker(), status).with_evidence(evidence),
+        )
+        .await
+        .unwrap();
+}
+
+async fn complete_contract_with(planner: &BasicCpmPlanner, plan_id: &PlanId, lock: &str) {
+    mark_with(
+        planner,
+        plan_id,
+        "contract",
+        DeliverableStatus::Complete,
+        focused(lock),
+    )
+    .await;
+}
+
+async fn targeted(
+    planner: &BasicCpmPlanner,
+    plan_id: &PlanId,
+    target: Option<Identity>,
+) -> Overview {
+    let mut req = OverviewRequest::new(by_id(plan_id)).with_as_of(as_of());
+    if let Some(target) = target {
+        req = req.with_evidence_target(target);
+    }
+    overview(planner, req).await.unwrap()
+}
+
+fn contract_evidence(o: &Overview) -> cpm_planner::evidence::DeliverableEvidenceStatus {
+    o.critical_path
+        .items
+        .iter()
+        .find(|e| e.item.id == "contract")
+        .unwrap()
+        .item
+        .evidence
+        .clone()
+        .unwrap()
+}
+
+/// Re-sync the export line with `contract`'s title edited: a metadata-only
+/// definition change that keeps its status.
+async fn retitle_contract(planner: &BasicCpmPlanner) {
+    let mut g = graph();
+    g.deliverables[0].metadata["title"] = json!("Export API contract v2");
+    planner
+        .sync_plan(SyncRequest::new(PROJECT, "export", "main", g))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn evidence_matching_the_target_is_current() {
+    let planner = planner();
+    let plan_id = synced(&planner).await;
+    complete_contract_with(&planner, &plan_id, "sha256:l1").await;
+    let o = targeted(&planner, &plan_id, Some(identity("sha256:l1"))).await;
+    assert_eq!(contract_evidence(&o).verdict, Verdict::Current);
+}
+
+#[tokio::test]
+async fn changed_dependency_lock_makes_evidence_stale_naming_the_field() {
+    let planner = planner();
+    let plan_id = synced(&planner).await;
+    complete_contract_with(&planner, &plan_id, "sha256:l1").await;
+    let o = targeted(&planner, &plan_id, Some(identity("sha256:l2"))).await;
+    let changed: Vec<(IdentityField, String, String)> = contract_evidence(&o)
+        .record
+        .unwrap()
+        .changed
+        .into_iter()
+        .map(|c| (c.field, c.recorded, c.target))
+        .collect();
+    assert_eq!(
+        changed,
+        [(
+            IdentityField::DependencyLock,
+            "sha256:l1".to_string(),
+            "sha256:l2".to_string()
+        )]
+    );
+}
+
+#[tokio::test]
+async fn definition_change_after_recording_makes_evidence_stale() {
+    let planner = planner();
+    let plan_id = synced(&planner).await;
+    complete_contract_with(&planner, &plan_id, "sha256:l1").await;
+    retitle_contract(&planner).await;
+    let o = targeted(&planner, &plan_id, Some(identity("sha256:l1"))).await;
+    let fields: Vec<IdentityField> = contract_evidence(&o)
+        .record
+        .unwrap()
+        .changed
+        .into_iter()
+        .map(|c| c.field)
+        .collect();
+    assert_eq!(fields, [IdentityField::Definition]);
+}
+
+#[tokio::test]
+async fn plain_note_evidence_is_unbound() {
+    let planner = planner();
+    let plan_id = synced(&planner).await;
+    mark_with(
+        &planner,
+        &plan_id,
+        "contract",
+        DeliverableStatus::Complete,
+        "all green",
+    )
+    .await;
+    let o = targeted(&planner, &plan_id, None).await;
+    assert_eq!(contract_evidence(&o).verdict, Verdict::Unbound);
+}
+
+#[tokio::test]
+async fn deliverable_without_evidence_reports_none() {
+    let planner = planner();
+    let plan_id = synced(&planner).await;
+    let o = targeted(&planner, &plan_id, None).await;
+    assert_eq!(contract_evidence(&o).verdict, Verdict::None);
+}
+
+#[tokio::test]
+async fn without_a_target_identity_fields_are_unknown() {
+    let planner = planner();
+    let plan_id = synced(&planner).await;
+    complete_contract_with(&planner, &plan_id, "sha256:l1").await;
+    let o = targeted(&planner, &plan_id, None).await;
+    assert_eq!(
+        contract_evidence(&o).record.unwrap().unknown,
+        IdentityField::IDENTITY
+    );
+}
+
+#[tokio::test]
+async fn target_argument_is_reported_as_the_target_source() {
+    let planner = planner();
+    let plan_id = synced(&planner).await;
+    complete_contract_with(&planner, &plan_id, "sha256:l1").await;
+    let o = targeted(&planner, &plan_id, Some(identity("sha256:l1"))).await;
+    assert_eq!(
+        contract_evidence(&o)
+            .record
+            .unwrap()
+            .target_source
+            .as_deref(),
+        Some("argument")
+    );
+}
+
+#[tokio::test]
+async fn overview_evidence_agrees_with_planner_evidence_status() {
+    let planner = planner();
+    let plan_id = synced(&planner).await;
+    complete_contract_with(&planner, &plan_id, "sha256:l1").await;
+    let target = identity("sha256:l2");
+    let expected = planner
+        .evidence_status(&plan_id, Some(&target))
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.deliverable_id == "contract")
+        .unwrap();
+    let o = targeted(&planner, &plan_id, Some(target)).await;
+    assert_eq!(contract_evidence(&o), expected);
+}
+
+#[tokio::test]
+async fn invalid_evidence_target_is_refused() {
+    let planner = planner();
+    let plan_id = synced(&planner).await;
+    let mut bad = identity("sha256:l1");
+    bad.schema_version = 2;
+    let err = overview(
+        &planner,
+        OverviewRequest::new(by_id(&plan_id)).with_evidence_target(bad),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, PlannerError::InvalidEvidence { .. }),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn stale_evidence_list_puts_complete_work_first_then_id() {
+    let planner = planner();
+    let plan_id = synced(&planner).await;
+    mark_with(
+        &planner,
+        &plan_id,
+        "docs",
+        DeliverableStatus::InProgress,
+        focused("sha256:l1"),
+    )
+    .await;
+    complete_contract_with(&planner, &plan_id, "sha256:l1").await;
+    let o = targeted(&planner, &plan_id, Some(identity("sha256:l2"))).await;
+    let ids: Vec<&str> = o
+        .stale_evidence
+        .items
+        .iter()
+        .map(|i| i.id.as_str())
+        .collect();
+    assert_eq!(ids, ["contract", "docs"]);
+}
+
+#[tokio::test]
+async fn evidence_counts_cover_the_whole_plan() {
+    let planner = planner();
+    let plan_id = synced(&planner).await;
+    complete_contract_with(&planner, &plan_id, "sha256:l1").await;
+    let o = targeted(&planner, &plan_id, Some(identity("sha256:l2"))).await;
+    assert_eq!(
+        (o.evidence_counts.stale, o.evidence_counts.none),
+        (1, o.counts.total - 1)
+    );
+}
+
+#[tokio::test]
+async fn evidence_text_names_changed_fields_in_contract_order() {
+    let planner = planner();
+    let plan_id = synced(&planner).await;
+    complete_contract_with(&planner, &plan_id, "sha256:l1").await;
+    retitle_contract(&planner).await;
+    let o = targeted(&planner, &plan_id, Some(identity("sha256:l2"))).await;
+    assert_eq!(
+        evidence_text(&contract_evidence(&o)).as_deref(),
+        Some("evidence: stale (dependency_lock, definition)")
+    );
+}
+
+#[tokio::test]
+async fn markdown_rows_show_compact_evidence_text() {
+    let planner = planner();
+    let plan_id = synced(&planner).await;
+    complete_contract_with(&planner, &plan_id, "sha256:l1").await;
+    let md = render_markdown(&targeted(&planner, &plan_id, Some(identity("sha256:l2"))).await);
+    assert!(
+        md.contains("Export API contract (`contract`) · evidence: stale (dependency_lock)"),
+        "{md}"
+    );
+}
+
+#[tokio::test]
+async fn snapshot_carries_the_stored_evidence() {
+    let planner = planner();
+    let plan_id = synced(&planner).await;
+    complete_contract_with(&planner, &plan_id, "sha256:l1").await;
+    let snap = read_snapshot(&planner, &plan_id, as_of()).await.unwrap();
+    assert_eq!(snap.evidence, planner.evidence(&plan_id).await.unwrap());
+}

@@ -33,6 +33,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::earned_value::{EvReport, EvRowStatus, PlanBaseline, Undefined};
+use crate::evidence::{DeliverableEvidenceStatus, Identity, StoredEvidence, Verdict};
 use crate::plan::{
     Deliverable, DeliverableStatus, FINISH_ID, LockInfo, MilestoneRow, OwnedFile, PlanGraph,
     PlanId, PlanRef, PlanStatus, PlannerError, START_ID, ScheduleRow,
@@ -111,9 +112,25 @@ pub struct OverviewOptions {
     pub limit: Option<usize>,
     #[serde(default, skip_serializing_if = "OverviewFilter::is_empty")]
     pub filter: OverviewFilter,
+    /// The plan-wide target identity evidence is judged against
+    /// (`docs/evidence.md`, target resolution step 1). Without it a gate is
+    /// judged against its candidate's newest identity, and other records
+    /// against no target (their identity fields read as unknown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_target: Option<Identity>,
 }
 
 impl OverviewOptions {
+    /// Check the limit (`INVALID_VALUE`) and the evidence target
+    /// (`INVALID_EVIDENCE`).
+    pub fn validate(&self) -> Result<(), PlannerError> {
+        self.effective_limit()?;
+        if let Some(target) = &self.evidence_target {
+            target.validate()?;
+        }
+        Ok(())
+    }
+
     /// The effective list length, or `INVALID_VALUE` for 0 or above
     /// [`MAX_LIMIT`].
     pub fn effective_limit(&self) -> Result<usize, PlannerError> {
@@ -169,6 +186,13 @@ impl OverviewRequest {
         self.options.filter = filter;
         self
     }
+
+    /// Judge evidence against `target` (the `evidence_target` argument;
+    /// parse wire JSON with [`Identity::from_json`]).
+    pub fn with_evidence_target(mut self, target: Identity) -> Self {
+        self.options.evidence_target = Some(target);
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -188,11 +212,15 @@ pub struct PlanSnapshot {
     pub status: PlanStatus,
     /// What `plan.ev` returns at `as_of`; `None` before the first baseline.
     pub ev: Option<EvReport>,
+    /// Stored evidence entries per deliverable (only those with any), in
+    /// append order ([`Planner::stored_evidence`]).
+    pub evidence: HashMap<String, Vec<StoredEvidence>>,
 }
 
-/// Read `status`, the head graph and `ev` of `plan_id` at `as_of`, re-reading
-/// when a write lands in between (see the module docs). Before the first
-/// baseline `ev` is `None`; any other EV error is returned.
+/// Read `status`, the head graph, `ev` at `as_of` and the stored evidence of
+/// `plan_id`, re-reading when a write lands in between (see the module
+/// docs). Before the first baseline `ev` is `None`; any other EV error is
+/// returned.
 ///
 /// Blocking: `status` and `ev` recompute the CPM, so async servers should
 /// run this off the runtime's worker threads.
@@ -203,14 +231,19 @@ pub async fn read_snapshot<P: Planner + ?Sized>(
 ) -> Result<PlanSnapshot, PlannerError> {
     for _ in 0..MAX_READ_ATTEMPTS {
         let (revision, graph) = planner.revision_graph(plan_id, None).await?;
+        let evidence = planner.stored_evidence(plan_id).await?;
         let status = planner.status(plan_id).await?;
         let ev = match planner.ev(plan_id, Some(as_of)).await {
             Ok(report) => Some(report),
             Err(PlannerError::NotBaselined { .. }) => None,
             Err(e) => return Err(e),
         };
+        let evidence_after = planner.stored_evidence(plan_id).await?;
         let (revision_after, _) = planner.revision_graph(plan_id, None).await?;
-        if revision == revision_after && reads_agree(&graph, &status, ev.as_ref()) {
+        if revision == revision_after
+            && evidence == evidence_after
+            && reads_agree(&graph, &status, ev.as_ref())
+        {
             return Ok(PlanSnapshot {
                 plan_id: plan_id.clone(),
                 as_of,
@@ -218,6 +251,7 @@ pub async fn read_snapshot<P: Planner + ?Sized>(
                 graph,
                 status,
                 ev,
+                evidence,
             });
         }
     }
@@ -261,7 +295,7 @@ pub async fn overview<P: Planner + ?Sized>(
     req: OverviewRequest,
 ) -> Result<Overview, PlannerError> {
     // Validate before any read so a bad request costs nothing.
-    req.options.effective_limit()?;
+    req.options.validate()?;
     let plan_id = planner.resolve_plan(req.plan).await?;
     let as_of = req.as_of.unwrap_or_else(Utc::now);
     let snapshot = read_snapshot(planner, &plan_id, as_of).await?;
@@ -388,6 +422,9 @@ pub struct PlanIndex<'a> {
     milestones: Vec<&'a MilestoneRow>,
     /// Per milestone id: the milestone and every ancestor.
     milestone_ancestors: HashMap<&'a str, HashSet<&'a str>>,
+    /// Evidence status per deliverable, when attached with
+    /// [`PlanIndex::with_evidence`].
+    evidence: HashMap<String, DeliverableEvidenceStatus>,
 }
 
 impl<'a> PlanIndex<'a> {
@@ -432,6 +469,7 @@ impl<'a> PlanIndex<'a> {
             dependents,
             milestones,
             milestone_ancestors: HashMap::new(),
+            evidence: HashMap::new(),
         };
         let ancestors: HashMap<&str, HashSet<&str>> = index
             .milestones
@@ -440,6 +478,22 @@ impl<'a> PlanIndex<'a> {
             .collect();
         index.milestone_ancestors = ancestors;
         index
+    }
+
+    /// Attach each deliverable's evidence status (from
+    /// [`crate::evidence::plan_evidence_status`]); [`PlanIndex::item_ref`]
+    /// then carries it.
+    pub fn with_evidence(mut self, statuses: Vec<DeliverableEvidenceStatus>) -> Self {
+        self.evidence = statuses
+            .into_iter()
+            .map(|s| (s.deliverable_id.clone(), s))
+            .collect();
+        self
+    }
+
+    /// The attached evidence status of `id`.
+    pub fn evidence(&self, id: &str) -> Option<&DeliverableEvidenceStatus> {
+        self.evidence.get(id)
     }
 
     /// The deliverable with `id`, if it is in the graph.
@@ -547,7 +601,7 @@ impl<'a> PlanIndex<'a> {
             kind: self.kind(id),
             owner: self.owner(id),
             route: self.route(id),
-            evidence: None,
+            evidence: self.evidence(id).cloned(),
         }
     }
 
@@ -736,6 +790,11 @@ pub struct Overview {
     pub leases: Section<LeaseEntry>,
     /// Failed, superseded, circuit-broken or lapsing deliverables.
     pub attention: Section<AttentionEntry>,
+    /// Deliverables per evidence verdict, over the whole plan.
+    pub evidence_counts: EvidenceCounts,
+    /// Every deliverable whose evidence verdict is `stale`, complete ones
+    /// first, then by id.
+    pub stale_evidence: Section<ItemRef>,
 }
 
 /// Plan identity, from `plan.status` and the head revision.
@@ -856,28 +915,66 @@ impl<T> Section<T> {
     }
 }
 
-/// Freshness of a deliverable's recorded evidence. Reserved: the overview
-/// leaves [`ItemRef::evidence`] `None` until evidence is scoped to a commit
-/// (`overview-evidence`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EvidenceFreshness {
-    /// Recorded against the current commit/tree and plan revision.
-    Current,
-    /// Recorded against an older commit/tree or plan revision.
-    Stale,
-    /// Recorded without a scope, so freshness cannot be judged.
-    Unscoped,
+/// Compact text of a deliverable's evidence status: the verdict, then the
+/// changed fields for `stale` or the unknown fields for `unknown`, e.g.
+/// `evidence: stale (dependency_lock, definition)`. `None` for `none`.
+pub fn evidence_text(status: &DeliverableEvidenceStatus) -> Option<String> {
+    let fields = |names: Vec<&str>| {
+        if names.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", names.join(", "))
+        }
+    };
+    let record = status.record.as_ref();
+    let text = match status.verdict {
+        Verdict::None => return None,
+        Verdict::Current => "current".to_string(),
+        Verdict::Unbound => "unbound".to_string(),
+        Verdict::Stale => format!(
+            "stale{}",
+            fields(
+                record
+                    .map(|r| r.changed.iter().map(|c| c.field.as_str()).collect())
+                    .unwrap_or_default()
+            )
+        ),
+        Verdict::Unknown => format!(
+            "unknown{}",
+            fields(
+                record
+                    .map(|r| r.unknown.iter().map(|f| f.as_str()).collect())
+                    .unwrap_or_default()
+            )
+        ),
+    };
+    Some(format!("evidence: {text}"))
 }
 
-/// Reserved evidence summary of one deliverable (see [`EvidenceFreshness`]).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EvidenceSummary {
-    pub entries: usize,
-    pub freshness: EvidenceFreshness,
-    /// The commit/tree SHA the newest entry was recorded against.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scope: Option<String>,
+/// Deliverables per evidence verdict, over the whole plan.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceCounts {
+    pub current: usize,
+    pub stale: usize,
+    pub unknown: usize,
+    pub unbound: usize,
+    pub none: usize,
+}
+
+impl EvidenceCounts {
+    fn of(statuses: &[DeliverableEvidenceStatus]) -> Self {
+        let mut c = Self::default();
+        for s in statuses {
+            match s.verdict {
+                Verdict::Current => c.current += 1,
+                Verdict::Stale => c.stale += 1,
+                Verdict::Unknown => c.unknown += 1,
+                Verdict::Unbound => c.unbound += 1,
+                Verdict::None => c.none += 1,
+            }
+        }
+        c
+    }
 }
 
 /// The fields every deliverable entry starts with.
@@ -891,9 +988,12 @@ pub struct ItemRef {
     pub owner: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route: Option<String>,
-    /// Reserved for evidence freshness; always omitted in v1.
+    /// The deliverable's evidence status, in the `docs/evidence.md` shape
+    /// (verdict `current`, `stale`, `unknown`, `unbound` or `none`, with the
+    /// governing record's changed and unknown fields). Always set by the
+    /// overview; omitted where evidence is not read (`plan.explain`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub evidence: Option<EvidenceSummary>,
+    pub evidence: Option<DeliverableEvidenceStatus>,
 }
 
 /// A short reference: id and title.
@@ -1068,10 +1168,17 @@ pub fn build_overview(
     snapshot: &PlanSnapshot,
     options: &OverviewOptions,
 ) -> Result<Overview, PlannerError> {
+    options.validate()?;
     let limit = options.effective_limit()?;
     let full = options.detail == Detail::Full;
     let status = &snapshot.status;
-    let index = PlanIndex::new(&snapshot.graph, status);
+    let evidence = crate::evidence::plan_evidence_status(
+        &snapshot.graph,
+        &snapshot.evidence,
+        options.evidence_target.as_ref(),
+    );
+    let evidence_counts = EvidenceCounts::of(&evidence);
+    let index = PlanIndex::new(&snapshot.graph, status).with_evidence(evidence);
     if let Some(m) = &options.filter.milestone {
         match index.deliverable(m) {
             None => {
@@ -1300,6 +1407,27 @@ pub fn build_overview(
         })
         .collect();
 
+    // Stale evidence: complete first, then by id (docs/evidence.md).
+    let mut stale: Vec<&str> = snapshot
+        .graph
+        .deliverables
+        .iter()
+        .map(|d| d.id.as_str())
+        .filter(|id| {
+            index
+                .evidence(id)
+                .is_some_and(|e| e.verdict == Verdict::Stale)
+                && keep(id)
+        })
+        .collect();
+    stale.sort_by(|a, b| {
+        index
+            .is_complete(b)
+            .cmp(&index.is_complete(a))
+            .then_with(|| a.cmp(b))
+    });
+    let stale_evidence: Vec<ItemRef> = stale.into_iter().map(item).collect();
+
     Ok(Overview {
         schema: OVERVIEW_SCHEMA.to_string(),
         as_of: snapshot.as_of,
@@ -1331,6 +1459,8 @@ pub fn build_overview(
         blocked,
         leases: Section::bounded(leases, limit),
         attention: Section::bounded(attention, limit),
+        evidence_counts,
+        stale_evidence: Section::bounded(stale_evidence, limit),
     })
 }
 
@@ -1422,11 +1552,16 @@ fn cell(s: &str) -> String {
     s.replace('|', "\\|").replace(['\n', '\r'], " ")
 }
 
+/// Title and id, then the evidence text when there is any evidence.
 fn label(item: &ItemRef) -> String {
-    if item.title == item.id {
+    let name = if item.title == item.id {
         format!("`{}`", item.id)
     } else {
         format!("{} (`{}`)", cell(&item.title), item.id)
+    };
+    match item.evidence.as_ref().and_then(evidence_text) {
+        Some(text) => format!("{name} · {text}"),
+        None => name,
     }
 }
 
@@ -1502,6 +1637,13 @@ pub fn render_markdown(o: &Overview) -> String {
         c.milestones,
         o.critical_path_hours
     ));
+    let e = &o.evidence_counts;
+    if e.none < c.total {
+        out.push_str(&format!(
+            "evidence: {} current · {} stale · {} unknown · {} unbound · {} none\n",
+            e.current, e.stale, e.unknown, e.unbound, e.none
+        ));
+    }
     if !o.filter.is_empty() {
         let mut parts = Vec::new();
         if let Some(owner) = &o.filter.owner {
@@ -1676,6 +1818,14 @@ pub fn render_markdown(o: &Overview) -> String {
             ));
         }
         omitted_line(&mut out, &o.attention);
+    }
+
+    if !o.stale_evidence.items.is_empty() {
+        out.push_str("\n## Stale evidence\n\n");
+        for item in &o.stale_evidence.items {
+            out.push_str(&format!("- {} ({})\n", label(item), item.status.as_str()));
+        }
+        omitted_line(&mut out, &o.stale_evidence);
     }
     out
 }

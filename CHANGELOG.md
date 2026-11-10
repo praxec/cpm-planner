@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   plan's next work in classes (ready and critical, ready with slack, blocked by dependency, manual,
   external or gate, file-conflicting). File conflicts preview `plan.acquire_cohort`'s fill without
   leasing. The overview's blocker class now follows the driving chain's root (#129, #127).
+- The overview shows each deliverable's evidence status (`current`, `stale` with the changed
+  fields, `unknown`, `unbound`, `none`), an `evidence_target` option, evidence counts and a
+  stale-evidence list. The evidence is read inside the same consistent snapshot through the new
+  read-only `Planner::stored_evidence` (#128, #130).
 - Evidence bound to its governed identity (`docs/evidence.md`, version 1; library API in
   `cpm_planner::evidence`). `plan.mark_status` and `plan.accept` take an `Evidence` that is a plain
   note or a record with a scope (`focused`, `gate`, `manual_approval`, `external_signoff`, `merge`,
