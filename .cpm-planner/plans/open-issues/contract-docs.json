@@ -52,7 +52,8 @@
           "#130",
           "#127"
         ],
-        "artifact": "docs/evidence.md: evidence identity schema v1 (tree/image, dependency-lock digest, toolchain, test-contract version, environment), current/stale rules with the changed field named, and evidence scopes (focused, gate, manual approval, external sign-off, merge, publish, activation) with which scope may satisfy which deliverable kind"
+        "artifact": "docs/evidence.md: evidence identity schema v1 (tree/image, dependency-lock digest, toolchain, test-contract version, environment), current/stale rules with the changed field named, and evidence scopes (focused, gate, manual approval, external sign-off, merge, publish, activation) with which scope may satisfy which deliverable kind",
+        "scope_folded": false
       }
     },
     {
@@ -97,7 +98,8 @@
           "#130"
         ],
         "artifact": "src/evidence.rs: evidence stored with its governed identity on mark_status/accept, evidence_status(current|stale + changed fields) against a target identity, scope check so focused evidence cannot close a gate and gate evidence cannot close a manual or external sign-off; tests/evidence.rs",
-        "verify": "cargo nextest run --test evidence --test planner"
+        "verify": "cargo nextest run --test evidence --test planner",
+        "scope_folded": false
       },
       "earning_rule": "fifty_fifty"
     },
@@ -133,7 +135,8 @@
           "#133"
         ],
         "artifact": "Deterministic lint findings with remediation for gates missing an evidence scope, a gate that does not record the candidate it verifies, approval, sign-off, merge, publish or activation folded into a work or gate deliverable, and THREAD_BROKEN when a metadata.thread is not one dependency chain; tests/lint.rs and tests/waves.rs",
-        "verify": "cargo nextest run --test lint --test waves"
+        "verify": "cargo nextest run --test lint --test waves",
+        "scope_folded": false
       },
       "earning_rule": "fifty_fifty"
     },
@@ -230,7 +233,7 @@
       },
       "metadata": {
         "owner": "agent",
-        "thread": "overview",
+        "thread": "explain",
         "issues": [
           "#129",
           "#127"
@@ -533,7 +536,10 @@
         {
           "path": "CHANGELOG.md",
           "mode": "append"
-        }
+        },
+        "skills/deliverable-cpm/examples/improvement-loop.md",
+        "docs/evidence.md",
+        "docs/README.md"
       ],
       "prerequisites": [
         {
@@ -565,14 +571,14 @@
       },
       "metadata": {
         "owner": "agent",
-        "thread": "surface",
+        "thread": "docs",
         "issues": [
           "#127",
           "#131",
           "#132",
           "#133"
         ],
-        "artifact": "Skills use plan.overview for status, plan.explain for blockers, plan.optimize before plan.review, record evidence identity, baseline levelled with per-resource calendars (agents 24/7, humans on working hours), and size deliverables per continuity thread; finding table updated",
+        "artifact": "Skills use plan.overview for status, plan.explain for blockers, plan.optimize before plan.review, record evidence identity, baseline levelled with per-resource calendars (agents 24/7, humans on working hours), and size deliverables per continuity thread; finding table updated; improvement-loop.md refreshed for the new small-plan.json; manual_approval vs external_signoff guidance; docs/evidence.md says a milestone gate follows gate rules; docs/README.md links the new guides",
         "verify": "cargo nextest run --test skill_docs --test repo_hygiene"
       },
       "earning_rule": "fifty_fifty"
@@ -628,7 +634,9 @@
       "metadata": {
         "owner": "ci",
         "kind": "gate",
-        "artifact": "Full regression on the integration head: every AGENTS.md gate locally, then a pull request into dev with CI green on that SHA; evidence records SHA, Cargo.lock digest and toolchain"
+        "artifact": "Full regression on the integration head: every AGENTS.md gate locally, then a pull request into dev with CI green on that SHA; evidence records SHA, Cargo.lock digest and toolchain",
+        "evidence_scope": "gate",
+        "candidate": "release-prep"
       }
     },
     {
