@@ -126,6 +126,7 @@ pub mod earned_value;
 pub mod edits;
 pub mod estimator;
 pub(crate) mod ev_store;
+pub mod evidence;
 pub mod explain;
 mod graph;
 #[cfg(test)]

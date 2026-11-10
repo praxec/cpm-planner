@@ -496,8 +496,9 @@ pub struct MarkStatusRequest {
     /// Reported total effort so far, in hours; replaces the stored value and
     /// takes precedence over leased hours for actual cost.
     pub actual_effort_hours: Option<f32>,
-    /// One evidence note, appended to the deliverable's evidence list.
-    pub evidence: Option<String>,
+    /// One evidence entry (a note or a [`crate::evidence::EvidenceRecord`]),
+    /// appended to the deliverable's evidence list.
+    pub evidence: Option<crate::evidence::Evidence>,
 }
 
 impl MarkStatusRequest {
@@ -530,8 +531,8 @@ impl MarkStatusRequest {
         self
     }
 
-    /// Append one evidence note.
-    pub fn with_evidence(mut self, evidence: impl Into<String>) -> Self {
+    /// Append one evidence entry: a note (`&str`/`String`) or a record.
+    pub fn with_evidence(mut self, evidence: impl Into<crate::evidence::Evidence>) -> Self {
         self.evidence = Some(evidence.into());
         self
     }
@@ -605,7 +606,9 @@ pub struct AcceptRequest {
     pub plan_id: PlanId,
     pub deliverable_id: String,
     pub accepted_by: String,
-    pub evidence: String,
+    /// A note or a [`crate::evidence::EvidenceRecord`]; also appended to the
+    /// deliverable's evidence list.
+    pub evidence: crate::evidence::Evidence,
     /// Take over a live lease held by someone else. Defaults to `false`.
     pub override_lock: bool,
 }
@@ -615,7 +618,7 @@ impl AcceptRequest {
         plan_id: PlanId,
         deliverable_id: impl Into<String>,
         accepted_by: impl Into<String>,
-        evidence: impl Into<String>,
+        evidence: impl Into<crate::evidence::Evidence>,
     ) -> Self {
         Self {
             plan_id,
@@ -1333,6 +1336,46 @@ pub enum PlannerError {
     /// [`MAX_EVIDENCE_ENTRIES`] entries for the deliverable.
     #[error("INVALID_ACTUALS: {reason}")]
     InvalidActuals { reason: String },
+
+    /// An evidence record or identity is malformed: unknown field or
+    /// `schema_version`, unknown scope, a value out of bounds, a required
+    /// identity field missing, `party` on the wrong scope, or a server-added
+    /// field sent by the caller (see [`crate::evidence`]).
+    #[error("INVALID_EVIDENCE: {reason}")]
+    InvalidEvidence { reason: String },
+
+    /// An evidence record's scope may not close the deliverable, or the
+    /// deliverable declares a `metadata.evidence_scope` its kind may not.
+    #[error("EVIDENCE_SCOPE_MISMATCH: deliverable '{deliverable_id}': {reason}")]
+    EvidenceScopeMismatch {
+        deliverable_id: String,
+        reason: String,
+    },
+
+    /// A closing call on a deliverable with a declared evidence scope (or a
+    /// gate whose candidate holds an identity) carried no record of an
+    /// allowed scope, and none is stored for the current definition.
+    #[error(
+        "EVIDENCE_REQUIRED: deliverable '{deliverable_id}' must be closed with a {scope} \
+         evidence record"
+    )]
+    EvidenceRequired {
+        deliverable_id: String,
+        scope: String,
+    },
+
+    /// A gate's closing record is not current against the newest identity
+    /// recorded on its `metadata.candidate`.
+    #[error(
+        "EVIDENCE_STALE: deliverable '{deliverable_id}': its evidence does not match candidate \
+         '{candidate}' on: {fields}",
+        fields = changed.join(", ")
+    )]
+    EvidenceStale {
+        deliverable_id: String,
+        candidate: String,
+        changed: Vec<String>,
+    },
 
     /// A request carried a value that is well-typed but out of range for
     /// the plan it targets, e.g. a `plan.baseline` `backfill_from` in the
