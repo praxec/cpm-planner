@@ -125,10 +125,10 @@ can never contain `default`. Consequences:
 
 - Every `calendar` value accepted today is a single calendar and behaves
   exactly as today (section 6.1).
-- `{"owner": {...}}` without `default` is a single calendar with an unknown
-  field `owner`, and is rejected exactly as an unknown calendar field is
-  today (section 7). Tools should mention in their schema description that a
-  per-resource map needs a `default` entry.
+- `{"owner": {...}}` without `default` is parsed as the single form, so it
+  is an unknown field `owner` and is rejected exactly as an unknown calendar
+  field is today: `INVALID_PARAMS` at argument parsing (section 7). The
+  message adds that a per-resource calendar map needs a `default` entry.
 - On `plan.baseline`, `"calendar": null` clears the calendar: the baseline
   counts wall-clock hours even when the previous baseline had a calendar.
   An omitted `calendar` reuses the previous baseline's (section 4.5).
@@ -274,8 +274,10 @@ omitted from links that did not wait on a calendar.
   hours. Criticality uses a backward pass with `retreat`: latest finish is the
   minimum over successors of their latest start minus lag (the makespan for
   the finish node), latest start is `retreat(W, latest_finish, L)`, and float
-  is `latest_start - earliest_start` in wall-clock hours. A driving chain has
-  zero float under this rule.
+  is `latest_start - earliest_start` in wall-clock hours. Float can be
+  positive on the driving chain across a calendar wait: in the worked example
+  (section 8) `impl` could finish as late as Monday 09:00 without moving
+  `review`, so it has 57 hours of float although the chain runs through it.
 - `plan.status`, `plan.lint` and the stored CPM result stay calendar-free.
 
 ## 4. Levelled baselines (`plan.baseline`)
@@ -416,7 +418,12 @@ waits for 09:00 as planned causes no schedule variance.
 
 - `rows[].calendar_wait_hours`: the row's stored value (0 for plan-clock
   baselines and rows that never waited);
-- `calendar_wait_hours`: their sum over the baseline rows.
+- `calendar_wait_hours`: the total, defined as the sum over the frozen
+  schedule's **driving chain** (section 3.5), the same total `plan.schedule`
+  reports for the same inputs. Waits off the driving chain do not delay the
+  finish, so they are reported per row but not counted in the total. The
+  baseline stores the total with its schedule (`baselines.schedule`,
+  `calendar_wait_hours`) and `plan.baseline` returns it too.
 
 Both are plan facts, independent of `as_of`, statuses and actuals. `plan.ev`
 does not report a share of schedule variance caused by calendar waits.
@@ -440,10 +447,10 @@ today; it is future work.
   their kind is `cpm`.
 - `plan.schedule` and `plan.simulate` without `calendar` return exactly
   today's output (no new fields).
-- Until per-calendar PV lands (`calendar-ev`), `plan.baseline` refuses a
-  calendar map with `INVALID_VALUE` ("plan.baseline does not support
-  per-resource calendar maps yet"). `plan.schedule` and `plan.simulate`
-  accept maps as soon as `calendar-schedule` lands.
+- A calendar map on `plan.baseline` freezes the resource clock: a cpm
+  baseline uses the calendar CPM forward pass (levelling with unbounded
+  capacity, so no deliverable waits for a unit), a levelled one is
+  `plan.schedule` on the same calendar and `start`.
 
 ### 6.2 Storage (`baselines` table)
 
@@ -454,7 +461,9 @@ today; it is future work.
   `migrate_v6_baseline_schedule`): JSON
   `{"kind": "levelled", "capacities": {...}, "resource_key": "owner",
   "project_buffer_pct": 25.0, "project_buffer_hours": 6.5}` or
-  `{"kind": "cpm", "resource_key": "owner"}`. `NULL` means
+  `{"kind": "cpm", "resource_key": "owner", "calendar_wait_hours": 57.0}`
+  (a cpm baseline on a calendar map; resource-clock baselines of either kind
+  add `calendar_wait_hours`, the driving-chain total). `NULL` means
   `{"kind": "cpm"}` and is what every plain CPM baseline stores, so CPM
   baselines are stored exactly as before v6.
 - `rows` (existing JSON): each row gains optional `calendars` (array of keys)
@@ -480,7 +489,6 @@ conflicts.
 | Calendar map: any entry with an unknown field, a wrong type or an out-of-range value | `INVALID_VALUE` |
 | Calendar map: an entry that is not an object, an empty key, or more than 256 entries | `INVALID_VALUE` |
 | A multi-pool deliverable whose calendars never overlap | `INVALID_VALUE` |
-| `plan.baseline`: a calendar map, until `calendar-ev` lands (section 6.1) | `INVALID_VALUE` |
 | `plan.baseline`: `schedule: "levelled"` without resolvable capacities; `capacities` with `schedule: "cpm"`; `resource_key` or `project_buffer_pct` with no effect; empty `resource_key`; `project_buffer_pct` outside `0..=100` | `INVALID_VALUE` |
 | `plan.baseline`: a resource carrying work has no or too few units | `INVALID_CAPACITIES`, with the same `missing` list and message `plan.schedule` gives for the same graph and inputs |
 | A capacity that is negative or not an integer, or `schedule` not `"cpm"`/`"levelled"` | `INVALID_PARAMS` (argument parsing), as `plan.schedule` |
@@ -604,8 +612,14 @@ On the owner calendar:
 | `project_buffer_pct` | `project_buffer_pct: Option<f32>` | `with_project_buffer_pct` |
 | `schedule` | `schedule: Option<ScheduleKind>` | `with_schedule` |
 
+- `earned_value::Calendar` is `calendar::Calendar` (one type, with
+  `day_start`). `Baseline::calendar` and `BaselineOutcome::calendar` are
+  `Option<calendar::CalendarSpec>`, which serializes as the single object or
+  the flat map, so the wire shape of a single calendar is unchanged apart
+  from the echoed `day_start`.
 - `BaselineCalendar` is `Inherit` (absent), `WallClock` (`null`),
-  `Single(Calendar)` or `PerResource(map)`. It implements `Deserialize`, so
+  `Single(Calendar)` or `PerResource(map)`; the planner validates a map with
+  `CalendarSpec::parse` (every error `INVALID_VALUE`). It implements `Deserialize`, so
   an argument struct field `#[serde(default)] calendar: BaselineCalendar`
   tells absent from `null`; a single calendar with an unknown field or a
   wrong type stays a deserialization error (`INVALID_PARAMS`), as today.
@@ -616,10 +630,14 @@ On the owner calendar:
   `Inherit`. `BaselineRequest::effective_calendar` gives the resolved choice.
 - `ScheduleKind` serializes as `"cpm"` / `"levelled"`.
 - `BaselineOutcome` adds `schedule`, `capacities`, `resource_key`,
-  `project_buffer_pct` and `project_buffer_hours`; `EvReport` adds
-  `schedule` and `capacities`; `PlanBaseline` (the `plan.status` summary)
-  adds `schedule`.
-- `build_levelled_baseline` is the pure builder behind a levelled baseline,
-  next to `build_baseline`; the recorded inputs are `Baseline::schedule`
-  (`BaselineSchedule`), whose `levelling_request()` rebuilds the
-  `ScheduleRequest`.
+  `project_buffer_pct`, `project_buffer_hours` and `calendar_wait_hours`;
+  `EvReport` adds `schedule`, `capacities` (omitted for cpm) and
+  `calendar_wait_hours`, and each `EvRow` adds `calendar_wait_hours`;
+  `PlanBaseline` (the `plan.status` summary) adds `schedule`.
+- Pure builders: `build_baseline` (CPM; a map goes to the resource clock
+  with `resource_key` `owner`), `build_levelled_baseline` (levelled), and
+  `build_baseline_on_calendar(graph, start, calendar, number,
+  resource_key, levelling)` for the resource clock. The recorded inputs are
+  `Baseline::schedule` (`BaselineSchedule`), whose `levelling_request()`
+  rebuilds the `ScheduleRequest`. Rows carry `calendars` and
+  `calendar_wait_hours` on the resource clock.

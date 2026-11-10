@@ -34,53 +34,22 @@
 //! revise reopened a carried deliverable can count copied leased hours
 //! twice (each select carries the source's leased hours onto the target).
 
+pub use crate::calendar::Calendar;
+use crate::calendar::{CalendarMap, CalendarSpec, ScheduleCalendar, WorkWindows};
 use crate::estimator::EffortEstimator;
 pub use crate::plan::EarningRule;
 use crate::plan::{
     Deliverable, DeliverableStatus, FINISH_ID, PlanGraph, PlanId, PlannerError, START_ID,
 };
-use crate::resource_schedule::{ScheduleRequest, check_buffer_pct, resource_schedule_with_cpm};
+use crate::resource_schedule::{
+    ResourceSchedule, ScheduleRequest, check_buffer_pct, default_buffer_pct, default_resource_key,
+    pools_of, resource_schedule_on_calendar, resource_schedule_with_cpm,
+};
 use crate::schedule::{compute_cpm, effort_basis};
 use crate::task::CriticalPathResult;
-use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc, Weekday};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, HashMap};
-
-/// Working-time calendar for the EV clock. Unknown fields are rejected.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Calendar {
-    /// Working hours per workday, in (0, 24]. A workday contributes these
-    /// hours starting at 00:00 local time.
-    #[serde(default = "default_hours_per_day")]
-    pub hours_per_day: f32,
-    /// Lowercase 3-letter weekday names (`"mon"`..`"sun"`).
-    #[serde(default = "default_workdays")]
-    pub workdays: Vec<String>,
-    /// Local offset from UTC in minutes, in [-1440, 1440].
-    #[serde(default)]
-    pub utc_offset_minutes: i32,
-}
-
-fn default_hours_per_day() -> f32 {
-    8.0
-}
-
-fn default_workdays() -> Vec<String> {
-    ["mon", "tue", "wed", "thu", "fri"]
-        .map(String::from)
-        .to_vec()
-}
-
-impl Default for Calendar {
-    fn default() -> Self {
-        Self {
-            hours_per_day: default_hours_per_day(),
-            workdays: default_workdays(),
-            utc_offset_minutes: 0,
-        }
-    }
-}
 
 /// One frozen baseline row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -95,6 +64,19 @@ pub struct BaselineRow {
     /// Cost rate captured at baseline time; AC uses this, not the live graph.
     #[serde(default = "one")]
     pub cost_rate: f32,
+    /// Resource clock only: the row's calendar keys (`docs/calendars.md`,
+    /// section 2.5); `[]` is always open (`wall_clock_only`). `None` on the
+    /// plan clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calendars: Option<Vec<String>>,
+    /// Resource clock only: planned wall-clock hours between the row being
+    /// ready (and its resource free) and its window opening.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub calendar_wait_hours: f32,
+}
+
+fn is_zero(x: &f32) -> bool {
+    *x == 0.0
 }
 
 fn one() -> f32 {
@@ -106,8 +88,10 @@ fn one() -> f32 {
 pub struct Baseline {
     pub number: u32,
     pub start: DateTime<Utc>,
-    /// `None` means wall-clock hours.
-    pub calendar: Option<Calendar>,
+    /// `None` means wall-clock hours. A single calendar is the plan clock
+    /// (rows in its working hours); a per-resource map is the resource clock
+    /// (rows in wall-clock hours from `start`, PV inside each row's windows).
+    pub calendar: Option<CalendarSpec>,
     pub rows: Vec<BaselineRow>,
     pub bac: f32,
     /// Baseline project finish (`__finish__` earliest finish), in hours.
@@ -152,6 +136,10 @@ pub struct BaselineSchedule {
     /// or PV. `None` for a CPM baseline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_buffer_hours: Option<f32>,
+    /// Resource clock only: the planned calendar wait summed over the
+    /// frozen schedule's driving chain, in wall-clock hours.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calendar_wait_hours: Option<f32>,
 }
 
 impl BaselineSchedule {
@@ -302,6 +290,10 @@ pub struct EvRow {
     pub ac: f32,
     /// Live status, or `removed` when the id left the graph after baselining.
     pub status: EvRowStatus,
+    /// Planned calendar wait frozen in the baseline row, in wall-clock
+    /// hours (0 on the plan clock).
+    #[serde(default)]
+    pub calendar_wait_hours: f32,
 }
 
 /// The ratios of an earlier snapshot, used for trend alerts.
@@ -357,6 +349,11 @@ pub struct EvReport {
     /// [`EvReport::undefined`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacities: Option<BTreeMap<String, u32>>,
+    /// Planned calendar wait of the baseline, summed over its frozen
+    /// schedule's driving chain (as `plan.schedule` reports it), in
+    /// wall-clock hours; 0 on the plan clock.
+    #[serde(default)]
+    pub calendar_wait_hours: f32,
     /// True when the plan belongs to an effectively archived variant (its
     /// line is archived or the variant itself is); false for unnamed plans
     /// and live variants. Archived variants stay readable through `ev`.
@@ -370,26 +367,6 @@ pub struct EvReport {
     /// [`EvReport::undefined`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_plan: Option<String>,
-}
-
-fn weekday_from_name(name: &str) -> Option<Weekday> {
-    Some(match name {
-        "mon" => Weekday::Mon,
-        "tue" => Weekday::Tue,
-        "wed" => Weekday::Wed,
-        "thu" => Weekday::Thu,
-        "fri" => Weekday::Fri,
-        "sat" => Weekday::Sat,
-        "sun" => Weekday::Sun,
-        _ => return None,
-    })
-}
-
-fn workdays_per_week(days: &[Weekday]) -> usize {
-    let mut uniq = days.to_vec();
-    uniq.sort_by_key(|d| d.num_days_from_monday());
-    uniq.dedup();
-    uniq.len()
 }
 
 /// `metadata.cost_rate`: finite and >= 0, default 1.0.
@@ -457,40 +434,9 @@ fn earned_pct(rule: EarningRule, status: &DeliverableStatus, reported: Option<u8
     }
 }
 
-impl Calendar {
-    /// Reject an unusable calendar with a clear reason.
-    pub fn validate(&self) -> Result<(), PlannerError> {
-        let bad = |reason: String| Err(PlannerError::InvalidGraph { reason });
-        if !(self.hours_per_day.is_finite()
-            && self.hours_per_day > 0.0
-            && self.hours_per_day <= 24.0)
-        {
-            return bad(format!(
-                "calendar.hours_per_day must be in (0, 24], got {}",
-                self.hours_per_day
-            ));
-        }
-        if !(-1440..=1440).contains(&self.utc_offset_minutes) {
-            return bad(format!(
-                "calendar.utc_offset_minutes must be in [-1440, 1440], got {}",
-                self.utc_offset_minutes
-            ));
-        }
-        if self.workdays.is_empty() {
-            return bad("calendar.workdays must not be empty".to_string());
-        }
-        for name in &self.workdays {
-            if weekday_from_name(name).is_none() {
-                return bad(format!(
-                    "calendar.workdays entry {name:?} is not a lowercase 3-letter weekday (mon..sun)"
-                ));
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Elapsed EV-clock hours between `start` and `as_of`.
+/// Elapsed EV-clock hours between `start` and `as_of`: wall-clock hours
+/// without a calendar, else the calendar's working hours (its windows open
+/// at `day_start` local time; `00:00` by default).
 pub fn elapsed_hours(
     start: DateTime<Utc>,
     as_of: DateTime<Utc>,
@@ -499,66 +445,60 @@ pub fn elapsed_hours(
     if as_of <= start {
         return Ok(0.0);
     }
+    let wall = wall_hours(start, as_of);
     let Some(calendar) = calendar else {
-        return Ok((as_of - start).num_milliseconds() as f32 / 3_600_000.0);
+        return Ok(wall as f32);
     };
     calendar.validate()?;
-    let off = Duration::minutes(i64::from(calendar.utc_offset_minutes));
-    let (ls, le) = (start.naive_utc() + off, as_of.naive_utc() + off);
-    let workdays: Vec<Weekday> = calendar
-        .workdays
-        .iter()
-        .filter_map(|n| weekday_from_name(n))
-        .collect();
-    let hpd = f64::from(calendar.hours_per_day);
-    let is_work = |d: NaiveDate| workdays.contains(&d.weekday());
-    // Working hours inside [from, to] on local day `d` (window is [00:00, 00:00 + hpd)).
-    let partial = |d: NaiveDate, from: chrono::NaiveDateTime, to: chrono::NaiveDateTime| -> f64 {
-        if !is_work(d) {
-            return 0.0;
-        }
-        let day0 = d.and_hms_opt(0, 0, 0).unwrap_or(from);
-        let lo = (from - day0).num_milliseconds() as f64 / 3_600_000.0;
-        let hi = (to - day0).num_milliseconds() as f64 / 3_600_000.0;
-        (hi.min(hpd) - lo.max(0.0)).max(0.0)
-    };
-    let (sd, ed) = (ls.date(), le.date());
-    let total = if sd == ed {
-        partial(sd, ls, le)
-    } else {
-        let mut t = partial(sd, ls, le) + partial(ed, ls, le);
-        // Interior days (strictly between) are full days; skip whole weeks arithmetically.
-        let interior = (ed - sd).num_days() - 1;
-        let weeks = interior / 7;
-        let per_week = workdays_per_week(&workdays) as f64;
-        t += weeks as f64 * per_week * hpd;
-        let mut d = sd + Duration::days(1 + weeks * 7);
-        while d < ed {
-            if is_work(d) {
-                t += hpd;
-            }
-            d += Duration::days(1);
-        }
-        t
-    };
-    Ok(total as f32)
+    Ok(WorkWindows::of(calendar, start).working_hours(0.0, wall) as f32)
+}
+
+/// Wall-clock hours from `start` to `at` (negative before `start`).
+fn wall_hours(start: DateTime<Utc>, at: DateTime<Utc>) -> f64 {
+    (at - start).num_milliseconds() as f64 / 3_600_000.0
+}
+
+/// Check a plan-clock calendar; a map is checked when it is placed.
+fn validate_single(calendar: Option<&CalendarSpec>) -> Result<(), PlannerError> {
+    match calendar {
+        Some(CalendarSpec::Single(c)) => c.validate(),
+        _ => Ok(()),
+    }
 }
 
 /// Freeze the current CPM schedule and budgets into a baseline.
+///
+/// A single calendar (or none) is the plan clock: rows are the CPM hours,
+/// read as that calendar's working hours. A per-resource map is the
+/// resource clock: rows come from the calendar CPM forward pass
+/// ([`build_baseline_on_calendar`], resources named by `metadata.owner`).
 pub fn build_baseline(
     graph: &PlanGraph,
     cpm: &CriticalPathResult,
     start: DateTime<Utc>,
-    calendar: Option<Calendar>,
+    calendar: Option<CalendarSpec>,
     number: u32,
 ) -> Result<Baseline, PlannerError> {
-    if let Some(c) = &calendar {
-        c.validate()?;
+    if let Some(spec @ CalendarSpec::Map(_)) = calendar {
+        return build_baseline_on_calendar(
+            graph,
+            start,
+            spec,
+            number,
+            &default_resource_key(),
+            None,
+        );
     }
-    let placed: HashMap<&str, (f32, f32)> = cpm
+    validate_single(calendar.as_ref())?;
+    let placed: HashMap<&str, Slot> = cpm
         .tasks
         .iter()
-        .map(|t| (t.id.as_str(), (t.earliest_start, t.earliest_finish)))
+        .map(|t| {
+            (
+                t.id.as_str(),
+                Slot::plain(t.earliest_start, t.earliest_finish),
+            )
+        })
         .collect();
     freeze(
         graph,
@@ -579,7 +519,8 @@ pub fn build_baseline(
 /// [`crate::resource_schedule::resource_schedule`] gives for the same graph
 /// and `req`, and `finish_hours` is its makespan. On the plan clock (one
 /// calendar or none) the levelled hours are read as working hours of that
-/// calendar, exactly as CPM hours are.
+/// calendar, exactly as CPM hours are; a per-resource map levels on the
+/// resource clock ([`build_baseline_on_calendar`]).
 ///
 /// Errors: an invalid calendar as [`build_baseline`]; an empty
 /// `resource_key` or a `project_buffer_pct` outside `0..=100` is
@@ -589,25 +530,27 @@ pub fn build_levelled_baseline(
     graph: &PlanGraph,
     cpm: &CriticalPathResult,
     start: DateTime<Utc>,
-    calendar: Option<Calendar>,
+    calendar: Option<CalendarSpec>,
     number: u32,
     req: &ScheduleRequest,
 ) -> Result<Baseline, PlannerError> {
-    if let Some(c) = &calendar {
-        c.validate()?;
+    if let Some(spec @ CalendarSpec::Map(_)) = calendar {
+        return build_baseline_on_calendar(
+            graph,
+            start,
+            spec,
+            number,
+            &req.resource_key,
+            Some(req),
+        );
     }
-    if req.resource_key.is_empty() {
-        return Err(PlannerError::InvalidValue {
-            reason: "resource_key must not be empty".to_string(),
-        });
-    }
-    check_buffer_pct(req.project_buffer_pct)
-        .map_err(|reason| PlannerError::InvalidValue { reason })?;
+    validate_single(calendar.as_ref())?;
+    check_levelling(req)?;
     let levelled = resource_schedule_with_cpm(graph, req, cpm)?;
-    let placed: HashMap<&str, (f32, f32)> = levelled
+    let placed: HashMap<&str, Slot> = levelled
         .rows
         .iter()
-        .map(|r| (r.id.as_str(), (r.start, r.finish)))
+        .map(|r| (r.id.as_str(), Slot::plain(r.start, r.finish)))
         .collect();
     freeze(
         graph,
@@ -624,24 +567,150 @@ pub fn build_levelled_baseline(
                 resource_key: Some(req.resource_key.clone()),
                 project_buffer_pct: Some(req.project_buffer_pct),
                 project_buffer_hours: Some(levelled.project_buffer_hours),
+                calendar_wait_hours: None,
             },
         },
     )
 }
 
+/// Freeze a baseline on the resource clock (`docs/calendars.md`, sections
+/// 3 and 5.2): every row is placed in its resource's windows from `start`,
+/// with `resource_key` naming each deliverable's resource. With
+/// `levelling` the rows are exactly
+/// [`resource_schedule_on_calendar`]'s for the same inputs; without it they
+/// are the calendar CPM forward pass (the same placement with unbounded
+/// capacity). Rows record their calendar keys and planned calendar wait;
+/// the schedule records `resource_key` and the driving chain's summed wait.
+///
+/// Errors: as [`build_levelled_baseline`], plus every calendar-map error
+/// and a multi-pool deliverable whose calendars never overlap as
+/// [`PlannerError::InvalidValue`].
+pub fn build_baseline_on_calendar(
+    graph: &PlanGraph,
+    start: DateTime<Utc>,
+    calendar: CalendarSpec,
+    number: u32,
+    resource_key: &str,
+    levelling: Option<&ScheduleRequest>,
+) -> Result<Baseline, PlannerError> {
+    let req = match levelling {
+        Some(req) => {
+            check_levelling(req)?;
+            req.clone()
+        }
+        None => {
+            if resource_key.is_empty() {
+                return Err(empty_resource_key());
+            }
+            unbounded(graph, resource_key)?
+        }
+    };
+    let when = ScheduleCalendar::new(calendar, start);
+    let placed = resource_schedule_on_calendar(graph, &req, Some(&when))?;
+    let slots: HashMap<&str, Slot> = placed
+        .rows
+        .iter()
+        .map(|r| {
+            (
+                r.id.as_str(),
+                Slot {
+                    es: r.start,
+                    ef: r.finish,
+                    calendars: Some(r.calendars.clone().unwrap_or_default()),
+                    calendar_wait_hours: r.calendar_wait_hours.unwrap_or(0.0),
+                },
+            )
+        })
+        .collect();
+    let schedule = BaselineSchedule {
+        kind: if levelling.is_some() {
+            ScheduleKind::Levelled
+        } else {
+            ScheduleKind::Cpm
+        },
+        capacities: levelling.map(|r| r.capacities.clone()),
+        resource_key: Some(req.resource_key.clone()),
+        project_buffer_pct: levelling.map(|r| r.project_buffer_pct),
+        project_buffer_hours: levelling.map(|_| placed.project_buffer_hours),
+        calendar_wait_hours: Some(placed.calendar_wait_hours.unwrap_or(0.0)),
+    };
+    freeze(
+        graph,
+        &slots,
+        "calendar schedule",
+        Frozen {
+            start,
+            calendar: Some(when.calendar),
+            number,
+            finish_hours: placed.makespan,
+            schedule,
+        },
+    )
+}
+
+fn empty_resource_key() -> PlannerError {
+    PlannerError::InvalidValue {
+        reason: "resource_key must not be empty".to_string(),
+    }
+}
+
+/// The baseline-side checks of a levelling request: `INVALID_VALUE` for an
+/// empty `resource_key` or an out-of-range `project_buffer_pct`.
+fn check_levelling(req: &ScheduleRequest) -> Result<(), PlannerError> {
+    if req.resource_key.is_empty() {
+        return Err(empty_resource_key());
+    }
+    check_buffer_pct(req.project_buffer_pct).map_err(|reason| PlannerError::InvalidValue { reason })
+}
+
+/// A levelling request that never makes work wait for a unit, so levelling
+/// is the calendar CPM forward pass: every claimed pool gets `u32::MAX`
+/// units (levelling allocates at most one unit per claim).
+fn unbounded(graph: &PlanGraph, resource_key: &str) -> Result<ScheduleRequest, PlannerError> {
+    let capacities = pools_of(graph, resource_key)?
+        .into_iter()
+        .flatten()
+        .map(|pool| (pool, u32::MAX))
+        .collect();
+    Ok(ScheduleRequest {
+        capacities,
+        resource_key: resource_key.to_string(),
+        project_buffer_pct: default_buffer_pct(),
+    })
+}
+
+/// Where a row landed.
+struct Slot {
+    es: f32,
+    ef: f32,
+    calendars: Option<Vec<String>>,
+    calendar_wait_hours: f32,
+}
+
+impl Slot {
+    fn plain(es: f32, ef: f32) -> Self {
+        Self {
+            es,
+            ef,
+            calendars: None,
+            calendar_wait_hours: 0.0,
+        }
+    }
+}
+
 /// The parts of a baseline that do not come from the rows.
 struct Frozen {
     start: DateTime<Utc>,
-    calendar: Option<Calendar>,
+    calendar: Option<CalendarSpec>,
     number: u32,
     finish_hours: f32,
     schedule: BaselineSchedule,
 }
 
-/// Build the rows from `placed` (id to start/finish hours) and budgets.
+/// Build the rows from `placed` (id to slot) and budgets.
 fn freeze(
     graph: &PlanGraph,
-    placed: &HashMap<&str, (f32, f32)>,
+    placed: &HashMap<&str, Slot>,
     source: &str,
     frozen: Frozen,
 ) -> Result<Baseline, PlannerError> {
@@ -651,17 +720,19 @@ fn freeze(
         if d.id == START_ID || d.id == FINISH_ID {
             continue;
         }
-        let Some(&(es, ef)) = placed.get(d.id.as_str()) else {
+        let Some(slot) = placed.get(d.id.as_str()) else {
             return Err(PlannerError::InvalidGraph {
                 reason: format!("deliverable {:?} missing from {source}", d.id),
             });
         };
         rows.push(BaselineRow {
             id: d.id.clone(),
-            es,
-            ef,
+            es: slot.es,
+            ef: slot.ef,
             budget: budget_of(d, &estimator)?,
             cost_rate: cost_rate(d)?,
+            calendars: slot.calendars.clone(),
+            calendar_wait_hours: slot.calendar_wait_hours,
         });
     }
     let bac = rows.iter().map(|r| f64::from(r.budget)).sum::<f64>() as f32;
@@ -681,6 +752,82 @@ fn freeze(
         backfilled: false,
         schedule: frozen.schedule,
     })
+}
+
+/// The PV clock of a baseline at one `as_of`.
+enum PvClock<'a> {
+    /// Plan clock: elapsed hours on the baseline's single calendar (or
+    /// wall-clock hours).
+    Plan(f64),
+    /// Resource clock: wall-clock hours since `start` and the map each
+    /// row's windows come from.
+    Resource {
+        tau: f64,
+        map: &'a CalendarMap,
+        start: DateTime<Utc>,
+    },
+}
+
+impl PvClock<'_> {
+    /// The planned share (0..=1) of row `r`'s budget at this clock.
+    fn fraction(&self, r: &BaselineRow) -> f64 {
+        let (es, ef) = (f64::from(r.es), f64::from(r.ef));
+        let linear = |t: f64| {
+            if ef <= es {
+                if t >= es { 1.0 } else { 0.0 }
+            } else {
+                ((t - es) / (ef - es)).clamp(0.0, 1.0)
+            }
+        };
+        match self {
+            Self::Plan(t) => linear(*t),
+            Self::Resource { tau, map, start } => {
+                if ef <= es {
+                    return linear(*tau);
+                }
+                let windows = r.calendars.as_deref().and_then(|k| map.windows(k, *start));
+                let Some(w) = windows else {
+                    return linear(*tau);
+                };
+                let span = w.working_hours(es, ef);
+                if span > 0.0 {
+                    (w.working_hours(es, tau.clamp(es, ef)) / span).clamp(0.0, 1.0)
+                } else {
+                    linear(*tau)
+                }
+            }
+        }
+    }
+}
+
+/// The current graph's finish, computed the way `baseline` froze its
+/// schedule (`docs/calendars.md`, section 4.4). A graph that no longer
+/// places with the recorded inputs falls back to the calendar CPM forward
+/// pass, then to the plain CPM finish.
+fn current_finish(baseline: &Baseline, graph: &PlanGraph, cpm: &CriticalPathResult) -> f32 {
+    let plain = finish_of(cpm);
+    let levelling = baseline.schedule.levelling_request();
+    match &baseline.calendar {
+        Some(spec @ CalendarSpec::Map(_)) => {
+            let when = ScheduleCalendar::new(spec.clone(), baseline.start);
+            let on = |req: &ScheduleRequest| -> Option<ResourceSchedule> {
+                resource_schedule_on_calendar(graph, req, Some(&when)).ok()
+            };
+            let key = baseline
+                .schedule
+                .resource_key
+                .clone()
+                .unwrap_or_else(default_resource_key);
+            levelling
+                .as_ref()
+                .and_then(on)
+                .or_else(|| unbounded(graph, &key).ok().as_ref().and_then(on))
+                .map_or(plain, |s| s.makespan)
+        }
+        _ => levelling
+            .and_then(|req| resource_schedule_with_cpm(graph, &req, cpm).ok())
+            .map_or(plain, |s| s.makespan),
+    }
 }
 
 /// Compute the earned-value report.
@@ -714,11 +861,17 @@ pub fn compute_ev(
     as_of: DateTime<Utc>,
     previous_snapshots: &[EvSummary],
 ) -> Result<EvReport, PlannerError> {
-    let t = f64::from(elapsed_hours(
-        baseline.start,
-        as_of,
-        baseline.calendar.as_ref(),
-    )?);
+    let clock = match &baseline.calendar {
+        Some(CalendarSpec::Map(map)) => PvClock::Resource {
+            tau: wall_hours(baseline.start, as_of).max(0.0),
+            map,
+            start: baseline.start,
+        },
+        Some(CalendarSpec::Single(c)) => {
+            PvClock::Plan(f64::from(elapsed_hours(baseline.start, as_of, Some(c))?))
+        }
+        None => PvClock::Plan(f64::from(elapsed_hours(baseline.start, as_of, None)?)),
+    };
     let (mut pv, mut ev, mut ac) = (0.0_f64, 0.0_f64, 0.0_f64);
     let mut rows = Vec::with_capacity(baseline.rows.len());
     let live: std::collections::HashSet<&str> =
@@ -734,12 +887,7 @@ pub fn compute_ev(
     };
     for r in &baseline.rows {
         let budget = f64::from(r.budget);
-        let (es, ef) = (f64::from(r.es), f64::from(r.ef));
-        let row_pv = if ef <= es {
-            if t >= es { budget } else { 0.0 }
-        } else {
-            budget * ((t - es) / (ef - es)).clamp(0.0, 1.0)
-        };
+        let row_pv = budget * clock.fraction(r);
         let act = actuals.get(&r.id);
         let (status, pct) = if live.contains(r.id.as_str()) {
             let status = statuses
@@ -767,6 +915,7 @@ pub fn compute_ev(
             ev: row_ev as f32,
             ac: row_ac as f32,
             status,
+            calendar_wait_hours: r.calendar_wait_hours,
         });
     }
     // AC is every actuals row of the plan (spend never disappears): baseline
@@ -837,14 +986,7 @@ pub fn compute_ev(
     let out = |v: Option<f64>| v.map(|x| x as f32);
 
     let cpm = compute_cpm(graph)?;
-    // A levelled baseline compares against the current graph levelled with
-    // the recorded inputs; if it no longer levels (a resource without
-    // capacity, say), the CPM finish stands in so the report still reads.
-    let current_finish = match baseline.schedule.levelling_request() {
-        Some(req) => resource_schedule_with_cpm(graph, &req, &cpm)
-            .map_or_else(|_| finish_of(&cpm), |s| s.makespan),
-        None => finish_of(&cpm),
-    };
+    let current_finish = current_finish(baseline, graph, &cpm);
     let critical_float = (current_finish - baseline.finish_hours).max(0.0);
 
     let alerts = trend_alerts(previous_snapshots, baseline.number);
@@ -901,6 +1043,7 @@ pub fn compute_ev(
         active_plan: None,
         schedule: baseline.schedule.kind,
         capacities: baseline.schedule.capacities.clone(),
+        calendar_wait_hours: baseline.schedule.calendar_wait_hours.unwrap_or(0.0),
     };
     Ok(report)
 }
@@ -1033,7 +1176,7 @@ pub struct BaselineOutcome {
     pub plan_id: String,
     pub baseline_number: u32,
     pub start: DateTime<Utc>,
-    pub calendar: Option<Calendar>,
+    pub calendar: Option<CalendarSpec>,
     pub bac: f32,
     /// The frozen schedule's finish (the levelled makespan for a levelled
     /// baseline).
@@ -1058,6 +1201,10 @@ pub struct BaselineOutcome {
     /// Levelled baselines only; `null` for CPM.
     #[serde(default)]
     pub project_buffer_hours: Option<f32>,
+    /// Planned calendar wait summed over the frozen driving chain, in
+    /// wall-clock hours; 0 on the plan clock.
+    #[serde(default)]
+    pub calendar_wait_hours: f32,
 }
 
 /// The reason recorded on a baseline an execution-starting call took
@@ -1287,7 +1434,7 @@ pub fn render_snapshots_markdown(snapshots: &[SnapshotSummary]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{TimeZone, Timelike};
+    use chrono::{Datelike, TimeZone, Timelike};
 
     const EPS: f32 = 1e-3;
 
@@ -1330,6 +1477,8 @@ mod tests {
             ef,
             budget,
             cost_rate: 1.0,
+            calendars: None,
+            calendar_wait_hours: 0.0,
         }
     }
 
@@ -1775,7 +1924,13 @@ mod tests {
             hours_per_day: 0.0,
             ..Calendar::default()
         };
-        let e = build_baseline(&g, &cpm, at(2026, 1, 5, 0), Some(c), 1);
+        let e = build_baseline(
+            &g,
+            &cpm,
+            at(2026, 1, 5, 0),
+            Some(CalendarSpec::Single(c)),
+            1,
+        );
         assert!(matches!(e, Err(PlannerError::InvalidGraph { .. })));
     }
 
@@ -2272,7 +2427,7 @@ mod tests {
     fn pv_is_flat_over_a_weekend_on_a_working_calendar() {
         // Task spans 40 working hours (a full work week); Fri 2026-01-09 00:00 + 8h = 40h elapsed.
         let mut b = baseline(vec![row("a", 0.0, 80.0, 100.0)]);
-        b.calendar = Some(Calendar::default());
+        b.calendar = Some(CalendarSpec::Single(Calendar::default()));
         let g = graph(vec![deliverable("a", 100.0, &[])]);
         let at_fri_end = compute_ev(
             &b,
@@ -2381,6 +2536,7 @@ mod tests {
             let hpd = [8.0_f32, 6.5, 24.0][next(3) as usize];
             let c = Calendar {
                 hours_per_day: hpd,
+                day_start: "00:00".to_string(),
                 workdays: workdays.clone(),
                 utc_offset_minutes: off,
             };
@@ -2691,7 +2847,14 @@ mod tests {
             hours_per_day: 0.0,
             ..Calendar::default()
         };
-        let got = build_levelled_baseline(&g, &cpm, at(2026, 1, 5, 0), Some(c), 1, &one_agent());
+        let got = build_levelled_baseline(
+            &g,
+            &cpm,
+            at(2026, 1, 5, 0),
+            Some(CalendarSpec::Single(c)),
+            1,
+            &one_agent(),
+        );
         assert!(matches!(got, Err(PlannerError::InvalidGraph { .. })));
     }
 

@@ -23,6 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `monte_carlo_on_calendar` place each deliverable in its resource's windows, reporting
   `waited_on: "calendar"`, `start_at`/`finish_at`, `calendars`, `calendar_wait_hours` and
   `available_hours`. Without a calendar the output is unchanged.
+- Earned-value baselines on per-resource calendars (#131): a calendar map on the planner's
+  `baseline` freezes each deliverable in its resource's windows (the calendar CPM forward pass, or
+  the levelled schedule with capacities), stores the map in `baselines.calendar`, and accrues PV
+  only while each deliverable's calendar is open. `plan.ev` reports each row's planned
+  `calendar_wait_hours` and the driving-chain total. A single calendar honours `day_start` and
+  otherwise reads exactly as before; `earned_value::Calendar` is now `calendar::Calendar`.
 
 ## [0.6.0] - 2026-11-09
 
