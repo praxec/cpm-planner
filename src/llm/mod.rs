@@ -152,7 +152,15 @@ pub enum ConfigError {
     /// The review provider settings are unusable. No value is kept.
     #[error("CPM_REVIEW_PROVIDER: {reason}")]
     InvalidReviewProvider { reason: &'static str },
+    /// `CPM_REVIEW_PROVIDER` names no known provider. Kept distinct from
+    /// [`ConfigError::InvalidReviewProvider`] so callers can report the
+    /// provider as `disabled` without matching message text.
+    #[error("CPM_REVIEW_PROVIDER: {UNKNOWN_REVIEW_PROVIDER_REASON}")]
+    UnknownReviewProvider,
 }
+
+/// Why an unknown `CPM_REVIEW_PROVIDER` value is refused.
+pub const UNKNOWN_REVIEW_PROVIDER_REASON: &str = "must be direct, command or disabled";
 
 impl ConfigError {
     /// A short `plan.review` `review_unavailable` reason naming the setting.
@@ -176,6 +184,9 @@ impl ConfigError {
             }
             Self::InvalidReviewProvider { reason } => {
                 format!("review provider invalid: {reason}")
+            }
+            Self::UnknownReviewProvider => {
+                format!("review provider invalid: {UNKNOWN_REVIEW_PROVIDER_REASON}")
             }
         }
     }

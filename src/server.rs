@@ -2912,16 +2912,10 @@ impl PlanServer {
 /// comes from the command adapter's own settings (`command`).
 fn unusable_provider(err: &ConfigError) -> &'static str {
     match err {
-        ConfigError::InvalidReviewProvider { reason } if *reason == UNKNOWN_PROVIDER_REASON => {
-            PROVIDER_DISABLED
-        }
+        ConfigError::UnknownReviewProvider => PROVIDER_DISABLED,
         _ => crate::llm::command::PROVIDER_NAME,
     }
 }
-
-/// [`ReviewProvider::from_lookup`]'s reason for a provider name it does not
-/// know.
-const UNKNOWN_PROVIDER_REASON: &str = "must be direct, command or disabled";
 
 /// Build and range-check `plan.review`'s request (`invalid_params`).
 fn review_request(

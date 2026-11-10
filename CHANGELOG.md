@@ -81,6 +81,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `cpm_planner::llm::ConfigError` gains `UnknownReviewProvider` for an unknown `CPM_REVIEW_PROVIDER`
+  value, so `plan.review` reports the provider as `disabled` without matching message text (#119).
+
 - `plan.accept` also appends its evidence to the deliverable's evidence list; at 100 entries it
   drops the oldest instead of refusing. `MarkStatusRequest::evidence` and `AcceptRequest::evidence`
   are now `cpm_planner::evidence::Evidence`; `with_evidence` and `AcceptRequest::new` still take a

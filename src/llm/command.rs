@@ -106,9 +106,7 @@ impl ReviewProvider {
             None | Some("") | Some("direct") => Ok(Self::Direct),
             Some("disabled") => Ok(Self::Disabled),
             Some("command") => CommandConfig::from_lookup(lookup).map(Self::Command),
-            Some(_) => Err(ConfigError::InvalidReviewProvider {
-                reason: "must be direct, command or disabled",
-            }),
+            Some(_) => Err(ConfigError::UnknownReviewProvider),
         }
     }
 }
