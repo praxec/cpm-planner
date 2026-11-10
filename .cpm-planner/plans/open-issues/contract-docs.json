@@ -60,8 +60,6 @@
       "owned_files": [
         "src/evidence.rs",
         "src/planner.rs",
-        "src/plan_store.rs",
-        "src/ev_store.rs",
         "tests/evidence.rs",
         {
           "path": "src/lib.rs",
@@ -69,6 +67,14 @@
         },
         {
           "path": "CHANGELOG.md",
+          "mode": "append"
+        },
+        {
+          "path": "src/plan_store.rs",
+          "mode": "append"
+        },
+        {
+          "path": "src/ev_store.rs",
           "mode": "append"
         }
       ],
@@ -362,7 +368,8 @@
         {
           "path": "CHANGELOG.md",
           "mode": "append"
-        }
+        },
+        "src/simulate.rs"
       ],
       "prerequisites": [
         {
@@ -396,7 +403,16 @@
         {
           "path": "CHANGELOG.md",
           "mode": "append"
-        }
+        },
+        {
+          "path": "src/plan_store.rs",
+          "mode": "append"
+        },
+        {
+          "path": "src/ev_store.rs",
+          "mode": "append"
+        },
+        "docs/calendars.md"
       ],
       "prerequisites": [
         {
