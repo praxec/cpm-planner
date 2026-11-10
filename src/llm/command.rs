@@ -4,15 +4,15 @@
 //!
 //! - unset or `direct`: this process calls OpenRouter with its own key;
 //! - `command`: the executable at `CPM_REVIEW_COMMAND` answers, so the
-//!   credentials can live only inside that process (for example behind Junior
-//!   or an OPV-provisioned gate);
+//!   credentials can live only inside that operator-supplied process;
 //! - `disabled`: review reports `review_unavailable`.
 //!
 //! A configured provider never falls back to another one.
 //!
 //! # Adapter protocol, version 1
 //!
-//! The adapter gets one JSON object on stdin and writes one on stdout:
+//! The adapter gets one JSON object on stdin ([`AdapterRequest`]) and writes
+//! one on stdout ([`AdapterReply`]):
 //!
 //! ```json
 //! {"schema_version":1,"kind":"plan.review.judgment","state":{},"questions":{}}
@@ -20,13 +20,17 @@
 //! {"schema_version":1,"status":"refused","reason":"policy_denied"}
 //! ```
 //!
+//! `docs/review-provider.md` is the published contract, and
+//! `docs/review-provider/fixtures/` holds conformance examples.
+//!
 //! # Secret boundary
 //!
 //! The request holds only the review state and questions. The child's
 //! environment is cleared, then given the platform basics and the variables
 //! named in `CPM_REVIEW_COMMAND_ENV`; the OpenRouter key variables can never
 //! be named. Stderr is discarded and no free text from the adapter reaches
-//! the result: `reason` and `model` are dropped unless they are short tokens.
+//! the result: `reason` and `model` are dropped unless they are short tokens
+//! with no key-shaped run of characters (see [`safe_token`]).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -54,7 +58,14 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// Largest adapter reply accepted, in bytes.
 pub const MAX_REPLY_BYTES: u64 = 16 * 1024 * 1024;
 /// Longest adapter token (`reason`, `model`) echoed into a review.
-const MAX_TOKEN_CHARS: usize = 64;
+pub const MAX_TOKEN_CHARS: usize = 64;
+/// Longest run of letters and digits a token may hold between separators.
+/// A longer run looks like a key or a digest, so the token is dropped.
+pub const MAX_TOKEN_SEGMENT_CHARS: usize = 23;
+/// The request `kind` of protocol version 1.
+pub const REQUEST_KIND: &str = "plan.review.judgment";
+/// The provider name recorded in a review an adapter answered.
+pub const PROVIDER_NAME: &str = "command";
 /// What every child needs to start on any platform.
 const BASE_ENV: [&str; 7] = [
     "PATH",
@@ -95,9 +106,7 @@ impl ReviewProvider {
             None | Some("") | Some("direct") => Ok(Self::Direct),
             Some("disabled") => Ok(Self::Disabled),
             Some("command") => CommandConfig::from_lookup(lookup).map(Self::Command),
-            Some(_) => Err(ConfigError::InvalidReviewProvider {
-                reason: "must be direct, command or disabled",
-            }),
+            Some(_) => Err(ConfigError::UnknownReviewProvider),
         }
     }
 }
@@ -147,42 +156,64 @@ impl CommandConfig {
     }
 }
 
-#[derive(Serialize)]
-struct AdapterRequest<'a> {
-    schema_version: u32,
-    kind: &'static str,
-    state: &'a serde_json::Value,
-    questions: &'a BTreeMap<String, Question>,
+/// The one request an adapter reads on stdin (protocol version 1).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdapterRequest {
+    /// Always [`SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// Always [`REQUEST_KIND`].
+    pub kind: String,
+    /// The plan's review state, as a direct review sends it.
+    pub state: serde_json::Value,
+    /// The typed questions, keyed `q00`, `q01`, ...
+    pub questions: BTreeMap<String, Question>,
 }
 
+/// The one reply an adapter writes on stdout (protocol version 1).
+///
+/// A reply whose `schema_version` is not [`SCHEMA_VERSION`] decodes here but
+/// the judge rejects it as a `decode` failure.
 // Decoded and consumed at once, so the size gap between variants costs nothing.
 #[allow(clippy::large_enum_variant)]
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
-enum AdapterReply {
+pub enum AdapterReply {
+    /// The adapter answered.
     Ok {
         schema_version: u32,
+        /// The model that answered; kept only when it is a [`safe_token`].
         #[serde(default)]
         model: Option<String>,
+        /// One answer per question id.
         answers: BTreeMap<String, Answer>,
+        /// Token accounting, when the adapter reports it.
         #[serde(default)]
         usage: Option<Usage>,
     },
+    /// The adapter declined to answer.
     Refused {
         schema_version: u32,
+        /// Why; kept only when it is a [`safe_token`].
         #[serde(default)]
         reason: Option<String>,
     },
 }
 
-/// `text` when it is a short identifier-like token, which cannot carry a
-/// credential-shaped sentence or a log line from the adapter.
-fn safe_token(text: &str) -> Option<&str> {
+/// `text` when it is a short identifier-like token: at most
+/// [`MAX_TOKEN_CHARS`] letters, digits and `._:/-`, with no run of
+/// letters and digits longer than [`MAX_TOKEN_SEGMENT_CHARS`]. Such a token
+/// cannot carry a sentence, a log line or a key-shaped value.
+pub fn safe_token(text: &str) -> Option<&str> {
+    let separator = |c: char| "._:/-".contains(c);
     (!text.is_empty()
         && text.chars().count() <= MAX_TOKEN_CHARS
         && text
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "._:/-".contains(c)))
+            .all(|c| c.is_ascii_alphanumeric() || separator(c))
+        && text
+            .split(separator)
+            .all(|segment| segment.chars().count() <= MAX_TOKEN_SEGMENT_CHARS))
     .then_some(text)
 }
 
@@ -230,13 +261,22 @@ impl CommandJudge {
             let _ = stdin.shutdown().await;
         });
         let mut reply = Vec::new();
-        stdout
-            .take(MAX_REPLY_BYTES + 1)
-            .read_to_end(&mut reply)
-            .await
-            .map_err(|_| {
-                JudgmentError::new(JudgmentErrorKind::Transport, "review adapter stdout failed")
-            })?;
+        let mut stdout = stdout.take(MAX_REPLY_BYTES + 1);
+        stdout.read_to_end(&mut reply).await.map_err(|_| {
+            JudgmentError::new(JudgmentErrorKind::Transport, "review adapter stdout failed")
+        })?;
+        // Checked before the exit status: an adapter still writing would block
+        // on the full pipe, or die of SIGPIPE once the pipe closes.
+        if reply.len() as u64 > MAX_REPLY_BYTES {
+            writer.abort();
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(JudgmentError::new(
+                JudgmentErrorKind::Decode,
+                "review adapter reply is too large",
+            ));
+        }
+        drop(stdout);
         let status = child.wait().await.map_err(|_| {
             JudgmentError::new(JudgmentErrorKind::Transport, "review adapter was lost")
         })?;
@@ -248,12 +288,6 @@ impl CommandJudge {
             return Err(JudgmentError::new(
                 JudgmentErrorKind::Upstream,
                 format!("review adapter exited with {code}"),
-            ));
-        }
-        if reply.len() as u64 > MAX_REPLY_BYTES {
-            return Err(JudgmentError::new(
-                JudgmentErrorKind::Decode,
-                "review adapter reply is too large",
             ));
         }
         Ok(reply)
@@ -269,9 +303,9 @@ impl JudgmentModel for CommandJudge {
     ) -> Result<Decisions, JudgmentError> {
         let request = serde_json::to_vec(&AdapterRequest {
             schema_version: SCHEMA_VERSION,
-            kind: "plan.review.judgment",
-            state: &state,
-            questions: &questions,
+            kind: REQUEST_KIND.to_string(),
+            state,
+            questions,
         })
         .map_err(|_| {
             JudgmentError::new(
@@ -325,6 +359,10 @@ impl JudgmentModel for CommandJudge {
 
     fn endpoint_host(&self) -> Option<String> {
         Some("command-adapter".to_string())
+    }
+
+    fn provider(&self) -> &'static str {
+        PROVIDER_NAME
     }
 }
 

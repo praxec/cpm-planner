@@ -11,6 +11,21 @@ client registration and the agent skills.
 - [Architecture](architecture.md): the modules in `src/`, the request flow from
   submit to review, the SQLite schema versions, the concurrency model and the
   security boundaries.
+- [Plan overview and explain](overview.md): `plan.overview`, one snapshot of
+  status, definition, earned value and evidence, and `plan.explain`, why a
+  deliverable is blocked and what completing it unlocks.
+- [Offline plan optimization](optimize.md): `plan.optimize`, deterministic
+  edit-list proposals (merges, false dependencies, gate consolidation and
+  bypass) checked by simulation, run before the optional AI review.
+- [Evidence](evidence.md): evidence records with a scope and an identity,
+  which scope closes which deliverable, stale or current verdicts, and the
+  gate-scope lint findings.
+- [Calendars and levelled baselines](calendars.md): per-resource working
+  calendars on `plan.schedule`, `plan.simulate` and `plan.baseline`, levelled
+  baselines, and how PV accrues inside working windows.
+- [Threads](threads.md): `metadata.thread` continuity threads, how leasing
+  prefers the agent that advanced a thread, and how to size deliverables per
+  thread.
 - [Releasing](releasing.md): the maintainer runbook for version bumps, the
   release PR, tagging, verifying the published assets, and the manual
   crates.io and npm steps.

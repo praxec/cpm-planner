@@ -25,6 +25,14 @@ fn an_unknown_provider_is_refused() {
 }
 
 #[test]
+fn an_unknown_provider_is_its_own_config_error() {
+    assert!(matches!(
+        ReviewProvider::from_lookup(lookup(&[("CPM_REVIEW_PROVIDER", "openrouter")])),
+        Err(cpm_planner::llm::ConfigError::UnknownReviewProvider)
+    ));
+}
+
+#[test]
 fn the_command_provider_requires_a_command() {
     assert!(ReviewProvider::from_lookup(lookup(&[("CPM_REVIEW_PROVIDER", "command")])).is_err());
 }
