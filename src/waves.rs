@@ -33,6 +33,10 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::estimator::EffortEstimator;
+use crate::evidence::{
+    CANDIDATE_KEY, DeliverableKind, EVIDENCE_SCOPE_KEY, SCOPE_FOLDED_KEY, Scope, declarable_scopes,
+    kind_name, kind_of, scope_requirement,
+};
 use crate::graph::{prerequisite_ids, reachability};
 use crate::lint::{LintFinding, Severity};
 use crate::plan::{Deliverable, PlanGraph};
@@ -544,98 +548,23 @@ pub(crate) fn wave_findings(graph: &PlanGraph, report: &WaveReport) -> Vec<LintF
 }
 
 // Evidence scopes: the plan-file side of docs/evidence.md, "Lint findings".
-
-/// `metadata` key: the evidence scope a deliverable must be closed with.
-pub const EVIDENCE_SCOPE_KEY: &str = "evidence_scope";
-
-/// `metadata` key: on a gate, the direct prerequisite producing the
-/// integrated candidate it verifies.
-pub const CANDIDATE_KEY: &str = "candidate";
-
-/// `metadata` key: `false` declares that scanned text naming an operation of
-/// another scope only mentions it.
-pub const SCOPE_FOLDED_KEY: &str = "scope_folded";
-
-/// The closed evidence-scope vocabulary of the version 1 contract, in the
-/// contract's order.
-pub const EVIDENCE_SCOPES: [&str; 7] = [
-    "focused",
-    "gate",
-    "manual_approval",
-    "external_signoff",
-    "merge",
-    "publish",
-    "activation",
-];
-
-/// A deliverable's kind for evidence purposes: `metadata.kind` of `"gate"`,
-/// `"manual"`, or anything else (including absent), which is work.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EvidenceKind {
-    Work,
-    Gate,
-    Manual,
-}
-
-impl EvidenceKind {
-    /// The kind of `d`.
-    pub fn of(d: &Deliverable) -> Self {
-        if is_gate(d) {
-            Self::Gate
-        } else if kind_is(d, "manual") {
-            Self::Manual
-        } else {
-            Self::Work
-        }
-    }
-
-    /// The scopes a deliverable of this kind may declare.
-    pub fn declarable_scopes(self) -> &'static [&'static str] {
-        match self {
-            Self::Work => &["focused"],
-            Self::Gate => &["gate", "merge", "publish", "activation"],
-            Self::Manual => &[
-                "manual_approval",
-                "external_signoff",
-                "merge",
-                "publish",
-                "activation",
-            ],
-        }
-    }
-
-    /// The scope that applies without a declaration; `None` for manual.
-    pub fn default_scope(self) -> Option<&'static str> {
-        match self {
-            Self::Work => Some("focused"),
-            Self::Gate => Some("gate"),
-            Self::Manual => None,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Work => "work",
-            Self::Gate => "gate",
-            Self::Manual => "manual",
-        }
-    }
-}
+// The vocabulary and the kind/scope table are `crate::evidence`'s, so the
+// lint and the closing rules never disagree.
 
 /// Phrases naming an operation of a scope other than `focused` or `gate`,
 /// matched like [`HEAVY_PHRASES`]. Gate operations themselves are
 /// `UNDECLARED_GATE`'s concern.
-const SCOPE_PHRASES: [(&str, &[&str]); 5] = [
+const SCOPE_PHRASES: [(Scope, &[&str]); 5] = [
     (
-        "manual_approval",
+        Scope::ManualApproval,
         &["approval", "approvals", "approve", "approves"],
     ),
     (
-        "external_signoff",
+        Scope::ExternalSignoff,
         &["sign off", "signs off", "signed off", "signoff"],
     ),
     (
-        "merge",
+        Scope::Merge,
         &[
             "merge the pr",
             "merge the pull request",
@@ -646,11 +575,11 @@ const SCOPE_PHRASES: [(&str, &[&str]); 5] = [
         ],
     ),
     (
-        "publish",
+        Scope::Publish,
         &["publish", "publishes", "release to", "tag the release"],
     ),
     (
-        "activation",
+        Scope::Activation,
         &[
             "deploy to production",
             "deploy to prod",
@@ -668,22 +597,11 @@ const SCOPE_PHRASES: [(&str, &[&str]); 5] = [
 /// check, not the operation: `cargo publish --dry-run` publishes nothing.
 const SCOPE_PHRASE_EXCLUSIONS: [&str; 2] = [" publish dry run ", " publish dryrun "];
 
-/// The declared `metadata.evidence_scope`, if it is a string.
-fn declared_scope(d: &Deliverable) -> Option<&str> {
-    d.metadata
-        .get(EVIDENCE_SCOPE_KEY)
-        .and_then(serde_json::Value::as_str)
-}
-
-/// The scope that governs `d`: its valid declaration, else its kind's default.
-fn effective_scope(d: &Deliverable, kind: EvidenceKind) -> Option<&str> {
-    declared_scope(d)
-        .filter(|s| kind.declarable_scopes().contains(s))
-        .or(kind.default_scope())
-}
-
-fn quoted_list(items: &[&str]) -> String {
-    items
+fn quoted_list(scopes: &[Scope]) -> String {
+    if scopes.is_empty() {
+        return "none".to_string();
+    }
+    scopes
         .iter()
         .map(|s| format!("'{s}'"))
         .collect::<Vec<_>>()
@@ -696,36 +614,51 @@ fn quoted_list(items: &[&str]) -> String {
 pub(crate) fn evidence_scope_findings(graph: &PlanGraph) -> Vec<LintFinding> {
     let mut out = Vec::new();
     for d in &graph.deliverables {
-        let kind = EvidenceKind::of(d);
-        let allowed = kind.declarable_scopes();
+        let kind = kind_of(d);
         let scope_value = d.metadata.get(EVIDENCE_SCOPE_KEY);
-        if let Some(value) = scope_value {
-            let scope = value.as_str();
-            if !scope.is_some_and(|s| allowed.contains(&s)) {
-                let shown = match scope {
-                    Some(s) if EVIDENCE_SCOPES.contains(&s) => {
-                        format!(
-                            "'{s}', which a {} deliverable may not declare",
-                            kind.label()
-                        )
-                    }
-                    Some(s) => format!("'{s}', which is not an evidence scope"),
-                    None => format!("{value}, which is not a string"),
-                };
-                out.push(finding(
-                    "EVIDENCE_SCOPE_INVALID",
-                    Severity::Error,
+        let requirement = scope_requirement(d);
+        if let (Some(value), Err(_)) = (scope_value, &requirement) {
+            let allowed = declarable_scopes(kind);
+            let shown = match value.as_str() {
+                Some(s) if Scope::parse(s).is_some() => {
                     format!(
-                        "'{}' declares metadata.{EVIDENCE_SCOPE_KEY} = {shown}; use one of {} for \
-                         a {} deliverable, or change metadata.kind",
-                        d.id,
-                        quoted_list(allowed),
-                        kind.label()
-                    ),
-                    vec![d.id.clone()],
-                ));
+                        "'{s}', which a {} deliverable may not declare",
+                        kind_name(kind)
+                    )
+                }
+                Some(s) => format!("'{s}', which is not an evidence scope"),
+                None => format!("{value}, which is not a string"),
+            };
+            let remedy = if allowed.is_empty() {
+                format!(
+                    "a {} carries no evidence requirement, so remove the key or change \
+                     metadata.kind",
+                    kind_name(kind)
+                )
+            } else {
+                format!(
+                    "use one of {} for a {} deliverable, or change metadata.kind",
+                    quoted_list(allowed),
+                    kind_name(kind)
+                )
+            };
+            out.push(finding(
+                "EVIDENCE_SCOPE_INVALID",
+                Severity::Error,
+                format!(
+                    "'{}' declares metadata.{EVIDENCE_SCOPE_KEY} = {shown}; {remedy}",
+                    d.id
+                ),
+                vec![d.id.clone()],
+            ));
+        }
+        if kind != DeliverableKind::Gate {
+            if let Some(value) = d.metadata.get(CANDIDATE_KEY) {
+                out.extend(candidate_problem(d, value));
             }
-        } else if kind == EvidenceKind::Gate {
+            continue;
+        }
+        if scope_value.is_none() {
             out.push(finding(
                 "GATE_SCOPE_MISSING",
                 Severity::Warning,
@@ -737,54 +670,63 @@ pub(crate) fn evidence_scope_findings(graph: &PlanGraph) -> Vec<LintFinding> {
                 vec![d.id.clone()],
             ));
         }
-
-        let candidate = d.metadata.get(CANDIDATE_KEY);
-        let verifies_candidate = scope_value.is_none() || declared_scope(d) == Some("gate");
-        if kind == EvidenceKind::Gate && candidate.is_none() && verifies_candidate {
-            out.push(finding(
-                "GATE_CANDIDATE_MISSING",
-                Severity::Warning,
-                format!(
-                    "gate '{}' does not record the candidate it verifies; set \
-                     metadata.{CANDIDATE_KEY} to the direct prerequisite that produces the \
-                     integrated candidate",
-                    d.id
-                ),
-                vec![d.id.clone()],
-            ));
-        }
-        if let Some(value) = candidate {
-            let named = value.as_str();
-            if !named.is_some_and(|c| prerequisite_ids(d).any(|p| p == c)) {
-                let mut ids = vec![d.id.clone()];
-                let shown = match named {
-                    Some(c) => {
-                        if c != d.id {
-                            ids.push(c.to_string());
-                        }
-                        format!("'{c}', which is not a direct prerequisite")
-                    }
-                    None => format!("{value}, which is not a string"),
-                };
-                out.push(finding(
-                    "GATE_CANDIDATE_INVALID",
-                    Severity::Error,
-                    format!(
-                        "'{}' names metadata.{CANDIDATE_KEY} = {shown}; point it at a direct \
-                         prerequisite id, or add that edge",
-                        d.id
-                    ),
-                    ids,
-                ));
+        match d.metadata.get(CANDIDATE_KEY) {
+            Some(value) => out.extend(candidate_problem(d, value)),
+            None => {
+                let verifies_candidate = requirement
+                    .as_ref()
+                    .is_ok_and(|r| r.required == Some(Scope::Gate));
+                if verifies_candidate {
+                    out.push(finding(
+                        "GATE_CANDIDATE_MISSING",
+                        Severity::Warning,
+                        format!(
+                            "gate '{}' does not record the candidate it verifies; set \
+                             metadata.{CANDIDATE_KEY} to the direct prerequisite that produces \
+                             the integrated candidate",
+                            d.id
+                        ),
+                        vec![d.id.clone()],
+                    ));
+                }
             }
         }
     }
     out
 }
 
+/// `GATE_CANDIDATE_INVALID` when `value`, the `metadata.candidate` of `d`, is
+/// not a string naming one of `d`'s direct prerequisites.
+fn candidate_problem(d: &Deliverable, value: &serde_json::Value) -> Option<LintFinding> {
+    let named = value.as_str();
+    if named.is_some_and(|c| prerequisite_ids(d).any(|p| p == c)) {
+        return None;
+    }
+    let mut ids = vec![d.id.clone()];
+    let shown = match named {
+        Some(c) => {
+            if c != d.id {
+                ids.push(c.to_string());
+            }
+            format!("'{c}', which is not a direct prerequisite")
+        }
+        None => format!("{value}, which is not a string"),
+    };
+    Some(finding(
+        "GATE_CANDIDATE_INVALID",
+        Severity::Error,
+        format!(
+            "'{}' names metadata.{CANDIDATE_KEY} = {shown}; point it at a direct prerequisite id, \
+             or add that edge",
+            d.id
+        ),
+        ids,
+    ))
+}
+
 /// For each scope other than `own` that `d`'s scanned text names, the scope
 /// and the first phrase found, in [`SCOPE_PHRASES`] order.
-fn folded_scopes(d: &Deliverable, own: Option<&str>) -> Vec<(&'static str, &'static str)> {
+fn folded_scopes(d: &Deliverable, own: Option<Scope>) -> Vec<(Scope, &'static str)> {
     let mut text = scanned_text(d);
     for excluded in SCOPE_PHRASE_EXCLUSIONS {
         while text.contains(excluded) {
@@ -810,9 +752,8 @@ fn folded_scopes(d: &Deliverable, own: Option<&str>) -> Vec<(&'static str, &'sta
 pub(crate) fn scope_folded_findings(graph: &PlanGraph) -> Vec<LintFinding> {
     let mut out = Vec::new();
     for d in &graph.deliverables {
-        let kind = EvidenceKind::of(d);
-        let exempt = kind == EvidenceKind::Manual
-            || (d.is_milestone() && kind != EvidenceKind::Gate)
+        let kind = kind_of(d);
+        let exempt = !matches!(kind, DeliverableKind::Work | DeliverableKind::Gate)
             || d.metadata.get("release").is_some()
             || d.metadata
                 .get(SCOPE_FOLDED_KEY)
@@ -821,7 +762,11 @@ pub(crate) fn scope_folded_findings(graph: &PlanGraph) -> Vec<LintFinding> {
         if exempt {
             continue;
         }
-        let folded = folded_scopes(d, effective_scope(d, kind));
+        // An invalid declaration is EVIDENCE_SCOPE_INVALID's concern; no
+        // phrase names `focused` or `gate`, so `None` then flags the same
+        // phrases the kind's default would.
+        let own = scope_requirement(d).ok().and_then(|r| r.required);
+        let folded = folded_scopes(d, own);
         if folded.is_empty() {
             continue;
         }
@@ -830,7 +775,7 @@ pub(crate) fn scope_folded_findings(graph: &PlanGraph) -> Vec<LintFinding> {
             .map(|(scope, phrase)| format!("'{phrase}' ({scope})"))
             .collect::<Vec<_>>()
             .join(", ");
-        let own = effective_scope(d, kind).unwrap_or("none");
+        let own = own.map_or("none", Scope::as_str);
         out.push(finding(
             "SCOPE_FOLDED",
             Severity::Warning,
@@ -839,7 +784,7 @@ pub(crate) fn scope_folded_findings(graph: &PlanGraph) -> Vec<LintFinding> {
                  into its own deliverable (metadata.kind = \"manual\" for approvals and \
                  sign-offs) with the matching metadata.{EVIDENCE_SCOPE_KEY}, or set \
                  metadata.{SCOPE_FOLDED_KEY} = false if the text only mentions it",
-                kind.label(),
+                kind_name(kind),
                 d.id
             ),
             vec![d.id.clone()],

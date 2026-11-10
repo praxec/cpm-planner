@@ -51,6 +51,10 @@ pub const EVIDENCE_SCOPE_KEY: &str = "evidence_scope";
 /// verifies.
 pub const CANDIDATE_KEY: &str = "candidate";
 
+/// `metadata` key: `false` declares that text naming an operation of another
+/// scope only mentions it (the lint's `SCOPE_FOLDED`).
+pub const SCOPE_FOLDED_KEY: &str = "scope_folded";
+
 /// Field names the server adds to a stored record; a caller may not send them.
 const SERVER_FIELDS: [&str; 5] = [
     "recorded_at",
@@ -777,7 +781,8 @@ pub fn scope_requirement(d: &Deliverable) -> Result<ScopeRequirement, PlannerErr
     })
 }
 
-fn kind_name(kind: DeliverableKind) -> &'static str {
+/// The name of `kind` in messages: `work`, `gate`, `manual` or `milestone`.
+pub fn kind_name(kind: DeliverableKind) -> &'static str {
     match kind {
         DeliverableKind::Work => "work",
         DeliverableKind::Gate => "gate",

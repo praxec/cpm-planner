@@ -2,6 +2,7 @@
 //! wave structure in `plan.lint`, and the findings that keep heavy operations
 //! at milestones.
 
+use cpm_planner::evidence::{Scope, scope_requirement};
 use cpm_planner::lint::{LintReport, Severity, lint};
 use cpm_planner::plan::PlanGraph;
 use cpm_planner::waves::{MilestoneClass, WaveReport, analyze};
@@ -608,4 +609,51 @@ fn scope_findings_do_not_depend_on_declaration_order() {
         lint(&graph(nodes)).findings,
         lint(&graph(reversed)).findings
     );
+}
+
+// A gate is a gate whether or not it is a milestone, in the lint and in the
+// closing rules alike.
+
+fn milestone_gate(extra: Value) -> PlanGraph {
+    let mut gate = gate("release", &["a"], 0.5, extra);
+    gate["milestone"] = json!(true);
+    graph(vec![work("a", &[], 4.0), gate])
+}
+
+#[test]
+fn a_milestone_gate_without_a_scope_is_gate_scope_missing() {
+    let g = milestone_gate(json!({ "candidate": "a" }));
+    assert!(fires(&lint(&g), "GATE_SCOPE_MISSING"));
+}
+
+#[test]
+fn a_milestone_gate_defaults_to_the_gate_scope_in_the_closing_rules() {
+    let g = milestone_gate(json!({ "candidate": "a" }));
+    let requirement = scope_requirement(&g.deliverables[1]).expect("valid requirement");
+    assert_eq!(requirement.required, Some(Scope::Gate));
+}
+
+#[test]
+fn lint_and_scope_requirement_agree_on_a_milestone_gate_declaring_publish() {
+    let g = milestone_gate(json!({ "evidence_scope": "publish" }));
+    let lint_accepts = !fires(&lint(&g), "EVIDENCE_SCOPE_INVALID");
+    let closing_accepts =
+        scope_requirement(&g.deliverables[1]).is_ok_and(|r| r.required == Some(Scope::Publish));
+    assert_eq!((lint_accepts, closing_accepts), (true, true));
+}
+
+#[test]
+fn lint_and_scope_requirement_agree_on_a_milestone_gate_declaring_focused() {
+    let g = milestone_gate(json!({ "evidence_scope": "focused", "candidate": "a" }));
+    let lint_refuses = fires(&lint(&g), "EVIDENCE_SCOPE_INVALID");
+    let closing_refuses = scope_requirement(&g.deliverables[1]).is_err();
+    assert_eq!((lint_refuses, closing_refuses), (true, true));
+}
+
+#[test]
+fn a_plain_milestone_declaring_a_scope_is_evidence_scope_invalid() {
+    let mut m = milestone("m", &["a"]);
+    m["metadata"]["evidence_scope"] = json!("focused");
+    let g = graph(vec![work("a", &[], 1.0), m]);
+    assert!(fires(&lint(&g), "EVIDENCE_SCOPE_INVALID"));
 }
