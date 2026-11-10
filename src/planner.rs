@@ -235,8 +235,8 @@ impl BasicCpmPlanner {
         self
     }
 
-    /// The backing store, for in-crate tests that inspect tables directly.
-    #[cfg(test)]
+    /// The backing store: for in-crate tests that inspect tables directly,
+    /// and the read-only evidence queries in [`crate::evidence`].
     pub(crate) fn store(&self) -> &SqlitePlanStore {
         &self.store
     }
@@ -1425,6 +1425,14 @@ impl Planner for BasicCpmPlanner {
         self.take_snapshot(req)
     }
 
+    async fn stored_evidence(
+        &self,
+        plan_id: &PlanId,
+    ) -> Result<HashMap<String, Vec<crate::evidence::StoredEvidence>>, PlannerError> {
+        // The inherent read in `crate::evidence`.
+        BasicCpmPlanner::evidence(self, plan_id).await
+    }
+
     async fn list_plans(
         &self,
         project: &str,
@@ -1884,13 +1892,23 @@ impl Planner for BasicCpmPlanner {
             &status,
             earned_pct.map(f64::from),
             actual_effort_hours.map(f64::from),
-            evidence.as_deref(),
+            evidence
+                .as_ref()
+                .and_then(crate::evidence::Evidence::as_note),
         )?;
-        let report = crate::ev_store::ReportedActuals {
+        if let Some(record) = evidence
+            .as_ref()
+            .and_then(crate::evidence::Evidence::as_record)
+        {
+            record.validate()?;
+        }
+        // The evidence entry is stamped (and the closing rules checked)
+        // inside the transaction, below.
+        let mut report = crate::ev_store::ReportedActuals {
             // Accepted alongside Complete, but ignored there.
             earned_pct: earned_pct.filter(|_| status == DeliverableStatus::InProgress),
             actual_hours: actual_effort_hours,
-            evidence,
+            evidence: None,
         };
         let deliverable_id = deliverable_id.as_str();
         let caller_id = &caller_id;
@@ -1952,6 +1970,20 @@ impl Planner for BasicCpmPlanner {
                     deliverable_id: deliverable_id.to_string(),
                 });
             }
+
+            // Evidence scope and closing rules (docs/evidence.md); closing
+            // means moving to Complete from another status.
+            report.evidence = crate::evidence::prepare_evidence(
+                tx,
+                &plan_id,
+                &state.graph,
+                deliverable_id,
+                evidence.as_ref(),
+                is_complete && !matches!(previous_status, DeliverableStatus::Complete),
+                &caller_id.0,
+                crate::evidence::Via::MarkStatus,
+                now,
+            )?;
 
             // Progress fields ride along with every accepted mark (also an
             // idempotent Complete); a refused mark rolls them back.
@@ -2248,7 +2280,11 @@ impl Planner for BasicCpmPlanner {
         let plan_id = req.plan_id.clone();
         let deliverable_id = req.deliverable_id.as_str();
         let now = self.now();
-        self.store.mutate_executable_plan(&plan_id, |state| {
+        if let Some(record) = req.evidence.as_record() {
+            record.validate()?;
+        }
+        let store = &self.store;
+        store.mutate_executable_plan_tx(&plan_id, |tx, state| {
             if !state
                 .graph
                 .deliverables
@@ -2298,6 +2334,28 @@ impl Planner for BasicCpmPlanner {
                     missing,
                 });
             }
+
+            // Evidence scope and closing rules (docs/evidence.md). Accept's
+            // evidence is stored too; at the cap the oldest entry goes.
+            let append = crate::evidence::prepare_evidence(
+                tx,
+                &plan_id,
+                &state.graph,
+                deliverable_id,
+                Some(&req.evidence),
+                true,
+                &req.accepted_by,
+                crate::evidence::Via::Accept,
+                now,
+            )?;
+            state.report_actuals(
+                deliverable_id,
+                crate::ev_store::ReportedActuals {
+                    evidence: append,
+                    ..Default::default()
+                },
+                now,
+            );
 
             let plan_done =
                 complete_deliverable(state, deliverable_id, &mut audit_buf, "accepted", now);

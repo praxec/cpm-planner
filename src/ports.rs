@@ -2,6 +2,8 @@
 //! a scheduling implementation. [`crate::planner::BasicCpmPlanner`] is the
 //! textbook Critical Path Method implementation shipped by this crate.
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
@@ -9,6 +11,7 @@ use crate::compare::Comparison;
 use crate::earned_value::{
     BaselineOutcome, BaselineRequest, BaselineTaken, EvReport, SnapshotOutcome, SnapshotRequest,
 };
+use crate::evidence::StoredEvidence;
 use crate::plan::{
     AcceptRequest, AcquireRequest, Cohort, ComparePlansRequest, ForceReleaseRequest, ForkRequest,
     HeartbeatRequest, MarkStatusRequest, PlanDefinition, PlanGraph, PlanId, PlanLineSummary,
@@ -270,4 +273,16 @@ pub trait Planner: Send + Sync {
     ///
     /// Blocks its poller like [`Planner::ev`].
     async fn snapshot(&self, req: SnapshotRequest) -> Result<SnapshotOutcome, PlannerError>;
+
+    /// The stored evidence entries (notes and records) of every deliverable
+    /// of `plan_id` that has any, in append order. Read-only and ungated;
+    /// `PLAN_NOT_FOUND` for an unknown plan. The default returns no
+    /// evidence, for implementations that do not store it.
+    async fn stored_evidence(
+        &self,
+        plan_id: &PlanId,
+    ) -> Result<HashMap<String, Vec<StoredEvidence>>, PlannerError> {
+        let _ = plan_id;
+        Ok(HashMap::new())
+    }
 }
