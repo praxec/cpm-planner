@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tokens with a key-shaped run are dropped; `docs/review-provider.md` is tool-neutral, with a
   "Writing an adapter" reference script and conformance fixtures under
   `docs/review-provider/fixtures/`, and end-to-end fake-adapter tests cover every outcome (#119).
+- `cpm_planner::optimize`: offline, deterministic plan optimization (#129, #127). It proposes
+  `plan.fork` edit lists (same-owner merges, false dependencies, parallel cohorts, gate
+  consolidation, work bypassing a gate) checked by lint, the schedule and simulate, with makespan,
+  resource-wait, effort and risk deltas. Candidates that lose acceptance criteria, gates, contracts,
+  ownership or milestones are rejected with reasons. See `docs/optimize.md`.
 
 ## [0.6.0] - 2026-11-09
 
