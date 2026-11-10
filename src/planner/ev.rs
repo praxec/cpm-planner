@@ -34,15 +34,17 @@ use serde_json::json;
 use super::BasicCpmPlanner;
 use crate::audit::AuditEvent;
 use crate::earned_value::{
-    BaselineMode, BaselineOutcome, BaselineRequest, BaselineTaken, EarningRule, EvReport,
-    EvSummary, FIRST_EXECUTION_REASON, MAX_BASELINE_REASON_CHARS, SNAPSHOT_EXPORT_LIMIT,
-    SnapshotFormat, SnapshotOutcome, SnapshotRequest, SnapshotSummary, build_baseline, compute_ev,
+    Baseline, BaselineCalendar, BaselineMode, BaselineOutcome, BaselineRequest, BaselineTaken,
+    Calendar, EarningRule, EvReport, EvSummary, FIRST_EXECUTION_REASON, MAX_BASELINE_REASON_CHARS,
+    SNAPSHOT_EXPORT_LIMIT, ScheduleKind, SnapshotFormat, SnapshotOutcome, SnapshotRequest,
+    SnapshotSummary, build_baseline, build_levelled_baseline, compute_ev,
     render_snapshots_markdown, trend_alerts,
 };
 use crate::ev_store;
 use crate::locks::PlanState;
 use crate::plan::{DeliverableStatus, PlanGraph, PlanId, PlannerError};
 use crate::plan_store::{backend, load_plan_state};
+use crate::resource_schedule::{ScheduleRequest, default_buffer_pct, default_resource_key};
 
 fn load_state(tx: &Transaction<'_>, plan_id: &PlanId) -> Result<PlanState, PlannerError> {
     load_plan_state(tx, plan_id)?.ok_or_else(|| PlannerError::PlanNotFound {
@@ -120,6 +122,89 @@ fn normalise_reason(reason: Option<&str>) -> Result<Option<String>, PlannerError
     Ok((!trimmed.is_empty()).then(|| trimmed.to_string()))
 }
 
+/// The calendar a baseline uses: the request's choice, with `Inherit`
+/// taking the previous baseline's calendar (wall-clock hours on a first
+/// baseline) and `WallClock` (`calendar: null`) clearing it. A per-resource
+/// map is refused with `INVALID_VALUE` until baselines support the resource
+/// clock (`docs/calendars.md`, section 6.1).
+fn resolve_calendar(
+    req: &BaselineRequest,
+    previous: Option<&Baseline>,
+) -> Result<Option<Calendar>, PlannerError> {
+    match req.effective_calendar() {
+        BaselineCalendar::Inherit => Ok(previous.and_then(|b| b.calendar.clone())),
+        BaselineCalendar::WallClock => Ok(None),
+        BaselineCalendar::Single(c) => Ok(Some(c)),
+        BaselineCalendar::PerResource(_) => Err(PlannerError::InvalidValue {
+            reason: "plan.baseline does not support per-resource calendar maps yet; pass one \
+                     calendar object or null"
+                .to_string(),
+        }),
+    }
+}
+
+/// The levelling inputs of a baseline, `None` for a CPM baseline
+/// (`docs/calendars.md`, section 4.2). Each of `capacities`,
+/// `resource_key` and `project_buffer_pct` comes from the request, else
+/// from a levelled previous baseline, else its default; the baseline is
+/// levelled exactly when capacities resolve, unless `schedule` forces the
+/// kind. Conflicting arguments are `INVALID_VALUE`.
+fn resolve_levelling(
+    req: &BaselineRequest,
+    previous: Option<&Baseline>,
+) -> Result<Option<ScheduleRequest>, PlannerError> {
+    let invalid = |reason: &str| PlannerError::InvalidValue {
+        reason: reason.to_string(),
+    };
+    let tuning_given = req.resource_key.is_some() || req.project_buffer_pct.is_some();
+    if req.schedule == Some(ScheduleKind::Cpm) {
+        if req.capacities.is_some() {
+            return Err(invalid(
+                "capacities cannot be combined with schedule \"cpm\"; omit one of them",
+            ));
+        }
+        if tuning_given {
+            return Err(invalid(
+                "resource_key and project_buffer_pct have no effect with schedule \"cpm\"",
+            ));
+        }
+        return Ok(None);
+    }
+    let inherited = previous
+        .map(|b| &b.schedule)
+        .filter(|s| s.kind == ScheduleKind::Levelled);
+    let Some(capacities) = req
+        .capacities
+        .clone()
+        .or_else(|| inherited.and_then(|s| s.capacities.clone()))
+    else {
+        if req.schedule == Some(ScheduleKind::Levelled) {
+            return Err(invalid(
+                "a levelled baseline needs capacities, and the previous baseline recorded none",
+            ));
+        }
+        if tuning_given {
+            return Err(invalid(
+                "resource_key and project_buffer_pct apply only to a levelled baseline; pass \
+                 capacities",
+            ));
+        }
+        return Ok(None);
+    };
+    Ok(Some(ScheduleRequest {
+        capacities,
+        resource_key: req
+            .resource_key
+            .clone()
+            .or_else(|| inherited.and_then(|s| s.resource_key.clone()))
+            .unwrap_or_else(default_resource_key),
+        project_buffer_pct: req
+            .project_buffer_pct
+            .or_else(|| inherited.and_then(|s| s.project_buffer_pct))
+            .unwrap_or_else(default_buffer_pct),
+    }))
+}
+
 /// `true` when `state` shows work on the plan has started: a non-pending,
 /// non-ready status, a lease or attempt history, a held lock, or queued
 /// actuals. Selecting such a variant is an execution-starting call.
@@ -166,6 +251,8 @@ pub(super) fn insert_first_baseline(
         "deliverable_count": baseline.rows.len(),
         "reason": FIRST_EXECUTION_REASON,
         "backfilled": baseline.backfilled,
+        "schedule": baseline.schedule.kind,
+        "capacities": baseline.schedule.capacities,
     }));
     Ok((taken, event))
 }
@@ -216,13 +303,17 @@ impl BasicCpmPlanner {
         })
     }
 
-    /// Freeze the plan's current CPM schedule and budgets as its next
+    /// Freeze the plan's current CPM schedule, or its levelled schedule
+    /// when capacities are given or inherited, and budgets as its next
     /// baseline (`plan.baseline`). The first baseline is number 1; a
     /// re-baseline takes the next number and needs a non-blank `reason`
     /// (`INVALID_GRAPH` otherwise). Actuals and snapshots are kept: only
     /// the PV curve and budgets change. `start` defaults to the clock's now.
     /// `calendar` defaults to wall-clock hours on the first baseline and to
-    /// the previous baseline's calendar on a re-baseline. `backfill_from`
+    /// the previous baseline's calendar on a re-baseline; `null` clears it.
+    /// Levelling inputs resolve as [`resolve_levelling`] describes, and a
+    /// resource without enough units is `INVALID_CAPACITIES` exactly as
+    /// `plan.schedule` reports it. `backfill_from`
     /// sets `start` retroactively and marks the baseline backfilled; it must
     /// not be in the future or before the plan's creation time
     /// (`INVALID_VALUE`).
@@ -236,7 +327,7 @@ impl BasicCpmPlanner {
         let now = self.now();
         let backfill_from = req.backfill_from;
         let start = backfill_from.or(req.start).unwrap_or(now);
-        let plan_id = req.plan_id;
+        let plan_id = req.plan_id.clone();
         let (outcome, previous) = self.store.write_tx(|tx| {
             crate::portfolio::ensure_executable(tx, &plan_id)?;
             if let Some(backfill) = backfill_from {
@@ -257,11 +348,10 @@ impl BasicCpmPlanner {
             }
             let state = load_state(tx, &plan_id)?;
             let latest = ev_store::latest_baseline(tx, &plan_id)?;
-            let previous = latest.as_ref().map(|b| b.baseline.number);
-            // A re-baseline without a calendar keeps the previous one.
-            let calendar = req
-                .calendar
-                .or_else(|| latest.and_then(|b| b.baseline.calendar));
+            let previous_baseline = latest.as_ref().map(|b| &b.baseline);
+            let previous = previous_baseline.map(|b| b.number);
+            let calendar = resolve_calendar(&req, previous_baseline)?;
+            let levelling = resolve_levelling(&req, previous_baseline)?;
             let number = match previous {
                 None => 1,
                 Some(n) if reason.is_none() => {
@@ -276,8 +366,19 @@ impl BasicCpmPlanner {
                     reason: format!("plan {plan_id} has used every baseline number"),
                 })?,
             };
-            let mut baseline =
-                build_baseline(&state.graph, &state.cached_result, start, calendar, number)?;
+            let mut baseline = match &levelling {
+                None => {
+                    build_baseline(&state.graph, &state.cached_result, start, calendar, number)?
+                }
+                Some(levelling) => build_levelled_baseline(
+                    &state.graph,
+                    &state.cached_result,
+                    start,
+                    calendar,
+                    number,
+                    levelling,
+                )?,
+            };
             baseline.backfilled = backfill_from.is_some();
             ev_store::insert_baseline(tx, &plan_id, &baseline, reason.as_deref(), now)?;
             let outcome = BaselineOutcome {
@@ -290,6 +391,11 @@ impl BasicCpmPlanner {
                 deliverable_count: baseline.rows.len(),
                 reason: reason.clone(),
                 backfilled: baseline.backfilled,
+                schedule: baseline.schedule.kind,
+                capacities: baseline.schedule.capacities,
+                resource_key: baseline.schedule.resource_key,
+                project_buffer_pct: baseline.schedule.project_buffer_pct,
+                project_buffer_hours: baseline.schedule.project_buffer_hours,
             };
             Ok((outcome, previous))
         })?;
@@ -303,6 +409,8 @@ impl BasicCpmPlanner {
             "deliverable_count": outcome.deliverable_count,
             "reason": outcome.reason,
             "backfilled": outcome.backfilled,
+            "schedule": outcome.schedule,
+            "capacities": outcome.capacities,
         }));
         self.flush_audit(vec![event]).await;
         Ok(outcome)
