@@ -501,10 +501,6 @@
         {
           "id": "evidence-binding",
           "consumes": "planner.rs acquire and mark_status paths with evidence recording merged"
-        },
-        {
-          "id": "levelled-baseline",
-          "consumes": "schema v6 migration it appends v7 after"
         }
       ],
       "estimate": {
@@ -520,7 +516,8 @@
           "#133"
         ],
         "artifact": "src/affinity.rs: metadata.thread preference in acquire_cohort (thread argument, successor offered first to the caller that completed its predecessor, affinity_seconds expiry), never bypassing file conflicts, prerequisites or the circuit breaker; plan.status threads; docs/threads.md; tests/affinity.rs",
-        "verify": "cargo nextest run --test affinity --test planner --test locks"
+        "verify": "cargo nextest run --test affinity --test planner --test locks",
+        "migration": "v7 thread_handoffs, appended after levelled-baseline v6 (already complete)"
       }
     },
     {
@@ -553,6 +550,11 @@
         {
           "id": "thread-affinity",
           "consumes": "thread semantics in docs/threads.md"
+        },
+        {
+          "id": "calendar-contract",
+          "consumes": "calendar and levelled-baseline argument contract",
+          "kind": "interface"
         }
       ],
       "estimate": {
