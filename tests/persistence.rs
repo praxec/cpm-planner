@@ -763,10 +763,10 @@ async fn reopening_store_repairs_stale_cached_critical_path() {
 }
 
 #[test]
-fn opened_store_reports_schema_version_5() {
+fn opened_store_reports_schema_version_6() {
     let db = TempDb::new();
     drop(SqlitePlanStore::open(&db.path).unwrap());
-    assert_eq!(user_version(&db.path), 5);
+    assert_eq!(user_version(&db.path), 6);
 }
 
 fn user_version(path: &Path) -> i64 {
@@ -796,7 +796,7 @@ async fn migration_from_v2_database_reaches_current_schema() {
     let db = TempDb::new();
     v2_database_with_legacy_plan(&db.path).await;
     drop(SqlitePlanStore::open(&db.path).unwrap());
-    assert_eq!(user_version(&db.path), 5);
+    assert_eq!(user_version(&db.path), 6);
 }
 
 /// A database written at the previous schema version (v4) has its
@@ -844,15 +844,15 @@ async fn migrated_v2_database_accepts_named_sync() {
 }
 
 #[test]
-fn newer_schema_rejection_names_supported_version_5() {
+fn newer_schema_rejection_names_supported_version_6() {
     let db = TempDb::new();
     drop(SqlitePlanStore::open(&db.path).unwrap());
     rusqlite::Connection::open(&db.path)
         .unwrap()
-        .pragma_update(None, "user_version", 6)
+        .pragma_update(None, "user_version", 7)
         .unwrap();
     let err = SqlitePlanStore::open(&db.path).err().unwrap();
-    assert!(format!("{err:#}").contains("(5)"));
+    assert!(format!("{err:#}").contains("(6)"));
 }
 
 #[tokio::test]

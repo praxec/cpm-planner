@@ -54,6 +54,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drops the oldest instead of refusing. `MarkStatusRequest::evidence` and `AcceptRequest::evidence`
   are now `cpm_planner::evidence::Evidence`; `with_evidence` and `AcceptRequest::new` still take a
   `&str` or `String`, and plain strings behave as before.
+### Added
+
+- Levelled earned-value baselines (#132): the planner's `baseline` takes `capacities`,
+  `resource_key`, `project_buffer_pct` and `schedule` (`"cpm"` or `"levelled"`) and freezes the
+  start and finish that `plan.schedule` gives for the same inputs, so PV follows what a fixed pool
+  can do. The baseline records the kind and inputs (schema v6, `baselines.schedule`), `plan.ev`
+  reports `schedule` and `capacities`, the `plan.status` baseline summary reports `schedule`, and a
+  re-baseline without them reuses the previous ones. A baseline without capacities is CPM, as
+  before. `calendar: null` on a re-baseline now returns to wall-clock hours. The contract is
+  `docs/calendars.md`.
 
 ## [0.6.0] - 2026-11-09
 

@@ -785,6 +785,7 @@ impl SqlitePlanStore {
                 crate::ev_store::latest_baseline(tx, plan_id)?.map(|stored| PlanBaseline {
                     baseline_number: stored.baseline.number,
                     as_of: stored.baseline.start,
+                    schedule: stored.baseline.schedule.kind,
                 });
             Ok(((f(&state), info), baseline))
         })
@@ -834,6 +835,7 @@ const MIGRATIONS: &[fn(&Connection) -> anyhow::Result<()>] = &[
     migrate_v3_portfolio,    // plan_lines, variants, revisions
     migrate_v4_earned_value, // baselines, ev_actuals, ev_snapshots
     migrate_v5_baseline_backfilled, // baselines.backfilled
+    migrate_v6_baseline_schedule, // baselines.schedule
 ];
 
 /// Runs the whole ladder plus the stale sweep in one immediate transaction,
@@ -1013,6 +1015,15 @@ fn migrate_v5_baseline_backfilled(conn: &Connection) -> anyhow::Result<()> {
         "backfilled",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
+    Ok(())
+}
+
+/// Add `baselines.schedule` (schema v6): the JSON
+/// [`crate::earned_value::BaselineSchedule`] of a levelled baseline. `NULL`
+/// means a CPM baseline, so every baseline written before v6 reads as CPM.
+/// Idempotent via [`add_column_if_missing`].
+fn migrate_v6_baseline_schedule(conn: &Connection) -> anyhow::Result<()> {
+    add_column_if_missing(conn, "baselines", "schedule", "TEXT")?;
     Ok(())
 }
 
