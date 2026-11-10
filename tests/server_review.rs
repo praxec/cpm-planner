@@ -488,6 +488,7 @@ async fn review_audit_event_omits_the_prompt() {
             "model",
             "plan_id",
             "prompt_hash",
+            "provider",
             "question_count",
             "status"
         ]
@@ -847,4 +848,100 @@ async fn review_without_judge_does_not_wait_for_a_slot() {
         h.await.unwrap();
     }
     assert!(lint_only.is_ok());
+}
+
+// ---------------------------------------------------------------- provider provenance
+
+fn provider_server(
+    provider: Result<cpm_planner::llm::command::ReviewProvider, ConfigError>,
+) -> (PlanServer, MemoryAuditSink) {
+    let sink = MemoryAuditSink::new();
+    let planner = BasicCpmPlanner::with_audit(Arc::new(sink.clone()));
+    let server = PlanServer::new(Arc::new(planner)).with_review_provider(provider, || Ok(None));
+    (server, sink)
+}
+
+fn provider_from(settings: &[(&str, &str)]) -> (PlanServer, MemoryAuditSink) {
+    let settings: Vec<(String, String)> = settings
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+    provider_server(cpm_planner::llm::command::ReviewProvider::from_lookup(
+        |name| {
+            settings
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        },
+    ))
+}
+
+#[tokio::test]
+async fn review_without_key_reports_the_direct_provider() {
+    let (server, _) = provider_from(&[]);
+    let resp = review(&server, json!({ "graph": graph() })).await;
+    assert_eq!(resp["provider"], json!("direct"));
+}
+
+#[tokio::test]
+async fn review_disabled_by_the_provider_setting_reports_disabled() {
+    let (server, _) = provider_from(&[("CPM_REVIEW_PROVIDER", "disabled")]);
+    let resp = review(&server, json!({ "graph": graph() })).await;
+    assert_eq!(resp["provider"], json!("disabled"));
+}
+
+#[tokio::test]
+async fn review_with_an_unknown_provider_reports_disabled() {
+    let (server, _) = provider_from(&[("CPM_REVIEW_PROVIDER", "oracle")]);
+    let resp = review(&server, json!({ "graph": graph() })).await;
+    assert_eq!(resp["provider"], json!("disabled"));
+}
+
+#[tokio::test]
+async fn review_with_an_unusable_command_setting_reports_command() {
+    let (server, _) = provider_from(&[("CPM_REVIEW_PROVIDER", "command")]);
+    let resp = review(&server, json!({ "graph": graph() })).await;
+    assert_eq!(resp["provider"], json!("command"));
+}
+
+#[tokio::test]
+async fn review_with_an_invalid_llm_config_reports_the_direct_provider() {
+    let server = PlanServer::new(Arc::new(BasicCpmPlanner::new()))
+        .with_llm_config(Err(ConfigError::InvalidTimeout));
+    let resp = review(&server, json!({ "graph": graph() })).await;
+    assert_eq!(resp["provider"], json!("direct"));
+}
+
+#[tokio::test]
+async fn review_of_a_lint_error_graph_reports_the_provider() {
+    let (server, _) = provider_from(&[("CPM_REVIEW_PROVIDER", "disabled")]);
+    let resp = review(&server, json!({ "graph": cyclic_graph() })).await;
+    assert_eq!(resp["provider"], json!("disabled"));
+}
+
+#[tokio::test]
+async fn review_audit_event_without_a_judge_records_the_provider() {
+    let (server, sink) = provider_from(&[("CPM_REVIEW_PROVIDER", "disabled")]);
+    review(&server, json!({ "graph": graph() })).await;
+    let event = review_events(&sink).pop().expect("review audited");
+    assert_eq!(event["provider"], json!("disabled"));
+}
+
+#[tokio::test]
+async fn review_audit_event_with_a_judge_records_its_provider() {
+    let (server, sink) = audited_server(Arc::new(FakeJudge { noul: 0.0 }));
+    review(&server, json!({ "graph": graph() })).await;
+    let event = review_events(&sink).pop().expect("review audited");
+    assert_eq!(event["provider"], json!("direct"));
+}
+
+#[tokio::test]
+async fn review_error_audit_event_records_the_provider() {
+    let (server, sink) = provider_from(&[]);
+    server
+        .dispatch_call(call_args(TOOL_REVIEW, json!({ "plan_id": "plan_missing" })))
+        .await
+        .expect_err("unknown plan");
+    let event = review_events(&sink).pop().expect("review audited");
+    assert_eq!(event["provider"], json!("direct"));
 }

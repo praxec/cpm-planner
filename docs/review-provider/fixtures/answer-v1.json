@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "status": "ok",
+  "model": "typesafe/jev-1.13",
+  "answers": {
+    "q00": {
+      "type": "choice",
+      "choice": "none",
+      "probabilities": {
+        "add_capacity": 0.1,
+        "fast_track": 0.1,
+        "none": 0.7,
+        "reduce_scope": 0.1
+      },
+      "confidence": 0.7
+    },
+    "q01": {
+      "type": "noul",
+      "noul": 0.95
+    },
+    "q02": {
+      "type": "noul",
+      "noul": 0.8
+    },
+    "q03": {
+      "type": "choice",
+      "choice": "none",
+      "probabilities": {
+        "add_capacity": 0.05,
+        "fast_track": 0.05,
+        "none": 0.85,
+        "reduce_scope": 0.05
+      },
+      "confidence": 0.85
+    },
+    "q04": {
+      "type": "noul",
+      "noul": 0.1
+    }
+  },
+  "usage": {
+    "input_tokens": 812,
+    "output_tokens": 64,
+    "total_tokens": 876
+  }
+}

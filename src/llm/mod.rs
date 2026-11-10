@@ -152,7 +152,15 @@ pub enum ConfigError {
     /// The review provider settings are unusable. No value is kept.
     #[error("CPM_REVIEW_PROVIDER: {reason}")]
     InvalidReviewProvider { reason: &'static str },
+    /// `CPM_REVIEW_PROVIDER` names no known provider. Kept distinct from
+    /// [`ConfigError::InvalidReviewProvider`] so callers can report the
+    /// provider as `disabled` without matching message text.
+    #[error("CPM_REVIEW_PROVIDER: {UNKNOWN_REVIEW_PROVIDER_REASON}")]
+    UnknownReviewProvider,
 }
+
+/// Why an unknown `CPM_REVIEW_PROVIDER` value is refused.
+pub const UNKNOWN_REVIEW_PROVIDER_REASON: &str = "must be direct, command or disabled";
 
 impl ConfigError {
     /// A short `plan.review` `review_unavailable` reason naming the setting.
@@ -176,6 +184,9 @@ impl ConfigError {
             }
             Self::InvalidReviewProvider { reason } => {
                 format!("review provider invalid: {reason}")
+            }
+            Self::UnknownReviewProvider => {
+                format!("review provider invalid: {UNKNOWN_REVIEW_PROVIDER_REASON}")
             }
         }
     }
@@ -350,9 +361,9 @@ fn parse_model(raw: &str, key: &ApiKey) -> Result<String, ConfigError> {
     Ok(raw.to_string())
 }
 
-/// Validate a [`LLM_MODEL_ENV`] value and refuse frontier vendors, matching
-/// Junior's `model-policy.ts`. `openai/gpt-oss*` is the one `openai/`
-/// exception.
+/// Validate a [`LLM_MODEL_ENV`] value and refuse frontier vendors:
+/// cpm-planner's own policy is to generate with commodity models only.
+/// `openai/gpt-oss*` (open weights) is the one `openai/` exception.
 fn parse_generative_model(raw: &str, key: &ApiKey) -> Result<String, ConfigError> {
     let model = parse_model(raw, key)?;
     if frontier_vendor(&model).is_some() {
@@ -564,6 +575,13 @@ pub trait JudgmentModel: Send + Sync {
     /// the provider never reported one. `None` when unknown (fakes).
     fn model_id(&self) -> Option<String> {
         None
+    }
+
+    /// The review provider this judge stands for, recorded in every review
+    /// it answers: `direct` (this process calls the model; the default) or
+    /// `command` (an operator-supplied adapter answers).
+    fn provider(&self) -> &'static str {
+        "direct"
     }
 }
 

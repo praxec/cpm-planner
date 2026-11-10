@@ -19,11 +19,12 @@ src/planner/ev.rs      earned-value operations
    |            \
    |             pure engines: algorithm, schedule, lint, simulate, resource_schedule,
    |             monte_carlo, compare, metrics, drag, risk, network_health,
-   |             edits, revise, earned_value, review
+   |             edits, revise, earned_value, calendar, evidence, affinity,
+   |             waves, overview, explain, optimize, review
    |
 src/plan_store.rs      SqlitePlanStore: one connection, BEGIN IMMEDIATE transactions
 src/portfolio.rs       plan lines, variants, revisions (schema v3)
-src/ev_store.rs        baselines, actuals, snapshots (schema v4)
+src/ev_store.rs        baselines, actuals, snapshots (schema v4-v6)
 src/project.rs         confined plan-file I/O under the project root
 src/llm/               OpenRouter / Jev judge for plan.review
 
@@ -98,7 +99,36 @@ them a graph, a state and a time.
 - `revise.rs`: `plan_revision`, which carries progress from an old state to a
   revised graph and reports the diff and reopened deliverables.
 - `earned_value.rs`: the pure PV, EV, AC, SPI, CPI and EAC engine. Undefined
-  ratios become `None` plus an explanation, never NaN or infinity.
+  ratios become `None` plus an explanation, never NaN or infinity. It builds
+  CPM and levelled baselines (`build_baseline`, `build_levelled_baseline`,
+  `build_baseline_on_calendar`) and accrues PV on the plan clock or, with a
+  per-resource calendar map, inside each row's windows
+  ([calendars](calendars.md)).
+- `calendar.rs`: working calendars (`Calendar` with `day_start`, the
+  per-resource `CalendarSpec` map) and the window arithmetic (`open_at`,
+  `advance`, `working_hours`, `retreat`) that `plan.schedule`,
+  `plan.simulate`, Monte Carlo and EV place work with.
+- `waves.rs`: delivery waves, the gates that prove each one and the
+  milestone classes `plan.lint` reports, plus the evidence-scope findings
+  (`EVIDENCE_SCOPE_INVALID`, `GATE_SCOPE_MISSING`, `GATE_CANDIDATE_MISSING`,
+  `GATE_CANDIDATE_INVALID`, `SCOPE_FOLDED`).
+- `evidence.rs`: evidence records with a scope and an identity, the closing
+  rules `plan.mark_status` and `plan.accept` enforce, and the
+  current/stale/unknown verdict against a target ([evidence](evidence.md)).
+- `affinity.rs`: continuity threads (`metadata.thread`): the token rule,
+  handoffs recorded on completion, the affinity ranking and hold
+  `plan.acquire_cohort` applies, and the `threads` rows of `plan.status`
+  ([threads](threads.md)).
+- `overview.rs`: `plan.overview`, one consistent snapshot of status,
+  definition, EV and evidence at one `as_of`, as JSON or Markdown
+  ([overview](overview.md)).
+- `explain.rs`: `plan.explain`, why one deliverable is blocked, what
+  completing it unlocks, and the plan's next work in classes, built on the
+  same snapshot as the overview.
+- `optimize.rs`: `plan.optimize`, offline and deterministic proposals
+  (merge, false dependency, parallel cohort, gate consolidation, gate
+  bypass), each an edit list checked by lint, the schedule and simulate
+  ([optimize](optimize.md)).
 
 ### Optional AI review
 
@@ -167,9 +197,13 @@ The usual lifecycle of a plan, by tool:
    content hash.
 2. **Schedule.** `plan.status` reads the plan and returns the schedule, the
    critical path, the ready set, the locks, milestones and, for a variant,
-   `definition_drift`. `plan.schedule`, `plan.simulate` and `plan.compare`
-   are read-only analysis run off the async runtime.
-3. **Improve.** `plan.fork` applies structured edits to a variant's head graph
+   `definition_drift`. `plan.overview` joins status, definition, EV and
+   evidence into one snapshot, and `plan.explain` says why one deliverable is
+   blocked and what it unlocks. `plan.schedule`, `plan.simulate` and
+   `plan.compare` are read-only analysis run off the async runtime; with a
+   `calendar` they place each deliverable in its resource's working windows.
+3. **Improve.** `plan.optimize` proposes structural edit lists offline;
+   `plan.fork` applies structured edits to a variant's head graph
    and registers a draft; `plan.compare` scores variants; `plan.select` makes
    one the executable variant, carrying progress over; `plan.revise` replaces
    a graph in place through `revise.rs`.
@@ -182,11 +216,14 @@ The usual lifecycle of a plan, by tool:
 5. **Mark.** `plan.mark_status` completes or fails a deliverable and releases
    its lock; dependents whose prerequisites are all complete become `ready`.
    The lease's hours and any reported `earned_pct`, `actual_effort_hours` and
-   `evidence` are written to `ev_actuals` in the same transaction.
+   `evidence` are written to `ev_actuals` in the same transaction; evidence
+   records are checked against the deliverable's scope first, and a
+   completed threaded deliverable records a thread handoff.
    `plan.accept` and `plan.force_release` are the owner and operator escape
    hatches.
-6. **Earned value.** `plan.baseline` freezes the current schedule and budgets
-   as a numbered baseline. `plan.ev` computes PV, EV, AC and the derived
+6. **Earned value.** `plan.baseline` freezes the current CPM or levelled
+   schedule and budgets as a numbered baseline, on wall-clock hours, one
+   calendar or per-resource calendars. `plan.ev` computes PV, EV, AC and the derived
    indices against the latest baseline; `plan.snapshot` appends that reading
    and exports the history. Both run on the blocking pool.
 7. **Review.** `plan.review` lints the plan, and if it is clean and a key is
@@ -210,6 +247,9 @@ refused with "upgrade cpm-planner".
 | v2 | `migrate_v2_cpm_version` | `plans.cpm_version`; plans cached by an older kernel are recomputed on open |
 | v3 | `migrate_v3_portfolio` | `plan_lines` (selected variant, archived), `variants` (plan id, source path, content hash, head revision, archived), `revisions` (graph per revision) |
 | v4 | `migrate_v4_earned_value` | `baselines`, `ev_actuals`, `ev_snapshots` and two snapshot position indexes |
+| v5 | `migrate_v5_baseline_backfilled` | `baselines.backfilled` |
+| v6 | `migrate_v6_baseline_schedule` | `baselines.schedule`: the levelled inputs (capacities, resource key, buffer) and calendar wait of a baseline; `NULL` is CPM |
+| v7 | `migrate_v7_thread_handoffs` | `thread_handoffs`: the caller that last completed a deliverable of each thread |
 
 After the ladder, `ensure_v4_columns` runs on every open and adds any v4
 columns an unreleased v4 build lacked (`deliverable_statuses.lockless`,

@@ -18,7 +18,8 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::earned_value::{Actuals, Baseline, BaselineRow, Calendar};
+use crate::calendar::CalendarSpec;
+use crate::earned_value::{Actuals, Baseline, BaselineRow, BaselineSchedule};
 use crate::plan::{PlanId, PlannerError};
 use crate::plan_store::backend;
 
@@ -51,7 +52,105 @@ pub(crate) struct ReportedActuals {
     /// Replaces the stored actual hours when set.
     pub(crate) actual_hours: Option<f32>,
     /// Appended to the stored evidence list when set.
-    pub(crate) evidence: Option<String>,
+    pub(crate) evidence: Option<EvidenceAppend>,
+}
+
+/// One evidence entry to append, and what to do at
+/// [`crate::plan::MAX_EVIDENCE_ENTRIES`]: `mark_status` refuses
+/// (`INVALID_ACTUALS`); `accept` drops the oldest entry first, so acceptance
+/// is never blocked by bookkeeping.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct EvidenceAppend {
+    pub(crate) entry: crate::evidence::StoredEvidence,
+    pub(crate) drop_oldest_at_cap: bool,
+}
+
+impl From<String> for EvidenceAppend {
+    fn from(note: String) -> Self {
+        Self {
+            entry: crate::evidence::StoredEvidence::Note(note),
+            drop_oldest_at_cap: false,
+        }
+    }
+}
+
+impl From<&str> for EvidenceAppend {
+    fn from(note: &str) -> Self {
+        Self::from(note.to_string())
+    }
+}
+
+/// Decode a stored `ev_actuals.evidence` column: a JSON array whose
+/// elements are notes (strings) or stored records.
+fn decode_evidence(
+    plan_id: &PlanId,
+    deliverable_id: &str,
+    json: &str,
+) -> Result<Vec<crate::evidence::StoredEvidence>, PlannerError> {
+    serde_json::from_str(json).map_err(|e| {
+        backend(anyhow::anyhow!(
+            "plan {plan_id}: stored evidence for {deliverable_id} is not a JSON list of notes \
+             and records: {e}"
+        ))
+    })
+}
+
+/// The stored evidence of every deliverable of `plan_id` with at least one
+/// entry, in append order.
+pub(crate) fn load_evidence(
+    conn: &Connection,
+    plan_id: &PlanId,
+) -> Result<HashMap<String, Vec<crate::evidence::StoredEvidence>>, PlannerError> {
+    let mut stmt = conn
+        .prepare("SELECT deliverable_id, evidence FROM ev_actuals WHERE plan_id = ?1")
+        .map_err(backend)?;
+    let rows = stmt
+        .query_map(params![plan_id.0], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
+        .map_err(backend)?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (id, json) = row.map_err(backend)?;
+        let entries = decode_evidence(plan_id, &id, &json)?;
+        if !entries.is_empty() {
+            out.insert(id, entries);
+        }
+    }
+    Ok(out)
+}
+
+/// The stored evidence of one deliverable (empty without a row).
+pub(crate) fn load_deliverable_evidence(
+    conn: &Connection,
+    plan_id: &PlanId,
+    deliverable_id: &str,
+) -> Result<Vec<crate::evidence::StoredEvidence>, PlannerError> {
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT evidence FROM ev_actuals WHERE plan_id = ?1 AND deliverable_id = ?2",
+            params![plan_id.0, deliverable_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(backend)?;
+    stored.map_or_else(
+        || Ok(Vec::new()),
+        |json| decode_evidence(plan_id, deliverable_id, &json),
+    )
+}
+
+/// The plan's head revision: the newest stored revision, or 1 for a plan
+/// with no revision rows yet.
+pub(crate) fn head_revision(conn: &Connection, plan_id: &PlanId) -> Result<u32, PlannerError> {
+    let max: Option<u32> = conn
+        .query_row(
+            "SELECT MAX(revision) FROM revisions WHERE plan_id = ?1",
+            params![plan_id.0],
+            |r| r.get(0),
+        )
+        .map_err(backend)?;
+    Ok(max.unwrap_or(1))
 }
 
 fn dt(us: i64, column: &str) -> Result<DateTime<Utc>, PlannerError> {
@@ -105,11 +204,12 @@ pub(crate) fn load_actuals(
         let removed_at = removed_us
             .map(|us| dt(us, "ev_actuals.removed_at_us"))
             .transpose()?;
-        let evidence: Vec<String> = serde_json::from_str(&evidence).map_err(|e| {
-            backend(anyhow::anyhow!(
-                "plan {plan_id}: stored evidence for {id} is not a JSON string list: {e}"
-            ))
-        })?;
+        // A record reads as its summary here; the full entries come from
+        // `load_evidence`.
+        let evidence: Vec<String> = decode_evidence(plan_id, &id, &evidence)?
+            .iter()
+            .map(|e| e.display_text().to_string())
+            .collect();
         out.insert(
             id,
             Actuals {
@@ -169,15 +269,16 @@ pub(crate) fn record_reported(
         )
         .optional()
         .map_err(backend)?;
-    let mut evidence: Vec<String> = match &stored {
-        Some(json) => serde_json::from_str(json).map_err(|e| {
-            backend(anyhow::anyhow!(
-                "plan {plan_id}: stored evidence for {deliverable_id} is not a JSON string list: {e}"
-            ))
-        })?,
+    let mut evidence = match &stored {
+        Some(json) => decode_evidence(plan_id, deliverable_id, json)?,
         None => Vec::new(),
     };
-    if let Some(e) = &report.evidence {
+    if let Some(append) = &report.evidence {
+        if append.drop_oldest_at_cap {
+            let excess = (evidence.len() + 1).saturating_sub(crate::plan::MAX_EVIDENCE_ENTRIES);
+            evidence.drain(..excess);
+        }
+        let e = &append.entry;
         if evidence.len() >= crate::plan::MAX_EVIDENCE_ENTRIES {
             return Err(PlannerError::InvalidActuals {
                 reason: format!(
@@ -283,8 +384,9 @@ pub(crate) fn carry_actuals(
             continue;
         };
         let new = target.remove(id).unwrap_or_default();
-        let mut evidence = old.evidence.clone();
-        evidence.extend(new.evidence);
+        // Full entries, so carried records keep their identity.
+        let mut evidence = load_deliverable_evidence(conn, from, id)?;
+        evidence.extend(load_deliverable_evidence(conn, to, id)?);
         // Keep the newest entries only, so a merged row never exceeds the cap.
         let excess = evidence
             .len()
@@ -343,6 +445,7 @@ pub(crate) fn insert_baseline(
         ],
     )
     .map_err(backend)?;
+    store_baseline_schedule(conn, plan_id, baseline)?;
     Ok(())
 }
 
@@ -409,7 +512,7 @@ pub(crate) fn latest_baseline(
     };
     let corrupt =
         |what: String| backend(anyhow::anyhow!("plan {plan_id}: baseline {number}: {what}"));
-    let calendar: Option<Calendar> = calendar
+    let calendar: Option<CalendarSpec> = calendar
         .map(|c| serde_json::from_str(&c))
         .transpose()
         .map_err(|e| corrupt(format!("stored calendar does not decode: {e}")))?;
@@ -434,10 +537,62 @@ pub(crate) fn latest_baseline(
             bac: bac as f32,
             finish_hours,
             backfilled: backfilled != 0,
+            schedule: load_baseline_schedule(conn, plan_id, number)?,
         },
         reason,
         created_at: dt(created_us, "baselines.created_at_us")?,
     }))
+}
+
+/// Write `baseline.schedule` into the `baselines.schedule` column (schema
+/// v6) of the row [`insert_baseline`] just stored. A CPM schedule with no
+/// recorded inputs stays `NULL`, so CPM baselines are stored exactly as
+/// before v6.
+fn store_baseline_schedule(
+    conn: &Connection,
+    plan_id: &PlanId,
+    baseline: &Baseline,
+) -> Result<(), PlannerError> {
+    if baseline.schedule == BaselineSchedule::default() {
+        return Ok(());
+    }
+    let schedule = serde_json::to_string(&baseline.schedule).map_err(backend)?;
+    conn.execute(
+        "UPDATE baselines SET schedule = ?3 WHERE plan_id = ?1 AND number = ?2",
+        params![plan_id.0, baseline.number, schedule],
+    )
+    .map_err(backend)?;
+    Ok(())
+}
+
+/// The recorded schedule of baseline `number` of `plan_id`: `NULL` (every
+/// baseline written before schema v6, and every plain CPM baseline) reads
+/// as the default CPM schedule. A value that does not decode is a
+/// `BACKEND_ERROR` naming the plan and baseline.
+fn load_baseline_schedule(
+    conn: &Connection,
+    plan_id: &PlanId,
+    number: u32,
+) -> Result<BaselineSchedule, PlannerError> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT schedule FROM baselines WHERE plan_id = ?1 AND number = ?2",
+            params![plan_id.0, number],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(backend)?
+        .flatten();
+    raw.map_or_else(
+        || Ok(BaselineSchedule::default()),
+        |raw| {
+            serde_json::from_str(&raw).map_err(|e| {
+                backend(anyhow::anyhow!(
+                    "plan {plan_id}: baseline {number}: stored schedule does not decode: {e}"
+                ))
+            })
+        },
+    )
 }
 
 /// Store one snapshot. Two snapshots of one plan at the same `taken_at`
@@ -646,21 +801,24 @@ mod tests {
         (store, plan_id)
     }
 
-    fn baseline(number: u32, calendar: Option<Calendar>) -> Baseline {
+    fn baseline(number: u32, calendar: Option<crate::earned_value::Calendar>) -> Baseline {
         Baseline {
             number,
             start: at(0),
-            calendar,
+            calendar: calendar.map(CalendarSpec::Single),
             rows: vec![BaselineRow {
                 id: "a".into(),
                 es: 0.0,
                 ef: 2.0,
                 budget: 4.0,
                 cost_rate: 2.0,
+                calendars: None,
+                calendar_wait_hours: 0.0,
             }],
             bac: 4.0,
             finish_hours: 2.0,
             backfilled: false,
+            schedule: BaselineSchedule::default(),
         }
     }
 
@@ -717,7 +875,7 @@ mod tests {
             })
             .unwrap();
         let note = |e: String| ReportedActuals {
-            evidence: Some(e),
+            evidence: Some(e.into()),
             ..Default::default()
         };
         store
@@ -783,7 +941,7 @@ mod tests {
     #[test]
     fn baseline_round_trips_through_the_store() {
         let (store, plan_id) = store_with_plan();
-        let b = baseline(1, Some(Calendar::default()));
+        let b = baseline(1, Some(crate::earned_value::Calendar::default()));
         store
             .write_tx(|tx| insert_baseline(tx, &plan_id, &b, Some("first"), at(1)))
             .unwrap();
@@ -1090,5 +1248,84 @@ mod tests {
             plan.iter().any(|d| d.contains("ev_snapshots_by_position")),
             "plan was {plan:?}"
         );
+    }
+
+    fn levelled(number: u32) -> Baseline {
+        Baseline {
+            schedule: BaselineSchedule {
+                kind: crate::earned_value::ScheduleKind::Levelled,
+                capacities: Some([("agent".to_string(), 3)].into_iter().collect()),
+                resource_key: Some("owner".into()),
+                project_buffer_pct: Some(25.0),
+                project_buffer_hours: Some(0.5),
+                calendar_wait_hours: None,
+            },
+            ..baseline(number, None)
+        }
+    }
+
+    fn schedule_column(store: &SqlitePlanStore, plan_id: &PlanId) -> Option<String> {
+        store
+            .read_tx(|tx| {
+                tx.query_row(
+                    "SELECT schedule FROM baselines WHERE plan_id = ?1",
+                    params![plan_id.0],
+                    |r| r.get(0),
+                )
+                .map_err(backend)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn levelled_schedule_round_trips_through_the_store() {
+        let (store, plan_id) = store_with_plan();
+        let b = levelled(1);
+        store
+            .write_tx(|tx| insert_baseline(tx, &plan_id, &b, None, at(1)))
+            .unwrap();
+        let got = store.read_tx(|tx| latest_baseline(tx, &plan_id)).unwrap();
+        assert_eq!(got.map(|s| s.baseline.schedule), Some(b.schedule));
+    }
+
+    #[test]
+    fn cpm_baseline_leaves_the_schedule_column_null() {
+        let (store, plan_id) = store_with_plan();
+        store
+            .write_tx(|tx| insert_baseline(tx, &plan_id, &baseline(1, None), None, at(1)))
+            .unwrap();
+        assert_eq!(schedule_column(&store, &plan_id), None);
+    }
+
+    #[test]
+    fn baseline_without_a_schedule_reads_as_cpm() {
+        let (store, plan_id) = store_with_plan();
+        raw_baseline(
+            &store,
+            &plan_id,
+            r#"[{"id":"a","es":0.0,"ef":2.0,"budget":2.0}]"#,
+        );
+        let got = store.read_tx(|tx| latest_baseline(tx, &plan_id)).unwrap();
+        assert_eq!(
+            got.map(|s| s.baseline.schedule),
+            Some(BaselineSchedule::default())
+        );
+    }
+
+    #[test]
+    fn undecodable_schedule_is_a_backend_error() {
+        let (store, plan_id) = store_with_plan();
+        store
+            .write_tx(|tx| {
+                insert_baseline(tx, &plan_id, &baseline(1, None), None, at(1))?;
+                tx.execute(
+                    "UPDATE baselines SET schedule = '{\"kind\":\"sideways\"}'",
+                    [],
+                )
+                .map_err(backend)
+            })
+            .unwrap();
+        let err = store.read_tx(|tx| latest_baseline(tx, &plan_id));
+        assert!(matches!(err, Err(PlannerError::BackendError(_))));
     }
 }

@@ -6,9 +6,23 @@
       "prerequisites": [],
       "estimated_effort_hours": 2.0,
       "metadata": {
-        "artifact": "docs/export-api.md: request/response schema and error codes, signed off by the UI and service owners",
+        "artifact": "docs/export-api.md: request/response schema and error codes",
         "owner": "agent",
         "contract": true
+      }
+    },
+    {
+      "id": "export-api-approval",
+      "owned_files": [],
+      "prerequisites": [
+        { "id": "export-api-contract", "consumes": "docs/export-api.md schema for review" }
+      ],
+      "estimated_effort_hours": 0.5,
+      "metadata": {
+        "artifact": "UI and service owners' approval of docs/export-api.md",
+        "owner": "owner",
+        "kind": "manual",
+        "evidence_scope": "manual_approval"
       }
     },
     {
@@ -66,7 +80,8 @@
       "id": "export-release",
       "owned_files": [],
       "prerequisites": [
-        { "id": "export-e2e-evidence", "consumes": "accepted evidence report" }
+        { "id": "export-e2e-evidence", "consumes": "accepted evidence report" },
+        { "id": "export-api-approval", "consumes": "approved export contract" }
       ],
       "milestone": true,
       "metadata": {

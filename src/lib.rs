@@ -118,14 +118,18 @@
 //! This crate has no dependency on praxec; it is consumed purely over the
 //! MCP protocol.
 
+pub mod affinity;
 pub mod algorithm;
 pub mod audit;
+pub mod calendar;
 pub mod compare;
 pub mod drag;
 pub mod earned_value;
 pub mod edits;
 pub mod estimator;
 pub(crate) mod ev_store;
+pub mod evidence;
+pub mod explain;
 mod graph;
 #[cfg(test)]
 mod lease_hours_tests;
@@ -137,6 +141,8 @@ mod mark_actuals_tests;
 pub mod metrics;
 pub mod monte_carlo;
 pub mod network_health;
+pub mod optimize;
+pub mod overview;
 pub mod plan;
 pub mod plan_store;
 pub mod planner;

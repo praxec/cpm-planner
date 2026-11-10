@@ -19,6 +19,7 @@
 //! `iterations × (deliverables + prerequisite edges)` may not exceed
 //! [`MAX_WORK`].
 
+use crate::calendar::{ScheduleCalendar, WorkWindows};
 use crate::estimator::EffortEstimator;
 use crate::plan::{FINISH_ID, PlanGraph, PlannerError};
 use crate::schedule::{compute_cpm, deliverable_to_task};
@@ -117,10 +118,27 @@ pub fn monte_carlo(
     graph: &PlanGraph,
     req: &MonteCarloRequest,
 ) -> Result<MonteCarloSummary, PlannerError> {
+    monte_carlo_on_calendar(graph, req, None)
+}
+
+/// [`monte_carlo`] on per-resource calendars (`docs/calendars.md`, section
+/// 3.6), or exactly [`monte_carlo`] when `calendar` is `None`.
+///
+/// Each iteration places the sampled lengths with the calendar forward
+/// pass, so `p50`, `p80`, `p95`, `mean` and `deterministic_makespan` are
+/// wall-clock hours from `calendar.start`. Criticality uses the calendar
+/// backward pass (latest start is `retreat` from latest finish). Calendars
+/// are looked up by `metadata.owner`.
+pub fn monte_carlo_on_calendar(
+    graph: &PlanGraph,
+    req: &MonteCarloRequest,
+    calendar: Option<&ScheduleCalendar>,
+) -> Result<MonteCarloSummary, PlannerError> {
     crate::planner::validate_graph(graph)?;
     check_request(graph, req)?;
     let cpm = compute_cpm(graph)?;
-    monte_carlo_with_cpm(graph, req, &cpm)
+    let key = crate::resource_schedule::default_resource_key();
+    monte_carlo_with_cpm(graph, req, &cpm, calendar.map(|c| (c, key.as_str())))
 }
 
 /// The per-iteration work of `graph`: deliverables plus prerequisite edges.
@@ -150,14 +168,15 @@ fn check_request(graph: &PlanGraph, req: &MonteCarloRequest) -> Result<(), Plann
 }
 
 /// [`monte_carlo`] over an already validated graph and its CPM result, so
-/// callers that already ran CPM (`simulate`) do not repeat it.
+/// callers that already ran CPM (`simulate`) do not repeat it. With
+/// `calendar` = (placement, resource key) the run is on the resource clock.
 pub(crate) fn monte_carlo_with_cpm(
     graph: &PlanGraph,
     req: &MonteCarloRequest,
     cpm: &CriticalPathResult,
+    calendar: Option<(&ScheduleCalendar, &str)>,
 ) -> Result<MonteCarloSummary, PlannerError> {
     check_request(graph, req)?;
-    let deterministic_makespan = cpm.critical_path_duration;
 
     let estimator = EffortEstimator::new();
     let mut tasks: Vec<Task> = graph
@@ -166,6 +185,23 @@ pub(crate) fn monte_carlo_with_cpm(
         .map(|d| deliverable_to_task(d, &estimator))
         .collect();
     crate::schedule::add_endpoints(graph, &mut tasks);
+    // Task `i < deliverables` is deliverable `i`; the synthetic endpoints
+    // that follow are zero-length instants.
+    let windows = calendar
+        .map(|(when, key)| -> Result<Vec<WorkWindows>, PlannerError> {
+            let pools = crate::resource_schedule::pools_of(graph, key)?;
+            let clock = crate::resource_schedule::Clock::new(graph, &pools, when)?;
+            Ok((0..tasks.len())
+                .map(|i| {
+                    if i < graph.deliverables.len() {
+                        clock.windows(i).clone()
+                    } else {
+                        WorkWindows::always_open()
+                    }
+                })
+                .collect())
+        })
+        .transpose()?;
 
     // (deliverable index, distribution) for each sampled deliverable: only
     // those whose scheduled length comes from the estimate.
@@ -194,6 +230,14 @@ pub(crate) fn monte_carlo_with_cpm(
             reason: "internal error: missing finish endpoint".to_string(),
         })?;
     let mut kernel = Kernel::new(&tasks)?;
+    let deterministic_makespan = match windows {
+        None => cpm.critical_path_duration,
+        Some(windows) => {
+            kernel.set_windows(windows);
+            kernel.run();
+            kernel.ef[finish_idx]
+        }
+    };
     let mut rng = ChaCha8Rng::seed_from_u64(req.seed);
     let mut makespans = Vec::with_capacity(n);
     let mut moments = Moments::new(sampled.len());
@@ -333,9 +377,75 @@ struct Kernel {
     ef: Vec<f32>,
     ls: Vec<f32>,
     float: Vec<f32>,
+    /// Resource clock: per-task windows and `f64` pass buffers. `None` is
+    /// the calendar-free kernel.
+    calendar: Option<CalendarPass>,
+}
+
+/// Windows and `f64` earliest start / finish and latest start of the
+/// calendar passes.
+struct CalendarPass {
+    windows: Vec<WorkWindows>,
+    es: Vec<f64>,
+    ef: Vec<f64>,
+    ls: Vec<f64>,
 }
 
 impl Kernel {
+    /// Put the kernel on the resource clock: `windows[i]` is task `i`'s.
+    fn set_windows(&mut self, windows: Vec<WorkWindows>) {
+        let n = windows.len();
+        self.calendar = Some(CalendarPass {
+            windows,
+            es: vec![0.0; n],
+            ef: vec![0.0; n],
+            ls: vec![0.0; n],
+        });
+    }
+
+    /// Calendar forward pass (open, then advance through the windows) and
+    /// backward pass (latest start is `retreat` from latest finish). Fills
+    /// `ef` and `float`, returns the makespan.
+    fn run_on_calendar(&mut self) -> f32 {
+        let pass = self
+            .calendar
+            .as_mut()
+            .expect("INVARIANT: run_on_calendar runs with windows set");
+        let mut makespan = 0.0_f64;
+        for &i in &self.order {
+            let mut ready = 0.0_f64;
+            for &(p, lag) in &self.preds[i] {
+                ready = ready.max(pass.ef[p] + f64::from(lag));
+            }
+            let len = f64::from(self.len[i]);
+            let w = &pass.windows[i];
+            let (es, ef) = if len > 0.0 {
+                let s = w.open_at(ready);
+                (s, w.advance(s, len))
+            } else {
+                (ready, ready)
+            };
+            pass.es[i] = es;
+            pass.ef[i] = ef;
+            makespan = makespan.max(ef);
+        }
+        for &i in self.order.iter().rev() {
+            let mut lf = makespan;
+            let mut first = true;
+            for &(s, lag) in &self.succs[i] {
+                let v = pass.ls[s] - f64::from(lag);
+                if first || v < lf {
+                    lf = v;
+                    first = false;
+                }
+            }
+            pass.ls[i] = pass.windows[i].retreat(lf, f64::from(self.len[i]));
+            self.float[i] = (pass.ls[i] - pass.es[i]) as f32;
+            self.ef[i] = pass.ef[i] as f32;
+        }
+        makespan as f32
+    }
+
     /// Errors if the task graph has a dependency cycle or unknown id.
     fn new(tasks: &[Task]) -> Result<Self, PlannerError> {
         let n = tasks.len();
@@ -390,12 +500,16 @@ impl Kernel {
             ef: vec![0.0; n],
             ls: vec![0.0; n],
             float: vec![0.0; n],
+            calendar: None,
         })
     }
 
     /// Forward and backward sweep over `self.len`; fills ES/EF/LS/float and
     /// returns the makespan (largest earliest finish). No allocation.
     fn run(&mut self) -> f32 {
+        if self.calendar.is_some() {
+            return self.run_on_calendar();
+        }
         let mut makespan = 0.0_f32;
         for &i in &self.order {
             let mut es = 0.0_f32;

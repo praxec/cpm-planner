@@ -1,12 +1,21 @@
 //! Resource-constrained scheduling: levels a plan against per-resource
 //! capacities with event-driven list scheduling, then reports the driving
 //! chain (what each link waited on) and project / feeding buffers.
+//!
+//! With a [`ScheduleCalendar`] ([`resource_schedule_on_calendar`]) hours are
+//! wall-clock hours from the plan start and each deliverable advances only
+//! inside its resource's calendar windows (`docs/calendars.md`, section 3).
+//! Without one the output is exactly the calendar-free schedule.
 
+use crate::calendar::{CalendarMap, CalendarSpec, ScheduleCalendar, WorkWindows, instant_after};
 use crate::estimator::EffortEstimator;
 use crate::plan::{Deliverable, FINISH_ID, PlanGraph, PlannerError};
 use crate::task::CriticalPathResult;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ops::{Add, Sub};
 
 const EPS: f32 = 1e-4;
 const UNASSIGNED: &str = "unassigned";
@@ -67,6 +76,20 @@ pub struct ScheduledRow {
     pub resources: BTreeMap<String, u32>,
     pub start: f32,
     pub finish: f32,
+    /// `start` as an RFC 3339 UTC instant; calendar schedules only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_at: Option<DateTime<Utc>>,
+    /// `finish` as an RFC 3339 UTC instant; calendar schedules only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_at: Option<DateTime<Utc>>,
+    /// Calendar keys whose windows this deliverable works in (`[]` for
+    /// `wall_clock_only`); calendar schedules only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calendars: Option<Vec<String>>,
+    /// Wall-clock hours from `unconstrained` (ready and resource free) to
+    /// `start`; calendar schedules only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calendar_wait_hours: Option<f32>,
 }
 
 /// Busy time of one resource.
@@ -75,17 +98,25 @@ pub struct ResourceLoad {
     pub resource: String,
     pub capacity: u32,
     pub busy_hours: f32,
+    /// `capacity` times the working hours of the pool's calendar in
+    /// `[0, makespan)`; calendar schedules only (without a calendar it is
+    /// `capacity * makespan`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_hours: Option<f32>,
+    /// `busy_hours / available_hours` (0 when nothing is available).
     pub utilisation: f32,
 }
 
 /// What a driving-chain link waited on before starting. For `Resource`, the
-/// concrete saturated pool is reported in [`ChainLink::waited_on_resource`].
+/// concrete saturated pool is reported in [`ChainLink::waited_on_resource`];
+/// for `Calendar`, the calendar keys in [`ChainLink::waited_on_calendar`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WaitKind {
     Start,
     Dependency,
     Resource,
+    Calendar,
 }
 
 /// One link of the driving chain.
@@ -93,9 +124,18 @@ pub enum WaitKind {
 pub struct ChainLink {
     pub id: String,
     pub waited_on: WaitKind,
-    /// The exact saturated pool when `waited_on` is `resource`.
+    /// The exact saturated pool when `waited_on` is `resource` (or a
+    /// calendar link whose `unconstrained` time came from that pool).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waited_on_resource: Option<String>,
+    /// The link's calendar keys joined with `+` when `waited_on` is
+    /// `calendar`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waited_on_calendar: Option<String>,
+    /// Wall-clock hours the link waited for its window to open, when
+    /// `waited_on` is `calendar`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calendar_wait_hours: Option<f32>,
 }
 
 /// Buffer protecting the point where a side chain joins the driving chain.
@@ -109,18 +149,27 @@ pub struct FeedingBuffer {
 /// Result of [`resource_schedule`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResourceSchedule {
+    /// The plan start hour 0 refers to; calendar schedules only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<DateTime<Utc>>,
     pub makespan: f32,
-    /// Unconstrained CPM makespan, for comparison.
+    /// Unconstrained CPM makespan, for comparison (on a calendar, the
+    /// calendar CPM forward pass on the same windows).
     pub cpm_makespan: f32,
     /// Graph order, no synthetic rows.
     pub rows: Vec<ScheduledRow>,
     /// Sorted by resource.
     pub load: Vec<ResourceLoad>,
-    /// Execution order; the first link waited on `Start`.
+    /// Execution order; the first link waited on `Start` (or `Calendar`
+    /// when the plan start falls outside its window).
     pub driving_chain: Vec<ChainLink>,
     /// Percentage of the summed scheduled lengths on `driving_chain`.
     pub project_buffer_hours: f32,
     pub feeding_buffers: Vec<FeedingBuffer>,
+    /// Summed calendar wait of the driving chain's links, in wall-clock
+    /// hours; calendar schedules only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calendar_wait_hours: Option<f32>,
 }
 
 struct Node {
@@ -129,6 +178,149 @@ struct Node {
     resources: BTreeMap<String, u32>,
     /// (predecessor index, lag); a repeated id keeps its largest lag.
     preds: Vec<(usize, f32)>,
+}
+
+/// Schedule hours: `f32` on the calendar-free path (its arithmetic is
+/// unchanged), `f64` on the resource clock.
+trait Hour: Copy + PartialOrd + Add<Output = Self> + Sub<Output = Self> {
+    const ZERO: Self;
+    const EPS: Self;
+    const NAN: Self;
+    fn from_f32(v: f32) -> Self;
+    fn to_f32(self) -> f32;
+    fn abs(self) -> Self;
+    fn max(self, other: Self) -> Self;
+    fn total_cmp(&self, other: &Self) -> Ordering;
+    fn is_nan(self) -> bool;
+}
+
+impl Hour for f32 {
+    const ZERO: Self = 0.0;
+    const EPS: Self = EPS;
+    const NAN: Self = f32::NAN;
+    fn from_f32(v: f32) -> Self {
+        v
+    }
+    fn to_f32(self) -> f32 {
+        self
+    }
+    fn abs(self) -> Self {
+        f32::abs(self)
+    }
+    fn max(self, other: Self) -> Self {
+        f32::max(self, other)
+    }
+    fn total_cmp(&self, other: &Self) -> Ordering {
+        f32::total_cmp(self, other)
+    }
+    fn is_nan(self) -> bool {
+        f32::is_nan(self)
+    }
+}
+
+impl Hour for f64 {
+    const ZERO: Self = 0.0;
+    const EPS: Self = EPS as f64;
+    const NAN: Self = f64::NAN;
+    fn from_f32(v: f32) -> Self {
+        f64::from(v)
+    }
+    fn to_f32(self) -> f32 {
+        self as f32
+    }
+    fn abs(self) -> Self {
+        f64::abs(self)
+    }
+    fn max(self, other: Self) -> Self {
+        f64::max(self, other)
+    }
+    fn total_cmp(&self, other: &Self) -> Ordering {
+        f64::total_cmp(self, other)
+    }
+    fn is_nan(self) -> bool {
+        f64::is_nan(self)
+    }
+}
+
+/// Where each deliverable landed, and its `unconstrained` time: the
+/// latest of ready and resource-free, before any calendar wait.
+struct Placed<H> {
+    start: Vec<H>,
+    finish: Vec<H>,
+    unconstrained: Vec<H>,
+}
+
+/// `place(i, unconstrained)`: start and finish of deliverable `i`.
+type Place<'a, H> = &'a dyn Fn(usize, H) -> (H, H);
+
+/// One driving-chain step: (index, wait kind, saturated pool, calendar wait).
+type ChainStep<H> = (usize, WaitKind, Option<String>, Option<H>);
+
+/// The resource clock of one schedule: each deliverable's calendar keys and
+/// windows (graph order), and the map and start they came from.
+pub(crate) struct Clock {
+    map: CalendarMap,
+    start: DateTime<Utc>,
+    keys: Vec<Vec<String>>,
+    windows: Vec<WorkWindows>,
+}
+
+impl Clock {
+    /// Resolve every deliverable's calendar keys and windows (section 2.5).
+    /// `pools[i]` lists the pools deliverable `i` claims; empty (a
+    /// `wall_clock_only` deliverable) is always open.
+    pub(crate) fn new(
+        graph: &PlanGraph,
+        pools: &[Vec<String>],
+        when: &ScheduleCalendar,
+    ) -> Result<Self, PlannerError> {
+        if let CalendarSpec::Single(c) = &when.calendar {
+            c.validate()?;
+        }
+        let map = when.calendar.to_map();
+        let mut keys = Vec::with_capacity(pools.len());
+        let mut windows = Vec::with_capacity(pools.len());
+        for (d, pools) in graph.deliverables.iter().zip(pools) {
+            let k = map.keys_for(pools.iter().map(String::as_str));
+            let w = map
+                .windows(&k, when.start)
+                .ok_or_else(|| PlannerError::InvalidValue {
+                    reason: format!(
+                        "deliverable {:?}: calendars [{}] never overlap",
+                        d.id,
+                        k.join(", ")
+                    ),
+                })?;
+            keys.push(k);
+            windows.push(w);
+        }
+        Ok(Self {
+            map,
+            start: when.start,
+            keys,
+            windows,
+        })
+    }
+
+    /// The windows of deliverable `i` (graph order).
+    pub(crate) fn windows(&self, i: usize) -> &WorkWindows {
+        &self.windows[i]
+    }
+
+    /// Placement rule (section 3.3): work of `len > 0` starts at the next
+    /// open at or after `u` and advances through the windows; anything else
+    /// is an instant at `u`.
+    pub(crate) fn place(&self, i: usize, u: f64, len: f64) -> (f64, f64) {
+        if len <= 0.0 {
+            return (u, u);
+        }
+        let s = self.windows[i].open_at(u);
+        (s, self.windows[i].advance(s, len))
+    }
+
+    fn instant(&self, hours: f64) -> DateTime<Utc> {
+        instant_after(self.start, hours)
+    }
 }
 
 /// Level `graph` against `req.capacities`.
@@ -145,6 +337,104 @@ pub fn resource_schedule(
     resource_schedule_with_cpm(graph, req, &cpm)
 }
 
+/// [`resource_schedule`] on per-resource calendars (`docs/calendars.md`,
+/// section 3), or exactly [`resource_schedule`] when `calendar` is `None`.
+///
+/// On a calendar, `start`, `finish` and `makespan` are wall-clock hours
+/// from `calendar.start`; rows add `start_at`, `finish_at`, `calendars`
+/// and `calendar_wait_hours`, loads add `available_hours`, and driving-chain
+/// links that waited for a window report `waited_on: "calendar"`. A
+/// multi-pool deliverable whose calendars never overlap is
+/// [`PlannerError::InvalidValue`].
+pub fn resource_schedule_on_calendar(
+    graph: &PlanGraph,
+    req: &ScheduleRequest,
+    calendar: Option<&ScheduleCalendar>,
+) -> Result<ResourceSchedule, PlannerError> {
+    match calendar {
+        None => resource_schedule(graph, req),
+        Some(calendar) => {
+            crate::planner::validate_graph(graph)?;
+            calendar_schedule(graph, req, calendar)
+        }
+    }
+}
+
+/// The pools each deliverable claims, exactly as levelling claims them
+/// (keys of `metadata.resources`, else `metadata.<key>`, else
+/// `unassigned`; empty for `wall_clock_only`), for calendar lookup.
+pub(crate) fn pools_of(graph: &PlanGraph, key: &str) -> Result<Vec<Vec<String>>, PlannerError> {
+    Ok(build_nodes(graph, key)?
+        .into_iter()
+        .map(|n| n.resources.into_keys().collect())
+        .collect())
+}
+
+/// [`resource_schedule_with_cpm`] on the resource clock, over a validated
+/// graph.
+pub(crate) fn calendar_schedule(
+    graph: &PlanGraph,
+    req: &ScheduleRequest,
+    when: &ScheduleCalendar,
+) -> Result<ResourceSchedule, PlannerError> {
+    check_buffer_pct(req.project_buffer_pct)
+        .map_err(|reason| PlannerError::InvalidGraph { reason })?;
+    let nodes = build_nodes(graph, &req.resource_key)?;
+    let pools: Vec<Vec<String>> = nodes
+        .iter()
+        .map(|n| n.resources.keys().cloned().collect())
+        .collect();
+    let clock = Clock::new(graph, &pools, when)?;
+    check_capacities(&nodes, &req.capacities)?;
+    let order = topological_order(&nodes)?;
+    let tail = tails(&nodes, &order);
+    let ids: Vec<&str> = graph.deliverables.iter().map(|d| d.id.as_str()).collect();
+    let place = |i: usize, u: f64| clock.place(i, u, f64::from(nodes[i].len));
+
+    let cpm = forward(&nodes, &order, &place);
+    let cpm_makespan = cpm.finish.iter().copied().fold(0.0_f64, f64::max);
+    let placed = level(&nodes, &ids, &tail, &req.capacities, &place)?;
+    let makespan = placed.finish.iter().copied().fold(0.0_f64, f64::max);
+
+    let rows = (0..nodes.len())
+        .map(|i| ScheduledRow {
+            id: ids[i].to_string(),
+            resource: nodes[i].resource.clone(),
+            resources: nodes[i].resources.clone(),
+            start: placed.start[i] as f32,
+            finish: placed.finish[i] as f32,
+            start_at: Some(clock.instant(placed.start[i])),
+            finish_at: Some(clock.instant(placed.finish[i])),
+            calendars: Some(clock.keys[i].clone()),
+            calendar_wait_hours: Some((placed.start[i] - placed.unconstrained[i]) as f32),
+        })
+        .collect();
+
+    let chain = driving_chain(&nodes, &ids, &placed, &req.capacities);
+    let chain_set: BTreeSet<usize> = chain.iter().map(|step| step.0).collect();
+    let pct = req.project_buffer_pct / 100.0;
+    let project_buffer_hours = pct * chain.iter().map(|step| nodes[step.0].len).sum::<f32>();
+    let feeding_buffers = feeding_buffers(&nodes, &ids, &order, &chain_set, pct);
+    let wait_total: f64 = chain.iter().filter_map(|step| step.3).sum();
+    let available = |resource: &str, capacity: u32| -> f32 {
+        let hours = WorkWindows::of(clock.map.calendar_for(resource), clock.start)
+            .working_hours(0.0, makespan);
+        (f64::from(capacity) * hours) as f32
+    };
+
+    Ok(ResourceSchedule {
+        start: Some(clock.start),
+        makespan: makespan as f32,
+        cpm_makespan: cpm_makespan as f32,
+        rows,
+        load: loads(&nodes, &req.capacities, Some(&available), makespan as f32),
+        driving_chain: chain_links(&ids, &clock.keys, chain),
+        project_buffer_hours,
+        feeding_buffers,
+        calendar_wait_hours: Some(wait_total as f32),
+    })
+}
+
 /// [`resource_schedule`] over an already validated graph and its CPM
 /// result, so callers that already ran CPM (`simulate`) do not repeat it.
 pub(crate) fn resource_schedule_with_cpm(
@@ -158,10 +448,98 @@ pub(crate) fn resource_schedule_with_cpm(
 
     let nodes = build_nodes(graph, &req.resource_key)?;
     check_capacities(&nodes, &req.capacities)?;
-    let n = nodes.len();
     let order = topological_order(&nodes)?;
     let tail = tails(&nodes, &order);
+    let ids: Vec<&str> = graph.deliverables.iter().map(|d| d.id.as_str()).collect();
+    let place = |i: usize, u: f32| (u, u + nodes[i].len);
+    let placed = level(&nodes, &ids, &tail, &req.capacities, &place)?;
+    let (start, finish) = (&placed.start, &placed.finish);
 
+    let makespan = finish.iter().copied().fold(0.0_f32, f32::max);
+    let rows = (0..nodes.len())
+        .map(|i| ScheduledRow {
+            id: ids[i].to_string(),
+            resource: nodes[i].resource.clone(),
+            resources: nodes[i].resources.clone(),
+            start: start[i],
+            finish: finish[i],
+            start_at: None,
+            finish_at: None,
+            calendars: None,
+            calendar_wait_hours: None,
+        })
+        .collect();
+
+    let chain = driving_chain(&nodes, &ids, &placed, &req.capacities);
+    let chain_set: BTreeSet<usize> = chain.iter().map(|step| step.0).collect();
+    let pct = req.project_buffer_pct / 100.0;
+    let project_buffer_hours = pct * chain.iter().map(|step| nodes[step.0].len).sum::<f32>();
+    let feeding_buffers = feeding_buffers(&nodes, &ids, &order, &chain_set, pct);
+
+    Ok(ResourceSchedule {
+        start: None,
+        makespan,
+        cpm_makespan,
+        rows,
+        load: loads(&nodes, &req.capacities, None, makespan),
+        driving_chain: chain_links(&ids, &[], chain),
+        project_buffer_hours,
+        feeding_buffers,
+        calendar_wait_hours: None,
+    })
+}
+
+/// The driving chain as wire links; calendar links name their keys.
+fn chain_links<H: Hour>(
+    ids: &[&str],
+    keys: &[Vec<String>],
+    chain: Vec<ChainStep<H>>,
+) -> Vec<ChainLink> {
+    chain
+        .into_iter()
+        .map(|(i, waited_on, waited_on_resource, wait)| ChainLink {
+            id: ids[i].to_string(),
+            waited_on,
+            waited_on_resource,
+            waited_on_calendar: wait.and_then(|_| keys.get(i)).map(|k| k.join("+")),
+            calendar_wait_hours: wait.map(Hour::to_f32),
+        })
+        .collect()
+}
+
+/// Calendar CPM forward pass (section 3.6): placement without levelling.
+fn forward<H: Hour>(nodes: &[Node], order: &[usize], place: Place<'_, H>) -> Placed<H> {
+    let n = nodes.len();
+    let mut out = Placed {
+        start: vec![H::ZERO; n],
+        finish: vec![H::ZERO; n],
+        unconstrained: vec![H::ZERO; n],
+    };
+    for &i in order {
+        let u = nodes[i]
+            .preds
+            .iter()
+            .map(|&(p, lag)| out.finish[p] + H::from_f32(lag))
+            .fold(H::ZERO, H::max);
+        let (s, f) = place(i, u);
+        out.unconstrained[i] = u;
+        out.start[i] = s;
+        out.finish[i] = f;
+    }
+    out
+}
+
+/// Event-driven list scheduling, shared by both clocks. Each step places
+/// the candidate (every predecessor placed) with the earliest `place`d
+/// start; ties go to milestones, then the longest tail, then the id.
+fn level<H: Hour>(
+    nodes: &[Node],
+    ids: &[&str],
+    tail: &[f32],
+    capacities: &BTreeMap<String, u32>,
+    place: Place<'_, H>,
+) -> Result<Placed<H>, PlannerError> {
+    let n = nodes.len();
     // Allocate units only for resources that carry work, and never more than
     // the number of work-bearing deliverables on that resource: extra units
     // could never be occupied, and sizing by raw capacity can demand huge
@@ -172,24 +550,24 @@ pub(crate) fn resource_schedule_with_cpm(
             *work_per_resource.entry(resource).or_insert(0) += *claim as usize;
         }
     }
-    let mut units: BTreeMap<String, Vec<f32>> = work_per_resource
+    let mut units: BTreeMap<String, Vec<H>> = work_per_resource
         .into_iter()
         .map(|(resource, work)| {
-            let capacity = req
-                .capacities
+            let capacity = capacities
                 .get(resource)
                 .copied()
                 .expect("INVARIANT: capacities validated before allocation")
                 as usize;
-            (resource.to_string(), vec![0.0; capacity.min(work)])
+            (resource.to_string(), vec![H::ZERO; capacity.min(work)])
         })
         .collect();
-    let mut start = vec![f32::NAN; n];
-    let mut finish = vec![f32::NAN; n];
+    let mut start = vec![H::NAN; n];
+    let mut finish = vec![H::NAN; n];
+    let mut unconstrained = vec![H::NAN; n];
     let mut done = 0;
     while done < n {
         // Candidate: every predecessor placed; its earliest feasible start.
-        let mut best: Option<(usize, f32)> = None; // (idx, start)
+        let mut best: Option<(usize, H, H, H)> = None; // (idx, start, finish, unconstrained)
         for i in 0..n {
             if !start[i].is_nan() || nodes[i].preds.iter().any(|&(p, _)| start[p].is_nan()) {
                 continue;
@@ -197,21 +575,22 @@ pub(crate) fn resource_schedule_with_cpm(
             let ready = nodes[i]
                 .preds
                 .iter()
-                .map(|&(p, lag)| finish[p] + lag)
-                .fold(0.0_f32, f32::max);
-            let mut s = ready;
+                .map(|&(p, lag)| finish[p] + H::from_f32(lag))
+                .fold(H::ZERO, H::max);
+            let mut u = ready;
             if nodes[i].len > 0.0 {
                 for (resource, claim) in &nodes[i].resources {
                     let mut availability = units[resource].clone();
-                    availability.sort_by(f32::total_cmp);
+                    availability.sort_by(H::total_cmp);
                     let free = availability[*claim as usize - 1];
-                    s = s.max(free);
+                    u = u.max(free);
                 }
             }
+            let (s, f) = place(i, u);
             let better = match best {
                 None => true,
-                Some((b, bs)) => {
-                    if (s - bs).abs() > EPS {
+                Some((b, bs, _, _)) => {
+                    if (s - bs).abs() > H::EPS {
                         s < bs
                     } else {
                         let (zi, zb) = (nodes[i].len <= 0.0, nodes[b].len <= 0.0);
@@ -220,22 +599,23 @@ pub(crate) fn resource_schedule_with_cpm(
                         } else if (tail[i] - tail[b]).abs() > EPS {
                             tail[i] > tail[b]
                         } else {
-                            graph.deliverables[i].id < graph.deliverables[b].id
+                            ids[i] < ids[b]
                         }
                     }
                 }
             };
             if better {
-                best = Some((i, s));
+                best = Some((i, s, f, u));
             }
         }
-        let Some((i, s)) = best else {
+        let Some((i, s, f, u)) = best else {
             return Err(PlannerError::InvalidGraph {
                 reason: "resource schedule could not place every deliverable".to_string(),
             });
         };
         start[i] = s;
-        finish[i] = s + nodes[i].len;
+        finish[i] = f;
+        unconstrained[i] = u;
         if nodes[i].len > 0.0 {
             for (resource, claim) in &nodes[i].resources {
                 let pool = units
@@ -250,40 +630,10 @@ pub(crate) fn resource_schedule_with_cpm(
         }
         done += 1;
     }
-
-    let ids: Vec<&str> = graph.deliverables.iter().map(|d| d.id.as_str()).collect();
-    let makespan = finish.iter().copied().fold(0.0_f32, f32::max);
-    let rows = (0..n)
-        .map(|i| ScheduledRow {
-            id: ids[i].to_string(),
-            resource: nodes[i].resource.clone(),
-            resources: nodes[i].resources.clone(),
-            start: start[i],
-            finish: finish[i],
-        })
-        .collect();
-
-    let chain = driving_chain(&nodes, &ids, &start, &finish, &req.capacities);
-    let chain_set: BTreeSet<usize> = chain.iter().map(|&(i, _, _)| i).collect();
-    let pct = req.project_buffer_pct / 100.0;
-    let project_buffer_hours = pct * chain.iter().map(|&(i, _, _)| nodes[i].len).sum::<f32>();
-    let feeding_buffers = feeding_buffers(&nodes, &ids, &order, &chain_set, pct);
-
-    Ok(ResourceSchedule {
-        makespan,
-        cpm_makespan,
-        rows,
-        load: loads(&nodes, &req.capacities, makespan),
-        driving_chain: chain
-            .iter()
-            .map(|(i, waited_on, waited_on_resource)| ChainLink {
-                id: ids[*i].to_string(),
-                waited_on: *waited_on,
-                waited_on_resource: waited_on_resource.clone(),
-            })
-            .collect(),
-        project_buffer_hours,
-        feeding_buffers,
+    Ok(Placed {
+        start,
+        finish,
+        unconstrained,
     })
 }
 
@@ -451,13 +801,18 @@ fn tails(nodes: &[Node], order: &[usize]) -> Vec<f32> {
     tail
 }
 
-fn driving_chain(
+/// Walk the driving chain back from the last finish (section 3.5). Each
+/// link that started later than its `unconstrained` time waited on its
+/// calendar; the walk always continues from `unconstrained`. On the
+/// calendar-free clock `unconstrained == start`, so no link is a calendar
+/// link.
+fn driving_chain<H: Hour>(
     nodes: &[Node],
     ids: &[&str],
-    start: &[f32],
-    finish: &[f32],
+    placed: &Placed<H>,
     capacities: &BTreeMap<String, u32>,
-) -> Vec<(usize, WaitKind, Option<String>)> {
+) -> Vec<ChainStep<H>> {
+    let (start, finish) = (&placed.start, &placed.finish);
     let Some(mut cur) = (0..nodes.len()).min_by(|&a, &b| {
         finish[b]
             .total_cmp(&finish[a])
@@ -467,19 +822,27 @@ fn driving_chain(
     };
     let mut rev = Vec::new();
     loop {
-        let s = start[cur];
-        if s <= EPS {
-            rev.push((cur, WaitKind::Start, None));
+        let s = placed.unconstrained[cur];
+        let wait = (start[cur] - s > H::EPS).then(|| start[cur] - s);
+        let kind = |k: WaitKind| {
+            if wait.is_some() {
+                WaitKind::Calendar
+            } else {
+                k
+            }
+        };
+        if s <= H::EPS {
+            rev.push((cur, kind(WaitKind::Start), None, wait));
             break;
         }
         let dep = nodes[cur]
             .preds
             .iter()
-            .filter(|&&(p, lag)| (finish[p] + lag - s).abs() <= EPS)
+            .filter(|&&(p, lag)| (finish[p] + H::from_f32(lag) - s).abs() <= H::EPS)
             .map(|&(p, _)| p)
             .min_by(|&a, &b| ids[a].cmp(ids[b]));
         if let Some(p) = dep {
-            rev.push((cur, WaitKind::Dependency, None));
+            rev.push((cur, kind(WaitKind::Dependency), None, wait));
             cur = p;
             continue;
         }
@@ -490,7 +853,9 @@ fn driving_chain(
                 let occupied: u32 = nodes
                     .iter()
                     .enumerate()
-                    .filter(|(j, _)| *j != cur && start[*j] < s - EPS && finish[*j] >= s - EPS)
+                    .filter(|(j, _)| {
+                        *j != cur && start[*j] < s - H::EPS && finish[*j] >= s - H::EPS
+                    })
                     .map(|(_, node)| node.resources.get(*resource).copied().unwrap_or(0))
                     .sum();
                 occupied + nodes[cur].resources[*resource]
@@ -501,17 +866,17 @@ fn driving_chain(
                     (j != cur
                         && nodes[j].len > 0.0
                         && nodes[j].resources.contains_key(resource)
-                        && (finish[j] - s).abs() <= EPS)
+                        && (finish[j] - s).abs() <= H::EPS)
                         .then_some((j, resource.clone()))
                 })
             })
             .min_by(|(a, ar), (b, br)| ids[*a].cmp(ids[*b]).then_with(|| ar.cmp(br)));
         if let Some((j, resource)) = res {
-            rev.push((cur, WaitKind::Resource, Some(resource)));
+            rev.push((cur, kind(WaitKind::Resource), Some(resource), wait));
             cur = j;
             continue;
         }
-        rev.push((cur, WaitKind::Start, None));
+        rev.push((cur, kind(WaitKind::Start), None, wait));
         break;
     }
     rev.reverse();
@@ -580,7 +945,18 @@ fn feeding_buffers(
     out
 }
 
-fn loads(nodes: &[Node], caps: &BTreeMap<String, u32>, makespan: f32) -> Vec<ResourceLoad> {
+/// Per-pool working hours available to a schedule: `capacity` times the
+/// pool calendar's working hours in `[0, makespan)`.
+type Available<'a> = &'a dyn Fn(&str, u32) -> f32;
+
+/// Busy hours per pool and utilisation against `available` (calendar
+/// schedules) or `capacity * makespan` (calendar-free).
+fn loads(
+    nodes: &[Node],
+    caps: &BTreeMap<String, u32>,
+    available: Option<Available<'_>>,
+    makespan: f32,
+) -> Vec<ResourceLoad> {
     let mut busy: BTreeMap<&str, f32> = BTreeMap::new();
     for n in nodes.iter().filter(|n| n.len > 0.0) {
         for (resource, claim) in &n.resources {
@@ -593,16 +969,16 @@ fn loads(nodes: &[Node], caps: &BTreeMap<String, u32>, makespan: f32) -> Vec<Res
                 .get(resource)
                 .copied()
                 .expect("INVARIANT: capacities validated before allocation");
-            let available = capacity as f32 * makespan;
+            let hours = match available {
+                Some(f) => f(resource, capacity),
+                None => capacity as f32 * makespan,
+            };
             ResourceLoad {
                 resource: resource.to_string(),
                 capacity,
                 busy_hours,
-                utilisation: if available > 0.0 {
-                    busy_hours / available
-                } else {
-                    0.0
-                },
+                available_hours: available.map(|_| hours),
+                utilisation: if hours > 0.0 { busy_hours / hours } else { 0.0 },
             }
         })
         .collect()

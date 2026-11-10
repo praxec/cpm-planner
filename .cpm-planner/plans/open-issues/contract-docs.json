@@ -1,0 +1,707 @@
+{
+  "deliverables": [
+    {
+      "id": "review-adapter",
+      "owned_files": [
+        "src/llm/command.rs",
+        "src/llm/mod.rs",
+        "src/review.rs",
+        "docs/review-provider.md",
+        "docs/review-provider/fixtures/request-v1.json",
+        "docs/review-provider/fixtures/answer-v1.json",
+        "docs/review-provider/fixtures/refused-v1.json",
+        "tests/review_adapter.rs",
+        {
+          "path": "CHANGELOG.md",
+          "mode": "append"
+        }
+      ],
+      "prerequisites": [],
+      "estimate": {
+        "optimistic": 4.0,
+        "likely": 6.0,
+        "pessimistic": 10.0
+      },
+      "metadata": {
+        "owner": "agent",
+        "thread": "review",
+        "issues": [
+          "#119"
+        ],
+        "artifact": "Fake-adapter end-to-end tests (success, refusal, timeout, non-zero exit, malformed, wrong schema_version, oversized, redaction), provider/model/request-digest/usage provenance on every review, tool-neutral docs/review-provider.md with conformance fixtures, no named external tools in code or docs",
+        "verify": "cargo nextest run --test review_adapter --test review_command --test review"
+      },
+      "earning_rule": "fifty_fifty"
+    },
+    {
+      "id": "evidence-contract",
+      "owned_files": [
+        "docs/evidence.md"
+      ],
+      "prerequisites": [],
+      "estimate": {
+        "optimistic": 1.5,
+        "likely": 2.0,
+        "pessimistic": 4.0
+      },
+      "metadata": {
+        "owner": "agent",
+        "thread": "evidence",
+        "contract": true,
+        "issues": [
+          "#130",
+          "#127"
+        ],
+        "artifact": "docs/evidence.md: evidence identity schema v1 (tree/image, dependency-lock digest, toolchain, test-contract version, environment), current/stale rules with the changed field named, and evidence scopes (focused, gate, manual approval, external sign-off, merge, publish, activation) with which scope may satisfy which deliverable kind",
+        "scope_folded": false
+      }
+    },
+    {
+      "id": "evidence-binding",
+      "owned_files": [
+        "src/evidence.rs",
+        "src/planner.rs",
+        "tests/evidence.rs",
+        {
+          "path": "src/lib.rs",
+          "mode": "append"
+        },
+        {
+          "path": "CHANGELOG.md",
+          "mode": "append"
+        },
+        {
+          "path": "src/plan_store.rs",
+          "mode": "append"
+        },
+        {
+          "path": "src/ev_store.rs",
+          "mode": "append"
+        }
+      ],
+      "prerequisites": [
+        {
+          "id": "evidence-contract",
+          "consumes": "evidence identity schema and staleness rules",
+          "kind": "interface"
+        }
+      ],
+      "estimate": {
+        "optimistic": 6.0,
+        "likely": 10.0,
+        "pessimistic": 16.0
+      },
+      "metadata": {
+        "owner": "agent",
+        "thread": "evidence",
+        "issues": [
+          "#130"
+        ],
+        "artifact": "src/evidence.rs: evidence stored with its governed identity on mark_status/accept, evidence_status(current|stale + changed fields) against a target identity, scope check so focused evidence cannot close a gate and gate evidence cannot close a manual or external sign-off; tests/evidence.rs",
+        "verify": "cargo nextest run --test evidence --test planner",
+        "scope_folded": false
+      },
+      "earning_rule": "fifty_fifty"
+    },
+    {
+      "id": "gate-scope-lint",
+      "owned_files": [
+        "src/lint.rs",
+        "src/waves.rs",
+        "tests/lint.rs",
+        "tests/waves.rs",
+        {
+          "path": "CHANGELOG.md",
+          "mode": "append"
+        }
+      ],
+      "prerequisites": [
+        {
+          "id": "evidence-contract",
+          "consumes": "evidence scope vocabulary",
+          "kind": "interface"
+        }
+      ],
+      "estimate": {
+        "optimistic": 4,
+        "likely": 6.5,
+        "pessimistic": 10
+      },
+      "metadata": {
+        "owner": "agent",
+        "thread": "lint",
+        "issues": [
+          "#130",
+          "#133"
+        ],
+        "artifact": "Deterministic lint findings with remediation for gates missing an evidence scope, a gate that does not record the candidate it verifies, approval, sign-off, merge, publish or activation folded into a work or gate deliverable, and THREAD_BROKEN when a metadata.thread is not one dependency chain; tests/lint.rs and tests/waves.rs",
+        "verify": "cargo nextest run --test lint --test waves",
+        "scope_folded": false
+      },
+      "earning_rule": "fifty_fifty"
+    },
+    {
+      "id": "overview-core",
+      "owned_files": [
+        "src/overview.rs",
+        "docs/overview.md",
+        "tests/overview.rs",
+        {
+          "path": "src/lib.rs",
+          "mode": "append"
+        },
+        {
+          "path": "CHANGELOG.md",
+          "mode": "append"
+        }
+      ],
+      "prerequisites": [],
+      "estimate": {
+        "optimistic": 6.0,
+        "likely": 9.0,
+        "pessimistic": 14.0
+      },
+      "metadata": {
+        "owner": "agent",
+        "thread": "overview",
+        "issues": [
+          "#128",
+          "#127"
+        ],
+        "artifact": "src/overview.rs: one snapshot at a single as_of joining status, get and EV (identity, drift, baseline, counts, EV with null reasons, titled critical path and milestones, ready queue with float/owner/next milestone, blocked items with the incomplete prerequisite chain and blocker class, leases); brief/full, JSON v1 and Markdown, bounded for large plans; docs/overview.md specifies plan.overview and plan.explain request/response; tests/overview.rs proving agreement with the existing read APIs",
+        "verify": "cargo nextest run --test overview"
+      },
+      "earning_rule": "fifty_fifty"
+    },
+    {
+      "id": "overview-evidence",
+      "owned_files": [
+        "src/overview.rs",
+        "tests/overview.rs",
+        "docs/overview.md"
+      ],
+      "prerequisites": [
+        {
+          "id": "overview-core",
+          "consumes": "overview snapshot builder"
+        },
+        {
+          "id": "evidence-binding",
+          "consumes": "evidence_status function"
+        }
+      ],
+      "estimate": {
+        "optimistic": 1.0,
+        "likely": 2.0,
+        "pessimistic": 3.0
+      },
+      "metadata": {
+        "owner": "agent",
+        "thread": "overview",
+        "issues": [
+          "#128",
+          "#130"
+        ],
+        "artifact": "Overview rows show live current/stale evidence with the changed identity fields; tests for stale-after-change; docs/overview.md aligned with the shipped explain/v1 (ready_critical definition, in_progress state, slack_hours and blocked_by fields) and the evidence verdict vocabulary",
+        "verify": "cargo nextest run --test overview"
+      }
+    },
+    {
+      "id": "explain-next-work",
+      "owned_files": [
+        "src/explain.rs",
+        "tests/explain.rs",
+        {
+          "path": "src/lib.rs",
+          "mode": "append"
+        },
+        {
+          "path": "CHANGELOG.md",
+          "mode": "append"
+        }
+      ],
+      "prerequisites": [
+        {
+          "id": "overview-core",
+          "consumes": "blocker-chain and next-milestone functions"
+        }
+      ],
+      "estimate": {
+        "optimistic": 3.0,
+        "likely": 5.0,
+        "pessimistic": 8.0
+      },
+      "metadata": {
+        "owner": "agent",
+        "thread": "explain",
+        "issues": [
+          "#129",
+          "#127"
+        ],
+        "artifact": "src/explain.rs: why a deliverable is blocked and what completing it unlocks (downstream milestones, critical-path impact); next-work classes: ready and critical, ready with slack, blocked by dependency/manual/external/gate, file-conflicting; uses acquire_cohort conflict semantics read-only; tests/explain.rs",
+        "verify": "cargo nextest run --test explain"
+      },
+      "earning_rule": "fifty_fifty"
+    },
+    {
+      "id": "optimize-core",
+      "owned_files": [
+        "src/optimize.rs",
+        "docs/optimize.md",
+        "tests/optimize.rs",
+        {
+          "path": "src/lib.rs",
+          "mode": "append"
+        },
+        {
+          "path": "CHANGELOG.md",
+          "mode": "append"
+        }
+      ],
+      "prerequisites": [],
+      "estimate": {
+        "optimistic": 8.0,
+        "likely": 12.0,
+        "pessimistic": 20.0
+      },
+      "metadata": {
+        "owner": "agent",
+        "thread": "optimize",
+        "issues": [
+          "#129",
+          "#127"
+        ],
+        "artifact": "src/optimize.rs: offline deterministic proposals (merge same-owner overlapping-file deliverables, false-dependency and parallel-cohort candidates, consolidate repeated gates after a wave, work waiting on a gate it does not consume), each a plan.fork edit list validated by lint/schedule/simulate with makespan, resource-wait, effort and risk deltas, rejecting lost acceptance, gates, contracts or ownership; docs/optimize.md; tests/optimize.rs proving determinism and no mutation",
+        "verify": "cargo nextest run --test optimize --test simulate"
+      },
+      "earning_rule": "fifty_fifty"
+    },
+    {
+      "id": "tool-wiring",
+      "owned_files": [
+        "src/server.rs",
+        "src/bin/server.rs",
+        "README.md",
+        "tests/server_overview.rs",
+        "tests/server_optimize.rs",
+        "tests/server_evidence.rs",
+        {
+          "path": "CHANGELOG.md",
+          "mode": "append"
+        },
+        "tests/server_calendars.rs",
+        "tests/server_affinity.rs"
+      ],
+      "prerequisites": [
+        {
+          "id": "overview-evidence",
+          "consumes": "final overview builder"
+        },
+        {
+          "id": "explain-next-work",
+          "consumes": "explain API"
+        },
+        {
+          "id": "optimize-core",
+          "consumes": "optimize API"
+        },
+        {
+          "id": "calendar-ev",
+          "consumes": "per-resource calendar and capacities baseline API"
+        },
+        {
+          "id": "thread-affinity",
+          "consumes": "thread-aware acquire API and thread status"
+        }
+      ],
+      "estimate": {
+        "optimistic": 4,
+        "likely": 6.5,
+        "pessimistic": 10
+      },
+      "metadata": {
+        "owner": "agent",
+        "thread": "surface",
+        "issues": [
+          "#128",
+          "#129",
+          "#130",
+          "#131",
+          "#132",
+          "#133"
+        ],
+        "artifact": "MCP tools plan.overview, plan.explain, plan.optimize and CLI commands; evidence identity arguments on plan.mark_status and plan.accept; calendars and capacities on plan.baseline, plan.schedule and plan.simulate; thread and affinity_seconds on plan.acquire_cohort and threads in plan.status; server instructions and README tool list; server tests for each",
+        "verify": "cargo nextest run --test server_overview --test server_optimize --test server_evidence --test server_integration"
+      },
+      "earning_rule": "fifty_fifty"
+    },
+    {
+      "id": "calendar-contract",
+      "owned_files": [
+        "docs/calendars.md"
+      ],
+      "prerequisites": [],
+      "estimate": {
+        "optimistic": 1.5,
+        "likely": 2,
+        "pessimistic": 4
+      },
+      "earning_rule": "zero_hundred",
+      "metadata": {
+        "owner": "agent",
+        "thread": "ev",
+        "contract": true,
+        "issues": [
+          "#131",
+          "#132"
+        ],
+        "artifact": "docs/calendars.md: per-resource calendars keyed by resource_key with day_start and a default, placement rule for work becoming ready outside a window, waited_on calendar, PV accrual inside each resource window, and plan.baseline capacities/resource_key/project_buffer_pct with the frozen schedule kind"
+      }
+    },
+    {
+      "id": "calendar-schedule",
+      "owned_files": [
+        "src/calendar.rs",
+        "src/resource_schedule.rs",
+        "src/monte_carlo.rs",
+        "tests/calendars.rs",
+        {
+          "path": "src/lib.rs",
+          "mode": "append"
+        },
+        {
+          "path": "CHANGELOG.md",
+          "mode": "append"
+        },
+        "src/simulate.rs"
+      ],
+      "prerequisites": [
+        {
+          "id": "calendar-contract",
+          "consumes": "calendar schema and placement rule",
+          "kind": "interface"
+        }
+      ],
+      "estimate": {
+        "optimistic": 5,
+        "likely": 8,
+        "pessimistic": 12
+      },
+      "earning_rule": "fifty_fifty",
+      "metadata": {
+        "owner": "agent",
+        "thread": "schedule",
+        "issues": [
+          "#131"
+        ],
+        "artifact": "src/calendar.rs window arithmetic; levelled schedule and Monte Carlo place each deliverable in its resource calendar windows and report waited_on calendar; tests/calendars.rs for overnight, weekend and day_start cases, single-calendar behaviour unchanged",
+        "verify": "cargo nextest run --test calendars --test resource_schedule --test monte_carlo"
+      }
+    },
+    {
+      "id": "levelled-baseline",
+      "owned_files": [
+        "src/earned_value.rs",
+        "src/planner/ev.rs",
+        "tests/earned_value_tools.rs",
+        {
+          "path": "CHANGELOG.md",
+          "mode": "append"
+        },
+        {
+          "path": "src/plan_store.rs",
+          "mode": "append"
+        },
+        {
+          "path": "src/ev_store.rs",
+          "mode": "append"
+        },
+        "docs/calendars.md"
+      ],
+      "prerequisites": [
+        {
+          "id": "calendar-contract",
+          "consumes": "plan.baseline capacities argument shape",
+          "kind": "interface"
+        }
+      ],
+      "estimate": {
+        "optimistic": 3,
+        "likely": 5,
+        "pessimistic": 8
+      },
+      "earning_rule": "fifty_fifty",
+      "metadata": {
+        "owner": "agent",
+        "thread": "ev",
+        "issues": [
+          "#132"
+        ],
+        "artifact": "plan.baseline with capacities freezes the levelled start and finish per deliverable, records schedule kind and capacities, reuses them on re-baseline; CPM baseline unchanged; tests/earned_value_tools.rs",
+        "verify": "cargo nextest run --test earned_value_tools --test auto_baseline"
+      }
+    },
+    {
+      "id": "calendar-ev",
+      "owned_files": [
+        "src/earned_value.rs",
+        "src/planner/ev.rs",
+        "tests/earned_value_tools.rs",
+        {
+          "path": "CHANGELOG.md",
+          "mode": "append"
+        },
+        "docs/calendars.md"
+      ],
+      "prerequisites": [
+        {
+          "id": "levelled-baseline",
+          "consumes": "baseline row builder with levelled placement"
+        },
+        {
+          "id": "calendar-schedule",
+          "consumes": "calendar window arithmetic in src/calendar.rs"
+        }
+      ],
+      "estimate": {
+        "optimistic": 3,
+        "likely": 5,
+        "pessimistic": 8
+      },
+      "earning_rule": "fifty_fifty",
+      "metadata": {
+        "owner": "agent",
+        "thread": "ev",
+        "issues": [
+          "#131"
+        ],
+        "artifact": "Baselines take per-resource calendars; PV accrues per deliverable inside its resource windows; plan.ev reports the schedule variance share caused by calendar waits; existing single-calendar baselines read unchanged; tests/earned_value_tools.rs",
+        "verify": "cargo nextest run --test earned_value_tools"
+      }
+    },
+    {
+      "id": "thread-affinity",
+      "owned_files": [
+        "src/affinity.rs",
+        "src/planner.rs",
+        "src/locks.rs",
+        "docs/threads.md",
+        "tests/affinity.rs",
+        {
+          "path": "src/lib.rs",
+          "mode": "append"
+        },
+        {
+          "path": "CHANGELOG.md",
+          "mode": "append"
+        },
+        {
+          "path": "src/plan_store.rs",
+          "mode": "append"
+        },
+        "tests/persistence.rs"
+      ],
+      "prerequisites": [
+        {
+          "id": "evidence-binding",
+          "consumes": "planner.rs acquire and mark_status paths with evidence recording merged"
+        }
+      ],
+      "estimate": {
+        "optimistic": 4,
+        "likely": 7,
+        "pessimistic": 12
+      },
+      "earning_rule": "fifty_fifty",
+      "metadata": {
+        "owner": "agent",
+        "thread": "evidence",
+        "issues": [
+          "#133"
+        ],
+        "artifact": "src/affinity.rs: metadata.thread preference in acquire_cohort (thread argument, successor offered first to the caller that completed its predecessor, affinity_seconds expiry), never bypassing file conflicts, prerequisites or the circuit breaker; plan.status threads; docs/threads.md; tests/affinity.rs",
+        "verify": "cargo nextest run --test affinity --test planner --test locks",
+        "migration": "v7 thread_handoffs, appended after levelled-baseline v6 (already complete)"
+      }
+    },
+    {
+      "id": "skills-docs",
+      "owned_files": [
+        "skills/cpm-plan/SKILL.md",
+        "skills/cpm-run/SKILL.md",
+        "skills/cpm-improve/SKILL.md",
+        "skills/deliverable-cpm/SKILL.md",
+        "skills/cpm-ev/SKILL.md",
+        "docs/architecture.md",
+        {
+          "path": "CHANGELOG.md",
+          "mode": "append"
+        },
+        "skills/deliverable-cpm/examples/improvement-loop.md",
+        "docs/evidence.md",
+        "docs/README.md"
+      ],
+      "prerequisites": [
+        {
+          "id": "gate-scope-lint",
+          "consumes": "new finding codes and remediation"
+        },
+        {
+          "id": "overview-core",
+          "consumes": "plan.overview and plan.explain request/response contract in docs/overview.md"
+        },
+        {
+          "id": "optimize-core",
+          "consumes": "plan.optimize contract in docs/optimize.md"
+        },
+        {
+          "id": "thread-affinity",
+          "consumes": "thread semantics in docs/threads.md"
+        },
+        {
+          "id": "calendar-contract",
+          "consumes": "calendar and levelled-baseline argument contract",
+          "kind": "interface"
+        }
+      ],
+      "estimate": {
+        "optimistic": 3,
+        "likely": 4,
+        "pessimistic": 6
+      },
+      "metadata": {
+        "owner": "agent",
+        "thread": "docs",
+        "issues": [
+          "#127",
+          "#131",
+          "#132",
+          "#133"
+        ],
+        "artifact": "Skills use plan.overview for status, plan.explain for blockers, plan.optimize before plan.review, record evidence identity, baseline levelled with per-resource calendars (agents 24/7, humans on working hours), and size deliverables per continuity thread; finding table updated; improvement-loop.md refreshed for the new small-plan.json; manual_approval vs external_signoff guidance; docs/evidence.md says a milestone gate follows gate rules; docs/README.md links the new guides",
+        "verify": "cargo nextest run --test skill_docs --test repo_hygiene"
+      },
+      "earning_rule": "fifty_fifty"
+    },
+    {
+      "id": "integration-branch",
+      "owned_files": [
+        {
+          "path": "CHANGELOG.md",
+          "mode": "append"
+        }
+      ],
+      "prerequisites": [
+        {
+          "id": "skills-docs",
+          "consumes": "skills branch"
+        },
+        {
+          "id": "review-adapter",
+          "consumes": "review adapter branch"
+        },
+        {
+          "id": "tool-wiring",
+          "consumes": "tool wiring branch"
+        }
+      ],
+      "estimate": {
+        "optimistic": 1.0,
+        "likely": 2.0,
+        "pessimistic": 4.0
+      },
+      "metadata": {
+        "owner": "agent",
+        "thread": "surface",
+        "artifact": "Integration branch from dev with every wave branch merged, conflicts resolved and targeted checks green",
+        "verify": "cargo build && cargo nextest run --test overview --test evidence --test optimize --test review_adapter"
+      }
+    },
+    {
+      "id": "wave-gate",
+      "owned_files": [],
+      "prerequisites": [
+        {
+          "id": "release-prep",
+          "consumes": "0.7.0 release candidate head"
+        }
+      ],
+      "estimate": {
+        "optimistic": 0.75,
+        "likely": 1.0,
+        "pessimistic": 2.0
+      },
+      "metadata": {
+        "owner": "ci",
+        "kind": "gate",
+        "artifact": "Full regression on the integration head: every AGENTS.md gate locally, then a pull request into dev with CI green on that SHA; evidence records SHA, Cargo.lock digest and toolchain",
+        "evidence_scope": "gate",
+        "candidate": "release-prep"
+      }
+    },
+    {
+      "id": "dev-merged",
+      "owned_files": [],
+      "prerequisites": [
+        {
+          "id": "wave-gate",
+          "consumes": "green PR evidence"
+        }
+      ],
+      "estimate": {
+        "optimistic": 0.5,
+        "likely": 2.0,
+        "pessimistic": 8.0
+      },
+      "metadata": {
+        "owner": "owner",
+        "kind": "manual",
+        "artifact": "0.7.0 integration PR reviewed and merged into dev; #119, #128-#133 closed and #127 with them"
+      },
+      "milestone": true
+    },
+    {
+      "id": "release-prep",
+      "owned_files": [
+        "Cargo.toml",
+        "Cargo.lock",
+        "npm/package.json",
+        "CHANGELOG.md"
+      ],
+      "prerequisites": [
+        {
+          "id": "integration-branch",
+          "consumes": "integration branch head"
+        }
+      ],
+      "estimated_effort_hours": 0.5,
+      "metadata": {
+        "owner": "agent",
+        "thread": "release",
+        "artifact": "Version 0.7.0 in Cargo.toml, Cargo.lock and npm/package.json, dated CHANGELOG section; scripts/check-version-sync.sh passes",
+        "verify": "scripts/check-version-sync.sh"
+      }
+    },
+    {
+      "id": "v0-7-0-released",
+      "owned_files": [],
+      "prerequisites": [
+        {
+          "id": "dev-merged",
+          "consumes": "merged dev head at 0.7.0"
+        }
+      ],
+      "estimate": {
+        "optimistic": 0.5,
+        "likely": 1.0,
+        "pessimistic": 8.0
+      },
+      "metadata": {
+        "owner": "owner",
+        "kind": "manual",
+        "artifact": "Owner opens the dev to main release PR per docs/releasing.md, merges it on green CI, tags v0.7.0 and publishes to crates.io and npm"
+      },
+      "milestone": true
+    }
+  ]
+}
