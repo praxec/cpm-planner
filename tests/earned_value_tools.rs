@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use cpm_planner::BasicCpmPlanner;
 use cpm_planner::audit::MemoryAuditSink;
+use cpm_planner::calendar::{CalendarSpec, ScheduleCalendar};
 use cpm_planner::earned_value::{
     BaselineCalendar, BaselineOutcome, BaselineRequest, Calendar, EvRowStatus, ScheduleKind,
     SnapshotFormat, SnapshotRequest,
@@ -20,7 +21,9 @@ use cpm_planner::plan::{
     PlannerError, ReviseRequest, SyncRequest,
 };
 use cpm_planner::ports::Planner;
-use cpm_planner::resource_schedule::{ScheduleRequest, resource_schedule};
+use cpm_planner::resource_schedule::{
+    ScheduleRequest, resource_schedule, resource_schedule_on_calendar,
+};
 
 fn t0() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 1, 5, 0, 0, 0).unwrap()
@@ -790,7 +793,7 @@ async fn rebaseline_without_calendar_inherits_previous_calendar() {
         .baseline(BaselineRequest::new(plan_id).with_reason("replan"))
         .await
         .unwrap();
-    assert_eq!(out.calendar, Some(calendar));
+    assert_eq!(out.calendar, Some(CalendarSpec::Single(calendar)));
 }
 
 // ── Levelled baselines (#132, docs/calendars.md section 4) ──────────────
@@ -1197,12 +1200,12 @@ async fn calendar_input_overrides_the_calendar_shorthand() {
 }
 
 #[tokio::test]
-async fn per_resource_calendar_map_is_invalid_value_for_now() {
+async fn invalid_calendar_map_entry_is_invalid_value() {
     let f = Fixture::new();
     let plan_id = f.plan().await;
     let map = BaselineCalendar::from_json(Some(serde_json::json!({
         "default": {"hours_per_day": 24},
-        "owner": {"hours_per_day": 8}
+        "owner": {"hours_per_day": 25}
     })))
     .unwrap();
     let err = f
@@ -1225,4 +1228,302 @@ async fn single_calendar_with_out_of_range_value_keeps_invalid_graph() {
         )
         .await;
     assert!(matches!(err, PlannerError::InvalidGraph { .. }), "{err}");
+}
+
+// ── Per-resource calendars on the resource clock (#131) ─────────────────
+
+#[tokio::test]
+async fn single_calendar_with_malformed_day_start_is_invalid_value() {
+    let f = Fixture::new();
+    let plan_id = f.plan().await;
+    let calendar = Calendar {
+        day_start: "9:00".into(),
+        ..Calendar::default()
+    };
+    let err = f
+        .baseline_err(BaselineRequest::new(plan_id).with_calendar(calendar))
+        .await;
+    assert!(matches!(err, PlannerError::InvalidValue { .. }), "{err}");
+}
+
+#[tokio::test]
+async fn single_calendar_day_start_delays_plan_clock_pv() {
+    let f = Fixture::new();
+    let plan_id = f.plan().await;
+    // Monday 00:00 UTC start, window 09:00-17:00: nothing is planned
+    // before 09:00, one hour by 10:00.
+    let calendar = Calendar {
+        day_start: "09:00".into(),
+        ..Calendar::default()
+    };
+    f.planner
+        .baseline(BaselineRequest::new(plan_id.clone()).with_calendar(calendar))
+        .await
+        .unwrap();
+    assert_eq!(f.pv_at(&plan_id, 10).await, 1.0);
+}
+
+/// Working calendar used for the equivalence property: 09:00-17:00 at
+/// UTC-5, Monday to Friday.
+fn office() -> Calendar {
+    Calendar {
+        hours_per_day: 8.0,
+        day_start: "09:00".into(),
+        utc_offset_minutes: -300,
+        ..Calendar::default()
+    }
+}
+
+async fn pv_curve(f: &Fixture, plan_id: &PlanId) -> Vec<f32> {
+    let mut out = Vec::new();
+    for h in (0..=24 * 14).step_by(3) {
+        out.push(f.pv_at(plan_id, h).await);
+    }
+    out
+}
+
+#[tokio::test]
+async fn uniform_map_pv_equals_single_calendar_pv() {
+    let f = Fixture::new();
+    let plan_id = f.plan().await;
+    f.planner
+        .baseline(
+            BaselineRequest::new(plan_id.clone())
+                .with_start(t0())
+                .with_calendar(office()),
+        )
+        .await
+        .unwrap();
+    let single = pv_curve(&f, &plan_id).await;
+    let map =
+        BaselineCalendar::from_json(Some(serde_json::json!({ "default": office() }))).unwrap();
+    f.rebaseline(
+        BaselineRequest::new(plan_id.clone())
+            .with_start(t0())
+            .with_calendar_input(map),
+    )
+    .await
+    .unwrap();
+    let uniform = pv_curve(&f, &plan_id).await;
+    let worst = single
+        .iter()
+        .zip(&uniform)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(worst < 1e-3, "single {single:?} uniform {uniform:?}");
+}
+
+// The worked example of docs/calendars.md, section 8: agents 24/7, the
+// owner Monday to Friday 09:00-17:00 at UTC-5, start Friday 14:00 local.
+
+fn example_start() -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 11, 13, 19, 0, 0).unwrap()
+}
+
+fn example_calendar() -> serde_json::Value {
+    serde_json::json!({
+        "default": {"hours_per_day": 24, "workdays": ["mon","tue","wed","thu","fri","sat","sun"]},
+        "owner": {"hours_per_day": 8, "day_start": "09:00",
+                  "workdays": ["mon","tue","wed","thu","fri"], "utc_offset_minutes": -300}
+    })
+}
+
+fn example_graph() -> PlanGraph {
+    let on = |owner: &str, id: &str, effort: f32, prereqs: &[&str]| Deliverable {
+        metadata: serde_json::json!({ "owner": owner }),
+        ..deliverable(id, effort, prereqs)
+    };
+    PlanGraph {
+        deliverables: vec![
+            on("agent", "impl", 10.0, &[]),
+            on("owner", "review", 2.0, &["impl"]),
+            on("agent", "release", 1.0, &["review"]),
+        ],
+        max_chained_dispatch: None,
+    }
+}
+
+fn example_capacities() -> BTreeMap<String, u32> {
+    BTreeMap::from([("agent".to_string(), 3), ("owner".to_string(), 1)])
+}
+
+impl Fixture {
+    /// The example plan, baselined on the calendar map; levelled when
+    /// `levelled`.
+    async fn example(&self, levelled: bool) -> (PlanId, BaselineOutcome) {
+        let plan_id = self.planner.submit_plan(example_graph()).await.unwrap();
+        let mut req = BaselineRequest::new(plan_id.clone())
+            .with_start(example_start())
+            .with_calendar_input(BaselineCalendar::from_json(Some(example_calendar())).unwrap());
+        if levelled {
+            req = req.with_capacities(example_capacities());
+        }
+        let out = self.planner.baseline(req).await.unwrap();
+        (plan_id, out)
+    }
+
+    /// Plan-start-relative EV report of the example.
+    async fn example_ev(
+        &self,
+        plan_id: &PlanId,
+        hours: i64,
+    ) -> cpm_planner::earned_value::EvReport {
+        self.planner
+            .ev(plan_id, Some(example_start() + Duration::hours(hours)))
+            .await
+            .unwrap()
+    }
+
+    async fn complete(&self, plan_id: &PlanId, id: &str) {
+        self.planner
+            .acquire_cohort(
+                AcquireRequest::new(plan_id.clone(), worker(), 1).with_ids(vec![id.to_string()]),
+            )
+            .await
+            .unwrap();
+        self.planner
+            .mark_status(MarkStatusRequest::new(
+                plan_id.clone(),
+                id,
+                worker(),
+                DeliverableStatus::Complete,
+            ))
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn example_baseline_finishes_monday_noon_local() {
+    let f = Fixture::new();
+    let (_, out) = f.example(true).await;
+    assert_eq!(out.finish_hours, 70.0);
+}
+
+#[tokio::test]
+async fn example_baseline_records_the_calendar_map() {
+    let f = Fixture::new();
+    let (_, out) = f.example(true).await;
+    assert!(matches!(out.calendar, Some(CalendarSpec::Map(_))));
+}
+
+#[tokio::test]
+async fn example_cpm_baseline_also_waits_for_monday() {
+    let f = Fixture::new();
+    let (_, out) = f.example(false).await;
+    assert_eq!(out.finish_hours, 70.0);
+}
+
+#[tokio::test]
+async fn example_cpm_baseline_records_the_resource_key() {
+    let f = Fixture::new();
+    let (_, out) = f.example(false).await;
+    assert_eq!(out.resource_key.as_deref(), Some("owner"));
+}
+
+#[tokio::test]
+async fn example_pv_is_flat_over_the_weekend() {
+    let f = Fixture::new();
+    let (plan_id, _) = f.example(true).await;
+    // Saturday 12:00 local.
+    assert_eq!(f.example_ev(&plan_id, 22).await.pv, 10.0);
+}
+
+#[tokio::test]
+async fn example_pv_accrues_agent_work_around_the_clock() {
+    let f = Fixture::new();
+    let (plan_id, _) = f.example(true).await;
+    // Friday 19:00 local, after office hours.
+    assert_eq!(f.example_ev(&plan_id, 5).await.pv, 5.0);
+}
+
+#[tokio::test]
+async fn example_pv_accrues_review_inside_the_owner_window() {
+    let f = Fixture::new();
+    let (plan_id, _) = f.example(true).await;
+    // Monday 10:00 local: one of review's two hours.
+    assert_eq!(f.example_ev(&plan_id, 68).await.pv, 11.0);
+}
+
+#[tokio::test]
+async fn example_spi_is_one_when_execution_matches_the_calendar() {
+    let f = Fixture::new();
+    let (plan_id, _) = f.example(true).await;
+    f.complete(&plan_id, "impl").await;
+    assert_eq!(f.example_ev(&plan_id, 22).await.spi, Some(1.0));
+}
+
+#[tokio::test]
+async fn example_review_row_reports_its_planned_calendar_wait() {
+    let f = Fixture::new();
+    let (plan_id, _) = f.example(true).await;
+    let report = f.example_ev(&plan_id, 22).await;
+    let review = report.rows.iter().find(|r| r.id == "review").unwrap();
+    assert_eq!(review.calendar_wait_hours, 57.0);
+}
+
+#[tokio::test]
+async fn example_total_calendar_wait_is_the_driving_chain_sum() {
+    let f = Fixture::new();
+    let (plan_id, _) = f.example(true).await;
+    let schedule = resource_schedule_on_calendar(
+        &example_graph(),
+        &ScheduleRequest {
+            capacities: example_capacities(),
+            resource_key: "owner".into(),
+            project_buffer_pct: 25.0,
+        },
+        Some(&ScheduleCalendar::new(
+            CalendarSpec::parse(&example_calendar()).unwrap(),
+            example_start(),
+        )),
+    )
+    .unwrap();
+    let report = f.example_ev(&plan_id, 22).await;
+    assert_eq!(
+        Some(report.calendar_wait_hours),
+        schedule.calendar_wait_hours
+    );
+}
+
+#[tokio::test]
+async fn example_pv_reaches_bac_at_the_calendar_finish() {
+    let f = Fixture::new();
+    let (plan_id, _) = f.example(true).await;
+    assert_eq!(f.example_ev(&plan_id, 70).await.pv, 13.0);
+}
+
+#[tokio::test]
+async fn rebaseline_without_calendar_reuses_the_calendar_map() {
+    let f = Fixture::new();
+    let (plan_id, _) = f.example(true).await;
+    let out = f.rebaseline(BaselineRequest::new(plan_id)).await.unwrap();
+    assert!(matches!(out.calendar, Some(CalendarSpec::Map(_))));
+}
+
+#[tokio::test]
+async fn resource_key_with_a_calendar_map_and_no_capacities_is_accepted() {
+    let f = Fixture::new();
+    let plan_id = f.planner.submit_plan(example_graph()).await.unwrap();
+    let out = f
+        .planner
+        .baseline(
+            BaselineRequest::new(plan_id)
+                .with_start(example_start())
+                .with_resource_key("owner")
+                .with_calendar_input(
+                    BaselineCalendar::from_json(Some(example_calendar())).unwrap(),
+                ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.schedule, ScheduleKind::Cpm);
+}
+
+#[tokio::test]
+async fn plan_clock_baseline_reports_no_calendar_wait() {
+    let f = Fixture::new();
+    let plan_id = f.baselined().await;
+    let report = f.planner.ev(&plan_id, None).await.unwrap();
+    assert_eq!(report.calendar_wait_hours, 0.0);
 }

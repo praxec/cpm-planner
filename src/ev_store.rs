@@ -18,7 +18,8 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::earned_value::{Actuals, Baseline, BaselineRow, BaselineSchedule, Calendar};
+use crate::calendar::CalendarSpec;
+use crate::earned_value::{Actuals, Baseline, BaselineRow, BaselineSchedule};
 use crate::plan::{PlanId, PlannerError};
 use crate::plan_store::backend;
 
@@ -511,7 +512,7 @@ pub(crate) fn latest_baseline(
     };
     let corrupt =
         |what: String| backend(anyhow::anyhow!("plan {plan_id}: baseline {number}: {what}"));
-    let calendar: Option<Calendar> = calendar
+    let calendar: Option<CalendarSpec> = calendar
         .map(|c| serde_json::from_str(&c))
         .transpose()
         .map_err(|e| corrupt(format!("stored calendar does not decode: {e}")))?;
@@ -800,17 +801,19 @@ mod tests {
         (store, plan_id)
     }
 
-    fn baseline(number: u32, calendar: Option<Calendar>) -> Baseline {
+    fn baseline(number: u32, calendar: Option<crate::earned_value::Calendar>) -> Baseline {
         Baseline {
             number,
             start: at(0),
-            calendar,
+            calendar: calendar.map(CalendarSpec::Single),
             rows: vec![BaselineRow {
                 id: "a".into(),
                 es: 0.0,
                 ef: 2.0,
                 budget: 4.0,
                 cost_rate: 2.0,
+                calendars: None,
+                calendar_wait_hours: 0.0,
             }],
             bac: 4.0,
             finish_hours: 2.0,
@@ -938,7 +941,7 @@ mod tests {
     #[test]
     fn baseline_round_trips_through_the_store() {
         let (store, plan_id) = store_with_plan();
-        let b = baseline(1, Some(Calendar::default()));
+        let b = baseline(1, Some(crate::earned_value::Calendar::default()));
         store
             .write_tx(|tx| insert_baseline(tx, &plan_id, &b, Some("first"), at(1)))
             .unwrap();
@@ -1255,6 +1258,7 @@ mod tests {
                 resource_key: Some("owner".into()),
                 project_buffer_pct: Some(25.0),
                 project_buffer_hours: Some(0.5),
+                calendar_wait_hours: None,
             },
             ..baseline(number, None)
         }
