@@ -8,8 +8,6 @@
 use std::path::PathBuf;
 
 use cpm_planner::llm::command::{AdapterReply, AdapterRequest, REQUEST_KIND, safe_token};
-use cpm_planner::plan::PlanGraph;
-use serde_json::json;
 
 fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -29,9 +27,10 @@ fn reply_fixture(name: &str) -> AdapterReply {
     serde_json::from_str(&fixture(name)).expect("reply fixture")
 }
 
-/// The plan `request-v1.json` was produced from.
-fn fixture_graph() -> PlanGraph {
-    serde_json::from_value(json!({ "deliverables": [
+/// The plan `request-v1.json` was produced from (used only by the unix adapter tests).
+#[cfg(unix)]
+fn fixture_graph() -> cpm_planner::plan::PlanGraph {
+    serde_json::from_value(serde_json::json!({ "deliverables": [
         { "id": "parser", "owned_files": ["src/parser.rs"], "prerequisites": [],
           "estimated_effort_hours": 4.0,
           "metadata": { "artifact": "src/parser.rs parses plan files" } },
