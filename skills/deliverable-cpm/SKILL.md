@@ -1,6 +1,6 @@
 ---
 name: deliverable-cpm
-description: "Use when you need the full method reference behind the cpm-plan, cpm-improve, cpm-run, cpm-ev and cpm-revise skills, or when no narrower cpm-* skill fits a cpm-planner (plan.* tools) task that spans the whole lifecycle. Covers the deliverable-based CPM method end to end: deliverables as artifacts, consumption edges, lint findings, sync and drift, resource levelling, the review/fork/simulate/compare/select improvement loop, leases and acceptance, baselines and earned value, and revising a tracked cpm-planner plan file."
+description: "Use when you need the full method reference behind the cpm-plan, cpm-improve, cpm-run, cpm-ev and cpm-revise skills, or when no narrower cpm-* skill fits a cpm-planner (plan.* tools) task that spans the whole lifecycle. Covers the deliverable-based CPM method end to end: deliverables as artifacts, consumption edges, continuity threads, gate evidence scopes, lint findings, sync and drift, resource levelling on working calendars, the optimize/review/fork/simulate/compare/select improvement loop, overview and explain, leases, evidence records and acceptance, levelled baselines and earned value, and revising a tracked cpm-planner plan file."
 ---
 
 # Deliverable-based CPM with cpm-planner
@@ -60,7 +60,10 @@ Rules:
 - **Give every deliverable an executor class** in `metadata.owner`, e.g. `agent`, `worker`
   or `owner`. Resource levelling and targeted acquire both use it.
 - **Mark work no agent may lease** (owner decisions, manual sign-off) with
-  `metadata.kind: "manual"`. It is closed with `plan.accept`.
+  `metadata.kind: "manual"`. It is closed with `plan.accept`. Declare who signs with
+  `metadata.evidence_scope`: `manual_approval` for an owner inside the team,
+  `external_signoff` for a party outside it (section 7).
+- **Group steps one agent should carry** with `metadata.thread` ([Threads](#threads)).
 - **List `owned_files` exactly**: the paths the implementer will write. Leases never hand out
   two deliverables with conflicting claims at the same time.
 - **Estimate effort.** Use `estimated_effort_hours`, or a three-point `estimate`
@@ -148,6 +151,13 @@ path, and lint flags the common wordings as `RESOURCE_CONSTRAINT_EDGE`.
 | `GATE_WITHOUT_MILESTONE` | warning | add the milestone the gate proves, or cut the gate |
 | `NO_ARTIFACT`, `NO_MILESTONE` | info | add `metadata.artifact` or a milestone |
 | `WORK_WAITS_ON_GATE` | info | consume the code or contract instead, unless the work needs the proven result |
+| `EVIDENCE_SCOPE_INVALID` | error | `metadata.evidence_scope` must be a scope the kind may declare: work `focused`; gate `gate`, `merge`, `publish` or `activation`; manual `manual_approval`, `external_signoff`, `merge`, `publish` or `activation` |
+| `GATE_CANDIDATE_INVALID` | error | point `metadata.candidate` at a direct prerequisite of the gate, or add that edge |
+| `GATE_SCOPE_MISSING` | warning | declare the gate's `metadata.evidence_scope`: `gate` for a regression or CI run, else `merge`, `publish` or `activation` |
+| `GATE_CANDIDATE_MISSING` | warning | name the direct prerequisite that produces the integrated candidate in `metadata.candidate` |
+| `SCOPE_FOLDED` | warning | split the approval, sign-off, merge, publish or activation the text names into its own deliverable (`manual` for approvals) with the matching `evidence_scope`; `metadata.scope_folded: false` if the text only mentions it |
+| `THREAD_INVALID` | warning | use a token of 1 to 64 ASCII letters, digits, `.`, `_` or `-` starting with a letter or digit, or remove `metadata.thread`; until then the deliverable is unthreaded |
+| `THREAD_BROKEN` | warning | a thread must be one dependency chain with no other thread inside it: add the edge if one step consumes the other, move the work into the thread, or end the thread and start a new one |
 
 ### Software delivery: code in bulk, gate at milestones
 
@@ -206,10 +216,45 @@ warrants it. If policy truly requires per-change evidence, say so and model thos
 repository rule or hook runs the full suite on every commit, raise the conflict rather than bypass
 it. Implementation-complete with the gate pending is what the graph itself shows.
 
-Record the evidence identity in gate metadata: complete tree or image, dependency lock/toolchain,
-test-contract version and environment. Reuse evidence across commits only when that identity is
-identical. Native release workflows compile to the same idea through `delivery_gates`; see
+**Declare what closes each gate.** Set `metadata.evidence_scope` on every gate: `gate` for a full
+regression, end-to-end or CI run, or `merge`, `publish` or `activation` for that step. A gate whose
+scope is `gate` also names `metadata.candidate`, the direct prerequisite that produces the integrated
+candidate it verifies (the integration-candidate deliverable, or the last work before it). The
+candidate's evidence identity then becomes the target the gate's evidence must match, so a green run
+on a different tree, lockfile, toolchain, test contract or environment cannot close it. A milestone
+that is also a gate (`"milestone": true` with `metadata.kind: "gate"`) follows the gate rules and must
+declare a scope. Keep one operation per deliverable: an approval, sign-off, merge, publish or deploy
+folded into a work or gate deliverable is `SCOPE_FOLDED`. Reuse evidence across commits only when the
+whole identity is identical ([docs/evidence.md](https://github.com/praxec/cpm-planner/blob/main/docs/evidence.md)). Native release workflows compile to the same idea through `delivery_gates`; see
 [docs/release-workflows.md](https://github.com/praxec/cpm-planner/blob/main/docs/release-workflows.md).
+
+### Threads
+
+A thread groups deliverables one agent session should do in order, so the context it builds on one
+step carries into the next: the failing tests and then the implementation of one feature, or a
+contract and its first consumer. Put the same token in `metadata.thread` on each step (1 to 64 ASCII
+letters, digits, `.`, `_` or `-`, starting with a letter or digit). When a caller completes a
+threaded deliverable, `plan.acquire_cohort` offers that caller the thread's next ready step first.
+It is a preference, never a lock: file conflicts, prerequisites, manual and gate exclusion, the
+lapse limit and the circuit breaker all still apply.
+
+**Size deliverables per thread.**
+- **Thread the steps that share context, not everything one person owns.** A thread is worth having
+  when the second step is cheaper for the agent that did the first: the same files, the same
+  contract, the same failing test.
+- **Keep each step a whole artifact.** Threading is not a reason to cut work into
+  micro-deliverables; each step still has its own artifact, acceptance criteria and owned files, and
+  could be done by a fresh agent if it had to.
+- **Keep threads short.** Two to five deliverables, a few hours to a working day in total, is what one
+  agent session holds in context. Split a longer chain into two threads at a natural hand-off, such
+  as a contract document another agent can read.
+- **Make a thread one dependency chain.** Each step after the first consumes the one before it,
+  directly or through steps of the same thread. A thread split across parallel branches or
+  interleaved with another thread's step is `THREAD_BROKEN`.
+- **Leave parallel work unthreaded.** Deliverables that can run beside the thread belong to other
+  threads or none, so other agents can take them meanwhile.
+- **Name threads by the line of work** (`evidence`, `overview`, `lint`), not by the agent; who holds a
+  thread is decided at lease time.
 
 ## 4. Sync and verify the critical path
 
@@ -249,11 +294,58 @@ Read the response:
 - `load`: a resource near `utilisation` 1.0 is the bottleneck;
 - `project_buffer_hours` and `feeding_buffers`: the buffers to protect.
 
+**Working calendars.** Agents and CI run around the clock; people work office hours. Pass
+`calendar` (and `start`, hour 0 as RFC 3339, default now) to place each deliverable in its
+resource's working windows:
+
+```text
+plan.schedule {"plan_id": "...", "capacities": {"agent": 3, "owner": 1},
+               "start": "2026-11-13T19:00:00Z",
+               "calendar": {"default": {"hours_per_day": 24, "workdays": ["mon","tue","wed","thu","fri","sat","sun"]},
+                            "owner": {"hours_per_day": 8, "day_start": "09:00",
+                                      "workdays": ["mon","tue","wed","thu","fri"], "utc_offset_minutes": -300}}}
+```
+
+- A calendar is `hours_per_day` (0 < h <= 24, default 8), `day_start` (`HH:MM` local, default
+  `00:00`), `workdays` (default mon..fri) and `utc_offset_minutes` (fixed, default 0). An object
+  with a `default` key is a per-resource map keyed by the `resource_key` value (default
+  `metadata.owner`); `default` covers every resource without its own entry. A single calendar
+  applies to everyone. A deliverable with `metadata.wall_clock_only: true` ignores calendars.
+- Hours are then wall-clock hours from `start`; rows add `start_at`, `finish_at`, `calendars` and
+  `calendar_wait_hours`, and `cpm_makespan` is the unlevelled schedule on the same calendars.
+- Work that becomes ready outside its window starts at the next open, and longer work pauses at
+  each close. A driving-chain step that waited for a window reports `waited_on: "calendar"` with
+  `waited_on_calendar` and `calendar_wait_hours`: a handover to a person late on Friday shows here.
+- Calendar errors: a map entry or `day_start` that is malformed is `INVALID_VALUE`; a single
+  calendar keeps `INVALID_PARAMS` for unknown fields and `INVALID_GRAPH` for out-of-range values.
+  `plan.status` and `plan.lint` stay calendar-free.
+
 ## 6. The improvement loop
 
 Design several variants and pick one. Never edit the selected variant to try an idea.
 
-1. **Review (optional).** Run `plan.review {path, capacities}`. It sends one batched request
+1. **Optimize first.** Run `plan.optimize {path, capacities}` (one of `graph`, `plan_id` or
+   `path`; optional `capacities`, `resource_key`, `project_buffer_pct`, `max_proposals`, default
+   32). It is offline, deterministic and free: no model, provider or network call, the same
+   proposals for the same graph, and it never writes. It looks for structural waste the graph shows
+   by itself:
+   - `merge`: two same-owner work deliverables claim the same file exclusively;
+   - `false_dependency`: an edge lint flags `RESOURCE_CONSTRAINT_EDGE`, `NO_RATIONALE` or
+     `LOW_INFORMATION_CONSUMES`;
+   - `parallel_cohort`: three or more work deliverables joined only by such edges;
+   - `gate_consolidation`: two consecutive waves, the first with a single gate and no
+     `boundary_reason`;
+   - `gate_bypass`: work waits on a gate but consumes neither its result nor its artifact.
+
+   Each proposal is a `plan.fork` edit list already applied to a copy and checked by lint, the
+   schedule and simulate. It never lengthens the makespan (the levelled one with capacities) or adds
+   effort, and it keeps every acceptance criterion, gate, milestone, manual or external approval,
+   interface contract, interface edge and owned file. Read `deltas` (`after − before`, so negative
+   is better), `score`, `rationale`, `preserved` and `trade_offs`, and `rejected` with its
+   `reasons`. Optimize suggests; you still decide whether each edge really hands nothing over.
+2. **Review (optional, AI).** Run `plan.review {path, capacities}` after optimize, for judgments
+   the graph cannot make alone (whether an edge that names an artifact is still unnecessary, which
+   crash technique fits). It sends one batched request
    to Jev (TypeSafe's calibrated-judgment model, through OpenRouter) and needs an OpenRouter
    key. Without one it returns `review_unavailable` plus lint; carry on without it. The
    graph is sent to OpenRouter, so skip review for plans you may not share.
@@ -276,7 +368,7 @@ Design several variants and pick one. Never edit the selected variant to try an 
      ones to vet. Stop when a pass changes nothing, the chain repeats a chain you already vetted,
      or after 5 passes, and report which. Remove an edge only on your own check of the hand-over;
      a probability alone is not proof.
-2. **Reason.** Choose moves from the review, the levelled schedule and the Monte Carlo
+3. **Reason.** Choose moves from the optimize proposals, the review, the levelled schedule and the Monte Carlo
    `sensitivity`. Use one move per variant, so each effect can be measured.
 
    | Move | Edits | Watch for |
@@ -293,26 +385,28 @@ Design several variants and pick one. Never edit the selected variant to try an 
 
    The graph has no cache-hit or conditional-execution primitive. Model reuse as explicit
    edges and metadata, and disclose that approximation when it materially affects the forecast.
-3. **Fork.** Run `plan.fork {plan_id, variant, edits}`. The edit ops are `remove_edge
+4. **Fork.** Run `plan.fork {plan_id, variant, edits}`. The edit ops are `remove_edge
    {from, to}`, `add_edge {from, to, consumes}`, `set_effort {id, hours}`, `set_duration
    {id, hours}`, `set_estimate {id, estimate}`, `set_metadata {id, key, value}`,
    `remove_deliverable {id}` and `add_deliverable {deliverable}`. `remove_deliverable` is
    refused while others depend on it: `remove_edge` each dependent first, then `add_edge`
    them back after the `add_deliverable`. The fork is written to
    `.cpm-planner/plans/<name>/<variant>.json` as a draft. It is not selected.
-4. **Measure.** Run `plan.simulate {plan_id, schedule: {capacities}, monte_carlo: {}}` on
+5. **Measure.** Run `plan.simulate {plan_id, schedule: {capacities}, monte_carlo: {}}` on
    any variant, then `plan.compare {plan: "<name>", schedule: {capacities}, monte_carlo: {}}`.
    This scores every live variant on makespan (levelled when `schedule` is given), P80,
    criticality risk, total effort and peak load. The capacities must cover every pool of
    every variant, or the call fails with `INVALID_CAPACITIES`. P80 comes from Monte Carlo
-   on the unlevelled network, so it ignores resource waits. Read `pareto_optimal`, `rank` and
+   on the unlevelled network, so it ignores resource waits. `plan.simulate` also takes `calendar`
+   and `start` (section 5) at the top level and applies them to the levelled schedule and to Monte
+   Carlo, so P50/P80 become wall-clock hours that include the nights and weekends of people's steps. Read `pareto_optimal`, `rank` and
    `rationale` on each `variants[]` entry, and the top-level `recommended` (with
    `tied_with_recommended` when scores tie; then the pick is only a tie-break). Change the
    priorities with `weights`.
-5. **Explain the trade-off** to the user before you select, in numbers: what each candidate
+6. **Explain the trade-off** to the user before you select, in numbers: what each candidate
    gains, what it costs (effort, risk band, P80), and which assumption it depends on (for
    example, that a worker pool exists). Rejected variants are results too.
-6. **Select.** Run `plan.select {plan_id}`. Only the selected variant can execute. Complete
+7. **Select.** Run `plan.select {plan_id}`. Only the selected variant can execute. Complete
    statuses of identically defined deliverables, and their actuals, carry over. Archive
    rejected variants with `plan.archive {name, variant}`. `plan.list` shows the line.
 
@@ -328,13 +422,42 @@ plan line name) or `active: true` (the project's single active line), with an op
 returned by `plan.acquire_cohort` for the lease: `active` matches only an incomplete
 line and changes when another line goes live.
 
+- **See where the plan is** with `plan.overview {plan | plan_id | active, as_of?, detail?,
+  limit?, filter?: {owner, milestone}, evidence_target?, format?}`. It is read-only and
+  deterministic, and joins `plan.status`, `plan.get` and `plan.ev` at one `as_of`: `counts`,
+  `ev`, `critical_path` (with `remaining_hours` and the milestones each step feeds),
+  `milestones` (with `next_on_path`), `ready` (each with `action`: `acquire`, `accept` for manual
+  or gate work, or `operator` at a failure or lapse cap, plus `file_conflicts`), `blocked` (with
+  `class` `dependency`, `manual`, `external` or `gate`, and its `root_blockers`), `leases`,
+  `attention`, `evidence_counts` and `stale_evidence`. Every entry carries its `evidence` verdict:
+  `current`, `stale` (with the `changed` fields), `unknown`, `unbound` (notes only) or `none`.
+  `format: "markdown"` prints a short report for people; `detail: "full"` adds chains and files.
+  Filters narrow the lists, never the counts or EV.
+- **Ask why one deliverable is not moving** with `plan.explain {plan | plan_id | active,
+  deliverable_id?, as_of?, limit?, format?}`. It reports the deliverable's `state` (`complete`,
+  `leased`, `in_progress`, `ready` with its `action`, `blocked`, `failed`), the blocker `chain`
+  to its driving root and that root's `action`, what completing it `unlocks`, the milestones it
+  feeds with their `slack_hours`, and `critical_path_impact` in one sentence. Without a
+  `deliverable_id` it returns only `next_work`, every startable or blocked deliverable in exactly
+  one class: `file_conflicting`, `ready_critical`, `ready_slack`, `blocked_manual`,
+  `blocked_external`, `blocked_gate`, `blocked_dependency`. Take `ready_critical` first, act on
+  root blockers rather than on what they block, and chase people for `blocked_manual` and
+  `blocked_external`.
 - **Claim work** with `plan.acquire_cohort {plan_id, caller_id, max_count}`. It hands out
   ready deliverables whose files don't conflict, ordered by priority:
   - narrow it with `ids: [...]`, or with `filter: {"metadata": {"owner": "agent"}}`;
   - pass `ttl_seconds` for long work. The default lease is 5 minutes, up to the server
     maximum;
+  - keep a `caller_id` stable per agent session: when it completes a threaded deliverable, the
+    next acquire by that caller ranks the thread's next ready step first, then unthreaded work and
+    threads nobody advanced, then threads another caller advanced. `thread: "<token>"` asks for one
+    thread explicitly (an invalid token is `INVALID_VALUE`). `affinity_seconds` (default 0, clamped
+    to the maximum TTL) holds back a deliverable whose thread another caller advanced less than that
+    long ago, so its agent can come back for it. The ranking only reorders what the acquire would
+    lease anyway;
   - read `blocked`: each requested id that was not leased, with a code (`MANUAL`,
-    `NOT_READY`, `LOCKED`, `LAPSE_LIMIT`, `FILE_CONFLICT`, `MAX_COUNT`);
+    `NOT_READY`, `LOCKED`, `LAPSE_LIMIT`, `FILE_CONFLICT`, `MAX_COUNT`, or `AFFINITY_HOLD`
+    naming the affine caller and the seconds left);
   - `exhausted: true` with `needs_operator: true` means the plan is stalled on
     lapse-limited work, not finished. Fix the environment, then run `plan.force_release
     {plan_id, deliverable_id, reason, reset_counters: true}`.
@@ -346,9 +469,9 @@ line and changes when another line goes live.
     "failed", "reason": "..."}`;
   - for earned value add `earned_pct` (an integer 0 to 100, only with `in_progress`),
     `actual_effort_hours` (total so far; replaces the leased hours as actual cost) and
-    `evidence` (a link or commit, appended to the list; at most 100 entries per
-    deliverable. Past that, any mark carrying `evidence`, including `complete`, is refused
-    with `INVALID_ACTUALS`, so omit `evidence` then);
+    `evidence` (appended to the list; at most 100 entries per deliverable. Past that, any
+    mark carrying `evidence`, including `complete`, is refused with `INVALID_ACTUALS`, so omit
+    `evidence` then);
   - mark `complete` only when the artifact meets its acceptance criteria, with evidence. A
     report of done is not acceptance. A `failed` mark leaves it Failed (`NOT_READY`);
     retry with a lockless `{"status": "ready"}` mark. Three explicit failures, across
@@ -356,8 +479,47 @@ line and changes when another line goes live.
   - a lockless `in_progress` (owner or manual work, no lease) persists across server
     restarts and is not leasable. Hand it back with a lockless `{"status": "ready"}` (or
     another status) mark; `plan.force_release` does not affect it, since there is no lock.
-- **Close owner or manual work** with `plan.accept {plan_id, deliverable_id, accepted_by,
-  evidence}`. Evidence is required. `override_lock: true` takes over a live lease, so use it
+- **Record evidence with its identity.** `evidence` on `plan.mark_status` and `plan.accept` is a
+  note string (up to 2048 characters; it can never satisfy a declared scope) or a record:
+
+  ```json
+  {"schema_version": 1, "scope": "focused",
+   "summary": "cargo nextest run --test export_service: 14 passed, 0 failed",
+   "ref": "https://ci.example/runs/4411",
+   "identity": {"schema_version": 1, "tree": "git-tree:<hex of HEAD^{tree}>",
+                "dependency_lock": "sha256:<lockfile hash>", "toolchain": "rustc 1.89.0; cargo-nextest 0.9.104",
+                "test_contract": "nextest:export_service@sha256:<config digest>",
+                "environment": "linux-x86_64; ubuntu-24.04"}}
+  ```
+
+  The scope says what the record proves, and who records it:
+
+  | Scope | Proves | Recorded by | Identity |
+  |---|---|---|---|
+  | `focused` | the deliverable's own targeted checks passed | the worker, on `mark_status complete` | all five fields |
+  | `gate` | a full regression, end-to-end or CI run on one integrated candidate | the gate's `plan.accept` | all five fields |
+  | `manual_approval` | a named owner **inside the team** approved the artifact | the owner's `plan.accept` | optional |
+  | `external_signoff` | a party **outside the team** (customer, auditor, vendor) accepted it; needs `party` | the owner's `plan.accept` | optional |
+  | `merge`, `publish`, `activation` | the merge, the release or package push, the deploy or flag flip | that step | `tree` (activation adds `environment`) |
+
+  Work closes with `focused` or `gate`; a gate with exactly its declared scope (default `gate`);
+  a manual deliverable with its declared scope, or any scope when it declares none. A gate with
+  `metadata.candidate` closes only with a record that is `current` against the newest identity
+  the candidate recorded, so record the candidate's `focused` evidence with an identity and run
+  the gate on that same tree. The server adds `recorded_at`, `recorded_by`, `via`,
+  `plan_revision` and `definition_digest`; never send them. Refusals roll back the whole call:
+  - `INVALID_EVIDENCE`: a malformed record or identity (unknown field, scope or version, a value
+    out of bounds, a missing identity field, `party` on the wrong scope);
+  - `EVIDENCE_SCOPE_MISMATCH`: the record's scope may not close this kind of deliverable;
+  - `EVIDENCE_REQUIRED`: a declared `evidence_scope` is not met by this call or a current record;
+  - `EVIDENCE_STALE`: the gate's record differs from its candidate's identity; the message names
+    the changed fields.
+
+  A stale verdict in `plan.overview` (a changed tree, lock, toolchain, test contract,
+  environment or definition) is reported, never acted on: it reopens nothing. Re-run the check, or
+  revise the plan (section 9).
+- **Close owner, gate or manual work** with `plan.accept {plan_id, deliverable_id, accepted_by,
+  evidence}`. Evidence is required, and is stored with the deliverable as well as audited. `override_lock: true` takes over a live lease, so use it
   only when the holder is gone. `plan.accept` records no hours. To record the actual cost
   (AC), follow it with a lockless `plan.mark_status {plan_id, deliverable_id, caller_id,
   status: {"status": "complete"}, actual_effort_hours}`.
@@ -371,14 +533,14 @@ line and changes when another line goes live.
 - **A red run is not a `failed` mark.** Failed marks trip the circuit breaker, and red runs are a
   normal part of a gate. Record the run as `evidence` on a lockless `in_progress`, read the whole
   run, fix every failure with focused checks, then re-run once. Close with `plan.accept` and the
-  green run's evidence for the final tree. After 2 red runs, or for a fix that changes scope or a
+  green run's `gate` record for the final tree. After 2 red runs, or for a fix that changes scope or a
   contract, stop and take it through section 9 so the gate consumes a new deliverable. Mark
   `failed` only when it needs a decision. After the merge, delete the wave's merged worktrees and
   branches.
 - **Re-optimise at natural pauses (adaptive execution).** When a cohort closes or a gate returns,
   check for these signals: `plan.ev` shows SPI or CPI below 0.9, a gate took over 1.5 times its
-  estimate, the `critical_path` moved, a deliverable overran its estimate by 50%, or a ready
-  deliverable is waiting only on capacity. On a signal, run section 6 on the *remaining* work, and
+  estimate, the `critical_path` moved, a deliverable overran its estimate by 50%, `plan.overview`
+  lists stale evidence, or a ready deliverable is waiting only on capacity. On a signal, run section 6 on the *remaining* work, and
   apply the result when it saves more than it costs. Stay non-disruptive: change only unleased,
   incomplete work, never interrupt a lease or a running gate, don't reopen completed work, and keep
   the current plan when the saving is small or uncertain. With no signal, keep working. A scope
@@ -387,19 +549,40 @@ line and changes when another line goes live.
 ## 8. Baseline and earned value
 
 1. **Baseline** the selected variant before work starts: `plan.baseline {plan_id, start,
-   calendar}`. It freezes the CPM schedule and budgets (effort × `metadata.cost_rate`,
-   default 1) as baseline 1.
-   - `calendar` is `{hours_per_day, workdays, utc_offset_minutes}`. Without it, PV uses
-     wall-clock hours.
-   - The working window opens at local midnight, local time being UTC shifted by
-     `utc_offset_minutes`, and lasts `hours_per_day` hours. Give `start` as 00:00 local
-     on a workday. A 09:00 start with 8 hours per day earns no PV that day.
+   calendar, capacities?, resource_key?, project_buffer_pct?, schedule?}`. It freezes a
+   schedule and the budgets (effort × `metadata.cost_rate`, default 1) as baseline 1.
+   - **Levelled or CPM.** With `capacities` (as `plan.schedule`) it freezes the levelled
+     schedule; without, the CPM schedule. When a fixed pool executes the plan (three agents, one
+     owner), baseline the levelled schedule: a CPM baseline assumes unlimited workers, so PV runs
+     ahead of what the pool can do and SPI reads low from the first day. `schedule: "levelled"`
+     or `"cpm"` forces the kind; `"cpm"` is the only way back from a levelled baseline, and
+     `capacities` with it is `INVALID_VALUE`, as is `"levelled"` without capacities.
+   - **Calendars.** `calendar` is one calendar or a per-resource map with a `default` entry, as
+     for `plan.schedule` (section 5). Give agents and CI a 24/7 calendar and people their working
+     hours with `day_start`:
+     `{"default": {"hours_per_day": 24, "workdays": ["mon","tue","wed","thu","fri","sat","sun"]},
+     "owner": {"hours_per_day": 8, "day_start": "09:00", "utc_offset_minutes": 60}}`. With a map,
+     each row's PV accrues only while its calendar is open: flat overnight and over weekends for a
+     person's row, around the clock for an agent's. A planned wait for 09:00 is then no schedule
+     variance. One calendar for everyone (the plan clock) puts agent work into office hours it
+     does not keep. Without `calendar`, PV uses wall-clock hours. `day_start` defaults to `00:00`,
+     so set it to when people start.
+   - **Reuse and reset.** A re-baseline reuses the previous baseline's `calendar`, `capacities`,
+     `resource_key` and `project_buffer_pct` unless you pass them. `"calendar": null` clears the
+     calendar back to wall-clock hours; `"schedule": "cpm"` drops the capacities. `start` is never
+     reused.
+   - The result reports `schedule`, `capacities`, `resource_key`, `project_buffer_hours`,
+     `finish_hours` (the frozen finish, levelled when levelled) and `calendar_wait_hours` (the
+     planned window waits on the driving chain). `plan.status` reports the latest `baseline` as
+     `{baseline_number, as_of, schedule}`. The automatic first baseline taken by execution is
+     always CPM on wall-clock hours; re-baseline it with a reason when the pool is fixed.
 2. **Read** with `plan.ev {plan_id, as_of}`, and never calculate earned value by hand: progress,
    budgets and actuals are all stored on the plan, and `plan.ev` is the only source of these
    numbers. If it fails, report the error and fix the cause. It returns `bac`, `pv`, `ev`, `ac`, `sv`, `cv`,
-   `spi`, `cpi`, `eac`, `etc`, `vac`, `tcpi`, per-deliverable rows and
-   `critical_float_consumed_hours`. A ratio with a zero denominator is `null`; `undefined`
-   explains why.
+   `spi`, `cpi`, `eac`, `etc`, `vac`, `tcpi`, per-deliverable rows (each with its planned
+   `calendar_wait_hours`), `critical_float_consumed_hours` (against the levelled finish for a
+   levelled baseline), `schedule`, `capacities` (levelled baselines only) and the total
+   `calendar_wait_hours`. A ratio with a zero denominator is `null`; `undefined` explains why.
 3. **Record** with `plan.snapshot {plan_id, format: "markdown"}` at a steady cadence, such as
    each working day or each cohort. Alerts (`SPI_BELOW_0_9`, `CPI_BELOW_0_9`) fire only
    when the two latest stored snapshots are both below 0.9, so without snapshots there are

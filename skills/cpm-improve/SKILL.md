@@ -1,6 +1,6 @@
 ---
 name: cpm-improve
-description: Use when shortening, cheapening or de-risking a synced cpm-planner plan (plan.* tools); when asked to crash or fast-track a schedule, shorten it past a known bottleneck, try a split or contract-first as a variant, compare plan variants, run Monte Carlo (P80, sensitivity), or get an AI plan review (Jev via OpenRouter). Covers optional plan.review, plan.fork with edits, plan.simulate and plan.compare, explaining the trade-off in numbers, plan.select and plan.archive.
+description: Use when shortening, cheapening or de-risking a synced cpm-planner plan (plan.* tools); when asked to crash or fast-track a schedule, shorten it past a known bottleneck, try a split or contract-first as a variant, compare plan variants, run Monte Carlo (P80, sensitivity), find structural waste (false dependencies, mergeable deliverables, redundant gates), or get an AI plan review (Jev via OpenRouter). Covers plan.optimize first, optional plan.review, plan.fork with edits, plan.simulate and plan.compare (with calendars), explaining the trade-off in numbers, plan.select and plan.archive.
 ---
 
 # cpm-improve: fork, measure, compare, select
@@ -20,31 +20,33 @@ Calling the tools: see [Calling the tools](../deliverable-cpm/SKILL.md#calling-t
 - During execution, on the remaining work, when `cpm-ev` alerts fire.
 - Not for: applying an approved definition change to the selected variant → use cpm-revise.
 
-## 1. Review (optional)
+## 1. Optimize first (offline, free)
 
 ```text
-plan.review {"path": ".cpm-planner/plans/<name>/main.json", "capacities": {"agent": 1, "owner": 1}}
+plan.optimize {"path": ".cpm-planner/plans/<name>/main.json", "capacities": {"agent": 1, "owner": 1}}
 ```
 
-- Takes exactly one of `graph`, `plan_id` or `path`; optional `capacities`, `resource_key`,
-  `project_buffer_pct`, `max_questions` (1..64, default 64).
-- Needs an OpenRouter key (`OPENROUTER_API_KEY`, or `CPM_OPENROUTER_KEY_FILE`) or an adapter
-  (`CPM_REVIEW_PROVIDER=command`). Without one, `status` is `review_unavailable` plus lint: carry on.
-- The graph is sent to OpenRouter. Skip review for plans you may not share.
-- Lint errors return `status: "invalid_graph"` and no judge call; fix them first.
-- `findings` (`false_dependency`, `missing_dependency`, `split_candidate`, `interface_split`,
-  `crash_option`, `wave_merge`, `merge_candidate`) are advisory probabilities. Check each.
-- `proposals` are ready `plan.fork` edit lists, simulation-checked and ranked by
-  `hours_saved / max(cost, 1)`. An `add_capacity` crash proposal only has `set_duration`;
-  append `set_effort {id, hours: <current effort + cost>}` so the cost is counted.
+- Takes one of `graph`, `plan_id` or `path`; optional `capacities`, `resource_key`,
+  `project_buffer_pct`, `max_proposals` (default 32). Deterministic, no model or network call,
+  never writes.
+- `proposals` (`merge`, `false_dependency`, `parallel_cohort`, `gate_consolidation`, `gate_bypass`)
+  are `plan.fork` edit lists already checked by lint, the schedule and simulate, with `deltas`
+  (negative is better), `score`, `rationale`, `preserved` and `trade_offs`. Read every
+  `trade_offs` entry. `rejected` lists candidates with their `reasons`.
+- Approvals, gates, milestones, contracts, acceptance criteria and owned files are always kept.
 
-**Then vet the critical path until it stabilises.** After one full review, loop on
-`plan.review {"plan_id": "<id>", "scope": "critical_path"}`, which asks only about false dependencies
-between zero-float deliverables. Check each finding against the artifact the edge claims to hand over
-and remove false edges. Review again: a moved `critical_path` has new edges to vet. Stop when a pass
-changes nothing, a chain repeats, or after 5 passes. Worker limits are never edges.
+## 2. Review (optional AI step)
 
-## 2. Reason: one move per variant
+`plan.review {path, capacities}` (one of `graph`, `plan_id`, `path`; `max_questions` 1..64) asks
+Jev for judgments the graph cannot make alone. It needs `OPENROUTER_API_KEY` (or
+`CPM_OPENROUTER_KEY_FILE`, or `CPM_REVIEW_PROVIDER=command`); without one it returns
+`review_unavailable` plus lint: carry on. The graph is sent to OpenRouter; skip it for plans you may
+not share. `findings` are advisory probabilities; `proposals` are simulation-checked edit lists. An
+`add_capacity` crash proposal only has `set_duration`: append `set_effort {id, hours: <effort + cost>}`.
+Then loop `plan.review {plan_id, scope: "critical_path"}`, checking each `false_dependency` against
+the artifact handed over, until a pass changes nothing, a chain repeats, or 5 passes.
+
+## 3. Reason: one move per variant
 
 | Move | Edits |
 |---|---|
@@ -57,18 +59,14 @@ changes nothing, a chain repeats, or after 5 passes. Worker limits are never edg
 | Merge waves | Remove the earlier wave's gates, repoint dependents, let the later gate prove both; keep targeted checks |
 | Reuse immutable evidence | Remove a repeated gate only when a prior evidence artifact has the same governed identity (complete tree/image, dependency lock/toolchain, test-contract version and environment); make the consumer depend on that evidence |
 
-Use the levelled `driving_chain`, `load` and Monte Carlo `sensitivity` to pick moves.
+Use optimize proposals, the levelled `driving_chain`, `load` and Monte Carlo `sensitivity`.
 
-### Audit delivery gates
+**Audit delivery gates.** Read `waves` from `plan.lint`: target the fewest waves real boundaries
+allow and the highest `work_per_gate_hour`; fork a merged variant when no `boundary_reason` survives.
+Count added integration effort, not only gate savings. Never reuse evidence across a changed tree,
+lockfile, toolchain, test contract or environment: a commit SHA alone proves nothing.
 
-Read `waves` from `plan.lint` before choosing a move. Target the fewest waves that real boundaries
-allow, and the highest `work_per_gate_hour`. For each boundary, ask whether a concrete
-`boundary_reason` survives `wave_merge`; if not, fork a merged variant and compare. Count added
-integration effort and the longer feedback batch rather than only gate savings. Never reuse evidence
-across a changed tree or image, lockfile or toolchain, test contract or environment: a commit SHA
-alone proves nothing here.
-
-## 3. Fork
+## 4. Fork
 
 ```text
 plan.fork {"plan_id": "<main plan_id>", "variant": "ui-worker",
@@ -88,16 +86,19 @@ Edit ops (tagged by `op`, unknown fields rejected):
 The fork is written to `.cpm-planner/plans/<name>/<variant>.json` as a draft, not
 selected. An archived line is refused with `ARCHIVE_REFUSED`.
 
-## 4. Measure
+## 5. Measure
 
 ```text
-plan.simulate {"plan_id": "<fork plan_id>", "schedule": {"capacities": {...}}, "monte_carlo": {}}
+plan.simulate {"plan_id": "<fork plan_id>", "schedule": {"capacities": {...}}, "monte_carlo": {},
+               "calendar": {"default": {...}, "owner": {...}}, "start": "2026-11-16T08:00:00Z"}
 plan.compare  {"plan": "<name>", "schedule": {"capacities": {...}}, "monte_carlo": {}}
 ```
 
 - `plan.simulate` takes one of `graph`, `plan_id` or `path`; `schedule` is
   `{capacities, resource_key?, project_buffer_pct?}`; `monte_carlo` is
   `{iterations? (1..50000, default 2000), seed?}`. It persists nothing.
+- `calendar` and `start` (as on `plan.schedule`) apply to the levelled schedule and Monte Carlo,
+  so P50/P80 are wall-clock hours that include nights and weekends of people's steps.
 - `plan.compare` takes `plan` (a line name, every live variant, at most 16) or `plan_ids`
   (2..16), optional `project`, `schedule`, `monte_carlo` and `weights`
   `{makespan, p80, criticality_risk, total_effort, peak_load}` (finite, >= 0).
@@ -106,7 +107,7 @@ plan.compare  {"plan": "<name>", "schedule": {"capacities": {...}}, "monte_carlo
   top-level `recommended`. A non-empty `tied_with_recommended` means the scores tie:
   the recommendation is a tie-break, so choose on the trade-off, not the rank.
 
-## 5. Explain, then select
+## 6. Explain, then select
 
 Before selecting, tell the user in numbers what each candidate gains (makespan, P80), what
 it costs (effort, peak load, risk band) and which assumption it depends on (for example,

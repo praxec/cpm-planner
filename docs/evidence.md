@@ -148,7 +148,8 @@ activation.
 
 A deliverable's kind is its `metadata.kind`: `"gate"`, `"manual"`, or anything
 else (including absent), which is **work**. Milestones carry no evidence
-requirement and are outside this section.
+requirement and are outside this section. A milestone that is also a gate (`"milestone": true`
+with `metadata.kind: "gate"`) follows the gate rules and must declare a scope.
 
 A deliverable may declare the scope it must be closed with in
 `metadata.evidence_scope`. When it does not, the kind's default applies.

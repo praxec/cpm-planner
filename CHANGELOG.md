@@ -77,6 +77,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drops the oldest instead of refusing. `MarkStatusRequest::evidence` and `AcceptRequest::evidence`
   are now `cpm_planner::evidence::Evidence`; `with_evidence` and `AcceptRequest::new` still take a
   `&str` or `String`, and plain strings behave as before.
+- Skills and docs for 0.7.0 (#127, #130, #131, #132, #133): `cpm-run` reads status with
+  `plan.overview` and blockers with `plan.explain`, records evidence records with scope and
+  identity (`manual_approval` inside the team, `external_signoff` outside it) and leases with
+  `thread`/`affinity_seconds`; `cpm-plan` sizes deliverables per thread, declares gate
+  `evidence_scope` and `candidate`, lists the new lint findings and levels on per-resource
+  calendars; `cpm-improve` runs `plan.optimize` before the optional `plan.review`; `cpm-ev`
+  recommends a levelled baseline on per-resource calendars (agents 24/7, people on working hours);
+  `deliverable-cpm` carries the method for all of it and its improvement-loop example is refreshed
+  for the new approval step. `docs/README.md` links the evidence, calendars, overview, optimize and
+  threads guides, and `docs/architecture.md` describes the new modules and schema v5 to v7.
 ### Added
 
 - Levelled earned-value baselines (#132): the planner's `baseline` takes `capacities`,

@@ -1,6 +1,6 @@
 ---
 name: cpm-ev
-description: Use when tracking a cpm-planner plan (plan.* tools) against a baseline with earned value; when asked to baseline or re-baseline a plan, report schedule or cost performance (PV, EV, AC, SV, CV, SPI, CPI, EAC, ETC, VAC, TCPI), take a status snapshot, explain SPI_BELOW_0_9 or CPI_BELOW_0_9 alerts, or read null or undefined ratios. Covers plan.baseline (start, working calendar, reason), plan.ev (as_of), plan.snapshot (json or markdown, backfilled) and acting on alerts. Never hand-calculate these numbers; always read them from plan.ev.
+description: Use when tracking a cpm-planner plan (plan.* tools) against a baseline with earned value; when asked to baseline or re-baseline a plan, report schedule or cost performance (PV, EV, AC, SV, CV, SPI, CPI, EAC, ETC, VAC, TCPI), take a status snapshot, explain SPI_BELOW_0_9 or CPI_BELOW_0_9 alerts, or read null or undefined ratios. Covers plan.baseline (start, levelled capacities, per-resource working calendars, reason), plan.ev (as_of), plan.snapshot (json or markdown, backfilled) and acting on alerts. Never hand-calculate these numbers; always read them from plan.ev.
 ---
 
 # cpm-ev: baseline, measure, snapshot, act
@@ -36,27 +36,39 @@ them.
 
 ## 1. Baseline
 
+When a fixed pool executes the plan (three agents, one owner), baseline the **levelled** schedule,
+on **per-resource calendars**: agents and CI 24/7, people on their working hours.
+
 ```text
-plan.baseline {"plan_id": "<plan_id>", "start": "2026-10-12T00:00:00+02:00",
-               "calendar": {"hours_per_day": 8, "workdays": ["mon","tue","wed","thu","fri"],
-                            "utc_offset_minutes": 120}}
+plan.baseline {"plan_id": "<plan_id>", "start": "2026-11-16T08:00:00Z",
+               "capacities": {"agent": 3, "owner": 1},
+               "calendar": {"default": {"hours_per_day": 24, "workdays": ["mon","tue","wed","thu","fri","sat","sun"]},
+                            "owner": {"hours_per_day": 8, "day_start": "09:00",
+                                      "workdays": ["mon","tue","wed","thu","fri"], "utc_offset_minutes": 60}}}
 ```
 
-- `start`: RFC 3339, default now. `calendar`: `hours_per_day` (0 < h <= 24, default 8),
-  `workdays` (lowercase three-letter names, default mon..fri), `utc_offset_minutes`
-  (-1440..1440, default 0). Unknown fields are rejected.
-- Without a calendar the first baseline uses wall-clock hours; a re-baseline reuses the
-  previous calendar.
-- **The working window opens at local midnight** (UTC shifted by `utc_offset_minutes`) and
-  lasts `hours_per_day` hours. Give `start` as 00:00 local on a workday. A 09:00 start with
-  8 hours per day earns no PV that day.
-- Budgets are effort × `metadata.cost_rate` (default 1).
-- Selected, unarchived variant only.
+- `capacities` (as `plan.schedule`, with `resource_key`, `project_buffer_pct`) freezes the levelled
+  schedule, so PV follows what the pool can really do; a CPM baseline assumes unlimited workers and
+  reads SPI low from day one. `schedule: "cpm"` or `"levelled"` forces the kind.
+- `calendar` is one calendar or a map with a `default` entry keyed by resource (`metadata.owner`).
+  A calendar is `hours_per_day` (0 < h <= 24, default 8), `day_start` (`HH:MM` local, default
+  `00:00`), `workdays` (default mon..fri), `utc_offset_minutes` (default 0); unknown fields are
+  rejected. With a map, PV accrues only inside each row's windows, so a person's step waiting for
+  09:00 is planned, not a variance. One calendar for all applies its windows to agents too.
+- Set `day_start` to when people start: without it the window opens at local midnight.
+- A re-baseline without an argument reuses the previous `calendar`, `capacities`, `resource_key`
+  and `project_buffer_pct`. `"calendar": null` clears the calendar to wall-clock hours;
+  `"schedule": "cpm"` drops the capacities.
+- The result has `schedule`, `capacities`, `finish_hours` and `calendar_wait_hours` (planned
+  waits on the driving chain). Budgets are effort × `metadata.cost_rate` (default 1).
+- Selected, unarchived variant only. Errors: `INVALID_VALUE` (bad map or `day_start`, levelled
+  without capacities), `INVALID_CAPACITIES` (a resource with work and no unit).
 - **Execution auto-baselines.** The first execution-starting call (`plan.acquire_cohort`
   that leases work, a `plan.mark_status` to in-progress or complete, or `plan.select` of a
   variant with progress) takes baseline 1 from the current graph and reports
   `baseline_taken`; with `CPM_BASELINE_MODE=refuse` it fails with `BASELINE_REQUIRED`.
-  `plan.status` reports the latest `baseline` (`{baseline_number, as_of}` or null).
+  `plan.status` reports the latest `baseline` (`{baseline_number, as_of, schedule}` or null). An
+  auto-baseline is always CPM on wall-clock hours: re-baseline it with a reason if the pool is fixed.
 - `plan.lint` on a plan with progress but no baseline warns `NO_BASELINE`.
 - `backfill_from` (RFC 3339) recovers an unbaselined plan: it sets the baseline `start`
   retroactively and marks it `backfilled: true` (reported by `plan.ev`). It must not be in
@@ -75,8 +87,9 @@ plan.ev {"plan_id": "<plan_id>", "as_of": "2026-10-14T18:00:00Z"}
 ```
 
 - Returns `bac`, `pv`, `ev`, `ac`, `sv`, `cv`, `spi`, `cpi`, `eac`, `etc`, `vac`, `tcpi`,
-  per-deliverable `rows`, `critical_float_consumed_hours`, `alerts` and
-  `excluded_unbaselined`.
+  per-deliverable `rows` (with `calendar_wait_hours`), `critical_float_consumed_hours`, `alerts`,
+  `excluded_unbaselined`, `schedule` (`cpm` or `levelled`), `capacities` (levelled only) and
+  `calendar_wait_hours`.
 - `as_of` is the PV status date (default now). EV and AC are what is recorded when the call
   runs. `plan.ev` is read-only; `NOT_BASELINED` before the first baseline.
 - **Undefined ratios.** A ratio with a zero denominator is `null`, never NaN, and
