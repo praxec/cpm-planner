@@ -344,7 +344,8 @@ impl From<&DeliverableStatus> for StatusLabel {
 }
 
 impl StatusLabel {
-    fn as_str(self) -> &'static str {
+    /// The wire label, e.g. `"in_progress"`.
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
             Self::Ready => "ready",
@@ -364,8 +365,8 @@ pub struct BlockerChain {
     /// Its direct prerequisites that are not `Complete`, in declaration order.
     pub waiting_on: Vec<String>,
     /// Incomplete ancestors with no incomplete prerequisite of their own:
-    /// the work that can move now. Sorted by earliest finish descending
-    /// (the latest-finishing, i.e. driving, blocker first), then id.
+    /// the work that can move now. The driving root (the end of `chain`)
+    /// comes first; the rest follow by earliest finish descending, then id.
     pub roots: Vec<String>,
     /// The driving chain: `id`, then at each step the incomplete
     /// prerequisite with the latest earliest finish, ending at `roots[0]`.
@@ -523,6 +524,41 @@ impl<'a> PlanIndex<'a> {
         )
     }
 
+    /// How a ready `id` is started: `Operator` at the failure or lapse cap
+    /// (`acquire_cohort` skips it), `Accept` for manual or gate work, else
+    /// `Acquire`.
+    pub fn ready_action(&self, id: &str) -> ReadyAction {
+        let (_, failures, lapses) = self.counters(id);
+        if failures >= MAX_ATTEMPTS || lapses >= MAX_LAPSES {
+            ReadyAction::Operator
+        } else if self.is_accept_only(id) {
+            ReadyAction::Accept
+        } else {
+            ReadyAction::Acquire
+        }
+    }
+
+    /// The common entry fields of `id`.
+    pub fn item_ref(&self, id: &str) -> ItemRef {
+        ItemRef {
+            id: id.to_string(),
+            title: self.title(id),
+            status: StatusLabel::from(self.status(id)),
+            kind: self.kind(id),
+            owner: self.owner(id),
+            route: self.route(id),
+            evidence: None,
+        }
+    }
+
+    /// `{id, title}` of `id`.
+    pub fn named(&self, id: &str) -> Named {
+        Named {
+            id: id.to_string(),
+            title: self.title(id),
+        }
+    }
+
     /// Direct prerequisites of `id` that are not `Complete`, in declaration
     /// order.
     pub fn incomplete_prerequisites(&self, id: &str) -> Vec<&'a str> {
@@ -576,6 +612,14 @@ impl<'a> PlanIndex<'a> {
             }
             chain.push(n.to_string());
             cursor = self.driving_pick(&self.incomplete_prerequisites(n));
+        }
+        // The driving root leads, so `roots[0]` and `class` describe the end
+        // of `chain` rather than merely the latest-finishing root.
+        if let Some(driver) = chain.last()
+            && let Some(at) = roots.iter().position(|r| r == driver)
+        {
+            let driver = roots.remove(at);
+            roots.insert(0, driver);
         }
         let class = roots
             .first()
@@ -800,7 +844,8 @@ pub struct Section<T> {
 }
 
 impl<T> Section<T> {
-    fn bounded(all: Vec<T>, limit: usize) -> Self {
+    /// The first `limit` of `all`, with `total` and `omitted` set.
+    pub fn bounded(all: Vec<T>, limit: usize) -> Self {
         let total = all.len();
         let items: Vec<T> = all.into_iter().take(limit).collect();
         Self {
@@ -1055,19 +1100,8 @@ pub fn build_overview(
                 .as_ref()
                 .is_none_or(|m| index.feeds(id, m))
     };
-    let item = |id: &str| ItemRef {
-        id: id.to_string(),
-        title: index.title(id),
-        status: StatusLabel::from(index.status(id)),
-        kind: index.kind(id),
-        owner: index.owner(id),
-        route: index.route(id),
-        evidence: None,
-    };
-    let named = |id: &str| Named {
-        id: id.to_string(),
-        title: index.title(id),
-    };
+    let item = |id: &str| index.item_ref(id);
+    let named = |id: &str| index.named(id);
     let feeds_cap = if full { limit } else { BRIEF_FEEDS };
     let float_of = |id: &str| index.schedule(id).map_or(0.0, |r| r.float);
     let critical_set: HashSet<&str> = status.critical_ids.iter().map(String::as_str).collect();
@@ -1145,14 +1179,7 @@ pub fn build_overview(
         .copied()
         .filter(|id| keep(id))
         .map(|id| {
-            let (_, failures, lapses) = index.counters(id);
-            let action = if failures >= MAX_ATTEMPTS || lapses >= MAX_LAPSES {
-                ReadyAction::Operator
-            } else if index.is_accept_only(id) {
-                ReadyAction::Accept
-            } else {
-                ReadyAction::Acquire
-            };
+            let action = index.ready_action(id);
             ReadyEntry {
                 item: item(id),
                 action,

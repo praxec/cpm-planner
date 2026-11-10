@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   manual, external, gate), leases and attention items; brief/full detail, a stable JSON v1 schema
   and a compact Markdown renderer, bounded for large plans. `docs/overview.md` specifies the
   `plan.overview` and `plan.explain` tools (#128, #127).
+- `cpm_planner::explain`: why a deliverable is blocked (driving prerequisite chain, root blockers
+  and how to move them), what completing it unlocks, its slack to each milestone it feeds, and the
+  plan's next work in classes (ready and critical, ready with slack, blocked by dependency, manual,
+  external or gate, file-conflicting). File conflicts preview `plan.acquire_cohort`'s fill without
+  leasing. The overview's blocker class now follows the driving chain's root (#129, #127).
 
 ## [0.6.0] - 2026-11-09
 
