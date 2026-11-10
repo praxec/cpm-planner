@@ -408,6 +408,103 @@ fn consumes_quality_findings(graph: &PlanGraph) -> Vec<LintFinding> {
     out
 }
 
+/// `metadata` key: the continuity thread a deliverable belongs to.
+pub const THREAD_KEY: &str = "thread";
+
+/// `THREAD_BROKEN` for an acyclic graph with unique, known ids. A thread is
+/// meant to stay with one agent session, which holds only when its
+/// deliverables form one dependency chain that no other thread's deliverable
+/// sits inside. Deliverables without `metadata.thread` are never checked.
+fn thread_findings(graph: &PlanGraph) -> Vec<LintFinding> {
+    fn thread_of(d: &Deliverable) -> Option<&str> {
+        d.metadata
+            .get(THREAD_KEY)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+    }
+    // Thread token -> members sorted by id, so findings never depend on
+    // declaration order.
+    let mut threads: std::collections::BTreeMap<&str, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    let mut threaded: Vec<(&str, &str)> = Vec::new();
+    for d in &graph.deliverables {
+        if let Some(t) = thread_of(d) {
+            threads.entry(t).or_default().push(d.id.as_str());
+            threaded.push((d.id.as_str(), t));
+        }
+    }
+    threaded.sort_unstable();
+    threads.retain(|_, members| members.len() > 1);
+    for members in threads.values_mut() {
+        members.sort_unstable();
+    }
+    if threads.is_empty() {
+        return Vec::new();
+    }
+    let reach = reachability(graph);
+    let reaches = |from: &str, to: &str| reach.get(from).is_some_and(|r| r.contains(to));
+
+    let mut out = Vec::new();
+    for (thread, members) in threads {
+        let unordered = members.iter().enumerate().find_map(|(i, &x)| {
+            members[i + 1..]
+                .iter()
+                .find(|&&y| !reaches(x, y) && !reaches(y, x))
+                .map(|&y| (x, y))
+        });
+        if let Some((x, y)) = unordered {
+            out.push(finding(
+                "THREAD_BROKEN",
+                Severity::Warning,
+                format!(
+                    "thread '{thread}' is not one dependency chain: '{x}' and '{y}' are not \
+                     ordered by prerequisites, so one agent cannot carry its context through \
+                     both; add the edge if one consumes the other's artifact, or move one into \
+                     its own metadata.{THREAD_KEY}"
+                ),
+                vec![x.to_string(), y.to_string()],
+            ));
+            continue;
+        }
+        // A chain: sort by how many thread members each one precedes.
+        let mut chain = members.clone();
+        chain.sort_by_key(|&x| {
+            std::cmp::Reverse(members.iter().filter(|&&y| reaches(x, y)).count())
+        });
+        for pair in chain.windows(2) {
+            let (x, y) = (pair[0], pair[1]);
+            let between: Vec<(&str, &str)> = threaded
+                .iter()
+                .copied()
+                .filter(|&(z, t)| t != thread && reaches(x, z) && reaches(z, y))
+                .collect();
+            if between.is_empty() {
+                continue;
+            }
+            let named = between
+                .iter()
+                .map(|(z, t)| format!("'{z}' (thread '{t}')"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut ids = vec![x.to_string(), y.to_string()];
+            ids.extend(between.iter().map(|(z, _)| (*z).to_string()));
+            out.push(finding(
+                "THREAD_BROKEN",
+                Severity::Warning,
+                format!(
+                    "thread '{thread}' is interleaved between '{x}' and '{y}' by {named}, so \
+                     its agent must wait on another thread mid-chain; move that work into \
+                     thread '{thread}', order it outside the chain, or end the thread at '{x}' \
+                     and start a new one at '{y}'"
+                ),
+                ids,
+            ));
+        }
+    }
+    out
+}
+
 /// Lint `graph`. Never errors or panics.
 pub fn lint(graph: &PlanGraph) -> LintReport {
     use Severity::{Error, Info, Warning};
@@ -587,12 +684,15 @@ pub fn lint(graph: &PlanGraph) -> LintReport {
     let mut wave_report = None;
     if !cyclic && !unknown && !duplicated {
         out.extend(structure_findings(graph));
+        out.extend(thread_findings(graph));
         wave_report = waves::analyze(graph);
         if let Some(report) = &wave_report {
             out.extend(waves::wave_findings(graph, report));
         }
     }
     out.extend(waves::undeclared_gate_findings(graph));
+    out.extend(waves::evidence_scope_findings(graph));
+    out.extend(waves::scope_folded_findings(graph));
 
     if !graph.deliverables.iter().any(Deliverable::is_milestone) {
         out.push(finding(

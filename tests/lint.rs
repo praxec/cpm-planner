@@ -529,3 +529,136 @@ fn timing_lint_5000_node_chain() {
         r.findings.len()
     );
 }
+
+// THREAD_BROKEN: a continuity thread that one agent cannot hold.
+
+fn threaded(id: &str, prereqs: &[&str], thread: Option<&str>) -> Value {
+    let edges: Vec<Value> = prereqs.iter().map(|p| edge(p)).collect();
+    let mut v = d(id, json!(edges), json!([]), json!({}));
+    if let Some(t) = thread {
+        v["metadata"]["thread"] = json!(t);
+    }
+    v
+}
+
+fn thread_broken_ids(r: &LintReport) -> Vec<Vec<String>> {
+    r.findings
+        .iter()
+        .filter(|f| f.code == "THREAD_BROKEN")
+        .map(|f| f.ids.clone())
+        .collect()
+}
+
+#[test]
+fn a_thread_on_one_dependency_chain_is_not_broken() {
+    let g = graph(json!([
+        threaded("a", &[], Some("t")),
+        threaded("b", &["a"], Some("t")),
+        threaded("c", &["b"], Some("t")),
+    ]));
+    assert!(thread_broken_ids(&lint(&g)).is_empty());
+}
+
+#[test]
+fn a_thread_with_unordered_deliverables_is_thread_broken() {
+    let g = graph(json!([
+        threaded("a", &[], Some("t")),
+        threaded("b", &["a"], Some("t")),
+        threaded("c", &["a"], Some("t")),
+    ]));
+    assert_eq!(
+        finding(&lint(&g), "THREAD_BROKEN").map(|f| f.severity),
+        Some(Severity::Warning)
+    );
+}
+
+#[test]
+fn thread_broken_names_the_unordered_pair() {
+    let g = graph(json!([
+        threaded("a", &[], Some("t")),
+        threaded("b", &["a"], Some("t")),
+        threaded("c", &["a"], Some("t")),
+    ]));
+    assert_eq!(
+        thread_broken_ids(&lint(&g)),
+        vec![vec!["b".to_string(), "c".to_string()]]
+    );
+}
+
+#[test]
+fn a_thread_interleaved_by_another_threads_deliverable_is_thread_broken() {
+    let g = graph(json!([
+        threaded("a", &[], Some("t")),
+        threaded("x", &["a"], Some("u")),
+        threaded("b", &["x"], Some("t")),
+    ]));
+    assert_eq!(
+        thread_broken_ids(&lint(&g)),
+        vec![vec!["a".to_string(), "b".to_string(), "x".to_string()]]
+    );
+}
+
+#[test]
+fn an_unthreaded_deliverable_inside_a_thread_does_not_break_it() {
+    let g = graph(json!([
+        threaded("a", &[], Some("t")),
+        threaded("gate", &["a"], None),
+        threaded("b", &["gate"], Some("t")),
+    ]));
+    assert!(thread_broken_ids(&lint(&g)).is_empty());
+}
+
+#[test]
+fn another_thread_joining_the_chain_does_not_interleave_it() {
+    let g = graph(json!([
+        threaded("a", &[], Some("t")),
+        threaded("b", &["a"], Some("t")),
+        threaded("side", &["a"], Some("u")),
+        threaded("c", &["b", "side"], Some("t")),
+    ]));
+    assert!(thread_broken_ids(&lint(&g)).is_empty());
+}
+
+#[test]
+fn an_unthreaded_plan_raises_no_thread_finding() {
+    let g = graph(json!([threaded("a", &[], None), threaded("b", &[], None)]));
+    assert!(thread_broken_ids(&lint(&g)).is_empty());
+}
+
+#[test]
+fn a_thread_of_one_deliverable_is_never_broken() {
+    let g = graph(json!([
+        threaded("a", &[], Some("t")),
+        threaded("b", &[], Some("u")),
+    ]));
+    assert!(thread_broken_ids(&lint(&g)).is_empty());
+}
+
+#[test]
+fn thread_broken_message_explains_the_remediation() {
+    let g = graph(json!([
+        threaded("a", &[], Some("t")),
+        threaded("b", &[], Some("t")),
+    ]));
+    let message = finding(&lint(&g), "THREAD_BROKEN")
+        .map(|f| f.message.clone())
+        .unwrap_or_default();
+    assert!(
+        message.contains("add the edge") && message.contains("own metadata.thread"),
+        "{message}"
+    );
+}
+
+#[test]
+fn thread_broken_does_not_depend_on_declaration_order() {
+    let nodes = vec![
+        threaded("a", &[], Some("t")),
+        threaded("b", &[], Some("t")),
+        threaded("c", &[], Some("t")),
+    ];
+    let reversed: Vec<Value> = nodes.iter().rev().cloned().collect();
+    assert_eq!(
+        thread_broken_ids(&lint(&graph(json!(nodes)))),
+        thread_broken_ids(&lint(&graph(json!(reversed))))
+    );
+}

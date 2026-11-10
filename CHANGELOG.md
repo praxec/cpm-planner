@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Lint findings for evidence scopes and continuity threads (#130, #133): `EVIDENCE_SCOPE_INVALID`
+  and `GATE_CANDIDATE_INVALID` (errors), and `GATE_SCOPE_MISSING`, `GATE_CANDIDATE_MISSING`,
+  `SCOPE_FOLDED` and `THREAD_BROKEN` (warnings), each with its remediation. Plans that use gates
+  now warn until each gate declares `metadata.evidence_scope` and, for a regression gate,
+  `metadata.candidate`; `metadata.scope_folded: false` exempts text that only mentions an operation.
+
 ## [0.6.0] - 2026-11-09
 
 ### Added
