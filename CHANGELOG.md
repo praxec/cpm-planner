@@ -7,121 +7,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- `plan.review` records its `provider` (`direct` or `command`) beside the model, request digest and
-  usage; an oversized adapter reply is now `decode` rather than a hang or `upstream`; adapter
-  tokens with a key-shaped run are dropped; `docs/review-provider.md` is tool-neutral, with a
-  "Writing an adapter" reference script and conformance fixtures under
-  `docs/review-provider/fixtures/`, and end-to-end fake-adapter tests cover every outcome (#119).
-- `cpm_planner::optimize`: offline, deterministic plan optimization (#129, #127). It proposes
-  `plan.fork` edit lists (same-owner merges, false dependencies, parallel cohorts, gate
-  consolidation, work bypassing a gate) checked by lint, the schedule and simulate, with makespan,
-  resource-wait, effort and risk deltas. Candidates that lose acceptance criteria, gates, contracts,
-  ownership or milestones are rejected with reasons. See `docs/optimize.md`.
+## [0.7.0] - 2026-11-10
+
 ### Added
 
-- MCP tools `plan.overview`, `plan.explain` and `plan.optimize`, and the CLI commands
-  `cpm-planner overview`, `explain` (Markdown by default) and `optimize`. `plan.mark_status` and
-  `plan.accept` take an evidence record as well as a note; `plan.schedule` and `plan.simulate` take
-  `calendar` and `start`; `plan.baseline` takes `capacities`, `resource_key`, `project_buffer_pct`,
-  `schedule` and a per-resource `calendar` map (`null` clears it); `plan.acquire_cohort` takes
-  `thread` and `affinity_seconds`; `plan.status` reports `threads`; every `plan.review` reports
-  `provider` (`direct`, `command` or `disabled`) in its result and audit event. Without the new
-  arguments every existing call returns what it did before (#128, #129, #130, #131, #132, #133).
-- `cpm_planner::overview`: a one-call plan overview at a single `as_of` that joins `plan.status`,
-  `plan.get` and `plan.ev`, with titles, milestone impact, a ready queue with float, owner and next
-  milestone, blocked items with their incomplete prerequisite chain and blocker class (dependency,
-  manual, external, gate), leases and attention items; brief/full detail, a stable JSON v1 schema
-  and a compact Markdown renderer, bounded for large plans. `docs/overview.md` specifies the
-  `plan.overview` and `plan.explain` tools (#128, #127).
-- `cpm_planner::explain`: why a deliverable is blocked (driving prerequisite chain, root blockers
-  and how to move them), what completing it unlocks, its slack to each milestone it feeds, and the
-  plan's next work in classes (ready and critical, ready with slack, blocked by dependency, manual,
-  external or gate, file-conflicting). File conflicts preview `plan.acquire_cohort`'s fill without
-  leasing. The overview's blocker class now follows the driving chain's root (#129, #127).
-- The overview shows each deliverable's evidence status (`current`, `stale` with the changed
-  fields, `unknown`, `unbound`, `none`), an `evidence_target` option, evidence counts and a
-  stale-evidence list. The evidence is read inside the same consistent snapshot through the new
+- MCP tools `plan.overview`, `plan.explain` and `plan.optimize`, with CLI commands
+  `cpm-planner overview`, `cpm-planner explain` (Markdown by default) and `cpm-planner optimize`
+  (JSON). Every existing call returns what it did before when the new arguments are left out
+  (#127, #128, #129).
+- `plan.overview` (`cpm_planner::overview`, `docs/overview.md`): one snapshot at a single `as_of`
+  joining `plan.status`, `plan.get` and `plan.ev`, with titles, milestone impact, a ready queue
+  with float, owner and next milestone, blocked items with their incomplete prerequisite chain and
+  blocker class (dependency, manual, external, gate), leases and attention items; `brief`/`full`
+  detail, filters, a stable JSON v1 schema and compact Markdown, bounded for large plans (#128).
+- `plan.explain` (`cpm_planner::explain`): why a deliverable is blocked and how to move its root
+  blockers, what completing it unlocks, its slack to each milestone it feeds, and the plan's next
+  work in classes (ready and critical, ready with slack, blocked by dependency, manual, external or
+  gate, file-conflicting). File conflicts preview `plan.acquire_cohort` without leasing (#129).
+- `plan.optimize` (`cpm_planner::optimize`, `docs/optimize.md`): offline, deterministic plan
+  optimization with no model call. It proposes `plan.fork` edit lists (same-owner merges, false
+  dependencies, parallel cohorts, gate consolidation, work bypassing a gate), each checked by lint,
+  the schedule and simulate, with makespan, resource-wait, effort and risk deltas. Candidates that
+  lose acceptance criteria, gates, contracts, ownership or milestones are rejected with reasons
+  (#129).
+- Evidence bound to its governed identity (`docs/evidence.md`, version 1; `cpm_planner::evidence`).
+  `plan.mark_status` and `plan.accept` take a plain note or a record with a scope (`focused`,
+  `gate`, `manual_approval`, `external_signoff`, `merge`, `publish`, `activation`) and an identity
+  (tree, dependency lock, toolchain, test contract, environment). Records are stored with who
+  recorded them, when, the plan revision and a digest of the deliverable's definition, and read as
+  `current`, `stale` (naming each changed field, including `definition`), `unknown`, `unbound` or
+  `none`. A record whose scope may not close the deliverable is refused
+  (`EVIDENCE_SCOPE_MISMATCH`), a declared `metadata.evidence_scope` must be met
+  (`EVIDENCE_REQUIRED`), a gate must close with evidence that matches its `metadata.candidate`
+  (`EVIDENCE_STALE`), and malformed records are `INVALID_EVIDENCE` (#130).
+- The overview shows each deliverable's evidence status, takes an `evidence_target`, and lists
+  evidence counts and stale evidence, read in the same consistent snapshot through the new
   read-only `Planner::stored_evidence` (#128, #130).
-- Lint findings for evidence scopes and continuity threads (#130, #133):
+- Lint findings for evidence scopes and continuity threads, each with its remediation:
   `EVIDENCE_SCOPE_INVALID` and `GATE_CANDIDATE_INVALID` (errors), and `GATE_SCOPE_MISSING`,
-  `GATE_CANDIDATE_MISSING`, `SCOPE_FOLDED`, `THREAD_BROKEN` and `THREAD_INVALID` (warnings), each
-  with its remediation. Plans that use gates now warn until each gate declares
-  `metadata.evidence_scope` and, for a regression gate, `metadata.candidate`;
-  `metadata.scope_folded: false` exempts text that only mentions an operation.
-- Evidence bound to its governed identity (`docs/evidence.md`, version 1; library API in
-  `cpm_planner::evidence`). `plan.mark_status` and `plan.accept` take an `Evidence` that is a plain
-  note or a record with a scope (`focused`, `gate`, `manual_approval`, `external_signoff`, `merge`,
-  `publish`, `activation`) and an identity (tree, dependency lock, toolchain, test contract,
-  environment). Records are stored with who recorded them, when, the plan revision and a digest of
-  the deliverable's definition. `BasicCpmPlanner::evidence_status` reports each deliverable's
-  evidence as `current`, `stale` (naming each changed field, including `definition`), `unknown`,
-  `unbound` or `none` against an optional target identity, or a gate's `metadata.candidate`.
-- Scope rules: a record whose scope may not close the deliverable is refused
-  (`EVIDENCE_SCOPE_MISMATCH`), so focused evidence cannot close a gate and gate evidence cannot
-  close an approval, sign-off, merge, publish or activation. A declared `metadata.evidence_scope`
-  must be met (`EVIDENCE_REQUIRED`), and a gate must close with evidence that matches its
-  candidate (`EVIDENCE_STALE`). Malformed records are `INVALID_EVIDENCE`.
-- Levelled earned-value baselines (#132): the planner's `baseline` takes `capacities`,
-  `resource_key`, `project_buffer_pct` and `schedule` (`"cpm"` or `"levelled"`) and freezes the
-  start and finish that `plan.schedule` gives for the same inputs, so PV follows what a fixed pool
-  can do. The baseline records the kind and inputs (schema v6, `baselines.schedule`), `plan.ev`
-  reports `schedule` and `capacities`, the `plan.status` baseline summary reports `schedule`, and a
-  re-baseline without them reuses the previous ones. A baseline without capacities is CPM, as
-  before. `calendar: null` on a re-baseline now returns to wall-clock hours. The contract is
-  `docs/calendars.md`.
-- Thread affinity (#133, `docs/threads.md`): a `metadata.thread` token groups deliverables one agent
+  `GATE_CANDIDATE_MISSING`, `SCOPE_FOLDED`, `THREAD_BROKEN` and `THREAD_INVALID` (warnings).
+  `metadata.scope_folded: false` exempts text that only mentions an operation (#130, #133).
+- Per-resource working calendars (`docs/calendars.md`): `calendar` is one calendar or a map with a
+  `default` entry keyed by resource, and every calendar gains `day_start`. `plan.schedule`,
+  `plan.simulate` and Monte Carlo take `calendar` and `start` and place each deliverable in its
+  resource's windows, reporting `waited_on: "calendar"`, `start_at`/`finish_at`, `calendars`,
+  `calendar_wait_hours` and `available_hours`. Baselines on a calendar map accrue PV only while
+  each deliverable's calendar is open, and `plan.ev` reports planned `calendar_wait_hours` per row
+  and for the driving chain (#131).
+- Levelled earned-value baselines: `plan.baseline` takes `capacities`, `resource_key`,
+  `project_buffer_pct` and `schedule` (`"cpm"` or `"levelled"`) and freezes the start and finish
+  that `plan.schedule` gives for the same inputs, so PV follows what a fixed pool can do. The kind
+  and inputs are recorded (schema v6, `baselines.schedule`), reported by `plan.ev` and the
+  `plan.status` baseline summary, and reused by a re-baseline that leaves them out; `calendar:
+  null` returns to wall-clock hours (#132).
+- Thread affinity (`docs/threads.md`): a `metadata.thread` token groups deliverables one agent
   should do in order. The caller that completes a thread's deliverable is offered its next ready
-  deliverable first, and other callers take other work first; `AcquireRequest` gains `thread`
-  (offer that thread first) and `affinity_seconds` (defer to another caller's thread for that
-  long, reported as `AFFINITY_HOLD`; default 0, clamped to the max TTL). Affinity never bypasses
-  file conflicts, prerequisites, manual or gate exclusion, the lapse limit or the circuit breaker,
-  and unthreaded plans lease in the same order. Handoffs persist in `thread_handoffs` (schema v7)
-  and are ignored once a revision removes or re-threads their deliverable. `plan.status` lists
-  `threads` (holder, affine caller, next ready, completed and total) when a plan has any.
+  deliverable first; `plan.acquire_cohort` takes `thread` and `affinity_seconds` (defer to another
+  caller's thread for that long, reported as `AFFINITY_HOLD`). Affinity never bypasses file
+  conflicts, prerequisites, manual or gate exclusion, the lapse limit or the circuit breaker, and
+  unthreaded plans lease in the same order. Handoffs persist in `thread_handoffs` (schema v7) and
+  are ignored once a revision removes or re-threads their deliverable. `plan.status` lists
+  `threads` when a plan has any (#133).
+- `plan.review` reports its `provider` (`direct`, `command` or `disabled`) on every path, in its
+  result and audit event, beside the model, request digest and usage. `docs/review-provider.md`
+  has a tool-neutral "Writing an adapter" reference script and version 1 conformance fixtures
+  under `docs/review-provider/fixtures/`, and fake-adapter tests cover every adapter outcome
+  (#119).
 
 ### Changed
 
-- `cpm_planner::llm::ConfigError` gains `UnknownReviewProvider` for an unknown `CPM_REVIEW_PROVIDER`
-  value, so `plan.review` reports the provider as `disabled` without matching message text (#119).
+- Plans that use gates now lint with warnings until each gate declares `metadata.evidence_scope`
+  and, for a regression gate, `metadata.candidate`, so `clean` can become false for them (#130).
+- `MarkStatusRequest::evidence` and `AcceptRequest::evidence` are now
+  `cpm_planner::evidence::Evidence`; `with_evidence` and `AcceptRequest::new` still take a `&str`
+  or `String`, and plain strings behave as before. `plan.accept` also appends its evidence to the
+  deliverable's evidence list, dropping the oldest entry at 100 instead of refusing (#130).
+- `earned_value::Calendar` is now `calendar::Calendar`; a single calendar reads exactly as before
+  apart from honouring `day_start` (#131).
+- `cpm_planner::llm::ConfigError` gains `UnknownReviewProvider` for an unknown
+  `CPM_REVIEW_PROVIDER` value (#119).
+- Skills: `cpm-run` reads status with `plan.overview` and blockers with `plan.explain`, records
+  evidence with scope and identity and leases by thread; `cpm-plan` sizes deliverables per thread,
+  declares gate scopes and candidates and lists the new findings; `cpm-improve` runs
+  `plan.optimize` before the optional `plan.review`; `cpm-ev` recommends a levelled baseline on
+  per-resource calendars (agents 24/7, people on working hours); `deliverable-cpm` carries the
+  method and its improvement-loop example is refreshed. `docs/README.md` links the new guides
+  (#127, #130, #131, #132, #133).
 
-- `plan.accept` also appends its evidence to the deliverable's evidence list; at 100 entries it
-  drops the oldest instead of refusing. `MarkStatusRequest::evidence` and `AcceptRequest::evidence`
-  are now `cpm_planner::evidence::Evidence`; `with_evidence` and `AcceptRequest::new` still take a
-  `&str` or `String`, and plain strings behave as before.
-- Skills and docs for 0.7.0 (#127, #130, #131, #132, #133): `cpm-run` reads status with
-  `plan.overview` and blockers with `plan.explain`, records evidence records with scope and
-  identity (`manual_approval` inside the team, `external_signoff` outside it) and leases with
-  `thread`/`affinity_seconds`; `cpm-plan` sizes deliverables per thread, declares gate
-  `evidence_scope` and `candidate`, lists the new lint findings and levels on per-resource
-  calendars; `cpm-improve` runs `plan.optimize` before the optional `plan.review`; `cpm-ev`
-  recommends a levelled baseline on per-resource calendars (agents 24/7, people on working hours);
-  `deliverable-cpm` carries the method for all of it and its improvement-loop example is refreshed
-  for the new approval step. `docs/README.md` links the evidence, calendars, overview, optimize and
-  threads guides, and `docs/architecture.md` describes the new modules and schema v5 to v7.
-### Added
+### Fixed
 
-- Levelled earned-value baselines (#132): the planner's `baseline` takes `capacities`,
-  `resource_key`, `project_buffer_pct` and `schedule` (`"cpm"` or `"levelled"`) and freezes the
-  start and finish that `plan.schedule` gives for the same inputs, so PV follows what a fixed pool
-  can do. The baseline records the kind and inputs (schema v6, `baselines.schedule`), `plan.ev`
-  reports `schedule` and `capacities`, the `plan.status` baseline summary reports `schedule`, and a
-  re-baseline without them reuses the previous ones. A baseline without capacities is CPM, as
-  before. `calendar: null` on a re-baseline now returns to wall-clock hours. The contract is
-  `docs/calendars.md`.
-### Added
-
-- Per-resource working calendars for the levelled schedule, simulation and Monte Carlo (#131):
-  `calendar::Calendar` gains `day_start`, `CalendarSpec` takes one calendar or a map with a
-  `default` entry, and `resource_schedule_on_calendar`, `simulate_on_calendar` and
-  `monte_carlo_on_calendar` place each deliverable in its resource's windows, reporting
-  `waited_on: "calendar"`, `start_at`/`finish_at`, `calendars`, `calendar_wait_hours` and
-  `available_hours`. Without a calendar the output is unchanged.
-- Earned-value baselines on per-resource calendars (#131): a calendar map on the planner's
-  `baseline` freezes each deliverable in its resource's windows (the calendar CPM forward pass, or
-  the levelled schedule with capacities), stores the map in `baselines.calendar`, and accrues PV
-  only while each deliverable's calendar is open. `plan.ev` reports each row's planned
-  `calendar_wait_hours` and the driving-chain total. A single calendar honours `day_start` and
-  otherwise reads exactly as before; `earned_value::Calendar` is now `calendar::Calendar`.
+- A command adapter that writes more than 16 MiB is now reported as `decode` and killed, instead of
+  dying of SIGPIPE and reporting `upstream` (#119).
+- Adapter `reason` and `model` tokens with a key-shaped run of characters are dropped, so a key
+  echoed by an adapter cannot reach a review result (#119).
+- The overview's blocker class now follows the driving chain's root, so work waiting on a manual
+  approval is no longer labelled as a plain dependency (#128).
 
 ## [0.6.0] - 2026-11-09
 
