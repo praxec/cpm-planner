@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `cpm_planner::overview`: a one-call plan overview at a single `as_of` that joins `plan.status`,
+  `plan.get` and `plan.ev`, with titles, milestone impact, a ready queue with float, owner and next
+  milestone, blocked items with their incomplete prerequisite chain and blocker class (dependency,
+  manual, external, gate), leases and attention items; brief/full detail, a stable JSON v1 schema
+  and a compact Markdown renderer, bounded for large plans. `docs/overview.md` specifies the
+  `plan.overview` and `plan.explain` tools (#128, #127).
+
 ## [0.6.0] - 2026-11-09
 
 ### Added

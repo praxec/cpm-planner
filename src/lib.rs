@@ -137,6 +137,7 @@ mod mark_actuals_tests;
 pub mod metrics;
 pub mod monte_carlo;
 pub mod network_health;
+pub mod overview;
 pub mod plan;
 pub mod plan_store;
 pub mod planner;
