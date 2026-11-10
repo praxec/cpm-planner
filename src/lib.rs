@@ -118,6 +118,7 @@
 //! This crate has no dependency on praxec; it is consumed purely over the
 //! MCP protocol.
 
+pub mod affinity;
 pub mod algorithm;
 pub mod audit;
 pub mod compare;

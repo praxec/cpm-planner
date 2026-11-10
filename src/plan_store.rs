@@ -836,6 +836,7 @@ const MIGRATIONS: &[fn(&Connection) -> anyhow::Result<()>] = &[
     migrate_v4_earned_value, // baselines, ev_actuals, ev_snapshots
     migrate_v5_baseline_backfilled, // baselines.backfilled
     migrate_v6_baseline_schedule, // baselines.schedule
+    migrate_v7_thread_handoffs, // thread_handoffs
 ];
 
 /// Runs the whole ladder plus the stale sweep in one immediate transaction,
@@ -1025,6 +1026,24 @@ fn migrate_v5_baseline_backfilled(conn: &Connection) -> anyhow::Result<()> {
 fn migrate_v6_baseline_schedule(conn: &Connection) -> anyhow::Result<()> {
     add_column_if_missing(conn, "baselines", "schedule", "TEXT")?;
     Ok(())
+}
+
+/// Create `thread_handoffs` (schema v7): per plan and `metadata.thread`,
+/// the caller that last completed one of the thread's deliverables and when
+/// (see [`crate::affinity`]). One row per `(plan_id, thread)`, replaced on
+/// each completion. Idempotent via `IF NOT EXISTS`.
+fn migrate_v7_thread_handoffs(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS thread_handoffs (
+             plan_id         TEXT NOT NULL REFERENCES plans(plan_id) ON DELETE CASCADE,
+             thread          TEXT NOT NULL,
+             caller_id       TEXT NOT NULL,
+             deliverable_id  TEXT NOT NULL,
+             completed_at_us INTEGER NOT NULL,
+             PRIMARY KEY (plan_id, thread)
+         );",
+    )
+    .context("creating thread_handoffs")
 }
 
 /// Bring every schema v4 database to the final v4 layout. Runs on EVERY open,

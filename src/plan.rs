@@ -439,6 +439,16 @@ pub struct AcquireRequest {
     /// Requested lease TTL for this call. `None` uses the planner
     /// default; the planner clamps the value to its configured maximum.
     pub ttl: Option<Duration>,
+    /// Offer this `metadata.thread`'s ready deliverables first (a thread
+    /// token, see [`crate::affinity`]). Without it, the threads this caller
+    /// last advanced come first.
+    pub thread: Option<String>,
+    /// How long this caller defers to another caller's thread: a ready
+    /// deliverable whose thread another caller advanced less than this long
+    /// ago is held back (`AFFINITY_HOLD`). `None` is
+    /// [`crate::affinity::DEFAULT_AFFINITY_SECONDS`] (no hold); clamped to
+    /// the planner's maximum lease TTL.
+    pub affinity_seconds: Option<u64>,
 }
 
 impl AcquireRequest {
@@ -450,7 +460,21 @@ impl AcquireRequest {
             ids: None,
             metadata_filter: None,
             ttl: None,
+            thread: None,
+            affinity_seconds: None,
         }
+    }
+
+    /// Offer this thread's ready deliverables first.
+    pub fn with_thread(mut self, thread: impl Into<String>) -> Self {
+        self.thread = Some(thread.into());
+        self
+    }
+
+    /// Defer this many seconds to a caller that advanced a thread.
+    pub fn with_affinity_seconds(mut self, seconds: u64) -> Self {
+        self.affinity_seconds = Some(seconds);
+        self
     }
 
     /// Restrict the acquire to these deliverable ids.
@@ -1105,6 +1129,11 @@ pub struct PlanStatus {
     /// first baseline.
     #[serde(default)]
     pub baseline: Option<PlanBaseline>,
+    /// One row per `metadata.thread`, sorted by token: holder, affine
+    /// caller, next ready deliverable, completed and total. Omitted from the
+    /// wire for a plan without threads.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub threads: Vec<crate::affinity::ThreadStatus>,
 }
 
 /// A milestone's schedule summary, reported by [`PlanStatus::milestones`].
