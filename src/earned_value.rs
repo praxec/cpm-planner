@@ -39,11 +39,12 @@ pub use crate::plan::EarningRule;
 use crate::plan::{
     Deliverable, DeliverableStatus, FINISH_ID, PlanGraph, PlanId, PlannerError, START_ID,
 };
+use crate::resource_schedule::{ScheduleRequest, check_buffer_pct, resource_schedule_with_cpm};
 use crate::schedule::{compute_cpm, effort_basis};
 use crate::task::CriticalPathResult;
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc, Weekday};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::{BTreeMap, HashMap};
 
 /// Working-time calendar for the EV clock. Unknown fields are rejected.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -115,6 +116,106 @@ pub struct Baseline {
     /// than the call time.
     #[serde(default)]
     pub backfilled: bool,
+    /// Which schedule the rows froze, and the levelling inputs. Baselines
+    /// stored before levelled baselines existed read as CPM.
+    #[serde(default)]
+    pub schedule: BaselineSchedule,
+}
+
+/// Which schedule a baseline froze (`schedule` on the wire).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleKind {
+    /// The CPM early-start schedule (unlimited capacity).
+    #[default]
+    Cpm,
+    /// The capacity-levelled schedule `plan.schedule` computes.
+    Levelled,
+}
+
+/// The schedule a baseline froze and, for a levelled baseline, the inputs
+/// it was levelled with (see `docs/calendars.md`, section 4).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BaselineSchedule {
+    pub kind: ScheduleKind,
+    /// Units per resource; `None` for a CPM baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacities: Option<BTreeMap<String, u32>>,
+    /// Metadata key naming a deliverable's resource; `None` for a CPM
+    /// baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_key: Option<String>,
+    /// Project buffer percentage; `None` for a CPM baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_buffer_pct: Option<f32>,
+    /// The levelled schedule's project buffer, in hours; never part of rows
+    /// or PV. `None` for a CPM baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_buffer_hours: Option<f32>,
+}
+
+impl BaselineSchedule {
+    /// The levelling request this baseline recorded, `None` for CPM.
+    pub fn levelling_request(&self) -> Option<ScheduleRequest> {
+        if self.kind != ScheduleKind::Levelled {
+            return None;
+        }
+        Some(ScheduleRequest {
+            capacities: self.capacities.clone()?,
+            resource_key: self
+                .resource_key
+                .clone()
+                .unwrap_or_else(crate::resource_schedule::default_resource_key),
+            project_buffer_pct: self
+                .project_buffer_pct
+                .unwrap_or_else(crate::resource_schedule::default_buffer_pct),
+        })
+    }
+}
+
+/// The `calendar` argument of `plan.baseline`, with absent and `null`
+/// told apart.
+///
+/// Deserialize it from a struct field marked `#[serde(default)]`: an absent
+/// field is [`BaselineCalendar::Inherit`], `null` is
+/// [`BaselineCalendar::WallClock`], an object with a `default` key is
+/// [`BaselineCalendar::PerResource`], and any other value must be a single
+/// [`Calendar`] (its unknown fields and wrong types are deserialization
+/// errors, as they are today).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum BaselineCalendar {
+    /// Omitted: the first baseline counts wall-clock hours, a re-baseline
+    /// keeps the previous baseline's calendar.
+    #[default]
+    Inherit,
+    /// `null`: count wall-clock hours, clearing any previous calendar.
+    WallClock,
+    /// One plan-wide working calendar.
+    Single(Calendar),
+    /// A per-resource calendar map (`docs/calendars.md`, section 2.3). Not
+    /// supported by `plan.baseline` yet: refused with `INVALID_VALUE`.
+    PerResource(serde_json::Map<String, serde_json::Value>),
+}
+
+impl BaselineCalendar {
+    /// Classify a raw argument value; `None` means the argument was absent.
+    pub fn from_json(value: Option<serde_json::Value>) -> Result<Self, serde_json::Error> {
+        match value {
+            None => Ok(Self::Inherit),
+            Some(serde_json::Value::Null) => Ok(Self::WallClock),
+            Some(serde_json::Value::Object(map)) if map.contains_key("default") => {
+                Ok(Self::PerResource(map))
+            }
+            Some(other) => serde_json::from_value(other).map(Self::Single),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for BaselineCalendar {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Self::from_json(Some(value)).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Reported progress for one deliverable.
@@ -248,6 +349,14 @@ pub struct EvReport {
     /// re-baseline, but their spend counts in AC at rate 1.0 (their live
     /// `cost_rate` applies only once a baseline row exists).
     pub excluded_unbaselined: Vec<String>,
+    /// Which schedule the baseline froze (`cpm` or `levelled`).
+    #[serde(default)]
+    pub schedule: ScheduleKind,
+    /// The levelled baseline's capacities; omitted for a CPM baseline (the
+    /// report's nulls are reserved for metrics explained by
+    /// [`EvReport::undefined`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacities: Option<BTreeMap<String, u32>>,
     /// True when the plan belongs to an effectively archived variant (its
     /// line is archived or the variant itself is); false for unnamed plans
     /// and live variants. Archived variants stay readable through `ev`.
@@ -446,23 +555,111 @@ pub fn build_baseline(
     if let Some(c) = &calendar {
         c.validate()?;
     }
-    let by_id: HashMap<&str, &crate::task::Task> =
-        cpm.tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+    let placed: HashMap<&str, (f32, f32)> = cpm
+        .tasks
+        .iter()
+        .map(|t| (t.id.as_str(), (t.earliest_start, t.earliest_finish)))
+        .collect();
+    freeze(
+        graph,
+        &placed,
+        "CPM result",
+        Frozen {
+            start,
+            calendar,
+            number,
+            finish_hours: finish_of(cpm),
+            schedule: BaselineSchedule::default(),
+        },
+    )
+}
+
+/// Freeze the capacity-levelled schedule and budgets into a baseline: each
+/// row's `es`/`ef` is the `start`/`finish` that
+/// [`crate::resource_schedule::resource_schedule`] gives for the same graph
+/// and `req`, and `finish_hours` is its makespan. On the plan clock (one
+/// calendar or none) the levelled hours are read as working hours of that
+/// calendar, exactly as CPM hours are.
+///
+/// Errors: an invalid calendar as [`build_baseline`]; an empty
+/// `resource_key` or a `project_buffer_pct` outside `0..=100` is
+/// [`PlannerError::InvalidValue`]; a resource with no or too few units is
+/// [`PlannerError::InvalidCapacities`], exactly as `plan.schedule`.
+pub fn build_levelled_baseline(
+    graph: &PlanGraph,
+    cpm: &CriticalPathResult,
+    start: DateTime<Utc>,
+    calendar: Option<Calendar>,
+    number: u32,
+    req: &ScheduleRequest,
+) -> Result<Baseline, PlannerError> {
+    if let Some(c) = &calendar {
+        c.validate()?;
+    }
+    if req.resource_key.is_empty() {
+        return Err(PlannerError::InvalidValue {
+            reason: "resource_key must not be empty".to_string(),
+        });
+    }
+    check_buffer_pct(req.project_buffer_pct)
+        .map_err(|reason| PlannerError::InvalidValue { reason })?;
+    let levelled = resource_schedule_with_cpm(graph, req, cpm)?;
+    let placed: HashMap<&str, (f32, f32)> = levelled
+        .rows
+        .iter()
+        .map(|r| (r.id.as_str(), (r.start, r.finish)))
+        .collect();
+    freeze(
+        graph,
+        &placed,
+        "levelled schedule",
+        Frozen {
+            start,
+            calendar,
+            number,
+            finish_hours: levelled.makespan,
+            schedule: BaselineSchedule {
+                kind: ScheduleKind::Levelled,
+                capacities: Some(req.capacities.clone()),
+                resource_key: Some(req.resource_key.clone()),
+                project_buffer_pct: Some(req.project_buffer_pct),
+                project_buffer_hours: Some(levelled.project_buffer_hours),
+            },
+        },
+    )
+}
+
+/// The parts of a baseline that do not come from the rows.
+struct Frozen {
+    start: DateTime<Utc>,
+    calendar: Option<Calendar>,
+    number: u32,
+    finish_hours: f32,
+    schedule: BaselineSchedule,
+}
+
+/// Build the rows from `placed` (id to start/finish hours) and budgets.
+fn freeze(
+    graph: &PlanGraph,
+    placed: &HashMap<&str, (f32, f32)>,
+    source: &str,
+    frozen: Frozen,
+) -> Result<Baseline, PlannerError> {
     let estimator = EffortEstimator::new();
     let mut rows = Vec::new();
     for d in &graph.deliverables {
         if d.id == START_ID || d.id == FINISH_ID {
             continue;
         }
-        let Some(t) = by_id.get(d.id.as_str()) else {
+        let Some(&(es, ef)) = placed.get(d.id.as_str()) else {
             return Err(PlannerError::InvalidGraph {
-                reason: format!("deliverable {:?} missing from CPM result", d.id),
+                reason: format!("deliverable {:?} missing from {source}", d.id),
             });
         };
         rows.push(BaselineRow {
             id: d.id.clone(),
-            es: t.earliest_start,
-            ef: t.earliest_finish,
+            es,
+            ef,
             budget: budget_of(d, &estimator)?,
             cost_rate: cost_rate(d)?,
         });
@@ -475,13 +672,14 @@ pub fn build_baseline(
         });
     }
     Ok(Baseline {
-        number,
-        start,
-        calendar,
+        number: frozen.number,
+        start: frozen.start,
+        calendar: frozen.calendar,
         rows,
         bac,
-        finish_hours: finish_of(cpm),
+        finish_hours: frozen.finish_hours,
         backfilled: false,
+        schedule: frozen.schedule,
     })
 }
 
@@ -639,7 +837,15 @@ pub fn compute_ev(
     let out = |v: Option<f64>| v.map(|x| x as f32);
 
     let cpm = compute_cpm(graph)?;
-    let critical_float = (finish_of(&cpm) - baseline.finish_hours).max(0.0);
+    // A levelled baseline compares against the current graph levelled with
+    // the recorded inputs; if it no longer levels (a resource without
+    // capacity, say), the CPM finish stands in so the report still reads.
+    let current_finish = match baseline.schedule.levelling_request() {
+        Some(req) => resource_schedule_with_cpm(graph, &req, &cpm)
+            .map_or_else(|_| finish_of(&cpm), |s| s.makespan),
+        None => finish_of(&cpm),
+    };
+    let critical_float = (current_finish - baseline.finish_hours).max(0.0);
 
     let alerts = trend_alerts(previous_snapshots, baseline.number);
     for (field, v) in [
@@ -693,6 +899,8 @@ pub fn compute_ev(
         },
         archived: false,
         active_plan: None,
+        schedule: baseline.schedule.kind,
+        capacities: baseline.schedule.capacities.clone(),
     };
     Ok(report)
 }
@@ -710,13 +918,24 @@ pub const SNAPSHOT_EXPORT_LIMIT: usize = 100;
 pub const MIN_MEASURABLE_PV_HOURS: f64 = 0.01;
 
 /// Take a baseline of a plan (`plan.baseline`).
+///
+/// The wire arguments map one to one: `start`, `calendar` (through
+/// [`BaselineRequest::calendar_input`], which tells absent from `null`),
+/// `reason`, `backfill_from`, `capacities`, `resource_key`,
+/// `project_buffer_pct` and `schedule`. See `docs/calendars.md`, section 4,
+/// for how omitted levelling arguments are inherited.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BaselineRequest {
     pub plan_id: PlanId,
     /// Baseline start; defaults to the planner clock's now.
     pub start: Option<DateTime<Utc>>,
-    /// Working-time calendar; `None` counts wall-clock hours.
+    /// One working-time calendar, the shorthand for
+    /// `calendar_input: BaselineCalendar::Single(..)`. Ignored when
+    /// [`BaselineRequest::calendar_input`] is not `Inherit`.
     pub calendar: Option<Calendar>,
+    /// The `calendar` argument with absent (`Inherit`) and `null`
+    /// (`WallClock`) told apart. Takes precedence over `calendar`.
+    pub calendar_input: BaselineCalendar,
     /// Why the plan is re-baselined. Required (non-blank) when the plan
     /// already has a baseline; at most [`MAX_BASELINE_REASON_CHARS`].
     pub reason: Option<String>,
@@ -724,6 +943,16 @@ pub struct BaselineRequest {
     /// instead of now and the baseline is marked `backfilled`. Must not be
     /// in the future or before the plan's creation time.
     pub backfill_from: Option<DateTime<Utc>>,
+    /// Units per resource. Given (or inherited from a levelled previous
+    /// baseline), the baseline freezes the levelled schedule.
+    pub capacities: Option<BTreeMap<String, u32>>,
+    /// Metadata key naming a deliverable's resource (default `owner`).
+    pub resource_key: Option<String>,
+    /// Project buffer percentage, `0..=100` (default 25).
+    pub project_buffer_pct: Option<f32>,
+    /// Force the frozen schedule: `Cpm` drops levelling, `Levelled` requires
+    /// capacities (given or inherited). `None` decides by capacities.
+    pub schedule: Option<ScheduleKind>,
 }
 
 impl BaselineRequest {
@@ -732,8 +961,13 @@ impl BaselineRequest {
             plan_id,
             start: None,
             calendar: None,
+            calendar_input: BaselineCalendar::Inherit,
             reason: None,
             backfill_from: None,
+            capacities: None,
+            resource_key: None,
+            project_buffer_pct: None,
+            schedule: None,
         }
     }
 
@@ -752,9 +986,44 @@ impl BaselineRequest {
         self
     }
 
+    /// Set the `calendar` argument as given on the wire.
+    pub fn with_calendar_input(mut self, calendar: BaselineCalendar) -> Self {
+        self.calendar_input = calendar;
+        self
+    }
+
     pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
         self.reason = Some(reason.into());
         self
+    }
+
+    pub fn with_capacities(mut self, capacities: BTreeMap<String, u32>) -> Self {
+        self.capacities = Some(capacities);
+        self
+    }
+
+    pub fn with_resource_key(mut self, resource_key: impl Into<String>) -> Self {
+        self.resource_key = Some(resource_key.into());
+        self
+    }
+
+    pub fn with_project_buffer_pct(mut self, pct: f32) -> Self {
+        self.project_buffer_pct = Some(pct);
+        self
+    }
+
+    pub fn with_schedule(mut self, schedule: ScheduleKind) -> Self {
+        self.schedule = Some(schedule);
+        self
+    }
+
+    /// The calendar choice this request makes: `calendar_input` unless it
+    /// is `Inherit`, else `calendar` as a single calendar, else `Inherit`.
+    pub fn effective_calendar(&self) -> BaselineCalendar {
+        match (&self.calendar_input, &self.calendar) {
+            (BaselineCalendar::Inherit, Some(c)) => BaselineCalendar::Single(c.clone()),
+            (input, _) => input.clone(),
+        }
     }
 }
 
@@ -766,12 +1035,29 @@ pub struct BaselineOutcome {
     pub start: DateTime<Utc>,
     pub calendar: Option<Calendar>,
     pub bac: f32,
+    /// The frozen schedule's finish (the levelled makespan for a levelled
+    /// baseline).
     pub finish_hours: f32,
     pub deliverable_count: usize,
     pub reason: Option<String>,
     /// True when `start` came from `backfill_from`.
     #[serde(default)]
     pub backfilled: bool,
+    /// Which schedule was frozen.
+    #[serde(default)]
+    pub schedule: ScheduleKind,
+    /// Levelled baselines only; `null` for CPM.
+    #[serde(default)]
+    pub capacities: Option<BTreeMap<String, u32>>,
+    /// Levelled baselines only; `null` for CPM.
+    #[serde(default)]
+    pub resource_key: Option<String>,
+    /// Levelled baselines only; `null` for CPM.
+    #[serde(default)]
+    pub project_buffer_pct: Option<f32>,
+    /// Levelled baselines only; `null` for CPM.
+    #[serde(default)]
+    pub project_buffer_hours: Option<f32>,
 }
 
 /// The reason recorded on a baseline an execution-starting call took
@@ -809,6 +1095,9 @@ pub struct BaselineTaken {
 pub struct PlanBaseline {
     pub baseline_number: u32,
     pub as_of: DateTime<Utc>,
+    /// Which schedule the baseline froze.
+    #[serde(default)]
+    pub schedule: ScheduleKind,
 }
 
 /// Export format of `plan.snapshot`.
@@ -1055,6 +1344,7 @@ mod tests {
             bac,
             finish_hours,
             backfilled: false,
+            schedule: BaselineSchedule::default(),
         }
     }
 
@@ -2301,5 +2591,209 @@ mod tests {
         let mut v = serde_json::to_value(summary_of(&textbook())).unwrap();
         v.as_object_mut().unwrap().remove("undefined");
         assert!(serde_json::from_value::<SnapshotSummary>(v).is_ok());
+    }
+
+    // ── Levelled baselines ──────────────────────────────────────────────
+
+    fn on(pool: &str, id: &str, effort: f32, prereqs: &[&str]) -> Deliverable {
+        Deliverable {
+            metadata: serde_json::json!({ "owner": pool }),
+            ..deliverable(id, effort, prereqs)
+        }
+    }
+
+    /// `a`, `b` (10h) feed `c` (5h), all on `agent`.
+    fn pool() -> PlanGraph {
+        graph(vec![
+            on("agent", "a", 10.0, &[]),
+            on("agent", "b", 10.0, &[]),
+            on("agent", "c", 5.0, &["a", "b"]),
+        ])
+    }
+
+    fn one_agent() -> ScheduleRequest {
+        ScheduleRequest {
+            capacities: BTreeMap::from([("agent".to_string(), 1)]),
+            resource_key: "owner".to_string(),
+            project_buffer_pct: 25.0,
+        }
+    }
+
+    fn levelled_of(g: &PlanGraph, req: &ScheduleRequest) -> Result<Baseline, PlannerError> {
+        let cpm = compute_cpm(g).unwrap();
+        build_levelled_baseline(g, &cpm, at(2026, 1, 5, 0), None, 1, req)
+    }
+
+    #[test]
+    fn levelled_rows_equal_the_resource_schedule() {
+        let g = pool();
+        let b = levelled_of(&g, &one_agent()).unwrap();
+        let expected: Vec<(String, f32, f32)> =
+            crate::resource_schedule::resource_schedule(&g, &one_agent())
+                .unwrap()
+                .rows
+                .into_iter()
+                .map(|r| (r.id, r.start, r.finish))
+                .collect();
+        let got: Vec<(String, f32, f32)> = b.rows.into_iter().map(|r| (r.id, r.es, r.ef)).collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn levelled_budget_equals_the_cpm_budget() {
+        let g = pool();
+        let cpm = compute_cpm(&g).unwrap();
+        let plain = build_baseline(&g, &cpm, at(2026, 1, 5, 0), None, 1).unwrap();
+        assert!(near(levelled_of(&g, &one_agent()).unwrap().bac, plain.bac));
+    }
+
+    #[test]
+    fn levelled_baseline_rejects_an_empty_resource_key() {
+        let req = ScheduleRequest {
+            resource_key: String::new(),
+            ..one_agent()
+        };
+        assert!(matches!(
+            levelled_of(&pool(), &req),
+            Err(PlannerError::InvalidValue { .. })
+        ));
+    }
+
+    #[test]
+    fn levelled_baseline_rejects_a_negative_buffer_pct() {
+        let req = ScheduleRequest {
+            project_buffer_pct: -1.0,
+            ..one_agent()
+        };
+        assert!(matches!(
+            levelled_of(&pool(), &req),
+            Err(PlannerError::InvalidValue { .. })
+        ));
+    }
+
+    #[test]
+    fn levelled_baseline_rejects_missing_capacity() {
+        let req = ScheduleRequest {
+            capacities: BTreeMap::from([("human".to_string(), 1)]),
+            ..one_agent()
+        };
+        assert!(matches!(
+            levelled_of(&pool(), &req),
+            Err(PlannerError::InvalidCapacities { .. })
+        ));
+    }
+
+    #[test]
+    fn levelled_baseline_rejects_an_invalid_calendar() {
+        let g = pool();
+        let cpm = compute_cpm(&g).unwrap();
+        let c = Calendar {
+            hours_per_day: 0.0,
+            ..Calendar::default()
+        };
+        let got = build_levelled_baseline(&g, &cpm, at(2026, 1, 5, 0), Some(c), 1, &one_agent());
+        assert!(matches!(got, Err(PlannerError::InvalidGraph { .. })));
+    }
+
+    #[test]
+    fn levelled_critical_float_compares_levelled_finishes() {
+        let b = levelled_of(&pool(), &one_agent()).unwrap();
+        // `a` grows by 2h: the levelled finish moves 25h -> 27h, while the
+        // CPM finish (17h) stays below the frozen 25h.
+        let g = graph(vec![
+            on("agent", "a", 12.0, &[]),
+            on("agent", "b", 10.0, &[]),
+            on("agent", "c", 5.0, &["a", "b"]),
+        ]);
+        let r = report(&b, &g, &HashMap::new(), &HashMap::new(), &HashMap::new(), 0);
+        assert!(near(r.critical_float_consumed_hours, 2.0));
+    }
+
+    #[test]
+    fn levelled_critical_float_falls_back_to_cpm_when_capacity_is_missing() {
+        let b = levelled_of(&pool(), &one_agent()).unwrap();
+        // A new pool has no recorded capacity: CPM finish 30h vs frozen 25h.
+        let mut g = pool();
+        g.deliverables.push(on("human", "d", 5.0, &["c"]));
+        g.deliverables[0].estimated_effort_hours = Some(20.0);
+        let r = report(&b, &g, &HashMap::new(), &HashMap::new(), &HashMap::new(), 0);
+        assert!(near(r.critical_float_consumed_hours, 5.0));
+    }
+
+    #[test]
+    fn baseline_json_without_schedule_reads_as_cpm() {
+        let v = serde_json::json!({
+            "number": 1, "start": "2026-01-05T00:00:00Z", "calendar": null,
+            "rows": [], "bac": 0.0, "finish_hours": 0.0
+        });
+        let b: Baseline = serde_json::from_value(v).unwrap();
+        assert_eq!(b.schedule, BaselineSchedule::default());
+    }
+
+    #[test]
+    fn schedule_kind_serializes_lowercase() {
+        assert_eq!(
+            serde_json::to_value(ScheduleKind::Levelled).unwrap(),
+            serde_json::json!("levelled")
+        );
+    }
+
+    // ── The plan.baseline calendar argument ─────────────────────────────
+
+    #[derive(Debug, Deserialize)]
+    struct Args {
+        #[serde(default)]
+        calendar: BaselineCalendar,
+    }
+
+    fn calendar_arg(v: serde_json::Value) -> Result<BaselineCalendar, serde_json::Error> {
+        serde_json::from_value::<Args>(v).map(|a| a.calendar)
+    }
+
+    #[test]
+    fn absent_calendar_argument_inherits() {
+        assert_eq!(
+            calendar_arg(serde_json::json!({})).unwrap(),
+            BaselineCalendar::Inherit
+        );
+    }
+
+    #[test]
+    fn null_calendar_argument_is_wall_clock() {
+        assert_eq!(
+            calendar_arg(serde_json::json!({ "calendar": null })).unwrap(),
+            BaselineCalendar::WallClock
+        );
+    }
+
+    #[test]
+    fn calendar_object_is_a_single_calendar() {
+        assert_eq!(
+            calendar_arg(serde_json::json!({ "calendar": { "hours_per_day": 6 } })).unwrap(),
+            BaselineCalendar::Single(Calendar {
+                hours_per_day: 6.0,
+                ..Calendar::default()
+            })
+        );
+    }
+
+    #[test]
+    fn calendar_object_with_default_is_a_map() {
+        let got = calendar_arg(serde_json::json!({ "calendar": { "default": {} } })).unwrap();
+        assert!(matches!(got, BaselineCalendar::PerResource(_)));
+    }
+
+    #[test]
+    fn calendar_with_unknown_field_is_a_deserialization_error() {
+        assert!(calendar_arg(serde_json::json!({ "calendar": { "owner": {} } })).is_err());
+    }
+
+    #[test]
+    fn shorthand_calendar_is_the_effective_single_calendar() {
+        let req = BaselineRequest::new(PlanId("p".into())).with_calendar(Calendar::default());
+        assert_eq!(
+            req.effective_calendar(),
+            BaselineCalendar::Single(Calendar::default())
+        );
     }
 }

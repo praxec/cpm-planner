@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::earned_value::{Actuals, Baseline, BaselineRow, Calendar};
+use crate::earned_value::{Actuals, Baseline, BaselineRow, BaselineSchedule, Calendar};
 use crate::plan::{PlanId, PlannerError};
 use crate::plan_store::backend;
 
@@ -343,6 +343,7 @@ pub(crate) fn insert_baseline(
         ],
     )
     .map_err(backend)?;
+    store_baseline_schedule(conn, plan_id, baseline)?;
     Ok(())
 }
 
@@ -434,10 +435,62 @@ pub(crate) fn latest_baseline(
             bac: bac as f32,
             finish_hours,
             backfilled: backfilled != 0,
+            schedule: load_baseline_schedule(conn, plan_id, number)?,
         },
         reason,
         created_at: dt(created_us, "baselines.created_at_us")?,
     }))
+}
+
+/// Write `baseline.schedule` into the `baselines.schedule` column (schema
+/// v6) of the row [`insert_baseline`] just stored. A CPM schedule with no
+/// recorded inputs stays `NULL`, so CPM baselines are stored exactly as
+/// before v6.
+fn store_baseline_schedule(
+    conn: &Connection,
+    plan_id: &PlanId,
+    baseline: &Baseline,
+) -> Result<(), PlannerError> {
+    if baseline.schedule == BaselineSchedule::default() {
+        return Ok(());
+    }
+    let schedule = serde_json::to_string(&baseline.schedule).map_err(backend)?;
+    conn.execute(
+        "UPDATE baselines SET schedule = ?3 WHERE plan_id = ?1 AND number = ?2",
+        params![plan_id.0, baseline.number, schedule],
+    )
+    .map_err(backend)?;
+    Ok(())
+}
+
+/// The recorded schedule of baseline `number` of `plan_id`: `NULL` (every
+/// baseline written before schema v6, and every plain CPM baseline) reads
+/// as the default CPM schedule. A value that does not decode is a
+/// `BACKEND_ERROR` naming the plan and baseline.
+fn load_baseline_schedule(
+    conn: &Connection,
+    plan_id: &PlanId,
+    number: u32,
+) -> Result<BaselineSchedule, PlannerError> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT schedule FROM baselines WHERE plan_id = ?1 AND number = ?2",
+            params![plan_id.0, number],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(backend)?
+        .flatten();
+    raw.map_or_else(
+        || Ok(BaselineSchedule::default()),
+        |raw| {
+            serde_json::from_str(&raw).map_err(|e| {
+                backend(anyhow::anyhow!(
+                    "plan {plan_id}: baseline {number}: stored schedule does not decode: {e}"
+                ))
+            })
+        },
+    )
 }
 
 /// Store one snapshot. Two snapshots of one plan at the same `taken_at`
@@ -661,6 +714,7 @@ mod tests {
             bac: 4.0,
             finish_hours: 2.0,
             backfilled: false,
+            schedule: BaselineSchedule::default(),
         }
     }
 
@@ -1090,5 +1144,83 @@ mod tests {
             plan.iter().any(|d| d.contains("ev_snapshots_by_position")),
             "plan was {plan:?}"
         );
+    }
+
+    fn levelled(number: u32) -> Baseline {
+        Baseline {
+            schedule: BaselineSchedule {
+                kind: crate::earned_value::ScheduleKind::Levelled,
+                capacities: Some([("agent".to_string(), 3)].into_iter().collect()),
+                resource_key: Some("owner".into()),
+                project_buffer_pct: Some(25.0),
+                project_buffer_hours: Some(0.5),
+            },
+            ..baseline(number, None)
+        }
+    }
+
+    fn schedule_column(store: &SqlitePlanStore, plan_id: &PlanId) -> Option<String> {
+        store
+            .read_tx(|tx| {
+                tx.query_row(
+                    "SELECT schedule FROM baselines WHERE plan_id = ?1",
+                    params![plan_id.0],
+                    |r| r.get(0),
+                )
+                .map_err(backend)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn levelled_schedule_round_trips_through_the_store() {
+        let (store, plan_id) = store_with_plan();
+        let b = levelled(1);
+        store
+            .write_tx(|tx| insert_baseline(tx, &plan_id, &b, None, at(1)))
+            .unwrap();
+        let got = store.read_tx(|tx| latest_baseline(tx, &plan_id)).unwrap();
+        assert_eq!(got.map(|s| s.baseline.schedule), Some(b.schedule));
+    }
+
+    #[test]
+    fn cpm_baseline_leaves_the_schedule_column_null() {
+        let (store, plan_id) = store_with_plan();
+        store
+            .write_tx(|tx| insert_baseline(tx, &plan_id, &baseline(1, None), None, at(1)))
+            .unwrap();
+        assert_eq!(schedule_column(&store, &plan_id), None);
+    }
+
+    #[test]
+    fn baseline_without_a_schedule_reads_as_cpm() {
+        let (store, plan_id) = store_with_plan();
+        raw_baseline(
+            &store,
+            &plan_id,
+            r#"[{"id":"a","es":0.0,"ef":2.0,"budget":2.0}]"#,
+        );
+        let got = store.read_tx(|tx| latest_baseline(tx, &plan_id)).unwrap();
+        assert_eq!(
+            got.map(|s| s.baseline.schedule),
+            Some(BaselineSchedule::default())
+        );
+    }
+
+    #[test]
+    fn undecodable_schedule_is_a_backend_error() {
+        let (store, plan_id) = store_with_plan();
+        store
+            .write_tx(|tx| {
+                insert_baseline(tx, &plan_id, &baseline(1, None), None, at(1))?;
+                tx.execute(
+                    "UPDATE baselines SET schedule = '{\"kind\":\"sideways\"}'",
+                    [],
+                )
+                .map_err(backend)
+            })
+            .unwrap();
+        let err = store.read_tx(|tx| latest_baseline(tx, &plan_id));
+        assert!(matches!(err, Err(PlannerError::BackendError(_))));
     }
 }
