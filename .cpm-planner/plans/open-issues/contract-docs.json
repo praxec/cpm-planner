@@ -174,7 +174,8 @@
       "id": "overview-evidence",
       "owned_files": [
         "src/overview.rs",
-        "tests/overview.rs"
+        "tests/overview.rs",
+        "docs/overview.md"
       ],
       "prerequisites": [
         {
@@ -198,7 +199,7 @@
           "#128",
           "#130"
         ],
-        "artifact": "Overview rows show live current/stale evidence with the changed identity fields; tests for stale-after-change",
+        "artifact": "Overview rows show live current/stale evidence with the changed identity fields; tests for stale-after-change; docs/overview.md aligned with the shipped explain/v1 (ready_critical definition, in_progress state, slack_hours and blocked_by fields) and the evidence verdict vocabulary",
         "verify": "cargo nextest run --test overview"
       }
     },
