@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Evidence bound to its governed identity (`docs/evidence.md`, version 1; library API in
+  `cpm_planner::evidence`). `plan.mark_status` and `plan.accept` take an `Evidence` that is a plain
+  note or a record with a scope (`focused`, `gate`, `manual_approval`, `external_signoff`, `merge`,
+  `publish`, `activation`) and an identity (tree, dependency lock, toolchain, test contract,
+  environment). Records are stored with who recorded them, when, the plan revision and a digest of
+  the deliverable's definition. `BasicCpmPlanner::evidence_status` reports each deliverable's
+  evidence as `current`, `stale` (naming each changed field, including `definition`), `unknown`,
+  `unbound` or `none` against an optional target identity, or a gate's `metadata.candidate`.
+- Scope rules: a record whose scope may not close the deliverable is refused
+  (`EVIDENCE_SCOPE_MISMATCH`), so focused evidence cannot close a gate and gate evidence cannot
+  close an approval, sign-off, merge, publish or activation. A declared `metadata.evidence_scope`
+  must be met (`EVIDENCE_REQUIRED`), and a gate must close with evidence that matches its
+  candidate (`EVIDENCE_STALE`). Malformed records are `INVALID_EVIDENCE`.
+
+### Changed
+
+- `plan.accept` also appends its evidence to the deliverable's evidence list; at 100 entries it
+  drops the oldest instead of refusing. `MarkStatusRequest::evidence` and `AcceptRequest::evidence`
+  are now `cpm_planner::evidence::Evidence`; `with_evidence` and `AcceptRequest::new` still take a
+  `&str` or `String`, and plain strings behave as before.
+
 ## [0.6.0] - 2026-11-09
 
 ### Added

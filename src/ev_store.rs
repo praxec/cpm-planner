@@ -51,7 +51,105 @@ pub(crate) struct ReportedActuals {
     /// Replaces the stored actual hours when set.
     pub(crate) actual_hours: Option<f32>,
     /// Appended to the stored evidence list when set.
-    pub(crate) evidence: Option<String>,
+    pub(crate) evidence: Option<EvidenceAppend>,
+}
+
+/// One evidence entry to append, and what to do at
+/// [`crate::plan::MAX_EVIDENCE_ENTRIES`]: `mark_status` refuses
+/// (`INVALID_ACTUALS`); `accept` drops the oldest entry first, so acceptance
+/// is never blocked by bookkeeping.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct EvidenceAppend {
+    pub(crate) entry: crate::evidence::StoredEvidence,
+    pub(crate) drop_oldest_at_cap: bool,
+}
+
+impl From<String> for EvidenceAppend {
+    fn from(note: String) -> Self {
+        Self {
+            entry: crate::evidence::StoredEvidence::Note(note),
+            drop_oldest_at_cap: false,
+        }
+    }
+}
+
+impl From<&str> for EvidenceAppend {
+    fn from(note: &str) -> Self {
+        Self::from(note.to_string())
+    }
+}
+
+/// Decode a stored `ev_actuals.evidence` column: a JSON array whose
+/// elements are notes (strings) or stored records.
+fn decode_evidence(
+    plan_id: &PlanId,
+    deliverable_id: &str,
+    json: &str,
+) -> Result<Vec<crate::evidence::StoredEvidence>, PlannerError> {
+    serde_json::from_str(json).map_err(|e| {
+        backend(anyhow::anyhow!(
+            "plan {plan_id}: stored evidence for {deliverable_id} is not a JSON list of notes \
+             and records: {e}"
+        ))
+    })
+}
+
+/// The stored evidence of every deliverable of `plan_id` with at least one
+/// entry, in append order.
+pub(crate) fn load_evidence(
+    conn: &Connection,
+    plan_id: &PlanId,
+) -> Result<HashMap<String, Vec<crate::evidence::StoredEvidence>>, PlannerError> {
+    let mut stmt = conn
+        .prepare("SELECT deliverable_id, evidence FROM ev_actuals WHERE plan_id = ?1")
+        .map_err(backend)?;
+    let rows = stmt
+        .query_map(params![plan_id.0], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
+        .map_err(backend)?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (id, json) = row.map_err(backend)?;
+        let entries = decode_evidence(plan_id, &id, &json)?;
+        if !entries.is_empty() {
+            out.insert(id, entries);
+        }
+    }
+    Ok(out)
+}
+
+/// The stored evidence of one deliverable (empty without a row).
+pub(crate) fn load_deliverable_evidence(
+    conn: &Connection,
+    plan_id: &PlanId,
+    deliverable_id: &str,
+) -> Result<Vec<crate::evidence::StoredEvidence>, PlannerError> {
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT evidence FROM ev_actuals WHERE plan_id = ?1 AND deliverable_id = ?2",
+            params![plan_id.0, deliverable_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(backend)?;
+    stored.map_or_else(
+        || Ok(Vec::new()),
+        |json| decode_evidence(plan_id, deliverable_id, &json),
+    )
+}
+
+/// The plan's head revision: the newest stored revision, or 1 for a plan
+/// with no revision rows yet.
+pub(crate) fn head_revision(conn: &Connection, plan_id: &PlanId) -> Result<u32, PlannerError> {
+    let max: Option<u32> = conn
+        .query_row(
+            "SELECT MAX(revision) FROM revisions WHERE plan_id = ?1",
+            params![plan_id.0],
+            |r| r.get(0),
+        )
+        .map_err(backend)?;
+    Ok(max.unwrap_or(1))
 }
 
 fn dt(us: i64, column: &str) -> Result<DateTime<Utc>, PlannerError> {
@@ -105,11 +203,12 @@ pub(crate) fn load_actuals(
         let removed_at = removed_us
             .map(|us| dt(us, "ev_actuals.removed_at_us"))
             .transpose()?;
-        let evidence: Vec<String> = serde_json::from_str(&evidence).map_err(|e| {
-            backend(anyhow::anyhow!(
-                "plan {plan_id}: stored evidence for {id} is not a JSON string list: {e}"
-            ))
-        })?;
+        // A record reads as its summary here; the full entries come from
+        // `load_evidence`.
+        let evidence: Vec<String> = decode_evidence(plan_id, &id, &evidence)?
+            .iter()
+            .map(|e| e.display_text().to_string())
+            .collect();
         out.insert(
             id,
             Actuals {
@@ -169,15 +268,16 @@ pub(crate) fn record_reported(
         )
         .optional()
         .map_err(backend)?;
-    let mut evidence: Vec<String> = match &stored {
-        Some(json) => serde_json::from_str(json).map_err(|e| {
-            backend(anyhow::anyhow!(
-                "plan {plan_id}: stored evidence for {deliverable_id} is not a JSON string list: {e}"
-            ))
-        })?,
+    let mut evidence = match &stored {
+        Some(json) => decode_evidence(plan_id, deliverable_id, json)?,
         None => Vec::new(),
     };
-    if let Some(e) = &report.evidence {
+    if let Some(append) = &report.evidence {
+        if append.drop_oldest_at_cap {
+            let excess = (evidence.len() + 1).saturating_sub(crate::plan::MAX_EVIDENCE_ENTRIES);
+            evidence.drain(..excess);
+        }
+        let e = &append.entry;
         if evidence.len() >= crate::plan::MAX_EVIDENCE_ENTRIES {
             return Err(PlannerError::InvalidActuals {
                 reason: format!(
@@ -283,8 +383,9 @@ pub(crate) fn carry_actuals(
             continue;
         };
         let new = target.remove(id).unwrap_or_default();
-        let mut evidence = old.evidence.clone();
-        evidence.extend(new.evidence);
+        // Full entries, so carried records keep their identity.
+        let mut evidence = load_deliverable_evidence(conn, from, id)?;
+        evidence.extend(load_deliverable_evidence(conn, to, id)?);
         // Keep the newest entries only, so a merged row never exceeds the cap.
         let excess = evidence
             .len()
@@ -717,7 +818,7 @@ mod tests {
             })
             .unwrap();
         let note = |e: String| ReportedActuals {
-            evidence: Some(e),
+            evidence: Some(e.into()),
             ..Default::default()
         };
         store
