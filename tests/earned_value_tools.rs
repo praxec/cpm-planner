@@ -5,19 +5,22 @@
 
 #![allow(clippy::float_cmp)]
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use cpm_planner::BasicCpmPlanner;
 use cpm_planner::audit::MemoryAuditSink;
 use cpm_planner::earned_value::{
-    BaselineRequest, Calendar, EvRowStatus, SnapshotFormat, SnapshotRequest,
+    BaselineCalendar, BaselineOutcome, BaselineRequest, Calendar, EvRowStatus, ScheduleKind,
+    SnapshotFormat, SnapshotRequest,
 };
 use cpm_planner::plan::{
     AcquireRequest, CallerId, Deliverable, DeliverableStatus, MarkStatusRequest, PlanGraph, PlanId,
     PlannerError, ReviseRequest, SyncRequest,
 };
 use cpm_planner::ports::Planner;
+use cpm_planner::resource_schedule::{ScheduleRequest, resource_schedule};
 
 fn t0() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 1, 5, 0, 0, 0).unwrap()
@@ -788,4 +791,438 @@ async fn rebaseline_without_calendar_inherits_previous_calendar() {
         .await
         .unwrap();
     assert_eq!(out.calendar, Some(calendar));
+}
+
+// ── Levelled baselines (#132, docs/calendars.md section 4) ──────────────
+
+/// `a` and `b` (10h each, on `agent`) feed `c` (5h, on `agent`). CPM runs
+/// `a` and `b` together (finish 15h); one agent levels them in sequence
+/// (`a` 0-10, `b` 10-20, `c` 20-25).
+fn pool_graph() -> PlanGraph {
+    let on_agent = |id: &str, effort: f32, prereqs: &[&str]| Deliverable {
+        metadata: serde_json::json!({"owner": "agent"}),
+        ..deliverable(id, effort, prereqs)
+    };
+    PlanGraph {
+        deliverables: vec![
+            on_agent("a", 10.0, &[]),
+            on_agent("b", 10.0, &[]),
+            on_agent("c", 5.0, &["a", "b"]),
+        ],
+        max_chained_dispatch: None,
+    }
+}
+
+fn one_agent() -> BTreeMap<String, u32> {
+    BTreeMap::from([("agent".to_string(), 1)])
+}
+
+impl Fixture {
+    async fn pool_plan(&self) -> PlanId {
+        self.planner.submit_plan(pool_graph()).await.unwrap()
+    }
+
+    async fn levelled(&self) -> (PlanId, BaselineOutcome) {
+        let plan_id = self.pool_plan().await;
+        let out = self
+            .planner
+            .baseline(BaselineRequest::new(plan_id.clone()).with_capacities(one_agent()))
+            .await
+            .unwrap();
+        (plan_id, out)
+    }
+
+    async fn rebaseline(&self, req: BaselineRequest) -> Result<BaselineOutcome, PlannerError> {
+        self.planner.baseline(req.with_reason("replan")).await
+    }
+
+    async fn pv_at(&self, plan_id: &PlanId, hours: i64) -> f32 {
+        self.planner
+            .ev(plan_id, Some(t0() + Duration::hours(hours)))
+            .await
+            .unwrap()
+            .pv
+    }
+
+    async fn baseline_err(&self, req: BaselineRequest) -> PlannerError {
+        self.planner.baseline(req).await.unwrap_err()
+    }
+}
+
+#[tokio::test]
+async fn baseline_without_capacities_freezes_cpm() {
+    let f = Fixture::new();
+    let plan_id = f.pool_plan().await;
+    let out = f
+        .planner
+        .baseline(BaselineRequest::new(plan_id))
+        .await
+        .unwrap();
+    assert_eq!(out.schedule, ScheduleKind::Cpm);
+}
+
+#[tokio::test]
+async fn cpm_baseline_records_no_capacities() {
+    let f = Fixture::new();
+    let plan_id = f.pool_plan().await;
+    let out = f
+        .planner
+        .baseline(BaselineRequest::new(plan_id))
+        .await
+        .unwrap();
+    assert_eq!(out.capacities, None);
+}
+
+#[tokio::test]
+async fn baseline_with_capacities_freezes_the_levelled_schedule() {
+    let f = Fixture::new();
+    let (_, out) = f.levelled().await;
+    assert_eq!(out.schedule, ScheduleKind::Levelled);
+}
+
+#[tokio::test]
+async fn levelled_baseline_records_its_capacities() {
+    let f = Fixture::new();
+    let (_, out) = f.levelled().await;
+    assert_eq!(out.capacities, Some(one_agent()));
+}
+
+#[tokio::test]
+async fn levelled_baseline_records_the_default_resource_key() {
+    let f = Fixture::new();
+    let (_, out) = f.levelled().await;
+    assert_eq!(out.resource_key.as_deref(), Some("owner"));
+}
+
+#[tokio::test]
+async fn levelled_baseline_finish_is_the_plan_schedule_makespan() {
+    let f = Fixture::new();
+    let (_, out) = f.levelled().await;
+    let schedule = resource_schedule(
+        &pool_graph(),
+        &ScheduleRequest {
+            capacities: one_agent(),
+            resource_key: "owner".into(),
+            project_buffer_pct: 25.0,
+        },
+    )
+    .unwrap();
+    assert_eq!(out.finish_hours, schedule.makespan);
+}
+
+#[tokio::test]
+async fn levelled_baseline_records_the_project_buffer() {
+    let f = Fixture::new();
+    let (_, out) = f.levelled().await;
+    // 25% of the 25h driving chain a -> b -> c.
+    assert_eq!(out.project_buffer_hours, Some(6.25));
+}
+
+#[tokio::test]
+async fn cpm_pv_front_loads_parallel_work() {
+    let f = Fixture::new();
+    let plan_id = f.pool_plan().await;
+    f.planner
+        .baseline(BaselineRequest::new(plan_id.clone()))
+        .await
+        .unwrap();
+    assert_eq!(f.pv_at(&plan_id, 10).await, 20.0);
+}
+
+#[tokio::test]
+async fn levelled_pv_follows_the_levelled_schedule() {
+    let f = Fixture::new();
+    let (plan_id, _) = f.levelled().await;
+    assert_eq!(f.pv_at(&plan_id, 10).await, 10.0);
+}
+
+#[tokio::test]
+async fn levelled_pv_reaches_bac_at_the_levelled_finish() {
+    let f = Fixture::new();
+    let (plan_id, _) = f.levelled().await;
+    assert_eq!(f.pv_at(&plan_id, 25).await, 25.0);
+}
+
+#[tokio::test]
+async fn ev_reports_the_levelled_schedule_kind() {
+    let f = Fixture::new();
+    let (plan_id, _) = f.levelled().await;
+    let report = f.planner.ev(&plan_id, None).await.unwrap();
+    assert_eq!(report.schedule, ScheduleKind::Levelled);
+}
+
+#[tokio::test]
+async fn ev_reports_the_levelled_capacities() {
+    let f = Fixture::new();
+    let (plan_id, _) = f.levelled().await;
+    let report = f.planner.ev(&plan_id, None).await.unwrap();
+    assert_eq!(report.capacities, Some(one_agent()));
+}
+
+#[tokio::test]
+async fn status_reports_the_baseline_schedule_kind() {
+    let f = Fixture::new();
+    let (plan_id, _) = f.levelled().await;
+    let status = f.planner.status(&plan_id).await.unwrap();
+    assert_eq!(
+        status.baseline.map(|b| b.schedule),
+        Some(ScheduleKind::Levelled)
+    );
+}
+
+#[tokio::test]
+async fn levelled_baseline_audit_records_the_schedule_kind() {
+    let f = Fixture::new();
+    f.levelled().await;
+    let event = f.audit.snapshot().pop().unwrap();
+    assert_eq!(event.payload["schedule"], serde_json::json!("levelled"));
+}
+
+#[tokio::test]
+async fn rebaseline_without_capacities_reuses_the_previous_capacities() {
+    let f = Fixture::new();
+    let (plan_id, _) = f.levelled().await;
+    let out = f.rebaseline(BaselineRequest::new(plan_id)).await.unwrap();
+    assert_eq!(out.capacities, Some(one_agent()));
+}
+
+#[tokio::test]
+async fn rebaseline_without_capacities_stays_levelled() {
+    let f = Fixture::new();
+    let (plan_id, _) = f.levelled().await;
+    let out = f.rebaseline(BaselineRequest::new(plan_id)).await.unwrap();
+    assert_eq!(out.schedule, ScheduleKind::Levelled);
+}
+
+#[tokio::test]
+async fn rebaseline_reuses_the_previous_project_buffer_pct() {
+    let f = Fixture::new();
+    let plan_id = f.pool_plan().await;
+    f.planner
+        .baseline(
+            BaselineRequest::new(plan_id.clone())
+                .with_capacities(one_agent())
+                .with_project_buffer_pct(10.0),
+        )
+        .await
+        .unwrap();
+    let out = f.rebaseline(BaselineRequest::new(plan_id)).await.unwrap();
+    assert_eq!(out.project_buffer_pct, Some(10.0));
+}
+
+#[tokio::test]
+async fn rebaseline_with_new_capacities_replaces_the_previous_ones() {
+    let f = Fixture::new();
+    let (plan_id, _) = f.levelled().await;
+    let two = BTreeMap::from([("agent".to_string(), 2)]);
+    let out = f
+        .rebaseline(BaselineRequest::new(plan_id).with_capacities(two))
+        .await
+        .unwrap();
+    // Two agents run a and b together: finish 15h, as CPM.
+    assert_eq!(out.finish_hours, 15.0);
+}
+
+#[tokio::test]
+async fn rebaseline_with_schedule_cpm_returns_to_cpm() {
+    let f = Fixture::new();
+    let (plan_id, _) = f.levelled().await;
+    let out = f
+        .rebaseline(BaselineRequest::new(plan_id).with_schedule(ScheduleKind::Cpm))
+        .await
+        .unwrap();
+    assert_eq!(out.schedule, ScheduleKind::Cpm);
+}
+
+#[tokio::test]
+async fn rebaseline_after_cpm_reset_stays_cpm() {
+    let f = Fixture::new();
+    let (plan_id, _) = f.levelled().await;
+    f.rebaseline(BaselineRequest::new(plan_id.clone()).with_schedule(ScheduleKind::Cpm))
+        .await
+        .unwrap();
+    let out = f.rebaseline(BaselineRequest::new(plan_id)).await.unwrap();
+    assert_eq!(out.schedule, ScheduleKind::Cpm);
+}
+
+#[tokio::test]
+async fn capacities_with_schedule_cpm_are_invalid_value() {
+    let f = Fixture::new();
+    let plan_id = f.pool_plan().await;
+    let err = f
+        .baseline_err(
+            BaselineRequest::new(plan_id)
+                .with_capacities(one_agent())
+                .with_schedule(ScheduleKind::Cpm),
+        )
+        .await;
+    assert!(matches!(err, PlannerError::InvalidValue { .. }), "{err}");
+}
+
+#[tokio::test]
+async fn schedule_levelled_without_capacities_is_invalid_value() {
+    let f = Fixture::new();
+    let plan_id = f.pool_plan().await;
+    let err = f
+        .baseline_err(BaselineRequest::new(plan_id).with_schedule(ScheduleKind::Levelled))
+        .await;
+    assert!(matches!(err, PlannerError::InvalidValue { .. }), "{err}");
+}
+
+#[tokio::test]
+async fn schedule_levelled_with_inherited_capacities_is_accepted() {
+    let f = Fixture::new();
+    let (plan_id, _) = f.levelled().await;
+    let out = f
+        .rebaseline(BaselineRequest::new(plan_id).with_schedule(ScheduleKind::Levelled))
+        .await
+        .unwrap();
+    assert_eq!(out.capacities, Some(one_agent()));
+}
+
+#[tokio::test]
+async fn resource_key_without_capacities_is_invalid_value() {
+    let f = Fixture::new();
+    let plan_id = f.pool_plan().await;
+    let err = f
+        .baseline_err(BaselineRequest::new(plan_id).with_resource_key("team"))
+        .await;
+    assert!(matches!(err, PlannerError::InvalidValue { .. }), "{err}");
+}
+
+#[tokio::test]
+async fn project_buffer_pct_with_schedule_cpm_is_invalid_value() {
+    let f = Fixture::new();
+    let plan_id = f.pool_plan().await;
+    let err = f
+        .baseline_err(
+            BaselineRequest::new(plan_id)
+                .with_project_buffer_pct(10.0)
+                .with_schedule(ScheduleKind::Cpm),
+        )
+        .await;
+    assert!(matches!(err, PlannerError::InvalidValue { .. }), "{err}");
+}
+
+#[tokio::test]
+async fn empty_resource_key_is_invalid_value() {
+    let f = Fixture::new();
+    let plan_id = f.pool_plan().await;
+    let err = f
+        .baseline_err(
+            BaselineRequest::new(plan_id)
+                .with_capacities(one_agent())
+                .with_resource_key(""),
+        )
+        .await;
+    assert!(matches!(err, PlannerError::InvalidValue { .. }), "{err}");
+}
+
+#[tokio::test]
+async fn project_buffer_pct_out_of_range_is_invalid_value() {
+    let f = Fixture::new();
+    let plan_id = f.pool_plan().await;
+    let err = f
+        .baseline_err(
+            BaselineRequest::new(plan_id)
+                .with_capacities(one_agent())
+                .with_project_buffer_pct(101.0),
+        )
+        .await;
+    assert!(matches!(err, PlannerError::InvalidValue { .. }), "{err}");
+}
+
+#[tokio::test]
+async fn missing_capacity_matches_the_plan_schedule_refusal() {
+    let f = Fixture::new();
+    let plan_id = f.pool_plan().await;
+    let none = BTreeMap::from([("human".to_string(), 1)]);
+    let err = f
+        .baseline_err(BaselineRequest::new(plan_id).with_capacities(none.clone()))
+        .await;
+    let expected = resource_schedule(
+        &pool_graph(),
+        &ScheduleRequest {
+            capacities: none,
+            resource_key: "owner".into(),
+            project_buffer_pct: 25.0,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(err.to_string(), expected.to_string());
+}
+
+#[tokio::test]
+async fn refused_levelled_baseline_stores_nothing() {
+    let f = Fixture::new();
+    let plan_id = f.pool_plan().await;
+    let none = BTreeMap::from([("human".to_string(), 1)]);
+    f.baseline_err(BaselineRequest::new(plan_id.clone()).with_capacities(none))
+        .await;
+    let err = f.planner.ev(&plan_id, None).await.unwrap_err();
+    assert!(matches!(err, PlannerError::NotBaselined { .. }), "{err}");
+}
+
+// ── calendar: null and per-resource maps ────────────────────────────────
+
+#[tokio::test]
+async fn rebaseline_with_null_calendar_returns_to_wall_clock_hours() {
+    let f = Fixture::new();
+    let plan_id = f.plan().await;
+    f.planner
+        .baseline(BaselineRequest::new(plan_id.clone()).with_calendar(Calendar::default()))
+        .await
+        .unwrap();
+    let out = f
+        .rebaseline(BaselineRequest::new(plan_id).with_calendar_input(BaselineCalendar::WallClock))
+        .await
+        .unwrap();
+    assert_eq!(out.calendar, None);
+}
+
+#[tokio::test]
+async fn calendar_input_overrides_the_calendar_shorthand() {
+    let f = Fixture::new();
+    let plan_id = f.plan().await;
+    let out = f
+        .planner
+        .baseline(
+            BaselineRequest::new(plan_id)
+                .with_calendar(Calendar::default())
+                .with_calendar_input(BaselineCalendar::WallClock),
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.calendar, None);
+}
+
+#[tokio::test]
+async fn per_resource_calendar_map_is_invalid_value_for_now() {
+    let f = Fixture::new();
+    let plan_id = f.plan().await;
+    let map = BaselineCalendar::from_json(Some(serde_json::json!({
+        "default": {"hours_per_day": 24},
+        "owner": {"hours_per_day": 8}
+    })))
+    .unwrap();
+    let err = f
+        .baseline_err(BaselineRequest::new(plan_id).with_calendar_input(map))
+        .await;
+    assert!(matches!(err, PlannerError::InvalidValue { .. }), "{err}");
+}
+
+#[tokio::test]
+async fn single_calendar_with_out_of_range_value_keeps_invalid_graph() {
+    let f = Fixture::new();
+    let plan_id = f.plan().await;
+    let calendar = Calendar {
+        hours_per_day: 25.0,
+        ..Calendar::default()
+    };
+    let err = f
+        .baseline_err(
+            BaselineRequest::new(plan_id).with_calendar_input(BaselineCalendar::Single(calendar)),
+        )
+        .await;
+    assert!(matches!(err, PlannerError::InvalidGraph { .. }), "{err}");
 }

@@ -235,8 +235,8 @@ impl BasicCpmPlanner {
         self
     }
 
-    /// The backing store, for in-crate tests that inspect tables directly.
-    #[cfg(test)]
+    /// The backing store: for in-crate tests that inspect tables directly,
+    /// and the read-only evidence queries in [`crate::evidence`].
     pub(crate) fn store(&self) -> &SqlitePlanStore {
         &self.store
     }
@@ -1556,7 +1556,15 @@ impl Planner for BasicCpmPlanner {
             ids,
             metadata_filter,
             ttl,
+            thread,
+            affinity_seconds,
         } = req;
+        crate::affinity::validate_thread_argument(thread.as_deref())?;
+        // Deference window to other callers' threads, bounded by the max TTL.
+        let affinity_window = Duration::from_secs(
+            affinity_seconds.unwrap_or(crate::affinity::DEFAULT_AFFINITY_SECONDS),
+        )
+        .min(self.max_ttl);
         let now = self.now();
         let expires_at = now
             + chrono::Duration::from_std(self.effective_ttl(ttl))
@@ -1744,7 +1752,50 @@ impl Planner for BasicCpmPlanner {
                         && !lapse_blocked.iter().any(|b| b.id == d.id)
                 }));
             }
-            ready.sort_by_key(|d| priority_key(&d.id, &sched_by_id));
+            // 4b. Thread affinity (docs/threads.md): hold back deliverables
+            //     another caller's thread claims within this caller's
+            //     deference window, then rank affine work first. A plan
+            //     without threads skips this, so its order is unchanged.
+            let affinity = if crate::affinity::has_threads(&state.graph) {
+                let handoffs = crate::affinity::current_handoffs(
+                    state,
+                    crate::affinity::load_handoffs(tx, &plan_id)?,
+                );
+                Some(crate::affinity::AffinityView::new(
+                    handoffs,
+                    &caller_id.0,
+                    thread.as_deref(),
+                    affinity_window,
+                    now,
+                ))
+            } else {
+                None
+            };
+            if let Some(view) = &affinity {
+                ready.retain(|d| match view.hold(d) {
+                    Some(hold) => {
+                        blocked.push(BlockedDeliverable {
+                            id: d.id.clone(),
+                            code: "AFFINITY_HOLD".to_string(),
+                            reason: format!(
+                                "held for {} for another {}s (its thread's last step); \
+                                 lower affinity_seconds to take it now",
+                                hold.caller, hold.remaining_seconds
+                            ),
+                        });
+                        false
+                    }
+                    None => true,
+                });
+            }
+            ready.sort_by_key(|d| {
+                (
+                    affinity
+                        .as_ref()
+                        .map_or(crate::affinity::Rank::Neutral, |v| v.rank(d)),
+                    priority_key(&d.id, &sched_by_id),
+                )
+            });
 
             // 5. Greedy fill with file-disjointness check. Requested ids that
             //    are skipped are reported as FILE_CONFLICT / MAX_COUNT.
@@ -1884,13 +1935,23 @@ impl Planner for BasicCpmPlanner {
             &status,
             earned_pct.map(f64::from),
             actual_effort_hours.map(f64::from),
-            evidence.as_deref(),
+            evidence
+                .as_ref()
+                .and_then(crate::evidence::Evidence::as_note),
         )?;
-        let report = crate::ev_store::ReportedActuals {
+        if let Some(record) = evidence
+            .as_ref()
+            .and_then(crate::evidence::Evidence::as_record)
+        {
+            record.validate()?;
+        }
+        // The evidence entry is stamped (and the closing rules checked)
+        // inside the transaction, below.
+        let mut report = crate::ev_store::ReportedActuals {
             // Accepted alongside Complete, but ignored there.
             earned_pct: earned_pct.filter(|_| status == DeliverableStatus::InProgress),
             actual_hours: actual_effort_hours,
-            evidence,
+            evidence: None,
         };
         let deliverable_id = deliverable_id.as_str();
         let caller_id = &caller_id;
@@ -1951,6 +2012,41 @@ impl Planner for BasicCpmPlanner {
                     caller_id: caller_id.0.clone(),
                     deliverable_id: deliverable_id.to_string(),
                 });
+            }
+
+            // Evidence scope and closing rules (docs/evidence.md); closing
+            // means moving to Complete from another status.
+            report.evidence = crate::evidence::prepare_evidence(
+                tx,
+                &plan_id,
+                &state.graph,
+                deliverable_id,
+                evidence.as_ref(),
+                is_complete && !matches!(previous_status, DeliverableStatus::Complete),
+                &caller_id.0,
+                crate::evidence::Via::MarkStatus,
+                now,
+            )?;
+
+            // Thread handoff: the caller that completes a threaded
+            // deliverable is offered the thread's next step first.
+            if is_complete
+                && !matches!(previous_status, DeliverableStatus::Complete)
+                && let Some(thread) = state
+                    .graph
+                    .deliverables
+                    .iter()
+                    .find(|d| d.id == deliverable_id)
+                    .and_then(crate::affinity::thread_of)
+            {
+                crate::affinity::record_handoff(
+                    tx,
+                    &plan_id,
+                    thread,
+                    &caller_id.0,
+                    deliverable_id,
+                    now,
+                )?;
             }
 
             // Progress fields ride along with every accepted mark (also an
@@ -2220,10 +2316,26 @@ impl Planner for BasicCpmPlanner {
                     active_plan: None,
                     definition_drift: None,
                     baseline: None,
+                    threads: Vec::new(),
                 };
                 (status, hash_graph(&state.graph))
             })?;
         status.baseline = baseline;
+        // Threads come from one snapshot of their own, holding the handoffs
+        // too; an unthreaded plan pays nothing.
+        status.threads = self.store.read_tx(|tx| {
+            let Some(state) = crate::plan_store::load_plan_state(tx, plan_id)? else {
+                return Ok(Vec::new());
+            };
+            if !crate::affinity::has_threads(&state.graph) {
+                return Ok(Vec::new());
+            }
+            let handoffs = crate::affinity::current_handoffs(
+                &state,
+                crate::affinity::load_handoffs(tx, plan_id)?,
+            );
+            Ok(crate::affinity::thread_statuses(&state, &handoffs))
+        })?;
         if let Some(info) = info {
             // File I/O outside the read snapshot; the head hash is from it.
             status.definition_drift =
@@ -2248,7 +2360,11 @@ impl Planner for BasicCpmPlanner {
         let plan_id = req.plan_id.clone();
         let deliverable_id = req.deliverable_id.as_str();
         let now = self.now();
-        self.store.mutate_executable_plan(&plan_id, |state| {
+        if let Some(record) = req.evidence.as_record() {
+            record.validate()?;
+        }
+        let store = &self.store;
+        store.mutate_executable_plan_tx(&plan_id, |tx, state| {
             if !state
                 .graph
                 .deliverables
@@ -2298,6 +2414,28 @@ impl Planner for BasicCpmPlanner {
                     missing,
                 });
             }
+
+            // Evidence scope and closing rules (docs/evidence.md). Accept's
+            // evidence is stored too; at the cap the oldest entry goes.
+            let append = crate::evidence::prepare_evidence(
+                tx,
+                &plan_id,
+                &state.graph,
+                deliverable_id,
+                Some(&req.evidence),
+                true,
+                &req.accepted_by,
+                crate::evidence::Via::Accept,
+                now,
+            )?;
+            state.report_actuals(
+                deliverable_id,
+                crate::ev_store::ReportedActuals {
+                    evidence: append,
+                    ..Default::default()
+                },
+                now,
+            );
 
             let plan_done =
                 complete_deliverable(state, deliverable_id, &mut audit_buf, "accepted", now);
