@@ -70,6 +70,14 @@
 //! JSON `{ "questions": …, "state": … }` with object keys sorted at every
 //! level and no whitespace.
 //!
+//! # Provenance
+//!
+//! Every review a configured judge handles records `provider` (`direct` or
+//! `command`) and `endpoint`; once questions are sent, `prompt_hash` (the
+//! request digest) and `question_count`; and once the judge answers, the
+//! `model` token and `usage` (token counts and cost, finite figures only).
+//! None of them ever holds a credential.
+//!
 //! # Findings
 //!
 //! A finding is reported when its probability is at least
@@ -373,6 +381,11 @@ pub struct ReviewReport {
     /// Candidates were left out to respect the question cap.
     pub truncated: bool,
     pub jev_called: bool,
+    /// The review provider that answered or was asked (`direct` or
+    /// `command`, [`JudgmentModel::provider`]); set whenever a judge is
+    /// configured, even when no question was sent or the judge failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     /// Model id the provider reported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -405,6 +418,7 @@ impl ReviewReport {
             proposals: Vec::new(),
             truncated: false,
             jev_called: false,
+            provider: None,
             model: None,
             endpoint: None,
             usage: None,
@@ -515,6 +529,7 @@ pub async fn review(
         .cloned()
         .collect();
     report.truncated = total > selected.len();
+    report.provider = Some(model.provider().to_string());
     report.endpoint = model.endpoint_host();
     if selected.is_empty() {
         return Ok(report);

@@ -350,9 +350,9 @@ fn parse_model(raw: &str, key: &ApiKey) -> Result<String, ConfigError> {
     Ok(raw.to_string())
 }
 
-/// Validate a [`LLM_MODEL_ENV`] value and refuse frontier vendors, matching
-/// Junior's `model-policy.ts`. `openai/gpt-oss*` is the one `openai/`
-/// exception.
+/// Validate a [`LLM_MODEL_ENV`] value and refuse frontier vendors:
+/// cpm-planner's own policy is to generate with commodity models only.
+/// `openai/gpt-oss*` (open weights) is the one `openai/` exception.
 fn parse_generative_model(raw: &str, key: &ApiKey) -> Result<String, ConfigError> {
     let model = parse_model(raw, key)?;
     if frontier_vendor(&model).is_some() {
@@ -564,6 +564,13 @@ pub trait JudgmentModel: Send + Sync {
     /// the provider never reported one. `None` when unknown (fakes).
     fn model_id(&self) -> Option<String> {
         None
+    }
+
+    /// The review provider this judge stands for, recorded in every review
+    /// it answers: `direct` (this process calls the model; the default) or
+    /// `command` (an operator-supplied adapter answers).
+    fn provider(&self) -> &'static str {
+        "direct"
     }
 }
 

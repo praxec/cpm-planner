@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "kind": "plan.review.judgment",
+  "state": {
+    "task": "Review a software delivery plan scheduled with the critical path method. Each question names deliverables by id; their details are in `deliverables`.",
+    "makespan_hours": 10.0,
+    "critical_path": [
+      "parser",
+      "cli"
+    ],
+    "deliverables": [
+      {
+        "id": "cli",
+        "scheduled_hours": 6.0,
+        "float_hours": 0.0,
+        "critical": true,
+        "milestone": false,
+        "description": null,
+        "artifact": "src/cli.rs runs the parser from the command line",
+        "owner": null,
+        "owned_files": [
+          "src/cli.rs"
+        ],
+        "prerequisites": [
+          {
+            "id": "parser",
+            "consumes": "src/parser.rs parse()",
+            "kind": null
+          }
+        ]
+      },
+      {
+        "id": "parser",
+        "scheduled_hours": 4.0,
+        "float_hours": 0.0,
+        "critical": true,
+        "milestone": false,
+        "description": null,
+        "artifact": "src/parser.rs parses plan files",
+        "owner": null,
+        "owned_files": [
+          "src/parser.rs"
+        ],
+        "prerequisites": []
+      }
+    ]
+  },
+  "questions": {
+    "q00": {
+      "type": "choice",
+      "instructions": {
+        "kind": "crash_option",
+        "ids": [
+          "cli"
+        ],
+        "question": "'cli' is on the critical path (6.00 h). Which technique would most realistically shorten it?"
+      },
+      "criteria": {
+        "add_capacity": "add a person or agent to shorten it, at extra coordination effort",
+        "fast_track": "overlap it with its prerequisites or dependents",
+        "none": "no realistic way to shorten it",
+        "reduce_scope": "cut or defer part of its scope"
+      }
+    },
+    "q01": {
+      "type": "noul",
+      "instructions": {
+        "kind": "false_dependency",
+        "ids": [
+          "parser",
+          "cli"
+        ],
+        "question": "'cli' lists 'parser' as a prerequisite (stated as consuming: src/parser.rs parse()). Does that dependency name a concrete artifact from 'parser'? Answer true only when the artifact can be identified."
+      },
+      "criteria": {
+        "false": "no concrete artifact can be named",
+        "true": "a concrete artifact is named"
+      }
+    },
+    "q02": {
+      "type": "noul",
+      "instructions": {
+        "kind": "interface_split",
+        "ids": [
+          "parser",
+          "cli"
+        ],
+        "question": "Could 'cli' start against an interface or contract that 'parser' publishes early (splitting 'parser' into interface and implementation), instead of waiting for all of 'parser'?"
+      }
+    },
+    "q03": {
+      "type": "choice",
+      "instructions": {
+        "kind": "crash_option",
+        "ids": [
+          "parser"
+        ],
+        "question": "'parser' is on the critical path (4.00 h). Which technique would most realistically shorten it?"
+      },
+      "criteria": {
+        "add_capacity": "add a person or agent to shorten it, at extra coordination effort",
+        "fast_track": "overlap it with its prerequisites or dependents",
+        "none": "no realistic way to shorten it",
+        "reduce_scope": "cut or defer part of its scope"
+      }
+    },
+    "q04": {
+      "type": "noul",
+      "instructions": {
+        "kind": "false_dependency",
+        "ids": [
+          "parser",
+          "cli"
+        ],
+        "question": "'cli' lists 'parser' as a prerequisite (stated as consuming: src/parser.rs parse()). Can 'cli' be built and tested correctly on a base without waiting for 'parser' to finish?"
+      },
+      "criteria": {
+        "false": "'cli' needs what 'parser' produces",
+        "true": "'cli' can proceed without 'parser'"
+      }
+    }
+  }
+}
