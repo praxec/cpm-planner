@@ -747,15 +747,59 @@ fn schedule_on_no_calendar_is_byte_for_byte_unchanged() {
     assert_eq!(serde_json::to_string(&s).expect("json"), LEGACY_SCHEDULE);
 }
 
-#[test]
-fn simulate_without_calendar_is_byte_for_byte_unchanged() {
-    let sim = simulate(&legacy_fixture(), &legacy_simulate_request()).expect("simulate");
-    assert_eq!(serde_json::to_string(&sim).expect("json"), LEGACY_SIMULATE);
+/// Whether `actual` matches the golden `expected` exactly in structure, keys,
+/// strings, booleans and integers, and within a relative 1e-6 for floats.
+/// Monte Carlo statistics such as `sensitivity` go through `sqrt` and long
+/// sums, whose last bit differs between x86-64 and aarch64, so a golden string
+/// captured on one cannot be compared byte for byte on the other.
+fn json_matches_golden(actual: &serde_json::Value, expected: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match (actual, expected) {
+        (Value::Number(a), Value::Number(e)) if a.is_f64() || e.is_f64() => {
+            match (a.as_f64(), e.as_f64()) {
+                (Some(a), Some(e)) => (a - e).abs() <= 1e-6 * e.abs().max(1.0),
+                _ => false,
+            }
+        }
+        (Value::Array(a), Value::Array(e)) => {
+            a.len() == e.len() && a.iter().zip(e).all(|(a, e)| json_matches_golden(a, e))
+        }
+        (Value::Object(a), Value::Object(e)) => {
+            a.len() == e.len()
+                && a.iter()
+                    .zip(e)
+                    .all(|((ak, av), (ek, ev))| ak == ek && json_matches_golden(av, ev))
+        }
+        (a, e) => a == e,
+    }
+}
+
+fn legacy_simulate_golden() -> serde_json::Value {
+    serde_json::from_str(LEGACY_SIMULATE).expect("golden simulate json")
 }
 
 #[test]
-fn simulate_on_no_calendar_is_byte_for_byte_unchanged() {
+fn simulate_without_calendar_matches_the_pre_calendar_output() {
+    let sim = simulate(&legacy_fixture(), &legacy_simulate_request()).expect("simulate");
+    let actual = serde_json::to_value(&sim).expect("json");
+    assert!(json_matches_golden(&actual, &legacy_simulate_golden()));
+}
+
+#[test]
+fn simulate_on_no_calendar_matches_the_pre_calendar_output() {
     let sim = simulate_on_calendar(&legacy_fixture(), &legacy_simulate_request(), None)
         .expect("simulate");
-    assert_eq!(serde_json::to_string(&sim).expect("json"), LEGACY_SIMULATE);
+    let actual = serde_json::to_value(&sim).expect("json");
+    assert!(json_matches_golden(&actual, &legacy_simulate_golden()));
+}
+
+#[test]
+fn simulate_on_no_calendar_is_byte_for_byte_simulate() {
+    let plain = simulate(&legacy_fixture(), &legacy_simulate_request()).expect("simulate");
+    let on_none = simulate_on_calendar(&legacy_fixture(), &legacy_simulate_request(), None)
+        .expect("simulate");
+    assert_eq!(
+        serde_json::to_string(&on_none).expect("json"),
+        serde_json::to_string(&plain).expect("json")
+    );
 }
