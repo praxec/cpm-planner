@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::affinity::{MAX_THREAD_CHARS, THREAD_KEY, thread_of};
 use crate::graph::{prerequisite_ids, reachability};
 use crate::plan::{
     Deliverable, FINISH_ID, FileMode, MAX_DELIVERABLES, PlanGraph, PrerequisiteKind, START_ID,
@@ -408,21 +409,38 @@ fn consumes_quality_findings(graph: &PlanGraph) -> Vec<LintFinding> {
     out
 }
 
-/// `metadata` key: the continuity thread a deliverable belongs to.
-pub const THREAD_KEY: &str = "thread";
+/// `THREAD_INVALID`: a `metadata.thread` value that breaks the token rule of
+/// [`crate::affinity::thread_token_problem`], so the planner treats the
+/// deliverable as unthreaded. Holds on any graph.
+fn thread_token_findings(graph: &PlanGraph) -> Vec<LintFinding> {
+    graph
+        .deliverables
+        .iter()
+        .filter_map(|d| {
+            let value = d.metadata.get(THREAD_KEY)?;
+            let problem = crate::affinity::thread_token_error(value)?;
+            Some(finding(
+                "THREAD_INVALID",
+                Severity::Warning,
+                format!(
+                    "'{}' has metadata.{THREAD_KEY} = {value}, which is not a thread token \
+                     ({problem}), so it is treated as unthreaded; use 1 to \
+                     {MAX_THREAD_CHARS} ASCII letters, digits, '.', '_' or '-' starting with a \
+                     letter or digit, or remove the key",
+                    d.id
+                ),
+                vec![d.id.clone()],
+            ))
+        })
+        .collect()
+}
 
 /// `THREAD_BROKEN` for an acyclic graph with unique, known ids. A thread is
 /// meant to stay with one agent session, which holds only when its
 /// deliverables form one dependency chain that no other thread's deliverable
-/// sits inside. Deliverables without `metadata.thread` are never checked.
+/// sits inside. Deliverables without a valid `metadata.thread` (see
+/// [`thread_of`]) are never checked.
 fn thread_findings(graph: &PlanGraph) -> Vec<LintFinding> {
-    fn thread_of(d: &Deliverable) -> Option<&str> {
-        d.metadata
-            .get(THREAD_KEY)
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-    }
     // Thread token -> members sorted by id, so findings never depend on
     // declaration order.
     let mut threads: std::collections::BTreeMap<&str, Vec<&str>> =
@@ -691,6 +709,7 @@ pub fn lint(graph: &PlanGraph) -> LintReport {
         }
     }
     out.extend(waves::undeclared_gate_findings(graph));
+    out.extend(thread_token_findings(graph));
     out.extend(waves::evidence_scope_findings(graph));
     out.extend(waves::scope_folded_findings(graph));
 

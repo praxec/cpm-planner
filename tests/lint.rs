@@ -650,6 +650,37 @@ fn thread_broken_message_explains_the_remediation() {
 }
 
 #[test]
+fn an_invalid_thread_token_is_thread_invalid() {
+    let g = graph(json!([threaded("a", &[], Some("not a token"))]));
+    assert_eq!(
+        finding(&lint(&g), "THREAD_INVALID").map(|f| f.severity),
+        Some(Severity::Warning)
+    );
+}
+
+#[test]
+fn a_non_string_thread_is_thread_invalid() {
+    let mut a = threaded("a", &[], None);
+    a["metadata"]["thread"] = json!(7);
+    assert!(finding(&lint(&graph(json!([a]))), "THREAD_INVALID").is_some());
+}
+
+#[test]
+fn a_valid_thread_token_is_not_thread_invalid() {
+    let g = graph(json!([threaded("a", &[], Some("lint-2.v_1"))]));
+    assert!(finding(&lint(&g), "THREAD_INVALID").is_none());
+}
+
+#[test]
+fn a_deliverable_with_an_invalid_thread_token_is_unthreaded_for_thread_broken() {
+    let g = graph(json!([
+        threaded("a", &[], Some("-t")),
+        threaded("b", &[], Some("-t")),
+    ]));
+    assert!(thread_broken_ids(&lint(&g)).is_empty());
+}
+
+#[test]
 fn thread_broken_does_not_depend_on_declaration_order() {
     let nodes = vec![
         threaded("a", &[], Some("t")),

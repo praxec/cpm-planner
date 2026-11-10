@@ -7,13 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- Lint findings for evidence scopes and continuity threads (#130, #133): `EVIDENCE_SCOPE_INVALID`
-  and `GATE_CANDIDATE_INVALID` (errors), and `GATE_SCOPE_MISSING`, `GATE_CANDIDATE_MISSING`,
-  `SCOPE_FOLDED` and `THREAD_BROKEN` (warnings), each with its remediation. Plans that use gates
-  now warn until each gate declares `metadata.evidence_scope` and, for a regression gate,
-  `metadata.candidate`; `metadata.scope_folded: false` exempts text that only mentions an operation.
 ### Added
 
+- Lint findings for evidence scopes and continuity threads (#130, #133):
+  `EVIDENCE_SCOPE_INVALID` and `GATE_CANDIDATE_INVALID` (errors), and `GATE_SCOPE_MISSING`,
+  `GATE_CANDIDATE_MISSING`, `SCOPE_FOLDED`, `THREAD_BROKEN` and `THREAD_INVALID` (warnings), each
+  with its remediation. Plans that use gates now warn until each gate declares
+  `metadata.evidence_scope` and, for a regression gate, `metadata.candidate`;
+  `metadata.scope_folded: false` exempts text that only mentions an operation.
 - Evidence bound to its governed identity (`docs/evidence.md`, version 1; library API in
   `cpm_planner::evidence`). `plan.mark_status` and `plan.accept` take an `Evidence` that is a plain
   note or a record with a scope (`focused`, `gate`, `manual_approval`, `external_signoff`, `merge`,

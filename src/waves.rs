@@ -830,11 +830,12 @@ pub(crate) fn scope_folded_findings(graph: &PlanGraph) -> Vec<LintFinding> {
             .map(|(scope, phrase)| format!("'{phrase}' ({scope})"))
             .collect::<Vec<_>>()
             .join(", ");
+        let own = effective_scope(d, kind).unwrap_or("none");
         out.push(finding(
             "SCOPE_FOLDED",
             Severity::Warning,
             format!(
-                "{} '{}' names {named}, an operation outside its own evidence scope; split it \
+                "{} '{}' (evidence scope '{own}') names {named}; split each such operation \
                  into its own deliverable (metadata.kind = \"manual\" for approvals and \
                  sign-offs) with the matching metadata.{EVIDENCE_SCOPE_KEY}, or set \
                  metadata.{SCOPE_FOLDED_KEY} = false if the text only mentions it",
