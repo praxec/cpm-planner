@@ -447,7 +447,8 @@
         {
           "path": "CHANGELOG.md",
           "mode": "append"
-        }
+        },
+        "docs/calendars.md"
       ],
       "prerequisites": [
         {
