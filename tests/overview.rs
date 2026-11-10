@@ -320,6 +320,7 @@ fn title_falls_back_to_the_id_without_metadata() {
         active_plan: None,
         definition_drift: None,
         baseline: None,
+        threads: Vec::new(),
     };
     let index = PlanIndex::new(&graph, &status);
     assert_eq!(index.title("ui"), "ui");
