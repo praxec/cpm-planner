@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `plan.review` records its `provider` (`direct` or `command`) beside the model, request digest and
+  usage; an oversized adapter reply is now `decode` rather than a hang or `upstream`; adapter
+  tokens with a key-shaped run are dropped; `docs/review-provider.md` is tool-neutral, with a
+  "Writing an adapter" reference script and conformance fixtures under
+  `docs/review-provider/fixtures/`, and end-to-end fake-adapter tests cover every outcome (#119).
+
 ## [0.6.0] - 2026-11-09
 
 ### Added
