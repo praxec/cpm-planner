@@ -20,12 +20,23 @@
 //! The findings all concern plans that declare gates, except
 //! `UNDECLARED_GATE`, which exists to catch the plan that hides heavy work
 //! inside an ordinary deliverable.
+//!
+//! The evidence-scope findings (`EVIDENCE_SCOPE_INVALID`,
+//! `GATE_SCOPE_MISSING`, `GATE_CANDIDATE_MISSING`, `GATE_CANDIDATE_INVALID`
+//! and `SCOPE_FOLDED`) are the plan-file side of `docs/evidence.md`: they check
+//! that each deliverable declares, or defaults to, the scope of evidence that
+//! may close it, and that no deliverable folds in an operation of another
+//! scope.
 
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
 use crate::estimator::EffortEstimator;
+use crate::evidence::{
+    CANDIDATE_KEY, DeliverableKind, EVIDENCE_SCOPE_KEY, SCOPE_FOLDED_KEY, Scope, declarable_scopes,
+    kind_name, kind_of, scope_requirement,
+};
 use crate::graph::{prerequisite_ids, reachability};
 use crate::lint::{LintFinding, Severity};
 use crate::plan::{Deliverable, PlanGraph};
@@ -532,6 +543,252 @@ pub(crate) fn wave_findings(graph: &PlanGraph, report: &WaveReport) -> Vec<LintF
                 ));
             }
         }
+    }
+    out
+}
+
+// Evidence scopes: the plan-file side of docs/evidence.md, "Lint findings".
+// The vocabulary and the kind/scope table are `crate::evidence`'s, so the
+// lint and the closing rules never disagree.
+
+/// Phrases naming an operation of a scope other than `focused` or `gate`,
+/// matched like [`HEAVY_PHRASES`]. Gate operations themselves are
+/// `UNDECLARED_GATE`'s concern.
+const SCOPE_PHRASES: [(Scope, &[&str]); 5] = [
+    (
+        Scope::ManualApproval,
+        &["approval", "approvals", "approve", "approves"],
+    ),
+    (
+        Scope::ExternalSignoff,
+        &["sign off", "signs off", "signed off", "signoff"],
+    ),
+    (
+        Scope::Merge,
+        &[
+            "merge the pr",
+            "merge the pull request",
+            "merge to main",
+            "merge into main",
+            "merged to main",
+            "merged into main",
+        ],
+    ),
+    (
+        Scope::Publish,
+        &["publish", "publishes", "release to", "tag the release"],
+    ),
+    (
+        Scope::Activation,
+        &[
+            "deploy to production",
+            "deploy to prod",
+            "deployed to production",
+            "activate",
+            "activates",
+            "roll out",
+            "rolls out",
+            "rollout",
+        ],
+    ),
+];
+
+/// Phrases removed before [`SCOPE_PHRASES`] are matched because they name a
+/// check, not the operation: `cargo publish --dry-run` publishes nothing.
+const SCOPE_PHRASE_EXCLUSIONS: [&str; 2] = [" publish dry run ", " publish dryrun "];
+
+fn quoted_list(scopes: &[Scope]) -> String {
+    if scopes.is_empty() {
+        return "none".to_string();
+    }
+    scopes
+        .iter()
+        .map(|s| format!("'{s}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `EVIDENCE_SCOPE_INVALID`, `GATE_SCOPE_MISSING`, `GATE_CANDIDATE_MISSING`
+/// and `GATE_CANDIDATE_INVALID`. Each looks at one deliverable and its own
+/// prerequisite list, so they hold on any graph, well formed or not.
+pub(crate) fn evidence_scope_findings(graph: &PlanGraph) -> Vec<LintFinding> {
+    let mut out = Vec::new();
+    for d in &graph.deliverables {
+        let kind = kind_of(d);
+        let scope_value = d.metadata.get(EVIDENCE_SCOPE_KEY);
+        let requirement = scope_requirement(d);
+        if let (Some(value), Err(_)) = (scope_value, &requirement) {
+            let allowed = declarable_scopes(kind);
+            let shown = match value.as_str() {
+                Some(s) if Scope::parse(s).is_some() => {
+                    format!(
+                        "'{s}', which a {} deliverable may not declare",
+                        kind_name(kind)
+                    )
+                }
+                Some(s) => format!("'{s}', which is not an evidence scope"),
+                None => format!("{value}, which is not a string"),
+            };
+            let remedy = if allowed.is_empty() {
+                format!(
+                    "a {} carries no evidence requirement, so remove the key or change \
+                     metadata.kind",
+                    kind_name(kind)
+                )
+            } else {
+                format!(
+                    "use one of {} for a {} deliverable, or change metadata.kind",
+                    quoted_list(allowed),
+                    kind_name(kind)
+                )
+            };
+            out.push(finding(
+                "EVIDENCE_SCOPE_INVALID",
+                Severity::Error,
+                format!(
+                    "'{}' declares metadata.{EVIDENCE_SCOPE_KEY} = {shown}; {remedy}",
+                    d.id
+                ),
+                vec![d.id.clone()],
+            ));
+        }
+        if kind != DeliverableKind::Gate {
+            if let Some(value) = d.metadata.get(CANDIDATE_KEY) {
+                out.extend(candidate_problem(d, value));
+            }
+            continue;
+        }
+        if scope_value.is_none() {
+            out.push(finding(
+                "GATE_SCOPE_MISSING",
+                Severity::Warning,
+                format!(
+                    "gate '{}' declares no metadata.{EVIDENCE_SCOPE_KEY}; declare 'gate' for a \
+                     regression or CI run, or 'merge', 'publish' or 'activation' for that step",
+                    d.id
+                ),
+                vec![d.id.clone()],
+            ));
+        }
+        match d.metadata.get(CANDIDATE_KEY) {
+            Some(value) => out.extend(candidate_problem(d, value)),
+            None => {
+                let verifies_candidate = requirement
+                    .as_ref()
+                    .is_ok_and(|r| r.required == Some(Scope::Gate));
+                if verifies_candidate {
+                    out.push(finding(
+                        "GATE_CANDIDATE_MISSING",
+                        Severity::Warning,
+                        format!(
+                            "gate '{}' does not record the candidate it verifies; set \
+                             metadata.{CANDIDATE_KEY} to the direct prerequisite that produces \
+                             the integrated candidate",
+                            d.id
+                        ),
+                        vec![d.id.clone()],
+                    ));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `GATE_CANDIDATE_INVALID` when `value`, the `metadata.candidate` of `d`, is
+/// not a string naming one of `d`'s direct prerequisites.
+fn candidate_problem(d: &Deliverable, value: &serde_json::Value) -> Option<LintFinding> {
+    let named = value.as_str();
+    if named.is_some_and(|c| prerequisite_ids(d).any(|p| p == c)) {
+        return None;
+    }
+    let mut ids = vec![d.id.clone()];
+    let shown = match named {
+        Some(c) => {
+            if c != d.id {
+                ids.push(c.to_string());
+            }
+            format!("'{c}', which is not a direct prerequisite")
+        }
+        None => format!("{value}, which is not a string"),
+    };
+    Some(finding(
+        "GATE_CANDIDATE_INVALID",
+        Severity::Error,
+        format!(
+            "'{}' names metadata.{CANDIDATE_KEY} = {shown}; point it at a direct prerequisite id, \
+             or add that edge",
+            d.id
+        ),
+        ids,
+    ))
+}
+
+/// For each scope other than `own` that `d`'s scanned text names, the scope
+/// and the first phrase found, in [`SCOPE_PHRASES`] order.
+fn folded_scopes(d: &Deliverable, own: Option<Scope>) -> Vec<(Scope, &'static str)> {
+    let mut text = scanned_text(d);
+    for excluded in SCOPE_PHRASE_EXCLUSIONS {
+        while text.contains(excluded) {
+            text = text.replace(excluded, " ");
+        }
+    }
+    SCOPE_PHRASES
+        .iter()
+        .filter(|(scope, _)| Some(*scope) != own)
+        .filter_map(|(scope, phrases)| {
+            phrases
+                .iter()
+                .find(|phrase| text.contains(&format!(" {phrase} ")))
+                .map(|phrase| (*scope, *phrase))
+        })
+        .collect()
+}
+
+/// `SCOPE_FOLDED`: an approval, sign-off, merge, publish or activation step
+/// named in a work or gate deliverable whose own scope it is not. Manual
+/// deliverables, milestones that are not gates, compiler-generated release
+/// nodes and `metadata.scope_folded: false` are exempt.
+pub(crate) fn scope_folded_findings(graph: &PlanGraph) -> Vec<LintFinding> {
+    let mut out = Vec::new();
+    for d in &graph.deliverables {
+        let kind = kind_of(d);
+        let exempt = !matches!(kind, DeliverableKind::Work | DeliverableKind::Gate)
+            || d.metadata.get("release").is_some()
+            || d.metadata
+                .get(SCOPE_FOLDED_KEY)
+                .and_then(serde_json::Value::as_bool)
+                == Some(false);
+        if exempt {
+            continue;
+        }
+        // An invalid declaration is EVIDENCE_SCOPE_INVALID's concern; no
+        // phrase names `focused` or `gate`, so `None` then flags the same
+        // phrases the kind's default would.
+        let own = scope_requirement(d).ok().and_then(|r| r.required);
+        let folded = folded_scopes(d, own);
+        if folded.is_empty() {
+            continue;
+        }
+        let named = folded
+            .iter()
+            .map(|(scope, phrase)| format!("'{phrase}' ({scope})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let own = own.map_or("none", Scope::as_str);
+        out.push(finding(
+            "SCOPE_FOLDED",
+            Severity::Warning,
+            format!(
+                "{} '{}' (evidence scope '{own}') names {named}; split each such operation \
+                 into its own deliverable (metadata.kind = \"manual\" for approvals and \
+                 sign-offs) with the matching metadata.{EVIDENCE_SCOPE_KEY}, or set \
+                 metadata.{SCOPE_FOLDED_KEY} = false if the text only mentions it",
+                kind_name(kind),
+                d.id
+            ),
+            vec![d.id.clone()],
+        ));
     }
     out
 }
