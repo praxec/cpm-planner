@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-11-11
+
+### Changed
+
+- Dependencies updated: `rig-core`, `rig-reqwest` and `rig-typesafeai` 0.46, `rusqlite` 0.42
+  (`libsqlite3-sys` 0.40), and every other crate to its latest compatible release.
+
+### Fixed
+
+- `serde_json`'s `preserve_order` feature is declared directly. It was only enabled through
+  `rig-core` 0.45, so updating that crate would have silently sorted the keys of JSON maps the
+  server builds, such as the printed MCP configuration snippets.
+
 ## [0.7.0] - 2026-11-10
 
 ### Added
