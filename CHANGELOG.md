@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The release workflow's npm check retries `npx @matthew-cochran/cpm@X.Y.Z --version` for about
+  ten minutes with `--prefer-online`, instead of two. v0.7.1 was published correctly, but the
+  registry took longer than two minutes to serve it, so the check failed the run.
+
 ## [0.7.1] - 2026-11-11
 
 ### Changed
