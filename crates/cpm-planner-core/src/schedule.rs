@@ -55,7 +55,8 @@ pub fn compute_cpm(graph: &PlanGraph) -> Result<CriticalPathResult, PlannerError
 /// Every root deliverable depends on `__start__`; `__finish__` depends on
 /// every sink (a deliverable no other deliverable lists as a prerequisite).
 /// Only the CPM input is touched; the stored graph never contains them.
-pub(crate) fn add_endpoints(graph: &PlanGraph, tasks: &mut Vec<Task>) {
+#[doc(hidden)]
+pub fn add_endpoints(graph: &PlanGraph, tasks: &mut Vec<Task>) {
     let referenced: HashSet<&str> = graph
         .deliverables
         .iter()
@@ -118,7 +119,8 @@ fn derived_effort(d: &Deliverable, estimator: &EffortEstimator) -> f32 {
 /// `duration_hours`, else `estimated_effort_hours`, else `estimate.likely`,
 /// else `0.0` for a milestone with no duration, else the estimator's
 /// kind-aware effort.
-pub(crate) fn scheduled_length(d: &Deliverable, estimator: &EffortEstimator) -> f32 {
+#[doc(hidden)]
+pub fn scheduled_length(d: &Deliverable, estimator: &EffortEstimator) -> f32 {
     if let Some(hours) = d.duration_hours {
         return hours;
     }
@@ -138,7 +140,8 @@ pub(crate) fn scheduled_length(d: &Deliverable, estimator: &EffortEstimator) -> 
 /// `estimate.likely`, else `0.0` for a milestone, else the estimator's
 /// kind-aware effort. Unlike [`scheduled_length`] this ignores
 /// `duration_hours`: calendar time is not cost.
-pub(crate) fn effort_basis(d: &Deliverable, estimator: &EffortEstimator) -> f32 {
+#[doc(hidden)]
+pub fn effort_basis(d: &Deliverable, estimator: &EffortEstimator) -> f32 {
     if let Some(hours) = d.estimated_effort_hours {
         return hours;
     }
@@ -157,7 +160,8 @@ pub(crate) fn effort_basis(d: &Deliverable, estimator: &EffortEstimator) -> f32 
 /// `complexity` hint can be carried in `metadata` (boolean
 /// `complexity`/`is_complex`) to opt a deliverable into the configured
 /// complexity multiplier.
-pub(crate) fn deliverable_to_task(d: &Deliverable, estimator: &EffortEstimator) -> Task {
+#[doc(hidden)]
+pub fn deliverable_to_task(d: &Deliverable, estimator: &EffortEstimator) -> Task {
     let description = d
         .metadata
         .get("description")
@@ -190,7 +194,8 @@ pub(crate) fn deliverable_to_task(d: &Deliverable, estimator: &EffortEstimator) 
 /// Schedule rows for `graph`: `__start__`, each deliverable in graph order,
 /// then `__finish__`. The synthetic endpoints are flagged. Shared by
 /// `plan.status` and `plan.simulate` so both report identical rows.
-pub(crate) fn schedule_rows(graph: &PlanGraph, cpm: &CriticalPathResult) -> Vec<ScheduleRow> {
+#[doc(hidden)]
+pub fn schedule_rows(graph: &PlanGraph, cpm: &CriticalPathResult) -> Vec<ScheduleRow> {
     let by_id = task_index(cpm);
     let task_of = |id: &str| by_id.get(id).copied();
     let row_of = |t: &Task, synthetic: bool| ScheduleRow {
@@ -218,7 +223,8 @@ pub(crate) fn schedule_rows(graph: &PlanGraph, cpm: &CriticalPathResult) -> Vec<
 
 /// Milestone rows for `graph`; `is_complete` supplies each milestone's
 /// completion flag (`plan.simulate` has no statuses and passes `false`).
-pub(crate) fn milestone_rows(
+#[doc(hidden)]
+pub fn milestone_rows(
     graph: &PlanGraph,
     cpm: &CriticalPathResult,
     is_complete: impl Fn(&str) -> bool,

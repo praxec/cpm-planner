@@ -10,11 +10,14 @@ Throughout, `X.Y.Z` is the new version and `vX.Y.Z` its tag.
 
 ## 1. Bump the version
 
-On a branch off `dev`, set the same version in the four files that carry it:
+On a branch off `dev`, set the same version in the files that carry it:
 
-- `Cargo.toml`: `[package] version`.
-- `Cargo.lock`: run `cargo check` (or `cargo update -p cpm-planner`) so the
-  lock file records the new version.
+- `Cargo.toml`: `[package] version`, and the `version` of the
+  `cpm-planner-core` dependency line.
+- `crates/cpm-planner-core/Cargo.toml`: `[package] version`. The two crates
+  always share one version.
+- `Cargo.lock`: run `cargo check` (or `cargo update -p cpm-planner -p
+  cpm-planner-core`) so the lock file records the new version.
 - `server.json`: the top-level `version` and the tag of the OCI identifier
   (`ghcr.io/praxec/cpm-planner:X.Y.Z`). The OCI package has no `version`
   field: the MCP registry rejects one.
@@ -27,8 +30,9 @@ Then check them:
 scripts/check-version-sync.sh
 ```
 
-It fails when any `server.json` version or OCI tag, or the `npm/package.json`
-version, differs from `Cargo.toml`.
+It fails when any `server.json` version or OCI tag, the `npm/package.json`
+version, the `cpm-planner-core` version or `cpm-planner`'s requirement on it
+differs from `Cargo.toml`.
 The release workflow repeats the check against the tag and refuses to build on
 a mismatch. Nothing else needs a version bump: the README writes `<version>`
 for a release tag instead of pinning one.
@@ -39,6 +43,15 @@ In [CHANGELOG.md](../CHANGELOG.md), rename `## [Unreleased]` to
 `## [X.Y.Z] - YYYY-MM-DD` and add a fresh empty `## [Unreleased]` above it.
 Follow Keep a Changelog: group entries under Added, Changed, Fixed and so on.
 The date here is the planned release date; step 3 corrects it on the day.
+
+At the bottom of the file, point `[Unreleased]` at `compare/vX.Y.Z...HEAD` and
+add `[X.Y.Z]: https://github.com/praxec/cpm-planner/compare/vPREV...vX.Y.Z`
+above the previous version's line, where `vPREV` is the last release tag.
+
+If the release changes `cpm-planner-core`, add a matching
+`## [X.Y.Z] - YYYY-MM-DD` section and link to
+[crates/cpm-planner-core/CHANGELOG.md](../crates/cpm-planner-core/CHANGELOG.md),
+summarising the kernel changes from the main changelog.
 
 Open the bump as a pull request into `dev` and merge it once CI is green.
 
@@ -182,15 +195,22 @@ registry and check that its version is `X.Y.Z`.
 
 ## 7. Publish to crates.io (manual)
 
-The workflow does not publish the crate. From the tagged commit, with a
-crates.io token configured (`cargo login`):
+The workflow does not publish the crates. There are two, and
+`cpm-planner-core` must be on crates.io before `cpm-planner`, which depends on
+it. `cargo publish --workspace` publishes them in that order and waits for the
+core to appear in the index before it uploads `cpm-planner`. From the tagged
+commit, with a crates.io token configured (`cargo login`):
 
 ```sh
 git checkout vX.Y.Z
-cargo publish --dry-run --locked
-cargo package --list --locked   # no docs/superpowers, .github or scripts
-cargo publish --locked
+cargo publish --workspace --dry-run --locked
+cargo package --workspace --list --locked   # no docs/superpowers, .github or scripts
+cargo publish --workspace --locked
 ```
+
+If the run stops between the two crates, publish the remaining one by name:
+`cargo publish -p cpm-planner --locked`. Never publish `cpm-planner` alone
+for a version whose `cpm-planner-core` is not on crates.io: it cannot resolve.
 
 Until this step runs, crates.io keeps serving the previous version, which is why
 the README installs from the git tag. docs.rs builds the new version on its own
@@ -239,6 +259,9 @@ the final channel and state decision.
   cargo yank --version X.Y.Z cpm-planner
   # undo: cargo yank --version X.Y.Z --undo cpm-planner
   ```
+
+  Yank `cpm-planner-core` the same way when the fault is in the kernel; yank
+  `cpm-planner` with it, because that version re-exports the bad kernel.
 
 - **The image job failed or timed out.** The GitHub release and npm are not
   affected. Rebuild the image for the existing release with

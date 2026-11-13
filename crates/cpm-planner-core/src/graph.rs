@@ -3,7 +3,8 @@
 use crate::plan::Deliverable;
 
 /// Ids of the deliverables `d` depends on, in declaration order.
-pub(crate) fn prerequisite_ids(d: &Deliverable) -> impl Iterator<Item = &str> {
+#[doc(hidden)]
+pub fn prerequisite_ids(d: &Deliverable) -> impl Iterator<Item = &str> {
     d.prerequisites.iter().map(|p| p.id())
 }
 
@@ -11,7 +12,8 @@ pub(crate) fn prerequisite_ids(d: &Deliverable) -> impl Iterator<Item = &str> {
 /// must wait (directly or through a chain) for `x`. Computed once per
 /// validation; assumes nothing about acyclicity (a cycle is rejected later,
 /// and the walk terminates regardless).
-pub(crate) fn reachability(
+#[doc(hidden)]
+pub fn reachability(
     graph: &crate::plan::PlanGraph,
 ) -> std::collections::HashMap<String, std::collections::HashSet<String>> {
     use std::collections::{HashMap, HashSet};
@@ -39,10 +41,13 @@ pub(crate) fn reachability(
 }
 
 /// One invalid hour value found by [`value_problems`].
-pub(crate) struct ValueProblem {
-    pub(crate) message: String,
+#[doc(hidden)]
+pub struct ValueProblem {
+    #[doc(hidden)]
+    pub message: String,
     /// Deliverable id, then the prerequisite id for a lag problem.
-    pub(crate) ids: Vec<String>,
+    #[doc(hidden)]
+    pub ids: Vec<String>,
 }
 
 /// True when `v` is a usable hour value: finite and within
@@ -62,7 +67,8 @@ fn range_message(subject: &str, field: &str, v: f32) -> String {
 /// three-point estimate (range, then ordering) and edge lag. Shared by
 /// submit-time validation (which reports the first) and `plan.lint` (which
 /// reports all), so both use identical messages.
-pub(crate) fn value_problems(graph: &crate::plan::PlanGraph) -> Vec<ValueProblem> {
+#[doc(hidden)]
+pub fn value_problems(graph: &crate::plan::PlanGraph) -> Vec<ValueProblem> {
     let mut out = Vec::new();
     for d in &graph.deliverables {
         let subject = format!("deliverable '{}'", d.id);

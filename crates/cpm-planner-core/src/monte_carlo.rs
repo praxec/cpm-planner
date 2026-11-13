@@ -46,7 +46,8 @@ fn default_seed() -> u64 {
 }
 
 /// Check `iterations` is within `1..=MAX_ITERATIONS`.
-pub(crate) fn check_iterations(iterations: u32) -> Result<(), String> {
+#[doc(hidden)]
+pub fn check_iterations(iterations: u32) -> Result<(), String> {
     if iterations == 0 || iterations > MAX_ITERATIONS {
         Err(format!(
             "iterations must be between 1 and {MAX_ITERATIONS}; got {iterations}"
@@ -134,7 +135,7 @@ pub fn monte_carlo_on_calendar(
     req: &MonteCarloRequest,
     calendar: Option<&ScheduleCalendar>,
 ) -> Result<MonteCarloSummary, PlannerError> {
-    crate::planner::validate_graph(graph)?;
+    crate::validate::validate_graph(graph)?;
     check_request(graph, req)?;
     let cpm = compute_cpm(graph)?;
     let key = crate::resource_schedule::default_resource_key();
@@ -143,7 +144,8 @@ pub fn monte_carlo_on_calendar(
 
 /// The per-iteration work of `graph`: deliverables plus prerequisite edges.
 /// `iterations × work_size` is what [`MAX_WORK`] bounds.
-pub(crate) fn work_size(graph: &PlanGraph) -> usize {
+#[doc(hidden)]
+pub fn work_size(graph: &PlanGraph) -> usize {
     graph.deliverables.len()
         + graph
             .deliverables
@@ -170,7 +172,8 @@ fn check_request(graph: &PlanGraph, req: &MonteCarloRequest) -> Result<(), Plann
 /// [`monte_carlo`] over an already validated graph and its CPM result, so
 /// callers that already ran CPM (`simulate`) do not repeat it. With
 /// `calendar` = (placement, resource key) the run is on the resource clock.
-pub(crate) fn monte_carlo_with_cpm(
+#[doc(hidden)]
+pub fn monte_carlo_with_cpm(
     graph: &PlanGraph,
     req: &MonteCarloRequest,
     cpm: &CriticalPathResult,

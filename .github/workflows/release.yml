@@ -253,14 +253,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # The registry can take a moment to serve a new version.
-          for _ in 1 2 3 4 5 6; do
-            if out=$(npx -y "${PKG}@${VERSION}" --version 2>/dev/null) \
+          # The registry can take several minutes to serve a new version
+          # (v0.7.1 took longer than two). Retry for about ten minutes, and
+          # bypass npx's cache of the earlier "no such version" answer.
+          for _ in $(seq 1 20); do
+            if out=$(npx -y --prefer-online "${PKG}@${VERSION}" --version 2>/dev/null) \
               && [ "$out" = "cpm-planner ${VERSION}" ]; then
               echo "$out"
               exit 0
             fi
-            sleep 20
+            sleep 30
           done
           echo "::error::npx ${PKG}@${VERSION} --version did not print cpm-planner ${VERSION}"
           exit 1

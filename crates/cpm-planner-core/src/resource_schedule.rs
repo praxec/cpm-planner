@@ -23,17 +23,20 @@ const WALL_CLOCK: &str = "wall_clock";
 
 /// Default `resource_key`: deliverables name their resource in
 /// `metadata.owner`.
-pub(crate) fn default_resource_key() -> String {
+#[doc(hidden)]
+pub fn default_resource_key() -> String {
     "owner".to_string()
 }
 
 /// Default `project_buffer_pct`.
-pub(crate) fn default_buffer_pct() -> f32 {
+#[doc(hidden)]
+pub fn default_buffer_pct() -> f32 {
     25.0
 }
 
 /// Check `project_buffer_pct` is a finite percentage in `0..=100`.
-pub(crate) fn check_buffer_pct(pct: f32) -> Result<(), String> {
+#[doc(hidden)]
+pub fn check_buffer_pct(pct: f32) -> Result<(), String> {
     if pct.is_finite() && (0.0..=100.0).contains(&pct) {
         Ok(())
     } else {
@@ -258,7 +261,8 @@ type ChainStep<H> = (usize, WaitKind, Option<String>, Option<H>);
 
 /// The resource clock of one schedule: each deliverable's calendar keys and
 /// windows (graph order), and the map and start they came from.
-pub(crate) struct Clock {
+#[doc(hidden)]
+pub struct Clock {
     map: CalendarMap,
     start: DateTime<Utc>,
     keys: Vec<Vec<String>>,
@@ -269,7 +273,8 @@ impl Clock {
     /// Resolve every deliverable's calendar keys and windows (section 2.5).
     /// `pools[i]` lists the pools deliverable `i` claims; empty (a
     /// `wall_clock_only` deliverable) is always open.
-    pub(crate) fn new(
+    #[doc(hidden)]
+    pub fn new(
         graph: &PlanGraph,
         pools: &[Vec<String>],
         when: &ScheduleCalendar,
@@ -303,14 +308,16 @@ impl Clock {
     }
 
     /// The windows of deliverable `i` (graph order).
-    pub(crate) fn windows(&self, i: usize) -> &WorkWindows {
+    #[doc(hidden)]
+    pub fn windows(&self, i: usize) -> &WorkWindows {
         &self.windows[i]
     }
 
     /// Placement rule (section 3.3): work of `len > 0` starts at the next
     /// open at or after `u` and advances through the windows; anything else
     /// is an instant at `u`.
-    pub(crate) fn place(&self, i: usize, u: f64, len: f64) -> (f64, f64) {
+    #[doc(hidden)]
+    pub fn place(&self, i: usize, u: f64, len: f64) -> (f64, f64) {
         if len <= 0.0 {
             return (u, u);
         }
@@ -332,7 +339,7 @@ pub fn resource_schedule(
     graph: &PlanGraph,
     req: &ScheduleRequest,
 ) -> Result<ResourceSchedule, PlannerError> {
-    crate::planner::validate_graph(graph)?;
+    crate::validate::validate_graph(graph)?;
     let cpm = crate::schedule::compute_cpm(graph)?;
     resource_schedule_with_cpm(graph, req, &cpm)
 }
@@ -354,7 +361,7 @@ pub fn resource_schedule_on_calendar(
     match calendar {
         None => resource_schedule(graph, req),
         Some(calendar) => {
-            crate::planner::validate_graph(graph)?;
+            crate::validate::validate_graph(graph)?;
             calendar_schedule(graph, req, calendar)
         }
     }
@@ -363,7 +370,8 @@ pub fn resource_schedule_on_calendar(
 /// The pools each deliverable claims, exactly as levelling claims them
 /// (keys of `metadata.resources`, else `metadata.<key>`, else
 /// `unassigned`; empty for `wall_clock_only`), for calendar lookup.
-pub(crate) fn pools_of(graph: &PlanGraph, key: &str) -> Result<Vec<Vec<String>>, PlannerError> {
+#[doc(hidden)]
+pub fn pools_of(graph: &PlanGraph, key: &str) -> Result<Vec<Vec<String>>, PlannerError> {
     Ok(build_nodes(graph, key)?
         .into_iter()
         .map(|n| n.resources.into_keys().collect())
@@ -372,7 +380,8 @@ pub(crate) fn pools_of(graph: &PlanGraph, key: &str) -> Result<Vec<Vec<String>>,
 
 /// [`resource_schedule_with_cpm`] on the resource clock, over a validated
 /// graph.
-pub(crate) fn calendar_schedule(
+#[doc(hidden)]
+pub fn calendar_schedule(
     graph: &PlanGraph,
     req: &ScheduleRequest,
     when: &ScheduleCalendar,
@@ -437,7 +446,8 @@ pub(crate) fn calendar_schedule(
 
 /// [`resource_schedule`] over an already validated graph and its CPM
 /// result, so callers that already ran CPM (`simulate`) do not repeat it.
-pub(crate) fn resource_schedule_with_cpm(
+#[doc(hidden)]
+pub fn resource_schedule_with_cpm(
     graph: &PlanGraph,
     req: &ScheduleRequest,
     cpm: &CriticalPathResult,
