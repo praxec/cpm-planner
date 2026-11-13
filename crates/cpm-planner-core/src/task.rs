@@ -8,8 +8,7 @@
 //! - [`CriticalPathResult`]: The full CPM analysis output
 //!
 //! These types are the *algorithm's internal* data model. The wire model
-//! that crosses the [`crate::ports::Planner`] boundary lives in
-//! `crate::plan`. PA3 will provide the bridge.
+//! (the graph a caller submits) lives in [`crate::plan`].
 
 use serde::{Deserialize, Serialize};
 

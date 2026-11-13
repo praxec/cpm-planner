@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- New crate `cpm-planner-core` (`crates/cpm-planner-core`): the pure scheduling kernel, with no
+  SQLite, tokio, rmcp, rig or other I/O dependency, so a program that links its own SQLite (for
+  example through sqlx, whose `libsqlite3-sys` pin conflicts with `rusqlite` 0.42) can use it. It
+  holds the modules `algorithm`, `calendar`, `drag`, `earned_value`, `estimator`, `monte_carlo`,
+  `network_health`, `resource_schedule`, `risk`, `schedule`, `task`, the new `validate`
+  (`validate_graph`, moved out of `planner`) and the graph model of `plan` (`PlanGraph`,
+  `Deliverable`, prerequisites, owned files, `DeliverableStatus`, ids, limits, `PlannerError`).
+  `scripts/check-core-deps.sh` keeps its dependency graph free of those crates in CI.
+
+### Changed
+
+- The repository is a Cargo workspace of `cpm-planner-core` and `cpm-planner`, which share one
+  version and publish to crates.io core first (`cargo publish --workspace`).
+  `scripts/check-version-sync.sh` also checks the core's version and `cpm-planner`'s requirement
+  on it.
+- `cpm-planner` re-exports every moved module at its old path (`cpm_planner::schedule`,
+  `cpm_planner::task`, `cpm_planner::earned_value`, …), and `cpm_planner::plan` re-exports the core
+  graph model next to the execution types (requests, cohorts, locks, `PlanStatus`) that stay in
+  `cpm-planner`. The types are the same in both crates, and existing code, the MCP server, CLI
+  and npm launcher are unchanged.
+- Dependencies updated to their latest releases (every one was already on its newest major):
+  `rmcp` 3.10, `libc` 0.2.191 and `toml` 1.2 (dev) as minimum versions, and in `Cargo.lock`
+  `cc` 1.11.2, `errno` 0.3.15, `mio` 1.2.5 and `rustls-webpki` 0.103.17. The toolchain stays on
+  Rust 1.99.1, the current stable.
+
 ### Fixed
 
 - The release workflow's npm check retries `npx @matthew-cochran/cpm@X.Y.Z --version` for about

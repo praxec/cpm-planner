@@ -490,7 +490,8 @@ impl CpmAlgorithm {
     /// Trace the longest chain ending at the task `end_id` (same tie rules as
     /// [`Self::trace_critical_path`]), restricted to that task's ancestors.
     /// Empty when `end_id` is unknown.
-    pub(crate) fn trace_path_to(tasks: &[Task], end_id: &str) -> Vec<String> {
+    #[doc(hidden)]
+    pub fn trace_path_to(tasks: &[Task], end_id: &str) -> Vec<String> {
         tasks
             .iter()
             .find(|t| t.id == end_id)

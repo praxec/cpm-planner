@@ -17,17 +17,25 @@ push; CI runs the same ones. Besides Rust you need `cargo-nextest`, `cargo-deny`
 `npm/test/*.test.mjs` glob).
 
 ```sh
-cargo build
+cargo build --workspace
 cargo fmt --all --check
-cargo clippy --all-targets -- -D warnings
-cargo nextest run --all-targets
-cargo test --doc
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
-cargo publish --dry-run --locked
+cargo clippy --workspace --all-targets -- -D warnings
+cargo nextest run --workspace --all-targets
+cargo test --workspace --doc
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+cargo publish --workspace --dry-run --locked
 cargo deny check
 scripts/check-version-sync.sh
+scripts/check-core-deps.sh
 node --test "npm/test/*.test.mjs"   # Node 21+ for the glob; the package supports 18+
 ```
+
+The repository is a workspace of two crates: `crates/cpm-planner-core`, the
+pure scheduling kernel, and the root `cpm-planner` (planner, store, MCP server,
+CLI), which re-exports the kernel's modules at their old paths. Keep the core
+free of I/O and of SQLite, tokio, rmcp, rig and the other runtime crates;
+`scripts/check-core-deps.sh` fails if one gets in. Both crates share one
+version.
 
 The binary is `cpm-planner`. With no arguments it is the MCP stdio server;
 `cargo run -q -- --help` lists the subcommands.

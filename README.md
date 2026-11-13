@@ -369,7 +369,26 @@ reports `review_unavailable` with a reason naming the setting.
 
 ## Use as a library
 
-The CPM kernel is also a plain Rust library, independent of MCP:
+The pure scheduling kernel is its own crate,
+[`cpm-planner-core`](crates/cpm-planner-core/README.md): the plan graph model,
+graph validation, the CPM passes (`schedule::compute_cpm`), estimation,
+calendars, resource levelling, Monte Carlo, DRAG, risk and the earned-value
+engine. It does no I/O and its dependency graph has no SQLite, tokio, MCP or
+LLM crates, so it works next to a different SQLite (for example sqlx's).
+Depend on it when you only need the computation:
+
+```toml
+cpm-planner-core = "<version>"
+```
+
+`cpm-planner` depends on `cpm-planner-core` and re-exports each kernel module
+at its old path (`cpm_planner::plan`, `cpm_planner::schedule`,
+`cpm_planner::task`, `cpm_planner::earned_value`, …), so code written against
+`cpm-planner` compiles unchanged and the types are the same in both crates.
+`cpm_planner::plan` also adds the execution types (cohort requests, locks,
+`PlanStatus`). Both crates always carry the same version.
+
+Either crate gives you the kernel without MCP:
 
 ```rust
 use cpm_planner::{CpmAlgorithm, Task, TaskKind};

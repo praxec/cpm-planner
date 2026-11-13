@@ -1,3 +1,13 @@
+# Two crates: `cpm-planner-core` (crates/cpm-planner-core), the pure
+# scheduling kernel with no SQLite or async runtime in its dependency graph,
+# and this package, the planner, MCP server and CLI, which re-exports the
+# kernel at its old paths. Both carry the same version and publish together,
+# core first (docs/releasing.md); scripts/check-version-sync.sh checks it.
+[workspace]
+members = [".", "crates/cpm-planner-core"]
+default-members = [".", "crates/cpm-planner-core"]
+resolver = "3"
+
 [package]
 name = "cpm-planner"
 version = "0.7.1"
@@ -17,6 +27,7 @@ categories = ["development-tools", "command-line-utilities"]
 # forms, doc links), so it is not packaged either.
 exclude = [
     "/.agents/",
+    "/crates/",
     "/.claude/",
     "/.cpm-planner/",
     "/.delivery/",
@@ -51,6 +62,8 @@ name = "cpm-planner"
 path = "src/bin/server.rs"
 
 [dependencies]
+# The pure scheduling kernel. Its version always equals this package's.
+cpm-planner-core = { path = "crates/cpm-planner-core", version = "0.7.1" }
 anyhow = "1.0"
 async-trait = "0.1"
 # Shared reliability vocabulary (retry / circuit-break). The durable, cross-process
@@ -62,7 +75,7 @@ chrono = { version = "0.4", features = ["serde"] }
 rand = { version = "0.10.3", default-features = false }
 rand_chacha = { version = "0.10.0", default-features = false }
 rand_distr = { version = "0.6.0", default-features = false, features = ["std"] }
-rmcp = { version = "3.9", default-features = false, features = ["server", "macros", "transport-io"] }
+rmcp = { version = "3.10", default-features = false, features = ["server", "macros", "transport-io"] }
 rusqlite = { version = "0.42", features = ["bundled", "backup"] }
 serde = { version = "1", features = ["derive"] }
 # Insertion-ordered JSON maps are part of the output contract (MCP results,
@@ -84,7 +97,7 @@ url = "2.5"
 
 [target.'cfg(unix)'.dependencies]
 # errno constants for classifying unsupported hard links (write_new_graph).
-libc = "0.2.190"
+libc = "0.2.191"
 
 [dev-dependencies]
 tempfile = "3.27.0"
@@ -92,4 +105,4 @@ wiremock = "0.6.5"
 # Parses the issue-form YAML in tests/repo_hygiene.rs (maintained serde_yaml fork).
 serde_yaml_ng = "0.10.0"
 # Parses the generated Gemini command files in tests/skills_install.rs.
-toml = "1.1"
+toml = "1.2"

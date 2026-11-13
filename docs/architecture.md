@@ -1,6 +1,7 @@
 # Architecture
 
-This page describes how cpm-planner is put together: the modules in `src/`, the
+This page describes how cpm-planner is put together: the modules in `src/` and
+`crates/cpm-planner-core/src/`, the
 path a request takes through them, the SQLite schema, the concurrency model and
 the security boundaries. It is derived from the module headers (`//!`) and the
 migrations in `src/plan_store.rs`; when the two disagree, the code wins.
@@ -31,15 +32,35 @@ src/llm/               OpenRouter / Jev judge for plan.review
 src/skills.rs          `cpm-planner skills` subcommand (no MCP; files only)
 build.rs               embeds skills/ into the binary
 npm/                   @matthew-cochran/cpm: npx launcher for the release binary
+
+crates/cpm-planner-core/   the pure kernel crate (no SQLite, async runtime or I/O):
+                           plan graph model, validate, algorithm, task, schedule,
+                           estimator, calendar, resource_schedule, monte_carlo,
+                           drag, risk, network_health, earned_value
 ```
+
+The workspace has two crates. `cpm-planner-core` is the kernel; it depends on
+nothing that does I/O, so a program that links its own SQLite (for example
+through sqlx) can use it. `cpm-planner` depends on it and re-exports each of
+its modules at the old path (`cpm_planner::schedule`, `cpm_planner::plan`,
+…), so both crates name the same types. `cpm_planner::plan` re-exports the
+core graph model and adds the execution types (requests, cohorts, locks,
+`PlanStatus`), which reference planner-side modules such as evidence and
+affinity.
 
 The pure engines do no I/O and read no clocks: the planner and the server pass
 them a graph, a state and a time.
 
 ## Module map
 
-### Kernel
+### Kernel (`cpm-planner-core`)
 
+These live in `crates/cpm-planner-core/src/`.
+
+- `plan.rs`: the graph model (`PlanGraph`, `Deliverable`, prerequisites, owned
+  files, `DeliverableStatus`), ids, limits and `PlannerError`.
+- `validate.rs`: `validate_graph`, the structural checks (ids, values,
+  prerequisites, file claims, cycles) every graph passes before scheduling.
 - `algorithm.rs`: the CPM forward and backward passes, float, critical path,
   batches by earliest start, bottleneck analysis. `CPM_VERSION` versions the
   cached results.
@@ -49,12 +70,14 @@ them a graph, a state and a time.
 - `schedule.rs`: `compute_cpm`, which turns a validated `PlanGraph` into a
   `CriticalPathResult` with synthetic `__start__` and `__finish__` endpoints.
   Submit, status, the store's recompute and the analysis tools share it.
-- `graph.rs`: crate-private helpers over the deliverable graph.
+- `graph.rs`: helpers over the deliverable graph, public but hidden so
+  `cpm-planner` can share them; not a stable API.
 
 ### Wire model and planner
 
-- `plan.rs`: the wire and domain types that cross the `Planner` boundary
-  (deliverables, cohorts, locks, requests, `PlannerError`). Every type is
+- `plan.rs`: the wire and domain types that cross the `Planner` boundary. It
+  re-exports the core graph model and `PlannerError`, and defines cohorts,
+  locks, requests and `PlanStatus`. Every type is
   serde, because the server sends them as JSON.
 - `ports.rs`: the `Planner` trait, the seam between a caller and a scheduling
   implementation.
@@ -82,6 +105,10 @@ them a graph, a state and a time.
   and writes (see [Security boundaries](#security-boundaries)).
 
 ### Analysis (read-only)
+
+`resource_schedule.rs`, `monte_carlo.rs`, `drag.rs`, `risk.rs`,
+`network_health.rs`, `earned_value.rs` and `calendar.rs` are in
+`cpm-planner-core`; the rest are in `src/`.
 
 - `lint.rs`: `plan.lint`, every submit-time rule reported as a finding, plus
   advisory checks.

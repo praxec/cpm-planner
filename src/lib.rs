@@ -87,6 +87,14 @@
 //!
 //! # Layout
 //!
+//! The pure kernel (`plan`'s graph model, `validate`, `algorithm`, `task`,
+//! `schedule`, `estimator`, `calendar`, `resource_schedule`, `monte_carlo`,
+//! `drag`, `risk`, `network_health` and `earned_value`) lives in the
+//! [`cpm_planner_core`] crate, which has no SQLite, async runtime or I/O in
+//! its dependency graph. This crate re-exports those modules at the paths
+//! below, so the types are identical in both crates; depend on
+//! `cpm-planner-core` directly when you only need the computation.
+//!
 //! - [`plan`] — the wire/domain model (deliverables, cohorts, locks, errors).
 //! - [`ports`] — the [`Planner`](ports::Planner) trait.
 //! - [`algorithm`] / [`task`] — the pure CPM kernel and its internal model
@@ -118,19 +126,23 @@
 //! This crate has no dependency on praxec; it is consumed purely over the
 //! MCP protocol.
 
+// The pure scheduling kernel lives in the `cpm-planner-core` crate, which has
+// no SQLite or async dependency. Its modules are re-exported here at their
+// old paths so `cpm_planner::schedule::compute_cpm` and friends keep working;
+// `plan` re-exports the core graph model and adds the execution types.
+pub(crate) use cpm_planner_core::graph;
+pub use cpm_planner_core::{
+    algorithm, calendar, drag, earned_value, estimator, monte_carlo, network_health,
+    resource_schedule, risk, schedule, task, validate,
+};
+
 pub mod affinity;
-pub mod algorithm;
 pub mod audit;
-pub mod calendar;
 pub mod compare;
-pub mod drag;
-pub mod earned_value;
 pub mod edits;
-pub mod estimator;
 pub(crate) mod ev_store;
 pub mod evidence;
 pub mod explain;
-mod graph;
 #[cfg(test)]
 mod lease_hours_tests;
 pub mod lint;
@@ -139,8 +151,6 @@ mod locks;
 #[cfg(test)]
 mod mark_actuals_tests;
 pub mod metrics;
-pub mod monte_carlo;
-pub mod network_health;
 pub mod optimize;
 pub mod overview;
 pub mod plan;
@@ -151,19 +161,15 @@ pub mod ports;
 pub mod project;
 pub mod release_cli;
 pub mod release_dag;
-pub mod resource_schedule;
 pub mod review;
 pub mod revise;
-pub mod risk;
-pub mod schedule;
 pub mod server;
 pub mod simulate;
 pub mod skills;
-pub mod task;
 pub mod waves;
 
 pub use algorithm::CpmAlgorithm;
-pub use drag::{DragResult, diameter, drag};
+pub use drag::{DragResult, diameter};
 pub use estimator::{EffortEstimator, EstimationConfig};
 pub use plan::{
     AcceptRequest, AcquireRequest, Estimate, ForceReleaseRequest, HeartbeatRequest,
