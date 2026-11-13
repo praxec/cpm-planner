@@ -5,7 +5,7 @@ Status: contract for issues #131 (per-resource working calendars) and #132
 the placement and accrual rules and the error codes that three pieces of
 work build against independently:
 
-- `calendar-schedule`: window arithmetic in `src/calendar.rs`; `plan.schedule`,
+- `calendar-schedule`: window arithmetic in `crates/cpm-planner-core/src/calendar.rs`; `plan.schedule`,
   `plan.simulate` and Monte Carlo place each deliverable in its resource's
   windows and report `waited_on: "calendar"`.
 - `levelled-baseline`: `plan.baseline` accepts `capacities`, `resource_key`
@@ -16,11 +16,11 @@ work build against independently:
 Where this document and the code disagree after those land, the code is
 wrong or this document must be amended in the same pull request.
 
-Today's code, for reference: the single [`Calendar`](../src/earned_value.rs)
+Today's code, for reference: the single [`Calendar`](../crates/cpm-planner-core/src/earned_value.rs)
 and its `elapsed_hours` EV clock, `build_baseline` and `compute_ev` in the
 same file, the baseline flow in [`src/planner/ev.rs`](../src/planner/ev.rs),
-levelling in [`src/resource_schedule.rs`](../src/resource_schedule.rs),
-Monte Carlo in [`src/monte_carlo.rs`](../src/monte_carlo.rs) and the
+levelling in [`resource_schedule.rs`](../crates/cpm-planner-core/src/resource_schedule.rs),
+Monte Carlo in [`monte_carlo.rs`](../crates/cpm-planner-core/src/monte_carlo.rs) and the
 `baselines` table in [`src/ev_store.rs`](../src/ev_store.rs). The user-facing
 guide is the [cpm-ev skill](../skills/cpm-ev/SKILL.md).
 

@@ -496,17 +496,26 @@ test('install.ps1 Get-LocationFromHeaders reads a string[] value and tolerates a
 });
 
 // ---------------------------------------------------------------------------
-// check-version-sync.sh: Cargo.toml, server.json and npm/package.json agree
+// check-version-sync.sh: Cargo.toml, server.json, npm/package.json and the
+// cpm-planner-core crate agree
 // ---------------------------------------------------------------------------
-function versionSync(t, { cargo = '1.2.3', server = '1.2.3', npm = '1.2.3', ociTag = server, ociVersion } = {}) {
+function versionSync(
+  t,
+  { cargo = '1.2.3', server = '1.2.3', npm = '1.2.3', ociTag = server, ociVersion, core = cargo, coreReq = cargo } = {},
+) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'praxec-version-sync-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const files = ['Cargo.toml', 'server.json', 'package.json'].map((f) => path.join(dir, f));
-  fs.writeFileSync(files[0], `[package]\nname = "cpm-planner"\nversion = "${cargo}"\n`);
+  const files = ['Cargo.toml', 'server.json', 'package.json', 'core.Cargo.toml'].map((f) => path.join(dir, f));
+  fs.writeFileSync(
+    files[0],
+    `[package]\nname = "cpm-planner"\nversion = "${cargo}"\n\n[dependencies]\n` +
+      `cpm-planner-core = { path = "crates/cpm-planner-core", version = "${coreReq}" }\n`,
+  );
   const oci = { registryType: 'oci', identifier: `ghcr.io/praxec/cpm-planner:${ociTag}` };
   if (ociVersion !== undefined) oci.version = ociVersion;
   fs.writeFileSync(files[1], JSON.stringify({ version: server, packages: [oci] }));
   fs.writeFileSync(files[2], JSON.stringify({ name: '@matthew-cochran/cpm', version: npm }));
+  fs.writeFileSync(files[3], `[package]\nname = "cpm-planner-core"\nversion = "${core}"\n`);
   return run('bash', [path.join(ROOT, 'check-version-sync.sh'), ...files]);
 }
 
@@ -524,4 +533,12 @@ test('check-version-sync.sh fails when an OCI package has a version field', (t) 
 
 test('check-version-sync.sh fails when the OCI identifier tag differs from Cargo.toml', (t) => {
   assert.equal(versionSync(t, { ociTag: '1.2.4' }).status, 1);
+});
+
+test('check-version-sync.sh fails when the cpm-planner-core version differs from Cargo.toml', (t) => {
+  assert.equal(versionSync(t, { core: '1.2.4' }).status, 1);
+});
+
+test('check-version-sync.sh fails when the cpm-planner-core dependency version differs from Cargo.toml', (t) => {
+  assert.equal(versionSync(t, { coreReq: '1.2.4' }).status, 1);
 });

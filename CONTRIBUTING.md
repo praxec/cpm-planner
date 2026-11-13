@@ -18,11 +18,12 @@ Run these before opening a pull request; CI runs them too.
 
 ```sh
 cargo fmt --all --check
-cargo clippy --all-targets -- -D warnings
-cargo nextest run --all-targets
-cargo test --doc
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
-cargo publish --dry-run --locked
+cargo clippy --workspace --all-targets -- -D warnings
+cargo nextest run --workspace --all-targets
+cargo test --workspace --doc
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+cargo publish --workspace --dry-run --locked
+scripts/check-core-deps.sh
 cargo deny check
 scripts/check-version-sync.sh
 node --test "npm/test/*.test.mjs"
@@ -44,27 +45,41 @@ Prerequisites beyond the Rust toolchain:
 
 ## Architecture map
 
-The pure kernel has no I/O; the planner, store, and server layers sit on top.
+The repository is a Cargo workspace of two crates. The pure kernel,
+`cpm-planner-core` in `crates/cpm-planner-core/`, has no I/O and no SQLite,
+async runtime, MCP or LLM dependency (`scripts/check-core-deps.sh` enforces
+that in CI). `cpm-planner` (the root package) re-exports the kernel's modules
+at their old paths and adds the planner, store and server layers on top.
 
-- `src/algorithm.rs`: the CPM forward/backward pass.
-- `src/task.rs`: core CPM task and result types.
-- `src/estimator.rs`: effort estimation per task kind.
-- `src/graph.rs`: crate-private helpers over the deliverable graph.
-- `src/schedule.rs`: turns a validated plan graph into a critical-path result.
+Kernel, in `crates/cpm-planner-core/src/`:
+
+- `plan.rs`: the graph model (deliverables, prerequisites, owned files,
+  statuses), ids, limits and `PlannerError`.
+- `validate.rs`: `validate_graph`, the structural checks before scheduling.
+- `algorithm.rs`: the CPM forward/backward pass.
+- `task.rs`: core CPM task and result types.
+- `estimator.rs`: effort estimation per task kind.
+- `graph.rs`: hidden helpers over the deliverable graph, shared with `cpm-planner`.
+- `schedule.rs`: turns a validated plan graph into a critical-path result.
+- `calendar.rs`: working calendars and their window arithmetic.
+- `drag.rs`: Devaux DRAG and graph diameter.
+- `risk.rs`: activity-risk and criticality-risk calculations.
+- `network_health.rs`: iDesign network-health metrics.
+- `monte_carlo.rs`: seeded Monte Carlo schedule risk.
+- `resource_schedule.rs`: resource-constrained leveling, driving chain, buffers.
+- `earned_value.rs`: pure earned-value engine (PV/EV/AC, SPI/CPI/EAC).
+
+Planner, store and server, in `src/`:
+
 - `src/lint.rs`: `plan.lint`, static checks over a plan graph.
-- `src/drag.rs`: Devaux DRAG and graph diameter.
-- `src/risk.rs`: activity-risk and criticality-risk calculations.
-- `src/network_health.rs`: iDesign network-health metrics.
 - `src/metrics.rs`: the plan scorecard combining DRAG, risk, health and lint.
-- `src/monte_carlo.rs`: seeded Monte Carlo schedule risk.
-- `src/resource_schedule.rs`: resource-constrained leveling, driving chain, buffers.
-- `src/earned_value.rs`: pure earned-value engine (PV/EV/AC, SPI/CPI/EAC).
 - `src/edits.rs`: pure structured edits over a plan graph.
 - `src/revise.rs`: pure plan revision carrying progress over.
 - `src/compare.rs`: Pareto front and weighted rank of plan variants.
 - `src/simulate.rs`: read-only simulation of a graph that is never persisted.
 - `src/review.rs`: `plan.review`, lint plus one batched judgment call.
-- `src/plan.rs`: wire data model for the `Planner` trait.
+- `src/plan.rs`: re-exports the core graph model and adds the execution
+  request and response types of the `Planner` trait.
 - `src/ports.rs`: the lock-aware `Planner` trait.
 - `src/planner.rs`: `BasicCpmPlanner`, the shipped `Planner` implementation.
 - `src/planner/ev.rs`: earned-value operations of the planner.

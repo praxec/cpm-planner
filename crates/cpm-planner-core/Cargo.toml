@@ -1,0 +1,34 @@
+[package]
+name = "cpm-planner-core"
+# Always the same version as cpm-planner (scripts/check-version-sync.sh).
+version = "0.7.1"
+edition = "2024"
+rust-version = "1.99"
+license = "Apache-2.0"
+repository = "https://github.com/praxec/cpm-planner"
+homepage = "https://github.com/praxec/cpm-planner"
+documentation = "https://docs.rs/cpm-planner-core"
+description = "Pure Critical Path Method kernel of cpm-planner: plan graph model, CPM forward/backward pass, slack and critical path, resource levelling, Monte Carlo and earned value, with no SQLite, async runtime or I/O."
+authors = ["Matthew Cochran <matthew@cochranweb.com>"]
+readme = "README.md"
+keywords = ["critical-path", "cpm", "scheduling", "earned-value", "monte-carlo"]
+categories = ["algorithms", "date-and-time"]
+
+[package.metadata.docs.rs]
+# No cargo features and no `docsrs` cfg: build the docs for one target only.
+targets = ["x86_64-unknown-linux-gnu"]
+
+# Computation only: no SQLite, no async runtime, no MCP, no LLM client, no
+# filesystem capability crates. scripts/check-core-deps.sh enforces it in CI.
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+rand = { version = "0.10.3", default-features = false }
+rand_chacha = { version = "0.10.0", default-features = false }
+rand_distr = { version = "0.6.0", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+# Insertion-ordered JSON maps are part of the output contract; declare it here
+# too so the kernel behaves the same outside cpm-planner.
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+tracing = "0.1"

@@ -315,6 +315,7 @@ dependencies = [
  "cap-fs-ext",
  "cap-std",
  "chrono",
+ "cpm-planner-core",
  "execution-policy",
  "libc",
  "rand 0.10.3",
@@ -338,6 +339,21 @@ dependencies = [
  "url",
  "uuid",
  "wiremock",
+]
+
+[[package]]
+name = "cpm-planner-core"
+version = "0.7.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "rand 0.10.3",
+ "rand_chacha 0.10.0",
+ "rand_distr",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]

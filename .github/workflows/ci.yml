@@ -31,11 +31,11 @@ jobs:
             - uses: taiki-e/install-action@nextest
             - uses: Swatinem/rust-cache@v2
             - name: Build
-              run: cargo build --all-targets
+              run: cargo build --workspace --all-targets
             - name: Test
-              run: cargo nextest run --all-targets
+              run: cargo nextest run --workspace --all-targets
             - name: Rustdoc tests
-              run: cargo test --doc
+              run: cargo test --workspace --doc
             # Windows normally has no HOME: the server must fall back to
             # USERPROFILE for its default database path and still start.
             - name: MCP smoke without HOME (Windows)
@@ -59,12 +59,16 @@ jobs:
               with:
                   components: rustfmt, clippy
             - uses: Swatinem/rust-cache@v2
-            - name: server.json version matches Cargo.toml
+            - name: server.json, npm and cpm-planner-core versions match Cargo.toml
               run: scripts/check-version-sync.sh
+            # The kernel crate exists so dependents that link their own SQLite
+            # (sqlx) can use it: no rusqlite, tokio, rmcp, ... on any target.
+            - name: cpm-planner-core dependency graph stays pure
+              run: scripts/check-core-deps.sh
             - name: rustfmt
               run: cargo fmt --all --check
             - name: clippy
-              run: cargo clippy --all-targets -- -D warnings   # required: zero warnings
+              run: cargo clippy --workspace --all-targets -- -D warnings   # required: zero warnings
 
     deny:
         name: cargo-deny
@@ -87,7 +91,7 @@ jobs:
             - uses: dtolnay/rust-toolchain@1.99.1
             - uses: Swatinem/rust-cache@v2
             - name: cargo doc
-              run: cargo doc --no-deps --locked
+              run: cargo doc --workspace --no-deps --locked
 
     package:
         name: package
@@ -97,10 +101,13 @@ jobs:
             - uses: actions/checkout@v7
             - uses: dtolnay/rust-toolchain@1.99.1
             - uses: Swatinem/rust-cache@v2
+            # Both crates, cpm-planner-core first: cargo packages the workspace
+            # in dependency order and verifies cpm-planner against the packaged
+            # core, as crates.io will see it.
             - name: cargo package (list)
-              run: cargo package --locked --list
+              run: cargo package --workspace --locked --list
             - name: cargo publish (dry run)
-              run: cargo publish --dry-run --locked
+              run: cargo publish --workspace --dry-run --locked
 
     npm:
         name: npm launcher (${{ matrix.os }})

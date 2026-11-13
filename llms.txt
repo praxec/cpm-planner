@@ -22,6 +22,8 @@ Install with `curl -fsSL https://github.com/praxec/cpm-planner/releases/latest/d
 ## Project
 
 - [Architecture](https://github.com/praxec/cpm-planner/blob/main/docs/architecture.md): modules, request flow, store schema and concurrency
+- [cpm-planner-core](https://github.com/praxec/cpm-planner/blob/main/crates/cpm-planner-core/README.md): the pure scheduling kernel crate (plan graph, `compute_cpm`, levelling, Monte Carlo, earned value) with no SQLite, tokio or MCP dependency; `cpm-planner` re-exports its modules at their old paths
+- [README: Use as a library](https://github.com/praxec/cpm-planner/blob/main/README.md#use-as-a-library): which crate to depend on, and the re-exported paths
 - [CHANGELOG](https://github.com/praxec/cpm-planner/blob/main/CHANGELOG.md): release history
 - [AGENTS.md](https://github.com/praxec/cpm-planner/blob/main/AGENTS.md): instructions for coding agents contributing to this repository
 
