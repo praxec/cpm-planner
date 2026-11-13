@@ -1,7 +1,7 @@
 [package]
 name = "cpm-planner-core"
 # Always the same version as cpm-planner (scripts/check-version-sync.sh).
-version = "0.7.1"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.99"
 license = "Apache-2.0"
