@@ -29,6 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   graph model next to the execution types (requests, cohorts, locks, `PlanStatus`) that stay in
   `cpm-planner`. The types are the same in both crates, and existing code, the MCP server, CLI
   and npm launcher are unchanged.
+- Dependencies updated to their latest releases (every one was already on its newest major):
+  `rmcp` 3.10, `libc` 0.2.191 and `toml` 1.2 (dev) as minimum versions, and in `Cargo.lock`
+  `cc` 1.11.2, `errno` 0.3.15, `mio` 1.2.5 and `rustls-webpki` 0.103.17. The toolchain stays on
+  Rust 1.99.1, the current stable.
 
 ### Fixed
 
