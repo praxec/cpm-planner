@@ -44,6 +44,15 @@ In [CHANGELOG.md](../CHANGELOG.md), rename `## [Unreleased]` to
 Follow Keep a Changelog: group entries under Added, Changed, Fixed and so on.
 The date here is the planned release date; step 3 corrects it on the day.
 
+At the bottom of the file, point `[Unreleased]` at `compare/vX.Y.Z...HEAD` and
+add `[X.Y.Z]: https://github.com/praxec/cpm-planner/compare/vPREV...vX.Y.Z`
+above the previous version's line, where `vPREV` is the last release tag.
+
+If the release changes `cpm-planner-core`, add a matching
+`## [X.Y.Z] - YYYY-MM-DD` section and link to
+[crates/cpm-planner-core/CHANGELOG.md](../crates/cpm-planner-core/CHANGELOG.md),
+summarising the kernel changes from the main changelog.
+
 Open the bump as a pull request into `dev` and merge it once CI is green.
 
 ## 3. Release PR from `dev` to `main`
